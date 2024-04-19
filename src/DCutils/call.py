@@ -14,8 +14,8 @@ from Bio import SeqIO
 from DCutils.funcs import *
 
 
-def bamIterateMultipleRegion(bam, regions):
-    bamObject = BAM(bam, "rb")
+def bamIterateMultipleRegion(bam, regions, refpath):
+    bamObject = getAlignmentObject(bam, refpath=refpath)
     for region in regions:
         for rec in bamObject.fetch(*region):
             if len(region) >= 2:
@@ -29,6 +29,7 @@ def callBam(params, processNo, chunkSize):
     bam = params["tumorBam"]
     nbam = params["normalBam"]
     regions = params["regions"]
+    refpath = params["reference"]
     if params["germline"]:
         germline = VCF(params["germline"], "rb")
     else:
@@ -76,9 +77,9 @@ def callBam(params, processNo, chunkSize):
     total_coverage = 0
     total_coverage_indel = 0
     starttime = time.time()
-    tumorBam = BAM(bam, "rb")
+    tumorBam = getAlignmentObject(bam, refpath)
     if nbam:
-        normalBam = BAM(nbam, "rb")
+        normalBam = getAlignmentObject(nbam, refpath)
     else:
         normalBam = None
     currentReadSet = []
@@ -108,7 +109,7 @@ def callBam(params, processNo, chunkSize):
 
     print(f"Process {str(processNo)}: Initiated. Regions:{region_start}-{regions_end}")
     # for region in regions:
-    for rec, region in bamIterateMultipleRegion(bam, regions):
+    for rec, region in bamIterateMultipleRegion(bam, regions, refpath):
         recCount += 1
         if recCount == currentCheckPoint:
             currentTime = (time.time() - starttime) / 60

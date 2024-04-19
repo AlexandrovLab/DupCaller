@@ -12,6 +12,7 @@ from pysam import AlignmentFile as BAM
 from DCutils.call import callBam
 from DCutils.funcs import createVcfStrings
 from DCutils.splitBamRegions import splitBamRegions
+from DCutils.funcs import getAlignmentObject
 
 if __name__ == "__main__":
     """
@@ -164,7 +165,7 @@ if __name__ == "__main__":
     startTime = time.time()
     if not os.path.exists("tmp"):
         os.mkdir("tmp")
-    bamObject = BAM(args.bam, "rb")
+    bamObject = getAlignmentObject(args.bam, args.reference)
 
     """
     Execulte variant calling

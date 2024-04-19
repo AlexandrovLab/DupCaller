@@ -9,13 +9,22 @@ from pysam import VariantFile as VCF
 from pysam import index as indexBam
 from scipy.stats import binom
 
+## Allow reading either bam or cram as bamObject
+def getAlignmentObject(bam, refpath=None):
+    if bam.endswith(".bam"):
+        bamObject = BAM(bam, "rb")
+    elif bam.endswith(".cram"):
+        bamObject=BAM(bam, "rc", reference_filename=refpath)
+    else:
+        raise NameError(f"{bam} should have .bam or .cram as file extension")
+    return(bamObject)
 
-def splitBamRegions(bam, num, contigs, fast=True):
+def splitBamRegions(bam, num, contigs, fast=True, refpath = None):
     if fast:
         # jobQueue = Queue()
         # jobLock = Lock()
         # resultQueue = Queue()
-        bamObject = BAM(bam, "rb")
+        bamObject = getAlignmentObject(bam, refpath)
         bamStats = bamObject.get_index_statistics()
         readNumber = 0
         contigCountsDict = {}
@@ -71,7 +80,7 @@ def splitBamRegions(bam, num, contigs, fast=True):
                 leftChunkSize = chunkSize
         return cutSite, chunkSize
     else:
-        bamObject = BAM(bam, "rb")
+        bamObject = getAlignmentObject(bam, refpath)
         bamStats = bamObject.get_index_statistics()
         readNumber = 0
         cutSites = [(0, 0)]

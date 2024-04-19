@@ -17,6 +17,7 @@ from pysam import AlignmentFile as BAM
 from DCutils.call import callBam
 from DCutils.funcs import createVcfStrings
 from DCutils.funcs import splitBamRegions
+from DCutils.funcs import getAlignmentObject
 
 if __name__ == "__main__":
     """
@@ -149,6 +150,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    ## If the user points to an absolute output path, it will make a giant path under tmp/
+    ## Quick check if params["output"] starts is an absolute path pointing to the working directory, and changes it to a non-absolute path. 
+    ## Otherwise, keeps the large path.
+    cwd = os.getcwd()
+    if args.output.startswith(cwd):
+        abs_path = args.output
+        outpath = abs_path.replace(cwd, "")
+        ## Make sure we don't end up with a root path
+        if outpath.startswith("/"):
+            outpath = outpath[1:]
+    else:
+        outpath = args.output
+
     """
     Store Parameters
     """
@@ -157,7 +171,7 @@ if __name__ == "__main__":
         "normalBam": args.normalBam,
         "germline": args.germline,
         "reference": args.reference,
-        "output": args.output,
+        "output": outpath,
         "regions": args.regions,
         "threads": args.threads,
         "amperr": args.amperrs,
@@ -191,20 +205,19 @@ if __name__ == "__main__":
     # print("..............Loading reference genome.....................")
     # fasta = SeqIO.to_dict(SeqIO.parse(args.reference, "fasta"))
     startTime = time.time()
-    if not os.path.exists("tmp"):
+    if not os.path.exists(os.path.join("tmp", outpath)):
         try:
-            os.mkdir("tmp")
+            os.makedirs(os.path.join("tmp", outpath))
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise 
-    if not os.path.exists(params["output"]):
+    if not os.path.exists(outpath):
         try:
-            os.mkdir(params["output"])
+            os.makedirs(outpath)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise 
-    bamObject = BAM(args.bam, "rb")
-
+    bamObject = getAlignmentObject(args.bam, args.reference)
     """
     Execulte variant calling
     """
@@ -414,9 +427,9 @@ if __name__ == "__main__":
         RPAll = sum(RPs, [])
 
         coverage_beds = [
-            f"tmp/{args.output}_{_}_coverage.bed.gz" for _ in range(args.threads)
+            f"tmp/{outpath}_{_}_coverage.bed.gz" for _ in range(args.threads)
         ]
-        coverage_bed = f"{args.output}/{args.output}_coverage.bed.gz"
+        coverage_bed = f"{outpath}_coverage.bed.gz"
 
         # with gzopen(coverage_bed, "w") as outfile:
         # for bed_file in coverage_beds:
@@ -426,7 +439,7 @@ if __name__ == "__main__":
         # subprocess.run(["rm"] + coverage_beds)
         # subprocess.run(["tabix",coverage_bed])
 
-    tBam = BAM(args.bam, "rb")
+    tBam = getAlignmentObject(args.bam, args.reference)
     contigs = tBam.references
     # print(contigs)
     chromDict = {contig: tBam.get_reference_length(contig) for contig in contigs}
@@ -445,11 +458,11 @@ if __name__ == "__main__":
     }
     filterDict = {"PASS": "All filter Passed"}
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, mutsAll)
-    with open(args.output + "/" + args.output + "_snv.vcf", "w") as vcf:
+    with open(outpath + "_snv.vcf", "w") as vcf:
         vcf.write(vcfLines)
 
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, indelsAll)
-    with open(args.output + "/" + args.output + "_indel.vcf", "w") as vcf:
+    with open(outpath + "_indel.vcf", "w") as vcf:
         vcf.write(vcfLines)
 
     burden_naive = muts_num / (coverage)
@@ -458,7 +471,7 @@ if __name__ == "__main__":
     pass_duprate = unique_read_num / pass_read_num
 
     with open(
-        params["output"] + "/" + args.output + "_duplex_group_stats.txt", "w"
+        outpath + "_duplex_group_stats.txt", "w"
     ) as f:
         f.write(
             "duplex_group_strand_composition\tduplex_group_number\t\
@@ -487,7 +500,7 @@ if __name__ == "__main__":
             )
 
     muts_by_group = np.loadtxt(
-        params["output"] + "/" + args.output + "_duplex_group_stats.txt",
+        outpath + "_duplex_group_stats.txt",
         skiprows=1,
         dtype=float,
         delimiter="\t",
@@ -526,7 +539,7 @@ if __name__ == "__main__":
     lgd2 = mpatches.Patch(color="blue", label="Naive")
     plt.legend(handles=[lgd1, lgd2])
     plt.savefig(
-        params["output"] + "/" + args.output + "_burden_by_duplex_group_size.png"
+        outpath + "_burden_by_duplex_group_size.png"
     )
     if len(FPAll + RPAll) != 0:
         FPs_count = [0 for _ in range(max(FPAll + RPAll))]
@@ -535,7 +548,7 @@ if __name__ == "__main__":
             FPs_count[nn] = FPAll.count(nn + 1)
             RPs_count[nn] = RPAll.count(nn + 1)
         with open(
-            params["output"] + "/" + args.output + "_SBS_end_profile.txt", "w"
+            outpath + "_SBS_end_profile.txt", "w"
         ) as f:
             f.write("Distance\tMutations_fragment_end\tMutations_read_end\n")
             for nn in range(max(FPAll + RPAll)):
@@ -558,7 +571,7 @@ if __name__ == "__main__":
         print(f"No mutations detected.")
         clonal_num = 0
 
-    with open(params["output"] + "/" + args.output + "_stats.txt", "w") as f:
+    with open(outpath + "_stats.txt", "w") as f:
         f.write(f"Number of Read Families\t{unique_read_num}\n")
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
@@ -570,7 +583,7 @@ if __name__ == "__main__":
         )
         f.write(f"Efficiency\t{efficiency}\n")
 
-    with open(params["output"] + "/" + args.output + "_snv_burden.txt", "w") as f:
+    with open(outpath + "_snv_burden.txt", "w") as f:
         f.write(f"Number of Mutations\t{muts_num}\n")
         f.write(f"Number of multi-clonal Mutations\t{clonal_num}\n")
         f.write(f"Estimated Naive Burden\t{burden_naive}\n")
@@ -578,7 +591,7 @@ if __name__ == "__main__":
         f.write(f"Least-square Burden Upper 95% CI\t{burden_lstsq_uci}\n")
         f.write(f"Least-square Burden Lower 95% CI\t{burden_lstsq_lci}\n")
 
-    with open(params["output"] + "/" + args.output + "_indel_burden.txt", "w") as f:
+    with open(outpath + "_indel_burden.txt", "w") as f:
         f.write(f"Number of Mutations\t{indels_num}\n")
         f.write(f"Effective Coverage\t{coverage+coverage_indel}\n")
         f.write(f"Estimated Naive Burden\t{indel_burden}\n")
