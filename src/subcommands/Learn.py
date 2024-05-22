@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import time
 from multiprocessing import Pool
@@ -12,12 +11,13 @@ from Bio import SeqIO
 from matplotlib import pyplot as plt
 
 
-from . funcs.call import callBam
-from . funcs.misc import createVcfStrings
-from . funcs.misc import splitBamRegions
-from . funcs.misc import getAlignmentObject as BAM
+from .funcs.call import callBam
+from .funcs.misc import createVcfStrings
+from .funcs.misc import splitBamRegions
+from .funcs.misc import getAlignmentObject as BAM
 
-#if __name__ == "__main__":
+
+# if __name__ == "__main__":
 def do_learn(args):
     params = {
         "tumorBam": args.bam,
@@ -28,11 +28,11 @@ def do_learn(args):
         "regions": args.regions,
         "threads": args.threads,
         "mutRate": 10e-7,
-        "pcutoff":2,
-        "amperr":1e-5,
-        "amperr_file":None,
-        "amperri":1e-6,
-        "amperri_file":None,
+        "pcutoff": 2,
+        "amperr": 1e-5,
+        "amperr_file": None,
+        "amperri": 1e-6,
+        "amperri_file": None,
         "dmgerr": 1e-5,
         "dmgerri": 1e-6,
         "dmgerr_file": None,
@@ -48,8 +48,8 @@ def do_learn(args):
         "minAltQual": args.minAltQual,
         "maxNM": args.nmflt,
         "step": args.windowSize,
-        "minRef":args.minRef,
-        "minAlt":args.minAlt,
+        "minRef": args.minRef,
+        "minAlt": args.minAlt,
     }
     """
     Initialze run
@@ -61,32 +61,37 @@ def do_learn(args):
             os.mkdir("tmp")
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise 
+                raise
     if not os.path.exists(params["output"]):
         try:
             os.mkdir(params["output"])
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise 
+                raise
     bamObject = BAM(args.bam, "rb")
 
     """
     Execulte variant calling
     """
-    if args.threads <=2 :
+    if args.threads <= 2:
         """
         Single-thread execution
         """
         print(".........Starting variant calling..............")
         # contigs = [(r.strip('\n'),) for r in open(args.regions,'r').readlines()] # Only process contigs in region file
         paramsNow = params
-        #paramsNow["reference"] = fasta
+        # paramsNow["reference"] = fasta
         paramsNow["isLearn"] = True
         regions = params["regions"]
         paramsNow["regions"] = [
             (chrom, 0, bamObject.get_reference_length(chrom) - 1) for chrom in regions
         ]
-        mismatch_profile, indelerr_profile,mismatch_dmg_profile,indelerr_dmg_profile = callBam(paramsNow, 0)
+        (
+            mismatch_profile,
+            indelerr_profile,
+            mismatch_dmg_profile,
+            indelerr_dmg_profile,
+        ) = callBam(paramsNow, 0)
     else:
         """
         Multi-thread execution
@@ -98,19 +103,19 @@ def do_learn(args):
         print(
             "...........Spliting genomic regions for parallel execution................"
         )
-        #print(args.threads)
-        #if args.normalBam:
+        # print(args.threads)
+        # if args.normalBam:
         cutSites, chunkSize, contigs = splitBamRegions(
             [args.bam], args.threads, contigs, args.windowSize
         )
-        #else:
-            #cutSites, chunkSize, contigs = splitBamRegions(
-                #[args.bam], args.threads, contigs, args.windowSize
-            #)            
-        #print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
+        # else:
+        # cutSites, chunkSize, contigs = splitBamRegions(
+        # [args.bam], args.threads, contigs, args.windowSize
+        # )
+        # print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
         regionSequence = []
         currentContigIndex = 0
-        usedTime = (time.time()-startTime)/60 
+        usedTime = (time.time() - startTime) / 60
         print(f"....Genomic regions splitted in {usedTime} minutes...")
         """
         Determine regions for each process
@@ -175,9 +180,9 @@ def do_learn(args):
         mismatch_profile = sum([_[0] for _ in results]).astype(int)
         indelerr_profile = sum([_[1] for _ in results]).astype(int)
         mismatch_dmg_profile = sum([_[2] for _ in results]).astype(int)
-        #mismatch_F2R1_dmg_profile = sum([_[3] for _ in results]).astype(int)       
-        indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)    
-    
+        # mismatch_F2R1_dmg_profile = sum([_[3] for _ in results]).astype(int)
+        indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)
+
     trinuc2num = dict()
     num2trinuc = list()
     trinuc_order = 0
@@ -195,14 +200,28 @@ def do_learn(args):
                 trinuc2num[trinuc] = trinuc_order
                 num2trinuc.append(trinuc)
                 trinuc_order += 1
-    amp_tn_pd = pd.DataFrame(mismatch_profile,columns=["A","T","C","G"],index=num2trinuc)
-    dmg_tn_pd = pd.DataFrame(mismatch_dmg_profile,columns=["A","T","C","G"],index=num2trinuc)
-    #np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-    amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt",sep='\t')
-    np.savetxt(params["output"] + "/" + args.output + ".amp.id.txt",indelerr_profile,delimiter="\t",fmt="%d")
-    dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt",sep='\t')
-    #np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-    np.savetxt(params["output"] + "/" + args.output + ".dmg.id.txt",indelerr_dmg_profile,delimiter="\t",fmt="%d")
+    amp_tn_pd = pd.DataFrame(
+        mismatch_profile, columns=["A", "T", "C", "G"], index=num2trinuc
+    )
+    dmg_tn_pd = pd.DataFrame(
+        mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
+    )
+    # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
+    amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt", sep="\t")
+    np.savetxt(
+        params["output"] + "/" + args.output + ".amp.id.txt",
+        indelerr_profile,
+        delimiter="\t",
+        fmt="%d",
+    )
+    dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt", sep="\t")
+    # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
+    np.savetxt(
+        params["output"] + "/" + args.output + ".dmg.id.txt",
+        indelerr_dmg_profile,
+        delimiter="\t",
+        fmt="%d",
+    )
     print(
         "..............Completed error learning "
         + str((time.time() - startTime) / 60)

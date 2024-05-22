@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import time
 from collections import OrderedDict
@@ -16,13 +15,15 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from pysam import AlignmentFile as BAM
 
-from . funcs.call import callBam
-from . funcs.misc import createVcfStrings
-from . funcs.misc import splitBamRegions
-from . funcs.misc import getAlignmentObject as BAM
-#from heapq import nlargest
+from .funcs.call import callBam
+from .funcs.misc import createVcfStrings
+from .funcs.misc import splitBamRegions
+from .funcs.misc import getAlignmentObject as BAM
 
-#if __name__ == "__main__":
+# from heapq import nlargest
+
+
+# if __name__ == "__main__":
 def do_call(args):
     params = {
         "tumorBam": args.bam,
@@ -32,14 +33,14 @@ def do_call(args):
         "output": args.output,
         "regions": args.regions,
         "threads": args.threads,
-        #"amperr": args.amperrs,
-        #"amperri": args.amperri,
-        "amperr_file": args.output+"/"+args.output+".amp.tn.txt",
-        "amperri_file": args.output+"/"+args.output+".amp.id.txt",
-        #"dmgerr": args.dmgerrs,
-        #"dmgerri": args.dmgerri,
-        "dmgerr_file": args.output+"/"+args.output+".dmg.tn.txt",
-        "dmgerri_file": args.output+"/"+args.output+".dmg.id.txt",
+        # "amperr": args.amperrs,
+        # "amperri": args.amperri,
+        "amperr_file": args.output + "/" + args.output + ".amp.tn.txt",
+        "amperri_file": args.output + "/" + args.output + ".amp.id.txt",
+        # "dmgerr": args.dmgerrs,
+        # "dmgerri": args.dmgerri,
+        "dmgerr_file": args.output + "/" + args.output + ".dmg.tn.txt",
+        "dmgerri_file": args.output + "/" + args.output + ".dmg.id.txt",
         "mutRate": args.mutRate,
         "pcutoff": args.threshold,
         "mapq": args.mapq,
@@ -54,7 +55,7 @@ def do_call(args):
         "germline_cutoff": args.germlineAfCutoff,
         "maxNM": args.nmflt,
         "step": args.windowSize,
-        "isLearn": None
+        "isLearn": None,
     }
 
     params_learn = {
@@ -66,11 +67,11 @@ def do_call(args):
         "regions": args.regionst,
         "threads": args.threads,
         "mutRate": 10e-7,
-        "pcutoff":2,
-        "amperr":1e-5,
-        "amperr_file":None,
-        "amperri":1e-6,
-        "amperri_file":None,
+        "pcutoff": 2,
+        "amperr": 1e-5,
+        "amperr_file": None,
+        "amperri": 1e-6,
+        "amperri_file": None,
         "dmgerr": 1e-5,
         "dmgerri": 1e-6,
         "dmgerr_file": None,
@@ -85,9 +86,9 @@ def do_call(args):
         "minAltQual": args.minAltQual,
         "maxNM": args.nmflt,
         "step": args.windowSize,
-        "minRef":args.minRef,
-        "minAlt":args.minAlt,
-        "isLearn":True
+        "minRef": args.minRef,
+        "minAlt": args.minAlt,
+        "isLearn": True,
     }
     if not params["normalBams"]:
         print(
@@ -110,24 +111,28 @@ def do_call(args):
             os.mkdir("tmp")
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise 
+                raise
     if not os.path.exists(params["output"]):
         try:
             os.mkdir(params["output"])
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise 
+                raise
     bamObject = BAM(args.bam, "rb")
 
     """
     Execulte variant calling
     """
 
-
     """
     Learn
     """
-    if not (os.path.exists(params["amperr_file"]) and os.path.exists(params["amperri_file"]) and os.path.exists(params["dmgerr_file"]) and os.path.exists(params["dmgerri_file"])):
+    if not (
+        os.path.exists(params["amperr_file"])
+        and os.path.exists(params["amperri_file"])
+        and os.path.exists(params["dmgerr_file"])
+        and os.path.exists(params["dmgerri_file"])
+    ):
         if args.threads == 1:
             """
             Single-thread execution
@@ -135,35 +140,43 @@ def do_call(args):
             print(".........Starting estimating error rates..............")
             # contigs = [(r.strip('\n'),) for r in open(args.regions,'r').readlines()] # Only process contigs in region file
             paramsNow = params_learn
-            #paramsNow["reference"] = fasta
-            #paramsNow["isLearn"] = True
+            # paramsNow["reference"] = fasta
+            # paramsNow["isLearn"] = True
             regions = params["regions"]
             paramsNow["regions"] = [
-                (chrom, 0, bamObject.get_reference_length(chrom) - 1) for chrom in regions
+                (chrom, 0, bamObject.get_reference_length(chrom) - 1)
+                for chrom in regions
             ]
-            mismatch_profile, indelerr_profile,mismatch_dmg_profile,indelerr_dmg_profile = callBam(paramsNow, 0)
+            (
+                mismatch_profile,
+                indelerr_profile,
+                mismatch_dmg_profile,
+                indelerr_dmg_profile,
+            ) = callBam(paramsNow, 0)
         else:
             """
             Multi-thread execution
             """
             contigs = args.regionst
-            contigLengths = [bamObject.get_reference_length(contig) for contig in contigs]
+            contigLengths = [
+                bamObject.get_reference_length(contig) for contig in contigs
+            ]
             print(
                 "...........Spliting genomic regions for parallel execution................"
             )
-            #print(args.threads)
-            #if args.normalBam:
+            # print(args.threads)
+            # if args.normalBam:
             cutSites, chunkSize, contigs = splitBamRegions(
                 [args.bam], args.threads, contigs, args.windowSize
             )
-            #else:
-                #cutSites, chunkSize, contigs = splitBamRegions(
-                    #[args.bam], args.threads, contigs, args.windowSize
-                #)            
-            #print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
+            # else:
+            # cutSites, chunkSize, contigs = splitBamRegions(
+            # [args.bam], args.threads, contigs, args.windowSize
+            # )
+            # print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
             regionSequence = []
             currentContigIndex = 0
-            usedTime = (time.time()-startTime)/60 
+            usedTime = (time.time() - startTime) / 60
             print(f"....Genomic regions splitted in {usedTime} minutes...")
             """
             Determine regions for each process
@@ -209,7 +222,7 @@ def do_call(args):
                 chroms = [region[0] for region in regions]
                 paramsNow = params_learn.copy()
                 paramsNow["regions"] = regions
-                #paramsNow["isLearn"] = True
+                # paramsNow["isLearn"] = True
                 callArgument = (paramsNow, nn)
                 callArguments.append(callArgument)
                 regions = []
@@ -227,9 +240,9 @@ def do_call(args):
 
             mismatch_profile = sum([_[0] for _ in results]).astype(int)
             indelerr_profile = sum([_[1] for _ in results]).astype(int)
-            mismatch_dmg_profile = sum([_[2] for _ in results]).astype(int)    
-            indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)    
-        
+            mismatch_dmg_profile = sum([_[2] for _ in results]).astype(int)
+            indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)
+
         trinuc2num = dict()
         num2trinuc = list()
         trinuc_order = 0
@@ -247,22 +260,33 @@ def do_call(args):
                     trinuc2num[trinuc] = trinuc_order
                     num2trinuc.append(trinuc)
                     trinuc_order += 1
-        amp_tn_pd = pd.DataFrame(mismatch_profile,columns=["A","T","C","G"],index=num2trinuc)
-        dmg_tn_pd = pd.DataFrame(mismatch_dmg_profile,columns=["A","T","C","G"],index=num2trinuc)
-        #np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-        amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt",sep='\t')
-        np.savetxt(params["output"] + "/" + args.output + ".amp.id.txt",indelerr_profile,delimiter="\t",fmt="%d")
-        dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt",sep='\t')
-        #np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-        np.savetxt(params["output"] + "/" + args.output + ".dmg.id.txt",indelerr_dmg_profile,delimiter="\t",fmt="%d")
+        amp_tn_pd = pd.DataFrame(
+            mismatch_profile, columns=["A", "T", "C", "G"], index=num2trinuc
+        )
+        dmg_tn_pd = pd.DataFrame(
+            mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
+        )
+        # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
+        amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt", sep="\t")
+        np.savetxt(
+            params["output"] + "/" + args.output + ".amp.id.txt",
+            indelerr_profile,
+            delimiter="\t",
+            fmt="%d",
+        )
+        dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt", sep="\t")
+        # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
+        np.savetxt(
+            params["output"] + "/" + args.output + ".dmg.id.txt",
+            indelerr_dmg_profile,
+            delimiter="\t",
+            fmt="%d",
+        )
         print(
             "..............Completed error estimation in "
             + str((time.time() - startTime) / 60)
             + " minutes..............."
         )
-
-
-
 
     if args.threads == 1:
         """
@@ -276,18 +300,18 @@ def do_call(args):
             (chrom, 0, bamObject.get_reference_length(chrom) - 1) for chrom in regions
         ]
         (
-        mutsAll,
-        coverage,
-        rec_num,
-        duplex_num,
-        duplex_read_num_single,
-        duplex_read_num_trinuc_single,
-        indelsAll,
-        coverage_indel,
-        unique_read_num,
-        pass_read_num,
-        FPAll,
-        RPAll,
+            mutsAll,
+            coverage,
+            rec_num,
+            duplex_num,
+            duplex_read_num_single,
+            duplex_read_num_trinuc_single,
+            indelsAll,
+            coverage_indel,
+            unique_read_num,
+            pass_read_num,
+            FPAll,
+            RPAll,
         ) = callBam(paramsNow, 0)
         muts_positions = [
             mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
@@ -309,16 +333,14 @@ def do_call(args):
             {num: duplex_read_num_single[num][1] for num in duplex_combinations}
         )
         duplex_read_num_trinuc = OrderedDict(
-            {
-            num: duplex_read_num_trinuc_single[num] for num in duplex_combinations
-            }
+            {num: duplex_read_num_trinuc_single[num] for num in duplex_combinations}
         )
 
     else:
         """
         Multi-thread execution
         """
-        #args.threads = args.threads - 1
+        # args.threads = args.threads - 1
         contigs = args.regions
         contigLengths = [bamObject.get_reference_length(contig) for contig in contigs]
         regions_list = list()
@@ -330,15 +352,15 @@ def do_call(args):
         else:
             cutSites, chunkSize, contigs = splitBamRegions(
                 [args.bam], args.threads, contigs, args.windowSize
-            )    
+            )
         regionSequence = []
         currentContigIndex = 0
-        usedTime = (time.time()-startTime)/60   
+        usedTime = (time.time() - startTime) / 60
         print(f"....Genomic regions splitted in {usedTime} minutes...")
         """
         Determine regions for each process
         """
-        #print(cutSites)
+        # print(cutSites)
         for nn, site in enumerate(cutSites[1:]):
             pSite = cutSites[nn]
             if site[0] == pSite[0]:
@@ -371,7 +393,9 @@ def do_call(args):
                     break
             # print(regions)
             if len(regions) == 0:
-                raise Exception(f"Window size {args.windowSize} is proabably too large. Change -w to a smaller value. An ideal value will be targetSize/(threads * 100)")
+                raise Exception(
+                    f"Window size {args.windowSize} is proabably too large. Change -w to a smaller value. An ideal value will be targetSize/(threads * 100)"
+                )
             paramsNow = params.copy()
             regions_list.append(regions)
             # paramsNow["reference"] = fastaNow
@@ -379,7 +403,7 @@ def do_call(args):
             callArgument = (paramsNow, nn)
             callArguments.append(callArgument)
         results = pool.starmap(callBam, callArguments)
-        
+
         muts = [_[0] for _ in results]
         coverages = [_[1] for _ in results]
         rec_nums = [_[2] for _ in results]
@@ -436,7 +460,7 @@ def do_call(args):
                 for num in duplex_combinations
             }
         )
-        
+
         duplex_read_num_trinuc = OrderedDict(
             {
                 num: sum([d.get(num, np.zeros(32)) for d in duplex_read_nums_trinuc])
@@ -444,11 +468,8 @@ def do_call(args):
             }
         )
 
-        
         FPAll = sum(FPs, [])
         RPAll = sum(RPs, [])
-
-
 
     tBam = BAM(args.bam, "rb")
     contigs = tBam.references
@@ -457,17 +478,17 @@ def do_call(args):
     infoDict = {
         "F1R2": [1, "Integer", "Number of F1R2 read(s) in the read bundle"],
         "F2R1": [1, "Integer", "Number of F2R1 read(s) in the read bundle"],
-        #"TLR": [1, "Float", "Alt/Ref log likelihood ratio of top strand"],
-        #"BLR": [1, "Float", "Alt/Ref log likelihood ratio of bottom strand"],
-        "LR": [1,"Float","Log-Likelihood ratio of major base over minor base"],
+        # "TLR": [1, "Float", "Alt/Ref log likelihood ratio of top strand"],
+        # "BLR": [1, "Float", "Alt/Ref log likelihood ratio of bottom strand"],
+        "LR": [1, "Float", "Log-Likelihood ratio of major base over minor base"],
         "TC": [4, "Integer", "Top strand base count"],
         "BC": [4, "Float", "Bottom strand base count"],
-        "DF": [1,"Integer","Distance from fragment end"],
-        "DR": [1,"Integer","Distance from read end"],
-        "TAG1":[1,"String","Barcode of top strand 5 prime"],
-        "TAG2":[1,"String","Barcode of bottom strand 5 prime"],
-        "TN": [1,"String","trinucleotide context"],
-        "HP": [1,"Integer","Homopolymer length"]
+        "DF": [1, "Integer", "Distance from fragment end"],
+        "DR": [1, "Integer", "Distance from read end"],
+        "TAG1": [1, "String", "Barcode of top strand 5 prime"],
+        "TAG2": [1, "String", "Barcode of bottom strand 5 prime"],
+        "TN": [1, "String", "trinucleotide context"],
+        "HP": [1, "Integer", "Homopolymer length"],
     }
     formatDict = {
         "AC": [1, "Integer", "Count of alt allele"],
@@ -511,7 +532,7 @@ def do_call(args):
                 muts_by_duplex_group[str(TC_total) + "+" + str(BC_total)] += 1
             else:
                 muts_by_duplex_group[str(BC_total) + "+" + str(TC_total)] += 1
-        
+
         for read_num in non_zero_keys:
             f.write(
                 f"{read_num}\t{duplex_read_num[read_num]}\t\
@@ -524,12 +545,14 @@ def do_call(args):
             for plus_base in ["A", "T", "C", "G"]:
                 trinuc2num[minus_base + ref_base + plus_base] = len(trinuc_list)
                 trinuc_list.append(minus_base + ref_base + plus_base)
-    duplex_read_num_trinuc = {_:duplex_read_num_trinuc[_] for _ in non_zero_keys}
+    duplex_read_num_trinuc = {_: duplex_read_num_trinuc[_] for _ in non_zero_keys}
     trinuc_by_duplex_group = pd.DataFrame(duplex_read_num_trinuc)
     trinuc_by_duplex_group.insert(0, "", trinuc_list)
-    trinuc_by_duplex_group.to_csv(params["output"] + "/" + args.output + "_trinuc_by_duplex_group.txt",sep='\t',index=False)    
-    
-        
+    trinuc_by_duplex_group.to_csv(
+        params["output"] + "/" + args.output + "_trinuc_by_duplex_group.txt",
+        sep="\t",
+        index=False,
+    )
 
     muts_by_group = np.loadtxt(
         params["output"] + "/" + args.output + "_duplex_group_stats.txt",
@@ -539,16 +562,16 @@ def do_call(args):
         usecols=(2, 3),
         ndmin=2,
     ).transpose()
-    x = muts_by_group[0,:]
-    y = muts_by_group[1,:]
+    x = muts_by_group[0, :]
+    y = muts_by_group[1, :]
     burden_lstsq = x.dot(y) / x.dot(x)
     bootstrap_lstsqs = []
     for _ in range(10000):
         muts_by_group_resampled = np.random.default_rng().choice(
             muts_by_group, muts_by_group.shape[1], axis=1
         )
-        x = muts_by_group_resampled[0,:]
-        y = muts_by_group_resampled[1,:]
+        x = muts_by_group_resampled[0, :]
+        y = muts_by_group_resampled[1, :]
         burden_lstsq_resampled = x.dot(y) / x.dot(x)
         bootstrap_lstsqs.append(burden_lstsq_resampled)
     bootstrap_lstsqs.sort()
@@ -600,7 +623,6 @@ def do_call(args):
         {1-unique_read_num/pass_read_num}\n"
         )
         f.write(f"Efficiency\t{efficiency}\n")
-
 
     print(
         "..............Completed variant calling "

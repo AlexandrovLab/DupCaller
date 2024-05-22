@@ -24,8 +24,12 @@ def trim(readPair, pattern):
     if len(bc1) > 0:
         namenew1 = (
             name1.strip("\n").split(" ")[0]
-            + "_"+bc1+"+"+bc2 + " "
-            #+ " ".join(name1.strip("\n").split(" ")[1:])
+            + "_"
+            + bc1
+            + "+"
+            + bc2
+            + " "
+            # + " ".join(name1.strip("\n").split(" ")[1:])
             + "DB:Z:"
             + bc1
             + "-"
@@ -34,8 +38,12 @@ def trim(readPair, pattern):
         )
         namenew2 = (
             name2.strip("\n").split(" ")[0]
-            + "_"+bc1+"+"+bc2 + " "
-            #+ " ".join(name2.strip("\n").split(" ")[1:])
+            + "_"
+            + bc1
+            + "+"
+            + bc2
+            + " "
+            # + " ".join(name2.strip("\n").split(" ")[1:])
             + "DB:Z:"
             + bc1
             + "-"

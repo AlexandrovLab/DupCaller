@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#if __name__ == "__main__":
+# if __name__ == "__main__":
 def do_summarize(args):
     samples = args.input
     with open(args.output, "w") as output:
@@ -9,7 +9,7 @@ def do_summarize(args):
         for sample in samples:
             stats_file = f"{sample}/{sample}_stats.txt"
             snv_burden_file = f"{sample}/{sample}_burden.txt"
-            #indel_burden_file = f"{sample}/{sample}_indel_burden.txt"
+            # indel_burden_file = f"{sample}/{sample}_indel_burden.txt"
             with open(stats_file) as stats:
                 lines = stats.readlines()
                 uniq_reads = int(lines[0].strip("\n").split("\t")[1])

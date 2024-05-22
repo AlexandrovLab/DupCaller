@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import copy
 from subcommands.Caller import do_call
 from subcommands.Trim import do_trim
 from subcommands.Summarize import do_summarize
@@ -8,23 +7,35 @@ from subcommands.Learn import do_learn
 from subcommands.AggregateProfile import do_aggregate
 from subcommands.Estimate import do_estimate
 from subcommands.Index import do_index
-#from Estimate import do_estimate
+
+# from Estimate import do_estimate
 if __name__ == "__main__":
     """
     Parse Arguments
     """
-    master_parser = argparse.ArgumentParser(description="DupCaller is a set of tool to call mutations and estimate mutation rate from ecNGS dataset")
+    master_parser = argparse.ArgumentParser(
+        description="DupCaller is a set of tool to call mutations and estimate mutation rate from ecNGS dataset"
+    )
     subparsers = master_parser.add_subparsers(dest="command")
 
-    trim_parser = subparsers.add_parser("trim",help="Trim an ecNGS fastq file. The input should be either fastq or gzipped fastq.")
-    trim_parser.add_argument("-i", "--fq", type=str, help="fastq file (read 1 if paired)")
+    trim_parser = subparsers.add_parser(
+        "trim",
+        help="Trim an ecNGS fastq file. The input should be either fastq or gzipped fastq.",
+    )
+    trim_parser.add_argument(
+        "-i", "--fq", type=str, help="fastq file (read 1 if paired)"
+    )
     trim_parser.add_argument("-i2", "--fq2", type=str, help="read 2 fastq file")
-    trim_parser.add_argument("-p", "--pattern", type=str, help="pattern of sequence barcode")
+    trim_parser.add_argument(
+        "-p", "--pattern", type=str, help="pattern of sequence barcode"
+    )
     trim_parser.add_argument(
         "-o", "--output", type=str, help="prefix of the output fastq files"
     )
     ### Call arguments
-    call_parser = subparsers.add_parser("call",help="Call mutations from an aligned ecNGS bam.")
+    call_parser = subparsers.add_parser(
+        "call", help="Call mutations from an aligned ecNGS bam."
+    )
     call_parser.add_argument(
         "-b", "--bam", type=str, help="bam file of sample sequencing reads"
     )
@@ -39,7 +50,9 @@ if __name__ == "__main__":
         default=0.001,
     )
     call_parser.add_argument("-f", "--reference", type=str, help="reference fasta file")
-    call_parser.add_argument("-o", "--output", type=str, help="prefix of the output files")
+    call_parser.add_argument(
+        "-o", "--output", type=str, help="prefix of the output files"
+    )
     call_parser.add_argument(
         "-r",
         "--regions",
@@ -54,7 +67,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         help="contigs to consider for training",
-        default=["chr1"]
+        default=["chr1"],
     )
     call_parser.add_argument(
         "-p", "--threads", type=int, help="number of threads", default=1
@@ -137,7 +150,7 @@ if __name__ == "__main__":
     )
 
     call_parser.add_argument(
-        "-n", "--normalBams", nargs="+",type=str, help="bam file of matched normal"
+        "-n", "--normalBams", nargs="+", type=str, help="bam file of matched normal"
     )
     call_parser.add_argument("-m", "--noise", type=str, help="noise mask")
     call_parser.add_argument(
@@ -146,7 +159,7 @@ if __name__ == "__main__":
         type=int,
         help="ignore mutation if it is less than n bps from ends of template",
         default=7,
-    ) 
+    )
     call_parser.add_argument(
         "-tr",
         "--trimR",
@@ -188,42 +201,42 @@ if __name__ == "__main__":
         "--nmflt",
         type=int,
         help="if set to a number, any read group and half of reads has a higher NM will be filtered",
-        default = 4,
+        default=4,
     )
     call_parser.add_argument(
         "-w",
         "--windowSize",
         type=int,
         help="genomic window size when calculating rough coverage and split bam files into equal regions. Adjust for smaller panel",
-        default = 100000
-    ) 
+        default=100000,
+    )
     call_parser.add_argument(
         "-bq",
         "--minBq",
         type=int,
         help="bases with quality less than this number will be set to 6",
-        default = 18
+        default=18,
     )
     call_parser.add_argument(
         "-aq",
         "--minAltQual",
         type=float,
         help="minimum consensus quality of alt allele, if not 0, in a read group to be considered for training",
-        default = 60,
-    ) 
+        default=60,
+    )
 
     call_parser.add_argument(
         "--minRef",
         type=float,
         help="minimum consensus quality of alt allele, if not 0, in a read group to be considered for training",
-        default = 2,
+        default=2,
     )
     call_parser.add_argument(
         "--minAlt",
         type=float,
         help="minimum consensus quality of alt allele, if not 0, in a read group to be considered for training",
-        default = 2,
-    ) 
+        default=2,
+    )
 
     ###########
     """
@@ -345,7 +358,9 @@ if __name__ == "__main__":
         default = 2,
     ) 
     """
-    aggregate_parser = subparsers.add_parser("aggregate",help="Aggregate learned mismatch profile from multiple samples")
+    aggregate_parser = subparsers.add_parser(
+        "aggregate", help="Aggregate learned mismatch profile from multiple samples"
+    )
     aggregate_parser.add_argument(
         "-i",
         "--input",
@@ -354,12 +369,31 @@ if __name__ == "__main__":
         help="folder where DupCallerCall results are stored",
     )
     aggregate_parser.add_argument("-o", "--output", type=str, help="output filename")
-    
-    estimate_parser = subparsers.add_parser("estimate",help="Estimate mutation rate and SBS96 from results")
-    estimate_parser.add_argument("-i","--prefix",type=str,help="Input prefix of results from call")
-    estimate_parser.add_argument("-f","--reference",type=str,help="Fasta file of reference. Either -f or -ft should be set")
-    estimate_parser.add_argument("-ft","--refTrinuc",type=str,help="Precomputed trinucleotide composition of reference genome. Either -f or -ft should be set")
-    estimate_parser.add_argument("-ot","--outTrinuc",type=str,help="If ref is set, output the computed trinucleotide composition file for future use")
+
+    estimate_parser = subparsers.add_parser(
+        "estimate", help="Estimate mutation rate and SBS96 from results"
+    )
+    estimate_parser.add_argument(
+        "-i", "--prefix", type=str, help="Input prefix of results from call"
+    )
+    estimate_parser.add_argument(
+        "-f",
+        "--reference",
+        type=str,
+        help="Fasta file of reference. Either -f or -ft should be set",
+    )
+    estimate_parser.add_argument(
+        "-ft",
+        "--refTrinuc",
+        type=str,
+        help="Precomputed trinucleotide composition of reference genome. Either -f or -ft should be set",
+    )
+    estimate_parser.add_argument(
+        "-ot",
+        "--outTrinuc",
+        type=str,
+        help="If ref is set, output the computed trinucleotide composition file for future use",
+    )
     estimate_parser.add_argument(
         "-r",
         "--regions",
@@ -369,7 +403,9 @@ if __name__ == "__main__":
         default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
     )
 
-    summarize_parser = subparsers.add_parser("summarize",help="Summarize results from multiple samples")
+    summarize_parser = subparsers.add_parser(
+        "summarize", help="Summarize results from multiple samples"
+    )
     summarize_parser.add_argument(
         "-i",
         "--input",
@@ -378,10 +414,14 @@ if __name__ == "__main__":
         help="folder where DupCallerCall results are stored",
     )
     summarize_parser.add_argument("-o", "--output", type=str, help="output filename")
-    
 
-    index_parser = subparsers.add_parser("index",help="Index reference genomes")
-    index_parser.add_argument("-f","--reference",type=str,help="Fasta file of reference. Either -f or -ft should be set")
+    index_parser = subparsers.add_parser("index", help="Index reference genomes")
+    index_parser.add_argument(
+        "-f",
+        "--reference",
+        type=str,
+        help="Fasta file of reference. Either -f or -ft should be set",
+    )
     args = master_parser.parse_args()
 
     """
