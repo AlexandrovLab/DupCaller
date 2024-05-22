@@ -112,7 +112,7 @@ These options should be understood by user and customized accordingly. Some of t
 | -r | --regions | contigs to consider for variant calling. The default is set for human. For any other species, please set the contigs accordingly. For example, for mouse, please set to "-r chr{1..19} chrX chrY" | default: chr{1..22} chrX chrY |
 | -g | --germline | indexed germline vcf with AF field. | None |
 | -p | --threads | number of threads | 1 |
-| -n | --normalBam | bam file of matched normal. When matched normal is not available, set the maximum allele frequency (-ma) to an appropriate value (e.x. 0.3) | None |
+| -n | --normalBam | bam file of matched normals. When matched normal is not available, set the maximum allele frequency (-ma) to an appropriate value (e.x. 0.3) | None |
 | -m | --noise | a bed interval file that masked noisy positions | None |
 | -maf | --maxAF | maximum allele fraction to call a somatic mutation. Must be set to appropriate value when a matched normal (-n) is not available | 1 |
 | -mac | --maxAltCount | maximum allele count of alt allele | 100000 |
