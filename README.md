@@ -86,7 +86,7 @@ DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {thread
 2. Mutagenesis panel without a matched normal
 
 ```bash
-DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -ma 0.1
+DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -maf 0.1
 ```
 
 Note that since DupCaller partition jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panel. In this case we suggest to run at most one thread per distince targeted region
