@@ -37,6 +37,8 @@ def prepare_reference_mats(
     germline_bed,
     noise_bed,
     indel_bed,
+    include_bed,
+    feature_beds,
     nbams,
     tbam,
     params,
@@ -109,6 +111,33 @@ def prepare_reference_mats(
             interval_len = interval_end - interval_start
             interval_start_ind = interval_start - start
             indel_mask[interval_start_ind : interval_start_ind + interval_len] = True
+    if include_bed != None:
+        include_arr = np.zeros(end - start, dtype=bool)
+        for rec in include_bed.fetch(chrom, start, end, parser=pysam.asBed()):
+            interval_start = max(rec.start, start)
+            interval_end = min(rec.end, end)
+            interval_len = interval_end - interval_start
+            interval_start_ind = interval_start - start
+            include_arr[interval_start_ind : interval_start_ind + interval_len] = True
+        include_mask = ~include_arr
+    else:
+        include_mask = np.zeros(end - start, dtype=bool)
+    if feature_beds != None:
+        feature_mat = np.zeros(
+            (len(feature_beds), end - start),
+        )
+        for nn, rec in range(
+            feature_files.fetch(chrom, start, end, parser=pysam.asBed())
+        ):
+            interval_start = max(rec.start, start)
+            interval_end = min(rec.end, end)
+            interval_len = interval_end - interval_start
+            interval_start_ind = interval_start - start
+            feature_mat[
+                nn, interval_start_ind : interval_start_ind + interval_len
+            ] = True
+    else:
+        feature_mat = None
 
     ### Prepare normal coverage mask
     if not params["isLearn"]:
@@ -134,6 +163,8 @@ def prepare_reference_mats(
         indel_mask,
         noise_mask,
         n_cov_mask,
+        include_mask,
+        feature_mat,
     )  # , reference_int, trinuc_int
 
 
@@ -213,6 +244,14 @@ def callBam(params, processNo):
         indel_bed = BED(params["indel_bed"])
     else:
         indel_bed = None
+    if params["region_file"]:
+        include_bed = BED(params["region_file"])
+    else:
+        include_bed = None
+    if params["feature_files"]:
+        feature_beds = [BED(_) for _ in params["feature_files"]]
+    else:
+        feature_beds = None
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
     num2base = "ATCG"
     muts = []
@@ -220,6 +259,10 @@ def callBam(params, processNo):
     muts_indels = []
     duplex_read_num_dict = dict()
     duplex_read_num_dict_trinuc = dict()
+    if feature_beds:
+        duplex_read_num_dict_trinuc_features = [dict() for _ in feature_beds]
+    else:
+        duplex_read_num_dict_trinuc_features = None
     unique_read_num = 0
     pass_read_num = 0
     FPs = []
@@ -456,10 +499,52 @@ def callBam(params, processNo):
         bcsplit = bc.split("+")
         bc1 = bcsplit[0]
         bc2 = bcsplit[1]
+        if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
+            label = bc1 + "+" + bc2  # + ":" + "f1r2"
+            # label = bc1 + "+" + bc2 + ":" + "f2r1"
+        else:
+            label = bc2 + "+" + bc1  # + ":" + "f1r2"
         chrom = tumorBam.get_reference_name(rec.reference_id)
         if currentStart == -1:
             currentStart = start
         if start == currentStart:
+            if currentReadDict.get(label):
+                if currentReadDict[label]["names"].get(rec.query_name):
+                    if rec.is_read2:
+                        continue
+                    else:
+                        ind = currentReadDict[label]["names"].get(rec.query_name)
+                        currentReadDict[label]["seqs"][ind] = rec
+                else:
+                    currentReadDict[label]["seqs"].append(rec)
+                    currentReadDict[label]["names"][rec.query_name] = (
+                        len(currentReadDict[label]["seqs"]) - 1
+                    )
+                    if (rec.is_forward and rec.is_read1) or (
+                        rec.is_reverse and rec.is_read2
+                    ):
+                        currentReadDict[label]["F1R2"] += 1
+                    else:
+                        currentReadDict[label]["F2R1"] += 1
+            else:
+                currentReadDict.update(
+                    {
+                        label: {
+                            "seqs": [rec],
+                            "F1R2": 0,
+                            "F2R1": 0,
+                            "names": {rec.query_name: 0},
+                        }
+                    }
+                )
+                if (rec.is_forward and rec.is_read1) or (
+                    rec.is_reverse and rec.is_read2
+                ):
+                    currentReadDict[label]["F1R2"] += 1
+                else:
+                    currentReadDict[label]["F2R1"] += 1
+
+            """
             if currentReadDict.get(bc1 + "+" + bc2) != None:
                 if not currentReadDict[bc1 + "+" + bc2]["names"].get(rec.query_name):
                     currentReadDict[bc1 + "+" + bc2]["seqs"].append(rec)
@@ -521,6 +606,7 @@ def callBam(params, processNo):
                     currentReadDict[bc1 + "+" + bc2]["F1R2"] += 1
                 else:
                     currentReadDict[bc1 + "+" + bc2]["F2R1"] += 1
+            """
         else:
             """
             Calling block starts
@@ -549,7 +635,7 @@ def callBam(params, processNo):
                 ) / len(readSet)
                 if meanASXS < 50:
                     continue
-                setBc = key.split("+")
+                setBc = key.split(":")[0].split("+")
                 setBc1 = setBc[0]
                 setBc2 = setBc[1]
                 F2R1 = currentReadDict[key]["F2R1"]
@@ -558,6 +644,12 @@ def callBam(params, processNo):
                 if duplex_read_num_dict.get(duplex_no) is None:
                     duplex_read_num_dict[duplex_no] = [0, 0]
                     duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
+                if feature_beds:
+                    for nn in range(len(duplex_read_num_dict_trinuc_features)):
+                        if duplex_read_num_dict[nn].get(duplex_no) is None:
+                            duplex_read_num_dict_trinuc_features[nn][
+                                duplex_no
+                            ] = np.zeros(96, dtype=int)
                 unique_read_num += 1
                 if setBc1 != setBc2 and F2R1 >= 1 and F1R2 >= 1:
                     rs_reference_end = max([r.reference_end for r in readSet])
@@ -621,6 +713,8 @@ def callBam(params, processNo):
                             indel_mask,
                             noise_mask,
                             n_cov_mask,
+                            include_mask,
+                            feature_mat
                             # ref_np,
                             # trinuc_np
                         ) = prepare_reference_mats(
@@ -633,6 +727,8 @@ def callBam(params, processNo):
                             germline,
                             noise,
                             indel_bed,
+                            include_bed,
+                            feature_beds,
                             nbams,
                             bam,
                             params,
@@ -640,6 +736,12 @@ def callBam(params, processNo):
                         # print(ref_np,reference_mat_start)
                         coverage = np.zeros(1000000, dtype=int)
                         coverage_indel = np.zeros(1000000, dtype=int)
+                        if feature_beds:
+                            trinuc_features = [
+                                np.zeros((96, 1000000), dtype=int) for _ in feature_beds
+                            ]
+                        else:
+                            trinuc_features = list()
 
                     ### Record read names to check if mate has been processed
                     processed_flag = 0
@@ -668,15 +770,16 @@ def callBam(params, processNo):
                         + reference_length_max
                         - reference_mat_start
                     )
-                    masks = np.zeros([4, end_ind - start_ind], dtype=bool)
+                    masks = np.zeros([5, end_ind - start_ind], dtype=bool)
                     masks[0, :] = snp_mask[start_ind:end_ind]
                     masks[1, :] = noise_mask[start_ind:end_ind]
                     masks[2, :] = n_cov_mask[start_ind:end_ind]
+                    masks[3, :] = include_mask[start_ind:end_ind]
                     left, right = determineTrimLength(
                         readSet[0], params=params, processed_flag=processed_flag
                     )
-                    masks[3, :left] = True
-                    masks[3, -right:] = True
+                    masks[4, :left] = True
+                    masks[4, -right:] = True
                     antimask = np.all(~masks, axis=0)
                     antimask[trinuc_np[start_ind:end_ind] > 64] = False
                     ### If the whole reads are masked:
@@ -830,7 +933,7 @@ def callBam(params, processNo):
                             indel_dict[indel_str] = 1
                     # else:
                     ### Calculate genotype probability
-                    if not any(indel_bool) or isLearn or len(indels_pass) == 0:
+                    if not any(indel_bool) or isLearn:
                         if isLearn:
                             (
                                 mismatch_now,
@@ -879,6 +982,8 @@ def callBam(params, processNo):
                         pass_bool = np.full(LR.size, False, dtype=bool)
                         pass_bool[refs_ind] = True
                         pass_bool[muts_ind] = True
+                        # if F1R2 >=2 and F2R1 >=2:
+                        # print("pass_bool",pass_bool,"antimask",antimask,"LR",LR,F1R2_count,F2R1_count)
                         pos = [
                             mut_ind + start_ind + reference_mat_start
                             for mut_ind in muts_ind
@@ -981,18 +1086,35 @@ def callBam(params, processNo):
                         duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
                             trinuc_pass, minlength=96
                         ).astype(int)
+                        if feature_beds:
+                            for nn in range(feature_beds):
+                                trinuc_pass_feature = trinuc_np[start_ind:end_ind][
+                                    pass_bool[feature_mat[nn, :]]
+                                ]
+                                duplex_read_num_dict_trinuc[nn][
+                                    duplex_no
+                                ] += np.bincount(
+                                    trinuc_pass_feature, minlength=96
+                                ).astype(
+                                    int
+                                )
                         duplex_read_num_dict[duplex_no][0] += 1
                         duplex_count += 1
             """
             Calling block ends
             """
             currentReadDict = {
-                bc: {"seqs": [rec], "F1R2": 0, "F2R1": 0, "names": {rec.query_name: 0}}
+                label: {
+                    "seqs": [rec],
+                    "F1R2": 0,
+                    "F2R1": 0,
+                    "names": {rec.query_name: 0},
+                }
             }
             if (rec.is_forward and rec.is_read1) or (rec.is_reverse and rec.is_read2):
-                currentReadDict[bc1 + "+" + bc2]["F1R2"] += 1
+                currentReadDict[label]["F1R2"] += 1
             else:
-                currentReadDict[bc1 + "+" + bc2]["F2R1"] += 1
+                currentReadDict[label]["F2R1"] += 1
             currentStart = start
     """
     Calling block starts
@@ -1021,15 +1143,21 @@ def callBam(params, processNo):
         ) / len(readSet)
         if meanASXS < 50:
             continue
-        setBc = key.split("+")
+        setBc = key.split(":")[0].split("+")
         setBc1 = setBc[0]
         setBc2 = setBc[1]
         F2R1 = currentReadDict[key]["F2R1"]
         F1R2 = currentReadDict[key]["F1R2"]
-        duplex_no = f"{min([F1R2,F2R1])}+{max([F1R2,F2R1])}"
+        duplex_no = f"{F1R2}+{F2R1}"
         if duplex_read_num_dict.get(duplex_no) is None:
             duplex_read_num_dict[duplex_no] = [0, 0]
             duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
+        if feature_beds:
+            for nn in range(len(duplex_read_num_dict_trinuc_features)):
+                if duplex_read_num_dict[nn].get(duplex_no) is None:
+                    duplex_read_num_dict_trinuc_features[nn][duplex_no] = np.zeros(
+                        96, dtype=int
+                    )
         unique_read_num += 1
         if setBc1 != setBc2 and F2R1 >= 1 and F1R2 >= 1:
             rs_reference_end = max([r.reference_end for r in readSet])
@@ -1088,6 +1216,8 @@ def callBam(params, processNo):
                     indel_mask,
                     noise_mask,
                     n_cov_mask,
+                    include_mask,
+                    feature_mat
                     # ref_np,
                     # trinuc_np
                 ) = prepare_reference_mats(
@@ -1100,6 +1230,8 @@ def callBam(params, processNo):
                     germline,
                     noise,
                     indel_bed,
+                    include_bed,
+                    feature_beds,
                     nbams,
                     bam,
                     params,
@@ -1107,6 +1239,12 @@ def callBam(params, processNo):
                 # print(ref_np,reference_mat_start)
                 coverage = np.zeros(1000000, dtype=int)
                 coverage_indel = np.zeros(1000000, dtype=int)
+                if feature_beds:
+                    trinuc_features = [
+                        np.zeros((96, 1000000), dtype=int) for _ in feature_beds
+                    ]
+                else:
+                    trinuc_features = list()
 
             ### Record read names to check if mate has been processed
             processed_flag = 0
@@ -1127,16 +1265,18 @@ def callBam(params, processNo):
             end_ind_max = (
                 readSet[0].reference_start + reference_length_max - reference_mat_start
             )
-            masks = np.zeros([4, end_ind - start_ind], dtype=bool)
+            masks = np.zeros([5, end_ind - start_ind], dtype=bool)
             masks[0, :] = snp_mask[start_ind:end_ind]
             masks[1, :] = noise_mask[start_ind:end_ind]
             masks[2, :] = n_cov_mask[start_ind:end_ind]
+            masks[3, :] = include_mask[start_ind:end_ind]
             left, right = determineTrimLength(
                 readSet[0], params=params, processed_flag=processed_flag
             )
-            masks[3, :left] = True
-            masks[3, -right:] = True
+            masks[4, :left] = True
+            masks[4, -right:] = True
             antimask = np.all(~masks, axis=0)
+            antimask[trinuc_np[start_ind:end_ind] > 64] = False
             ### If the whole reads are masked:
             if not np.any(antimask):
                 continue
@@ -1155,7 +1295,6 @@ def callBam(params, processNo):
                 masks_indel[3, :left] = True
                 masks_indel[3, -right:] = True
                 antimask_indel = np.all(~masks_indel, axis=0)
-                antimask[trinuc_np[start_ind:end_ind] > 64] = False
                 (
                     LR,
                     indels,
@@ -1177,20 +1316,15 @@ def callBam(params, processNo):
                     F2R1_BLR >= params["pcutoff"],
                 )
                 """
-                # pass_inds = np.nonzero(DCS)[0].tolist()
-                # pass_inds = np.nonzero(LR>=params["pcutoff"])[0].tolist()
                 pass_inds = np.nonzero(LR <= params["pcutoff"])[0].tolist()
                 indels_pass = [indels[_] for _ in pass_inds]
                 coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
-                # if len(indels_pass) >= 1:
                 for nn in range(len(indels_pass)):
                     indel = indels_pass[nn]
                     indel_chrom = chromNow
                     indel_pos = int(indel.split(":")[0])
                     indel_size = int(indel.split(":")[1])
                     NMs = [seq.get_tag("NM") for seq in readSet]
-                    # averageNM = sum(NMs) / len(NMs)
-                    # if averageNM - abs(indel_size) <= 1:
                     if indel_size < 0:
                         indel_ref = nums2str(
                             ref_np[
@@ -1291,7 +1425,7 @@ def callBam(params, processNo):
                     indel_dict[indel_str] = 1
             # else:
             ### Calculate genotype probability
-            if not any(indel_bool) or isLearn or len(indels_pass) == 0:
+            if not any(indel_bool) or isLearn:  # or len(indels_pass) == 0:
                 if isLearn:
                     (
                         mismatch_now,
@@ -1424,6 +1558,14 @@ def callBam(params, processNo):
                 duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
                     trinuc_pass, minlength=96
                 ).astype(int)
+                if feature_beds:
+                    for nn in range(feature_beds):
+                        trinuc_pass_feature = trinuc_np[start_ind:end_ind][
+                            pass_bool[feature_mat[nn, :]]
+                        ]
+                        duplex_read_num_dict_trinuc_features[nn][
+                            duplex_no
+                        ] += np.bincount(trinuc_pass_feature, minlength=96).astype(int)
                 duplex_read_num_dict[duplex_no][0] += 1
                 duplex_count += 1
     """
@@ -1595,6 +1737,15 @@ def callBam(params, processNo):
             + duplex_read_num_dict_trinuc[duplex_no][32:64]
         )
         duplex_read_num_dict_trinuc[duplex_no] = trinuc_profile
+
+    if feature_beds:
+        for nn in range(feature_beds):
+            for duplex_no in duplex_read_num_dict_trinuc.keys():
+                trinuc_profile = (
+                    duplex_read_num_dict_trinuc[nn][duplex_no][:32]
+                    + duplex_read_num_dict_trinuc[nn][duplex_no][32:64]
+                )
+                duplex_read_num_dict_trinuc[nn][duplex_no] = trinuc_profile
 
     return (
         mut_pass_filter,

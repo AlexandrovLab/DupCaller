@@ -22,13 +22,20 @@ pip install .
 ```
 
 ## Pipeline
+### Index reference genomes:
+DupCaller uses numpyrized reference genome to perform memory-efficient reference fetching and trinucleotide context indexing. To index the reference genome, run:
+```bash
+DupCaller.py index -f reference.fa
+```
+The command will generate three h5 file in the same folder: ref.h5, tn.h5 and hp.h5, which are numpyrized reference sequences, trinucleotide contexts and homopolymer length, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome. 
+
 
 ### Trim barcodes from reads:
 
 DupCallerTrim.py is a scripts that can extract 5-prime barcodes from paired-end fastqs. The usage is as follows:
 
 ```bash
-DupCallerTrim.py -i read1.fq -i2 read2.fq -p barcode_pattern -o sample_name
+DupCaller.py trim -i read1.fq -i2 read2.fq -p barcode_pattern -o sample_name
 ```
 
 where
@@ -43,10 +50,10 @@ If the matched normal is prepared in the same way as the sample, also apply the 
 
 ### Align trimmed fastqs
 
-Use a DNA NGS aligner, such as BWA-MEM, to align the trimmed fastqs of both sample and matched normal from the last step. Notice that GATK requires read group ID,SM and PL to be set, so adding those tags during bwa alignment is recommended. For example:
+Use a DNA NGS aligner, such as BWA-MEM, to align the trimmed fastqs of both sample and matched normal from the last step. Notice that GATK requires read group ID,SM and PL to be set, so adding those tags during bwa alignment is recommended. **Fastq tags must be kept. For bwa mem, this is using the -C option.** For example:
 
 ```bash
-bwa mem -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" reference.fa {sample_name}\_1.fastq {sample_name}\_2.fastq | samtools sort -@ {threads} > {sample_name}.bam
+bwa mem -C -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" reference.fa {sample_name}\_1.fastq {sample_name}\_2.fastq | samtools sort -@ {threads} > {sample_name}.bam
 samtools index -@ {threads} {sample_name}.bam
 ```
 
@@ -60,10 +67,10 @@ where
 
 ### MarkDuplicates with optical duplicates tags and new read name configuration
 
-Run GATK MarkDuplicates on sample and matched-normal bams. Notice that optical duplicates and PCR duplicates should be treated differently in ecNGS variant calling, so the "TAGGING_POLICY" of GATK MarkDuplicates should be set to OpticalOnly to differentiate optical duplicate from PCR duplicate. Also, since the read name of trimmed fastq is non-traditional, the READ_NAME_REGEX option should also be set to "(?:.*:)?([0-9]+)[^:]_:([0-9]+)[^:]_:([0-9]+)[^:]\_$". The MarkDuplicates commands should be looking like this:
+Run GATK MarkDuplicates on sample and matched-normal bams. Notice that optical duplicates and PCR duplicates should be treated differently in ecNGS variant calling, so the "TAGGING_POLICY" of GATK MarkDuplicates should be set to OpticalOnly to differentiate optical duplicate from PCR duplicate. Addtionally, DUPLEX_UMI option should be set to true, and since the read name of trimmed fastq is modified, the READ_NAME_REGEX option should also be set to "(?:.*:)?([0-9]+)[^:]_:([0-9]+)[^:]_:([0-9]+)[^:]\_$". **Outdated versions of GATK do not have the --DUPLEX_UMI tag. Please update gatk to latest version if this happens** The MarkDuplicates commands should be looking like this:
 
 ```bash
-gatk MarkDuplicates -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" --TAGGING_POLICY OpticalOnly
+gatk MarkDuplicates -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" --DUPLEX_UMI --TAGGING_POLICY OpticalOnly
 ```
 
 ### Variant Calling
@@ -73,20 +80,15 @@ After appropriate data preprocessing, DupCallerCall.py should be used to call so
 1. Whole genome/ whole exome / reduced genome (e.x. NanoSeq) with a matched normal
 
 ```bash
-DupCallerCall.py -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -n {normal.bam} -g germline.vcf.gz -m noise_mask.bed.gz
+DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -n {normal.bam} -g germline.vcf.gz -m noise_mask.bed.gz
 ```
 
 2. Mutagenesis panel without a matched normal
 
 ```bash
-DupCallerCall.py -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -ma 0.3
+DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -ma 0.1
 ```
 
-3. Deep sequencing of very small gene panels (e.x. less than 5 genes)
-
-```bash
-DupCallerCall.py -b ${sample}.bam -f reference.fa -o {output_predix} -p 2 -n {normal.bam} -g germline.vcf.gz -m noise_mask.bed.gz 
-```
 Note that since DupCaller partition jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panel. In this case we suggest to run at most one thread per distince targeted region
 
 Please see "Parameters" section for explanation of all parameters. See "Results" section for descriptions of all result files in the output folder
@@ -115,7 +117,6 @@ These options should be understood by user and customized accordingly. Some of t
 | -n | --normalBam | bam file of matched normals. When matched normal is not available, set the maximum allele frequency (-ma) to an appropriate value (e.x. 0.3) | None |
 | -m | --noise | a bed interval file that masked noisy positions | None |
 | -maf | --maxAF | maximum allele fraction to call a somatic mutation. Must be set to appropriate value when a matched normal (-n) is not available | 1 |
-| -mac | --maxAltCount | maximum allele count of alt allele | 100000 |
 | -tt | --trimF | ignore mutation if it is less than n bps from ends of template | 30 |
 | -tr | --trimR | ignore mutation if it is less than n bps from ends of read | 15 |
 | -id | --indelBed | an indel enhanced panel of normal (ePoN) used for indel calling | None | 
@@ -126,18 +127,32 @@ These are variant calling parameters and adjustment is unnecessary for general u
 
 | short option | long option | description | default |
 | --- | --- | --- | --- |
-| -aes | --amperrs | prior polymerase substitutionerror rate | 1e-5 |
-| -aei | --amperri | prior polymerase indel error rate | 3e-7 |
+| -AS | --amperrfile | pre-learned error profile for amplification SBS error | None | 
+| -AI | --amperri | pre-learned error profile for amplification indel error | None | 
+| -DS | --amperrfile | pre-learned error profile for SBS damage | None | 
+| -DI | --amperri | pre-learned error profile for indel damage | None | 
 | -mr | --mutRate | prior somatic mutation rate per base | 2.5e-7 |
-| -t | --threshold | log10 likelihood ratio threshold of making a mutation call | 2 |
-| -mq | --mapq |minumum mapq for an alignment to be considered | 30 |
+| -t | --threshold | score threshold to call a mutation | 3 |
+| -mq | --mapq | minumum mapq for an alignment to be considered | 40 |
 | -d | --minNdepth | minumum coverage in normal for called variants | 10 |
-| -nad | --maxAltCount | maximum allele count of alt allele in matched-normal | 0 |
-| -mnv | --maxMNVlen | maximum length of MNV for mutation calls | 2 |
 | -gaf | --germlineAfCutoff | locations at which there is a germline mutation with population af larger than this threshold will be skipped | 0.001 |
+| -nm | --nmflt | filter out any reads that has a editing distance larger than this value | 4 |
+| -w | --windowSize | genomic window size when calculating rough coverage and split bam files into equal regions. Adjust for smaller panel | 100000 |
+| -bq | --minBq | bases with quality less than this number will be set to 6 | default=18 |
+| -aq | --minAltQual | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
+| --minRef | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
+| --minAlt |
+| minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
+
+### Mutation burden estimation
+After mutation calling, mutational burden can be performed within the folder:
+```bash
+DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX
+```
+Adjust the region according to the reference genome used.
+
 
 #### Results
-
 snv.vcf:
 vcf of detected single nucleotide mutations in the sample. The vcf also includes multiple nucleotide mutations (MNVs).
 
@@ -146,9 +161,6 @@ naive burden and least-square snv burden estimation of the samples with 95% conf
 
 indel.vcf:
 vcf of detected short insertion/deletion (indel) mutations in the sample.
-
-indel_burden.txt:
-Indel burden estimation in sample.
 
 ## Citation
 

@@ -22,12 +22,14 @@ def sum_dataframes(dfs):
 
 
 def do_aggregate(args):
-    trinuc_pds = list()
+    dmg_id = list()
+    dmg_tn = list()
+    amp_id = list()
+    amp_tn = list()
     for sample in args.input:
-        trinuc_pds.append(
-            pd.read_csv(
-                sample + "/" + sample + "_mismatch_trinuc_profile.txt", sep="\t"
-            )
-        )
-    aggregate = sum_dataframes(trinuc_pds)
-    aggregate.to_csv(args.output, sep="\t", index=False)
+        dmg_id.append(pd.read_csv(sample + "/" + sample + ".dmg.id.txt", sep="\t"))
+        dmg_tn.append(pd.read_csv(sample + "/" + sample + ".dmg.tn.txt", sep="\t"))
+        amp_id.append(pd.read_csv(sample + "/" + sample + ".amp.id.txt", sep="\t"))
+        amp_tn.append(pd.read_csv(sample + "/" + sample + ".amp.tn.txt", sep="\t"))
+    # aggregate_dmg_id = sum_dataframes(trinuc_pds)
+    # aggregate.to_csv(args.output, sep="\t", index=False)

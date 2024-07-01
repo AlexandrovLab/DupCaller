@@ -62,12 +62,26 @@ if __name__ == "__main__":
         default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
     )
     call_parser.add_argument(
+        "-R",
+        "--regionfile",
+        type=str,
+        help="an inclusive bed file",
+        default=None,
+    )
+    call_parser.add_argument(
+        "-F",
+        "--featurefiles",
+        type=str,
+        help="bed file for features",
+        default=None,
+    )
+    call_parser.add_argument(
         "-rt",
         "--regionst",
         nargs="+",
         type=str,
         help="contigs to consider for training",
-        default=["chr1"],
+        default=None,
     )
     call_parser.add_argument(
         "-p", "--threads", type=int, help="number of threads", default=1
@@ -88,6 +102,7 @@ if __name__ == "__main__":
         help="estimated polymerase indel error rate",
         default=5e-7,
     )
+    """
     call_parser.add_argument(
         "-AS",
         "--amperrfile",
@@ -100,6 +115,7 @@ if __name__ == "__main__":
         type=str,
         help="amplification error matrix",
     )
+    """
     call_parser.add_argument(
         "-ds",
         "--dmgerrs",
@@ -114,6 +130,7 @@ if __name__ == "__main__":
         help="estimated polymerase indel error rate",
         default=3e-7,
     )
+    """
     call_parser.add_argument(
         "-DS",
         "--dmgerrfile",
@@ -126,7 +143,6 @@ if __name__ == "__main__":
         type=str,
         help="amplification error matrix",
     )
-    """
     call_parser.add_argument(
         "-mr",
         "--mutRate",
@@ -139,7 +155,7 @@ if __name__ == "__main__":
         "--threshold",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=3.5,
+        default=3,
     )
     call_parser.add_argument(
         "-mq",

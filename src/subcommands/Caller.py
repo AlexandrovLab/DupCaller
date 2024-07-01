@@ -32,6 +32,8 @@ def do_call(args):
         "reference": args.reference,
         "output": args.output,
         "regions": args.regions,
+        "region_file": args.regionfile,
+        "feature_files": args.featurefiles,
         "threads": args.threads,
         # "amperr": args.amperrs,
         # "amperri": args.amperri,
@@ -57,7 +59,14 @@ def do_call(args):
         "step": args.windowSize,
         "isLearn": None,
     }
-
+    if args.amperrfile:
+        params["amperr_file"] = args.amperrfile
+    if args.amperrfileindel:
+        params["amperri_file"] = args.amperrfileindel
+    if args.dmgerrfile:
+        params["dmgerr_file"] = args.dmgerrfile
+    if args.dmgerrfile:
+        params["dmgerri_file"] = args.dmgerrfileindel
     params_learn = {
         "tumorBam": args.bam,
         "normalBams": None,
@@ -65,6 +74,8 @@ def do_call(args):
         "reference": args.reference,
         "output": args.output,
         "regions": args.regionst,
+        "region_file": None,
+        "feature_files": args.featurefiles,
         "threads": args.threads,
         "mutRate": 10e-7,
         "pcutoff": 2,
@@ -90,6 +101,10 @@ def do_call(args):
         "minAlt": args.minAlt,
         "isLearn": True,
     }
+    same_regions_flag = False
+    if not params_learn["regions"]:
+        params_learn["regions"] = params["regions"]
+        same_regions_flag = True
     if not params["normalBams"]:
         print(
             f"A matched normal is not used. \
@@ -127,12 +142,14 @@ def do_call(args):
     """
     Learn
     """
+    learn_flag = False
     if not (
         os.path.exists(params["amperr_file"])
         and os.path.exists(params["amperri_file"])
         and os.path.exists(params["dmgerr_file"])
         and os.path.exists(params["dmgerri_file"])
     ):
+        learn_flag = True
         if args.threads == 1:
             """
             Single-thread execution
@@ -142,7 +159,7 @@ def do_call(args):
             paramsNow = params_learn
             # paramsNow["reference"] = fasta
             # paramsNow["isLearn"] = True
-            regions = params["regions"]
+            regions = params_learn["regions"]
             paramsNow["regions"] = [
                 (chrom, 0, bamObject.get_reference_length(chrom) - 1)
                 for chrom in regions
@@ -157,12 +174,12 @@ def do_call(args):
             """
             Multi-thread execution
             """
-            contigs = args.regionst
+            contigs = params_learn["regions"]
             contigLengths = [
                 bamObject.get_reference_length(contig) for contig in contigs
             ]
             print(
-                "...........Spliting genomic regions for parallel execution................"
+                "...........Spliting genomic regions for parallel execution (error estimation)................"
             )
             # print(args.threads)
             # if args.normalBam:
@@ -341,22 +358,25 @@ def do_call(args):
         Multi-thread execution
         """
         # args.threads = args.threads - 1
-        contigs = args.regions
-        contigLengths = [bamObject.get_reference_length(contig) for contig in contigs]
         regions_list = list()
-        print("....Splitting genomic regions for parallel execution.....")
-        if args.normalBams:
-            cutSites, chunkSize, contigs = splitBamRegions(
-                [args.bam], args.threads, contigs, args.windowSize
-            )
-        else:
-            cutSites, chunkSize, contigs = splitBamRegions(
-                [args.bam], args.threads, contigs, args.windowSize
-            )
         regionSequence = []
-        currentContigIndex = 0
-        usedTime = (time.time() - startTime) / 60
-        print(f"....Genomic regions splitted in {usedTime} minutes...")
+        if (not same_regions_flag) or (not learn_flag):
+            contigs = params["regions"]
+            contigLengths = [
+                bamObject.get_reference_length(contig) for contig in contigs
+            ]
+            print("....Splitting genomic regions for parallel execution.....")
+            if args.normalBams:
+                cutSites, chunkSize, contigs = splitBamRegions(
+                    [args.bam], args.threads, contigs, args.windowSize
+                )
+            else:
+                cutSites, chunkSize, contigs = splitBamRegions(
+                    [args.bam], args.threads, contigs, args.windowSize
+                )
+            currentContigIndex = 0
+            usedTime = (time.time() - startTime) / 60
+            print(f"....Genomic regions splitted in {usedTime} minutes...")
         """
         Determine regions for each process
         """

@@ -27,14 +27,15 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     nmin = np.vstack((n1, n2)).min(axis=0)
     trinuc_rate = np.zeros([96, nmin.max()])
     burden_uncorrected = np.zeros(nmin.max())
+    mutnum_uncorrected = np.zeros(nmin.max())
     for nn in range(nmin.max()):
         trinuc_mut = trinuc_mut_by_rf[:, nmin >= nn].sum(axis=1)
         trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
         trinuc_rate[:, nn] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
-        mutnum_uncorrected = trinuc_rate[:, nn].dot(
+        mutnum_uncorrected[nn] = trinuc_rate[:, nn].dot(
             trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
         )
-        burden_uncorrected[nn] = mutnum_uncorrected / (
+        burden_uncorrected[nn] = mutnum_uncorrected[nn] / (
             trinuc_cov_by_rf[:, nmin >= nn].sum(axis=1).sum()
         )
     corrected_mutnum = trinuc_rate.T.dot(np.repeat(ref_trinuc, 3))
@@ -62,10 +63,14 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
 def do_estimate(args):
     ref_trinuc = calculate_ref_trinuc(args)
     prefix = args.prefix
+    if len(prefix.split("/")[-1]) == 0:
+        sample = prefix.split("/")[-2]
+    else:
+        sample = prefix.split("/")[-1]
     trinuc_by_rf = pd.read_csv(
-        prefix + "/" + prefix + "_trinuc_by_duplex_group.txt", sep="\t", index_col=0
+        prefix + "/" + sample + "_trinuc_by_duplex_group.txt", sep="\t", index_col=0
     )
-    vcf = VCF(prefix + "/" + prefix + "_snv.vcf", "r")
+    vcf = VCF(prefix + "/" + sample + "_snv.vcf", "r")
     mut_by_rf = dict()
     trinuc_list = list()
     trinuc2num = dict()
@@ -133,6 +138,7 @@ def do_estimate(args):
         uburden_lb,
         uburden_ub,
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
+    print(trinuc_rate)
     corrected_trinuc_pd = pd.DataFrame(corrected_trinuc_num, index=num2trinucSbs)
     fig, ax = plt.subplots(figsize=(60, 10))
     SBS96_order = sorted(corrected_trinuc_pd.index, key=lambda x: (x[2:5], x[0] + x[6]))
@@ -191,7 +197,7 @@ def do_estimate(args):
     ax.set_xlabel(
         "Trinucleotide Context", fontsize=100, weight="bold", fontname="Arial"
     )
-    fig.savefig(args.prefix + "/" + args.prefix + "_sbs_96_corrected.png", dpi=300)
+    fig.savefig(args.prefix + "/" + sample + "_sbs_96_corrected.png", dpi=300)
 
     # corrected_burden = corrected_trinuc_num.sum()/ref_trinuc.sum()
     # original_burden = trinuc_rate
@@ -206,8 +212,8 @@ def do_estimate(args):
         x = np.linspace(0, trinuc_mut_np[nn, :].max() * 1.1)
         axs[nnn, mmm].plot(x, trinuc_rate[nn] * x, color="r")
         axs[nnn, mmm].set_title(num2trinucSbs[nn])
-    fig.savefig(args.prefix + "/" + args.prefix + "_sbs96_mutrates.png", dpi=300)
-    with open(args.prefix + "/" + args.prefix + "_burden.txt", "w") as f:
+    fig.savefig(args.prefix + "/" + sample + "_sbs96_mutrates.png", dpi=300)
+    with open(args.prefix + "/" + sample + "_burden.txt", "w") as f:
         f.write(f"Uncorrected burden\t{uburden}\n")
         f.write(f"Uncorrected burden 95% lower\t{uburden_lb}\n")
         f.write(f"Uncorrected burden 95% upper\t{uburden_ub}\n")
