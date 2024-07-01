@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from pysam import VariantFile as VCF
-import math
 
 
 def calculate_ref_trinuc(args):
@@ -138,7 +137,6 @@ def do_estimate(args):
         uburden_lb,
         uburden_ub,
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
-    print(trinuc_rate)
     corrected_trinuc_pd = pd.DataFrame(corrected_trinuc_num, index=num2trinucSbs)
     fig, ax = plt.subplots(figsize=(60, 10))
     SBS96_order = sorted(corrected_trinuc_pd.index, key=lambda x: (x[2:5], x[0] + x[6]))
@@ -202,6 +200,7 @@ def do_estimate(args):
     # corrected_burden = corrected_trinuc_num.sum()/ref_trinuc.sum()
     # original_burden = trinuc_rate
     # print(corrected_burden)
+    """
     fig, axs = plt.subplots(16, 6)
     for nn in range(96):
         nnn = math.floor(nn / 6)
@@ -213,6 +212,7 @@ def do_estimate(args):
         axs[nnn, mmm].plot(x, trinuc_rate[nn] * x, color="r")
         axs[nnn, mmm].set_title(num2trinucSbs[nn])
     fig.savefig(args.prefix + "/" + sample + "_sbs96_mutrates.png", dpi=300)
+    """
     with open(args.prefix + "/" + sample + "_burden.txt", "w") as f:
         f.write(f"Uncorrected burden\t{uburden}\n")
         f.write(f"Uncorrected burden 95% lower\t{uburden_lb}\n")
