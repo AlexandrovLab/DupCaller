@@ -103,9 +103,16 @@ def extractDepthRegion(bam, chrom, start, end, params):
     return depth, indelmask
 
 
-def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2):
+def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2, start):
+    discord_num = 0
     for pileupcolumn in bam.pileup(
-        chrom, pos - 1, pos, min_base_quality=0, truncated=True, stepper="samtools"
+        chrom,
+        pos - 1,
+        pos,
+        min_base_quality=0,
+        truncated=True,
+        stepper="samtools",
+        flag_filter=2828,
     ):
         if pileupcolumn.pos == pos - 1:
             for pileupread in pileupcolumn.pileups:
@@ -113,7 +120,7 @@ def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2):
                     pileupread.is_refskip
                     or pileupread.alignment.is_secondary
                     or pileupread.alignment.is_supplementary
-                    or pileupread.alignment.is_duplicate
+                    # or pileupread.alignment.is_duplicate
                     or pileupread.alignment.has_tag("DT")
                     or pileupread.alignment.mapping_quality <= params["mapq"]
                     or pileupread.is_del
@@ -124,8 +131,14 @@ def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2):
                 read_bc2 = (read_name.split("_")[1].split("+"))[1]
                 qual = pileupread.alignment.query_qualities[pileupread.query_position]
                 if (
-                    (read_bc1 == bc1 and read_bc2 == bc1)
-                    or (read_bc1 == bc2 and read_bc2 == bc1)
-                ) and qual == 0:
-                    return True
+                    (
+                        (read_bc1 == bc1 and read_bc2 == bc2)
+                        or (read_bc1 == bc2 and read_bc2 == bc1)
+                    )
+                    and qual == 0
+                    and pileupread.alignment.reference_start == start
+                ):
+                    discord_num += 1
+                    if discord_num >= 2:
+                        return True
     return False

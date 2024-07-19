@@ -507,6 +507,7 @@ def do_call(args):
         "DR": [1, "Integer", "Distance from read end"],
         "TAG1": [1, "String", "Barcode of top strand 5 prime"],
         "TAG2": [1, "String", "Barcode of bottom strand 5 prime"],
+        "SP": [1, "Integer", "Read family reference start position"],
         "TN": [1, "String", "trinucleotide context"],
         "HP": [1, "Integer", "Homopolymer length"],
     }

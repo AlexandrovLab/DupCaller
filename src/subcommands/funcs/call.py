@@ -363,6 +363,7 @@ def callBam(params, processNo):
         dmgmat = np.vstack((first_32rows, second_32rows))
     else:
         dmgmat = pd.read_csv(params["dmgerr_file"], sep="\t", index_col=0).to_numpy()
+        dmgmat += 1
     dmgmat = dmgmat / dmgmat.sum(axis=1, keepdims=True)
     dmgmat_min_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_min_error], axis=1)
@@ -921,6 +922,7 @@ def callBam(params, processNo):
                                     ),
                                     "TAG1": setBc[0],
                                     "TAG2": setBc[1],
+                                    "SP": currentStart,
                                     "DF": readPos5p,
                                     "DR": readPos3p,
                                     "TN": ".",
@@ -1062,6 +1064,7 @@ def callBam(params, processNo):
                                     ),
                                     "TAG1": setBc[0],
                                     "TAG2": setBc[1],
+                                    "SP": currentStart,
                                     "DF": readPos5p,
                                     "DR": readPos3p,
                                     "TN": mut_trinuc,
@@ -1413,6 +1416,7 @@ def callBam(params, processNo):
                             ),
                             "TAG1": setBc[0],
                             "TAG2": setBc[1],
+                            "SP": currentStart,
                             "DF": readPos5p,
                             "DR": readPos3p,
                             "TN": ".",
@@ -1538,6 +1542,7 @@ def callBam(params, processNo):
                             ),
                             "TAG1": setBc[0],
                             "TAG2": setBc[1],
+                            "SP": currentStart,
                             "DF": readPos5p,
                             "DR": readPos3p,
                             "TN": mut_trinuc,
@@ -1582,14 +1587,15 @@ def callBam(params, processNo):
         alt = mut["alt"]
         bc1 = mut["infos"]["TAG1"]
         bc2 = mut["infos"]["TAG2"]
+        readStartCoord = mut["infos"]["SP"]
 
         if not mut_dict.get(":".join([chrom, str(pos), ref, alt])):
             ta, tr, ti, tdp = extractDepthSnv(
                 tumorBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
             )
-            overlap_error = detectOverlapDiscord(
-                tumorBam, chrom, pos, ref, alt, params, bc1, bc2
-            )
+            # overlap_error = detectOverlapDiscord(
+            # tumorBam, chrom, pos, ref, alt, params, bc1, bc2, readStartCoord
+            # )
             # window_filter = False
             # if IndelFilterByWindows(tumorBam, chrom, pos, 3, params):
             # window_filter = True
@@ -1615,7 +1621,7 @@ def callBam(params, processNo):
                 tr,
                 ti,
                 tdp,
-                overlap_error,
+                # overlap_error,
                 na,
                 nr,
                 ni,
@@ -1623,7 +1629,7 @@ def callBam(params, processNo):
                 # window_filter,
             )
         else:
-            ta, tr, ti, tdp, overlap_error, na, nr, ni, ndp = mut_dict[
+            ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[
                 ":".join([chrom, str(pos), ref, alt])
             ]
         # if window_filter:
@@ -1636,8 +1642,8 @@ def callBam(params, processNo):
             continue
         if ti >= 1:
             continue
-        if overlap_error:
-            continue
+        # if overlap_error:
+        # continue
         if normalBams:
             if na > 0:
                 continue

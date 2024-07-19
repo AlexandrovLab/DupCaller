@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from pysam import VariantFile as VCF
+from scipy.stats import chi2
 
 
 def calculate_ref_trinuc(args):
@@ -17,6 +18,15 @@ def calculate_ref_trinuc(args):
     return trinuc_count_32
 
 
+def poisson_confint(k, cov, alpha=0.05):
+    low = chi2.ppf(alpha / 2, 2 * k) / 2
+    high = chi2.ppf(1 - alpha / 2, 2 * (k + 1)) / 2
+    if k == 0:
+        low = 0
+    return low / cov, high / cov
+
+
+"""
 def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     print("........Estimating mutation rate for each trinucleotide context.......")
     trinuc_mut_cov_by_rf = np.repeat(trinuc_cov_by_rf, 3, axis=0)
@@ -25,6 +35,7 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     n2 = np.array([int(_.split("+")[1]) for _ in n])
     nmin = np.vstack((n1, n2)).min(axis=0)
     trinuc_rate = np.zeros([96, nmin.max()])
+    trinuc_rate_CI95 = np.zeros([96, nmin.max()])
     burden_uncorrected = np.zeros(nmin.max())
     mutnum_uncorrected = np.zeros(nmin.max())
     for nn in range(nmin.max()):
@@ -38,12 +49,20 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
             trinuc_cov_by_rf[:, nmin >= nn].sum(axis=1).sum()
         )
     corrected_mutnum = trinuc_rate.T.dot(np.repeat(ref_trinuc, 3))
+    #corrected_mutnum_lb = (trinuc_rate - trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
+    #corrected_mutnum_ub = (trinuc_rate + trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
     burden = corrected_mutnum / ref_trinuc.sum()
-    CI95 = 1.96 * np.sqrt(corrected_mutnum)
-    burden_lb = burden - CI95 / ref_trinuc.sum()
-    burden_ub = burden + CI95 / ref_trinuc.sum()
+    burden_lb, burden_ub = poisson_confind(corrected_mutnum,ref_trinuc.sum())
+    #CI95 = 1.96 * np.sqrt(corrected_mutnum)
+    #burden_lb = trinuc_rate_CI95T.dot(np.repeat(ref_trinuc, 3))
+    #burden_ub = burden + CI95 / ref_trinuc.sum()
+    #burden_lb = corrected_mutnum_lb / ref_trinuc.sum()
+    #burden_ub = corrected_mutnum_ub / ref_trinuc.sum()
     hap_trinuc = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3).reshape(96, 1))
-
+    #corrected_mutnum = trinuc_rate.T.dot(np.repeat(ref_trinuc, 3))
+    #corrected_mutnum_lb = (trinuc_rate - trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
+    #corrected_mutnum_ub = (trinuc_rate + trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
+    #burden_lb, burden_ub = poisson_confind(mutnum_uncorrected,)
     CI95_uncorrected = 1.96 * np.sqrt(mutnum_uncorrected)
     burden_uncorrected_lb = burden_uncorrected - CI95_uncorrected / ref_trinuc.sum()
     burden_uncorrected_ub = burden_uncorrected + CI95_uncorrected / ref_trinuc.sum()
@@ -56,6 +75,50 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         burden_uncorrected[2],
         burden_uncorrected_lb[2],
         burden_uncorrected_ub[2],
+    )
+"""
+
+
+def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
+    print("........Estimating mutation rate for each trinucleotide context.......")
+    trinuc_mut_cov_by_rf = np.repeat(trinuc_cov_by_rf, 3, axis=0)
+    trinuc_rate = np.zeros(96)
+    n1 = np.array([int(_.split("+")[0]) for _ in n])
+    n2 = np.array([int(_.split("+")[1]) for _ in n])
+    nmin = np.vstack((n1, n2)).min(axis=0)
+    trinuc_rate = np.zeros(96)
+
+    trinuc_mut = trinuc_mut_by_rf[:, nmin >= 2].sum(axis=1)
+    trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 2].sum(axis=1)
+    trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    print(trinuc_rate)
+
+    mutnum_uncorrected = trinuc_mut.sum()
+    cov = trinuc_cov.sum() / 3
+    burden_uncorrected = mutnum_uncorrected / cov
+    print(mutnum_uncorrected, burden_uncorrected, cov)
+    burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(
+        mutnum_uncorrected, cov
+    )
+
+    mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
+
+    burden = mutnum_corrected / ref_trinuc.sum()
+    burden_lb, burden_ub = poisson_confint(mutnum_corrected, ref_trinuc.sum())
+    hap_trinuc = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+
+    return (
+        hap_trinuc,
+        burden,
+        burden_lb,
+        burden_ub,
+        trinuc_rate,
+        burden_uncorrected,
+        burden_uncorrected_lb,
+        burden_uncorrected_ub,
+        mutnum_uncorrected,
+        mutnum_corrected,
+        ref_trinuc.sum(),
     )
 
 
@@ -136,6 +199,9 @@ def do_estimate(args):
         uburden,
         uburden_lb,
         uburden_ub,
+        mutnum_uncorrected,
+        mutnum_per_genome,
+        genome_cov,
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
     corrected_trinuc_pd = pd.DataFrame(corrected_trinuc_num, index=num2trinucSbs)
     fig, ax = plt.subplots(figsize=(60, 10))
@@ -217,6 +283,9 @@ def do_estimate(args):
         f.write(f"Uncorrected burden\t{uburden}\n")
         f.write(f"Uncorrected burden 95% lower\t{uburden_lb}\n")
         f.write(f"Uncorrected burden 95% upper\t{uburden_ub}\n")
+        f.write(f"Uncorrected mutation number\t{mutnum_uncorrected}\n")
         f.write(f"Corrected burden\t{burden}\n")
         f.write(f"Corrected burden 95% lower\t{burden_lb}\n")
         f.write(f"Corrected burden 95% upper\t{burden_ub}\n")
+        f.write(f"mutation number per genome\t{mutnum_per_genome}\n")
+        f.write(f"genome coverage\t{genome_cov}\n")
