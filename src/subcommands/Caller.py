@@ -284,17 +284,17 @@ def do_call(args):
             mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
         )
         # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-        amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt", sep="\t")
+        amp_tn_pd.to_csv(args.output + ".amp.tn.txt", sep="\t")
         np.savetxt(
-            params["output"] + "/" + args.output + ".amp.id.txt",
+            args.output + ".amp.id.txt",
             indelerr_profile,
             delimiter="\t",
             fmt="%d",
         )
-        dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt", sep="\t")
+        dmg_tn_pd.to_csv(args.output + ".dmg.tn.txt", sep="\t")
         # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
         np.savetxt(
-            params["output"] + "/" + args.output + ".dmg.id.txt",
+            args.output + ".dmg.id.txt",
             indelerr_dmg_profile,
             delimiter="\t",
             fmt="%d",
@@ -570,13 +570,13 @@ def do_call(args):
     trinuc_by_duplex_group = pd.DataFrame(duplex_read_num_trinuc)
     trinuc_by_duplex_group.insert(0, "", trinuc_list)
     trinuc_by_duplex_group.to_csv(
-        params["output"] + "/" + args.output + "_trinuc_by_duplex_group.txt",
+        args.output + "_trinuc_by_duplex_group.txt",
         sep="\t",
         index=False,
     )
 
     muts_by_group = np.loadtxt(
-        params["output"] + "/" + args.output + "_duplex_group_stats.txt",
+        args.output + "_duplex_group_stats.txt",
         skiprows=1,
         dtype=float,
         delimiter="\t",
