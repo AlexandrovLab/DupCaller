@@ -133,7 +133,7 @@ def do_call(args):
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-    bamObject = BAM(args.bam, "rb")
+    bamObject = BAM(args.bam, "rb", args.reference)
 
     """
     Execulte variant calling
@@ -184,7 +184,7 @@ def do_call(args):
             # print(args.threads)
             # if args.normalBam:
             cutSites, chunkSize, contigs = splitBamRegions(
-                [args.bam], args.threads, contigs, args.windowSize
+                [args.bam], args.threads, contigs, args.windowSize, args.reference
             )
             # else:
             # cutSites, chunkSize, contigs = splitBamRegions(
@@ -368,11 +368,11 @@ def do_call(args):
             print("....Splitting genomic regions for parallel execution.....")
             if args.normalBams:
                 cutSites, chunkSize, contigs = splitBamRegions(
-                    [args.bam], args.threads, contigs, args.windowSize
+                    [args.bam], args.threads, contigs, args.windowSize, args.reference
                 )
             else:
                 cutSites, chunkSize, contigs = splitBamRegions(
-                    [args.bam], args.threads, contigs, args.windowSize
+                    [args.bam], args.threads, contigs, args.windowSize, args.reference
                 )
             currentContigIndex = 0
             usedTime = (time.time() - startTime) / 60
@@ -491,7 +491,7 @@ def do_call(args):
         FPAll = sum(FPs, [])
         RPAll = sum(RPs, [])
 
-    tBam = BAM(args.bam, "rb")
+    tBam = BAM(args.bam, "rb", args.reference)
     contigs = tBam.references
     # print(contigs)
     chromDict = {contig: tBam.get_reference_length(contig) for contig in contigs}

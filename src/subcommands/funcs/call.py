@@ -11,6 +11,7 @@ from pysam import FastaFile as FASTA
 from pysam import TabixFile as BED
 from pysam import VariantFile as VCF
 import pysam
+import os
 import re
 import h5py
 
@@ -207,8 +208,8 @@ def nums2str(nums, num2base="ATCG"):
     return "".join(bases)
 
 
-def bamIterateMultipleRegion(bam, regions):
-    bamObject = BAM(bam, "rb")
+def bamIterateMultipleRegion(bam, regions, ref):
+    bamObject = BAM(bam, "rb", ref)
     for region in regions:
         for rec in bamObject.fetch(*region):
             if len(region) >= 2:
@@ -223,7 +224,7 @@ def callBam(params, processNo):
     nbams = params["normalBams"]
     regions = params["regions"]
     if params["germline"]:
-        germline = VCF(params["germline"], "rb")
+        germline = VCF(params["germline"], mode = "rb")
     else:
         germline = None
     all_chroms = [_[0] for _ in regions]
@@ -235,7 +236,9 @@ def callBam(params, processNo):
     pcut = params["pcutoff"]
     isLearn = params.get("isLearn", False)
     nn = processNo
-    output = "tmp/" + params["output"] + "_" + str(nn)
+    output = os.path.join("tmp", params["output"].lstrip('/') + "_" + str(nn))
+    if not os.path.exists(os.path.dirname(output)):
+        os.makedirs(os.path.dirname(output))
     if params["noise"]:
         noise = BED(params["noise"])
     else:
@@ -252,6 +255,7 @@ def callBam(params, processNo):
         feature_beds = [BED(_) for _ in params["feature_files"]]
     else:
         feature_beds = None
+
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
     num2base = "ATCG"
     muts = []
@@ -412,16 +416,16 @@ def callBam(params, processNo):
 
     params["dmgmat_indel_mean"] = np.mean(dmgmat_indel, axis=1)
     params["dmgmat_indel_rev_mean"] = np.mean(dmgmat_indel_rev, axis=1)
-
     # Initialize
+
     total_coverage = 0
     total_coverage_indel = 0
     starttime = time.time()
-    tumorBam = BAM(bam, "rb")
+    tumorBam = BAM(bam, "rb", params.get("reference"))
     if nbams:
         normalBams = list()
         for nbam in nbams:
-            normalBams.append(BAM(nbam, "rb"))
+            normalBams.append(BAM(nbam, "rb", params.get("reference")))
     else:
         normalBams = None
     currentStart = -1
@@ -452,7 +456,7 @@ def callBam(params, processNo):
         )
         read_blacklist = set()
         rec_num = 0
-        for rec, region in bamIterateMultipleRegion(bam, regions):
+        for rec, region in bamIterateMultipleRegion(bam, regions, params.get("reference")):
             rec_num += 1
             if rec.query_name in read_blacklist or rec.is_unmapped:
                 continue
@@ -472,7 +476,7 @@ def callBam(params, processNo):
         print(
             f"Process {str(processNo)}: finished screening highly damaged reads in {currentTime: .2f} minutes. Blacklisted {len(read_blacklist)} ({percent_blocked: .2f}%) possible highly damaged read and started variant calling."
         )
-    for rec, region in bamIterateMultipleRegion(bam, regions):
+    for rec, region in bamIterateMultipleRegion(bam, regions, params.get("reference")):
         recCount += 1
         if recCount == currentCheckPoint:
             currentTime = (time.time() - starttime) / 60
