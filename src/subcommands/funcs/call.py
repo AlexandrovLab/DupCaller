@@ -306,7 +306,7 @@ def callBam(params, processNo):
     params["trinuc_convert"] = trinuc_convert_np
     params["trinuc2num_dict"] = trinuc2num
     params["num2trinuc_list"] = num2trinuc
-
+    print(params["amperr_file"])
     ### Load amp error matrix
     if not params["amperr_file"]:
         prob_amp = params["amperr"]
