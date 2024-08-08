@@ -238,7 +238,7 @@ def callBam(params, processNo):
     nn = processNo
     output = os.path.join("tmp", params["output"].lstrip('/') + "_" + str(nn))
     if not os.path.exists(os.path.dirname(output)):
-        os.makedirs(os.path.dirname(output))
+        os.makedirs(os.path.dirname(output), exist_ok = True)
     if params["noise"]:
         noise = BED(params["noise"])
     else:
