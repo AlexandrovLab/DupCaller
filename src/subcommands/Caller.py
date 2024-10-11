@@ -37,12 +37,12 @@ def do_call(args):
         "threads": args.threads,
         # "amperr": args.amperrs,
         # "amperri": args.amperri,
-        "amperr_file": args.output + "/" + args.output + ".amp.tn.txt",
-        "amperri_file": args.output + "/" + args.output + ".amp.id.txt",
+        "amperr_file": args.output + ".amp.tn.txt",
+        "amperri_file": args.output + ".amp.id.txt",
         # "dmgerr": args.dmgerrs,
         # "dmgerri": args.dmgerri,
-        "dmgerr_file": args.output + "/" + args.output + ".dmg.tn.txt",
-        "dmgerri_file": args.output + "/" + args.output + ".dmg.id.txt",
+        "dmgerr_file": args.output + ".dmg.tn.txt",
+        "dmgerri_file": args.output + ".dmg.id.txt",
         "mutRate": args.mutRate,
         "pcutoff": args.threshold,
         "mapq": args.mapq,
@@ -133,7 +133,7 @@ def do_call(args):
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-    bamObject = BAM(args.bam, "rb")
+    bamObject = BAM(args.bam, "rb", args.reference)
 
     """
     Execulte variant calling
@@ -184,7 +184,7 @@ def do_call(args):
             # print(args.threads)
             # if args.normalBam:
             cutSites, chunkSize, contigs = splitBamRegions(
-                [args.bam], args.threads, contigs, args.windowSize
+                [args.bam], args.threads, contigs, args.windowSize, args.reference
             )
             # else:
             # cutSites, chunkSize, contigs = splitBamRegions(
@@ -284,17 +284,17 @@ def do_call(args):
             mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
         )
         # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-        amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt", sep="\t")
+        amp_tn_pd.to_csv(args.output + ".amp.tn.txt", sep="\t")
         np.savetxt(
-            params["output"] + "/" + args.output + ".amp.id.txt",
+            args.output + ".amp.id.txt",
             indelerr_profile,
             delimiter="\t",
             fmt="%d",
         )
-        dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt", sep="\t")
+        dmg_tn_pd.to_csv(args.output + ".dmg.tn.txt", sep="\t")
         # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
         np.savetxt(
-            params["output"] + "/" + args.output + ".dmg.id.txt",
+            args.output + ".dmg.id.txt",
             indelerr_dmg_profile,
             delimiter="\t",
             fmt="%d",
@@ -368,11 +368,11 @@ def do_call(args):
             print("....Splitting genomic regions for parallel execution.....")
             if args.normalBams:
                 cutSites, chunkSize, contigs = splitBamRegions(
-                    [args.bam], args.threads, contigs, args.windowSize
+                    [args.bam], args.threads, contigs, args.windowSize, args.reference
                 )
             else:
                 cutSites, chunkSize, contigs = splitBamRegions(
-                    [args.bam], args.threads, contigs, args.windowSize
+                    [args.bam], args.threads, contigs, args.windowSize, args.reference
                 )
             currentContigIndex = 0
             usedTime = (time.time() - startTime) / 60
@@ -491,7 +491,7 @@ def do_call(args):
         FPAll = sum(FPs, [])
         RPAll = sum(RPs, [])
 
-    tBam = BAM(args.bam, "rb")
+    tBam = BAM(args.bam, "rb", args.reference)
     contigs = tBam.references
     # print(contigs)
     chromDict = {contig: tBam.get_reference_length(contig) for contig in contigs}
@@ -518,11 +518,11 @@ def do_call(args):
     }
     filterDict = {"PASS": "All filter Passed"}
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, mutsAll)
-    with open(args.output + "/" + args.output + "_snv.vcf", "w") as vcf:
+    with open(args.output + "_snv.vcf", "w") as vcf:
         vcf.write(vcfLines)
 
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, indelsAll)
-    with open(args.output + "/" + args.output + "_indel.vcf", "w") as vcf:
+    with open(args.output + "_indel.vcf", "w") as vcf:
         vcf.write(vcfLines)
 
     burden_naive = muts_num / (coverage)
@@ -531,7 +531,7 @@ def do_call(args):
     pass_duprate = unique_read_num / pass_read_num
 
     with open(
-        params["output"] + "/" + args.output + "_duplex_group_stats.txt", "w"
+        args.output + "_duplex_group_stats.txt", "w"
     ) as f:
         f.write(
             "duplex_group_strand_composition\tduplex_group_number\t\
@@ -570,13 +570,13 @@ def do_call(args):
     trinuc_by_duplex_group = pd.DataFrame(duplex_read_num_trinuc)
     trinuc_by_duplex_group.insert(0, "", trinuc_list)
     trinuc_by_duplex_group.to_csv(
-        params["output"] + "/" + args.output + "_trinuc_by_duplex_group.txt",
+        args.output + "_trinuc_by_duplex_group.txt",
         sep="\t",
         index=False,
     )
 
     muts_by_group = np.loadtxt(
-        params["output"] + "/" + args.output + "_duplex_group_stats.txt",
+        args.output + "_duplex_group_stats.txt",
         skiprows=1,
         dtype=float,
         delimiter="\t",
@@ -610,7 +610,7 @@ def do_call(args):
     lgd2 = mpatches.Patch(color="blue", label="Naive")
     plt.legend(handles=[lgd1, lgd2])
     plt.savefig(
-        params["output"] + "/" + args.output + "_burden_by_duplex_group_size.png"
+        args.output + "_burden_by_duplex_group_size.png"
     )
     """
     if len(FPAll + RPAll) != 0:
@@ -633,7 +633,7 @@ def do_call(args):
         clonal_num = 0
     """
 
-    with open(params["output"] + "/" + args.output + "_stats.txt", "w") as f:
+    with open(args.output + "_stats.txt", "w") as f:
         f.write(f"Number of Read Families\t{unique_read_num}\n")
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")

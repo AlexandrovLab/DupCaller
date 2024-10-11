@@ -48,13 +48,13 @@ def createVcfStrings(chromDict, infoDict, formatDict, filterDict, recs):
     return "\n".join(lines) + "\n"
 
 
-def bamReadCount(bam, chrom, start, end):
-    count = getAlignmentObject(bam, "rb").count(chrom, start, end)
+def bamReadCount(bam, chrom, start, end, ref):
+    count = getAlignmentObject(bam, "rb", ref).count(chrom, start, end)
     return count
 
 
-def splitBamRegions(bams, num, contigs, step):
-    bamObject = getAlignmentObject(bams[0], "rb")
+def splitBamRegions(bams, num, contigs, step, ref):
+    bamObject = getAlignmentObject(bams[0], "rb", ref)
     contigs_set = set(contigs)
     contigs_sorted = [_ for _ in bamObject.references if _ in contigs]
 
@@ -88,6 +88,7 @@ def splitBamRegions(bams, num, contigs, step):
                         contig,
                         current_start + k * step,
                         current_start + k * step + step,
+                        ref,
                     )
                     for k in range(num)
                 ]
@@ -97,7 +98,7 @@ def splitBamRegions(bams, num, contigs, step):
                 current_start += num * step
                 current_window += num
             current_arguments = [
-                (bam, contig, current_start + k * step, current_start + k * step + step)
+                (bam, contig, current_start + k * step, current_start + k * step + step, ref)
                 for k in range(window_nums_cumulative[c] - current_window)
             ]
             pool = Pool()
@@ -126,11 +127,11 @@ Detect if the input is a bam or cram and read accordingly. Commit by Luka Culibr
 
 
 ## Allow reading either bam or cram as bamObject
-def getAlignmentObject(bam, refpath=None):
+def getAlignmentObject(bam, mode, refpath=None):
     if bam.endswith(".bam"):
-        bamObject = BAM(bam, "rb")
+        bamObject = BAM(bam, mode)
     elif bam.endswith(".cram"):
-        bamObject = BAM(bam, "rc", reference_filename=refpath)
+        bamObject = BAM(bam, mode, reference_filename=refpath)
     else:
         raise NameError(f"{bam} should have .bam or .cram as file extension")
     return bamObject

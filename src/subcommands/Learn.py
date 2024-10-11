@@ -68,7 +68,7 @@ def do_learn(args):
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-    bamObject = BAM(args.bam, "rb")
+    bamObject = BAM(args.bam, args.reference, "rb")
 
     """
     Execulte variant calling
