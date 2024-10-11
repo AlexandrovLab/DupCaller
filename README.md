@@ -16,7 +16,7 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 The tool uses pip for installing scripts and prerequisites. To install DupCaller, simply clone this repository and install via pip:
 
 ```bash
-git clone https://github.com/AlexandrovLab/DupCaller.git
+git clone https://github.com/YuheCheng62/DupCaller.git
 cd DupCaller
 pip install .
 ```

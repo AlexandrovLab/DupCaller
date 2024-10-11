@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from pysam import VariantFile as VCF
-from scipy.stats import chi2
+from scipy.stats import chi2, barnard_exact
 
 
 def calculate_ref_trinuc(args):
@@ -168,10 +168,24 @@ def do_estimate(args):
     revcomp = {"A": "T", "T": "A", "C": "G", "G": "C"}
     for nn, duplex_no in enumerate(trinuc_by_rf.columns):
         duplex_no_dict[duplex_no] = nn
+
+    if args.dilute:
+        vcf_out = VCF(args.prefix + "/" + sample + "_flt.vcf", "w", header=vcf.header)
     for rec in vcf.fetch():
         F1R2 = rec.info["F1R2"]
         F2R1 = rec.info["F2R1"]
-        duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
+        TAC = rec.samples["TUMOR"]["AC"]
+        if TAC > 1 and args.dilute:
+            TDP = rec.samples["TUMOR"]["DP"]
+            NAC = rec.samples["NORMAL"]["AC"]
+            NDP = rec.samples["NORMAL"]["DP"]
+            barnard_p = barnard_exact([[TAC, TDP - TAC], [NAC, NDP - NAC]]).pvalue
+            if barnard_p <= 0.05:
+                continue
+        if args.dilute:
+            vcf_out.write(rec)
+        # duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
+        duplex_no = str(F1R2) + "+" + str(F2R1)
         ref = rec.ref
         if ref == "C" or ref == "T":
             trinuc = rec.info["TN"]

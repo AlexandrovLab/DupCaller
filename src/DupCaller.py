@@ -418,6 +418,20 @@ if __name__ == "__main__":
         help="contigs to consider for trinucleotide calculation",
         default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
     )
+    estimate_parser.add_argument(
+        "-c",
+        "--clonal",
+        type=bool,
+        help="If True, mutations detected in more than one molecule will be considered as clonal mutations",
+        default=False,
+    )
+    estimate_parser.add_argument(
+        "-d",
+        "--dilute",
+        type=bool,
+        help="Set to true when sample and matched normal are from the same starting DNA material",
+        default=False,
+    )
 
     summarize_parser = subparsers.add_parser(
         "summarize", help="Summarize results from multiple samples"

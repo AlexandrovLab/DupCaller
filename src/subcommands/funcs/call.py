@@ -367,6 +367,7 @@ def callBam(params, processNo):
     dmgmat = dmgmat / dmgmat.sum(axis=1, keepdims=True)
     dmgmat_min_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_min_error], axis=1)
+    # dmgmat += 1e-9
 
     params["dmgmat_top"] = dmgmat
     params["trinuc2num_dict"] = trinuc2num
@@ -380,6 +381,7 @@ def callBam(params, processNo):
             ]
     dmgmat_rev_min_error = dmgmat_rev.min(axis=1, keepdims=True)
     dmgmat_rev = np.concatenate([dmgmat_rev, dmgmat_rev_min_error], axis=1)
+    # dmgmat_rev += 1e-9
     params["dmgmat_rev_top"] = dmgmat_rev
 
     dmgmat_b = np.vstack((dmgmat[32:64, [1, 0, 3, 2]], dmgmat[:32, [1, 0, 3, 2]]))
@@ -390,6 +392,8 @@ def callBam(params, processNo):
     dmgmat_rev_b_min_error = dmgmat_rev_b.min(axis=1, keepdims=True)
     dmgmat_b = np.concatenate([dmgmat_b, dmgmat_b_min_error], axis=1)
     dmgmat_rev_b = np.concatenate([dmgmat_rev_b, dmgmat_rev_b_min_error], axis=1)
+    # dmgmat_b += 1e-9
+    # dmgmat_rev_b += 1e-9
     params["dmgmat_bot"] = dmgmat_b
     params["dmgmat_rev_bot"] = dmgmat_rev_b
 
@@ -402,14 +406,15 @@ def callBam(params, processNo):
             current_row = dmgmat_indel[nn, :]
             current_row[current_row == 0] = dmgmat_indel[nn - 1, :][current_row == 0]
             dmgmat_indel[nn, :] = current_row
+        # dmgmat_indel += 1e-9
         params["dmgmat_indel"] = dmgmat_indel
     else:
         params["dmgmat_indel"] = np.ones([40, 11]) * params["dmgerri"]
         dmgmat_indel = params["dmgmat_indel"]
 
     dmgmat_indel_rev = np.fliplr(dmgmat_indel)
+    # dmgmat_indel_rev += 1e-9
     params["dmgmat_indel_rev"] = dmgmat_indel_rev
-
     params["dmgmat_indel_mean"] = np.mean(dmgmat_indel, axis=1)
     params["dmgmat_indel_rev_mean"] = np.mean(dmgmat_indel_rev, axis=1)
 
@@ -936,6 +941,7 @@ def callBam(params, processNo):
                     # else:
                     ### Calculate genotype probability
                     if not any(indel_bool) or isLearn:
+                        # if 1:
                         if isLearn:
                             (
                                 mismatch_now,
@@ -1429,6 +1435,7 @@ def callBam(params, processNo):
                     indel_dict[indel_str] = 1
             # else:
             ### Calculate genotype probability
+            # if 1:
             if not any(indel_bool) or isLearn:  # or len(indels_pass) == 0:
                 if isLearn:
                     (
