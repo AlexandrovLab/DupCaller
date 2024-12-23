@@ -26,57 +26,63 @@ def poisson_confint(k, cov, alpha=0.05):
     return low / cov, high / cov
 
 
-"""
-def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
-    print("........Estimating mutation rate for each trinucleotide context.......")
-    trinuc_mut_cov_by_rf = np.repeat(trinuc_cov_by_rf, 3, axis=0)
-    trinuc_rate = np.zeros(96)
-    n1 = np.array([int(_.split("+")[0]) for _ in n])
-    n2 = np.array([int(_.split("+")[1]) for _ in n])
-    nmin = np.vstack((n1, n2)).min(axis=0)
-    trinuc_rate = np.zeros([96, nmin.max()])
-    trinuc_rate_CI95 = np.zeros([96, nmin.max()])
-    burden_uncorrected = np.zeros(nmin.max())
-    mutnum_uncorrected = np.zeros(nmin.max())
-    for nn in range(nmin.max()):
-        trinuc_mut = trinuc_mut_by_rf[:, nmin >= nn].sum(axis=1)
-        trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
-        trinuc_rate[:, nn] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
-        mutnum_uncorrected[nn] = trinuc_rate[:, nn].dot(
-            trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
-        )
-        burden_uncorrected[nn] = mutnum_uncorrected[nn] / (
-            trinuc_cov_by_rf[:, nmin >= nn].sum(axis=1).sum()
-        )
-    corrected_mutnum = trinuc_rate.T.dot(np.repeat(ref_trinuc, 3))
-    #corrected_mutnum_lb = (trinuc_rate - trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
-    #corrected_mutnum_ub = (trinuc_rate + trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
-    burden = corrected_mutnum / ref_trinuc.sum()
-    burden_lb, burden_ub = poisson_confind(corrected_mutnum,ref_trinuc.sum())
-    #CI95 = 1.96 * np.sqrt(corrected_mutnum)
-    #burden_lb = trinuc_rate_CI95T.dot(np.repeat(ref_trinuc, 3))
-    #burden_ub = burden + CI95 / ref_trinuc.sum()
-    #burden_lb = corrected_mutnum_lb / ref_trinuc.sum()
-    #burden_ub = corrected_mutnum_ub / ref_trinuc.sum()
-    hap_trinuc = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3).reshape(96, 1))
-    #corrected_mutnum = trinuc_rate.T.dot(np.repeat(ref_trinuc, 3))
-    #corrected_mutnum_lb = (trinuc_rate - trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
-    #corrected_mutnum_ub = (trinuc_rate + trinuc_rate_CI95).T.dot(np.repeat(ref_trinuc, 3))
-    #burden_lb, burden_ub = poisson_confind(mutnum_uncorrected,)
-    CI95_uncorrected = 1.96 * np.sqrt(mutnum_uncorrected)
-    burden_uncorrected_lb = burden_uncorrected - CI95_uncorrected / ref_trinuc.sum()
-    burden_uncorrected_ub = burden_uncorrected + CI95_uncorrected / ref_trinuc.sum()
-    return (
-        hap_trinuc[:, 2],
-        burden[2],
-        burden_lb[2],
-        burden_ub[2],
-        trinuc_rate[:, 2],
-        burden_uncorrected[2],
-        burden_uncorrected_lb[2],
-        burden_uncorrected_ub[2],
+def plot_96(ax, trinuc_pd):
+    # fig, ax = plt.subplots(figsize=(60, 10))
+    SBS96_order = sorted(trinuc_pd.index, key=lambda x: (x[2:5], x[0] + x[6]))
+    palette = OrderedDict(
+        {
+            "C>A": "#03BDEF",
+            "C>G": "#010101",
+            "C>T": "#E42926",
+            "T>A": "#CBCACA",
+            "T>C": "#A2CF63",
+            "T>G": "#ECC7C5",
+        }
     )
-"""
+    palette_list = ["#03BDEF", "#010101", "#E42926", "#CBCACA", "#A2CF63", "#ECC7C5"]
+    palette_list = np.repeat(np.array(palette_list), 16).tolist()
+    ax.bar(
+        SBS96_order,
+        [
+            trinuc_pd.loc[trinuc_pd.index == m, trinuc_pd.columns[0]].values[0]
+            for m in SBS96_order
+        ],
+        color=palette_list,
+    )
+    plt.yticks(size=60)
+    ax.set(ylabel=None)
+    ax.get_xaxis().get_label().set_visible(False)
+    for nnn, muttype in enumerate(palette.keys()):
+        rect = mpatches.Rectangle(
+            (-0.5 + nnn * 16, 1),
+            16,
+            0.2,
+            color=palette[muttype],
+            zorder=0,
+            transform=ax.get_xaxis_transform(),
+            clip_on=False,
+        )
+        ax.add_patch(rect)
+        ax.text(
+            -0.5 + nnn * 16 + 8,
+            1.065,
+            muttype,
+            color="#FFFFFF",
+            fontsize=100,
+            horizontalalignment="center",
+            transform=ax.get_xaxis_transform(),
+            verticalalignment="center",
+        )
+    labels = [label.get_text() for label in ax.get_xticklabels()]
+    new_labels = []
+    for label in SBS96_order:
+        new_label = label[0] + label[2] + label[6]
+        new_labels.append(new_label)
+    ax.set_xticklabels(new_labels, fontsize=30, rotation=90, weight="bold")
+    ax.set_xlabel(
+        "Trinucleotide Context", fontsize=100, weight="bold", fontname="Arial"
+    )
+    return ax
 
 
 def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
@@ -219,6 +225,7 @@ def do_estimate(args):
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
     corrected_trinuc_pd = pd.DataFrame(corrected_trinuc_num, index=num2trinucSbs)
     fig, ax = plt.subplots(figsize=(60, 10))
+    """
     SBS96_order = sorted(corrected_trinuc_pd.index, key=lambda x: (x[2:5], x[0] + x[6]))
     palette = OrderedDict(
         {
@@ -275,7 +282,11 @@ def do_estimate(args):
     ax.set_xlabel(
         "Trinucleotide Context", fontsize=100, weight="bold", fontname="Arial"
     )
+    """
+    ax = plot_96(ax, corrected_trinuc_pd)
     fig.savefig(args.prefix + "/" + sample + "_sbs_96_corrected.png", dpi=300)
+
+    fig, axs = plt.subplots(nrows=2, ncols=1)
 
     # corrected_burden = corrected_trinuc_num.sum()/ref_trinuc.sum()
     # original_burden = trinuc_rate

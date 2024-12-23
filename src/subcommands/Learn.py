@@ -28,7 +28,7 @@ def do_learn(args):
         "regions": args.regions,
         "threads": args.threads,
         "mutRate": 10e-7,
-        "pcutoff": 2,
+        "pcutoff": 1,
         "amperr": 1e-5,
         "amperr_file": None,
         "amperri": 1e-6,

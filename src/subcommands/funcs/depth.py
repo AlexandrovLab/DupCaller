@@ -25,6 +25,7 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=1):
                 processed_read_names[pileupread.alignment.query_name] = 1
                 if pileupread.alignment.is_duplicate:
                     continue
+                # if pileupread.alignment.query_name
                 if pileupread.is_del or pileupread.indel != 0:
                     indelAlleleCount += 1
                     otherAlleleCount += 1

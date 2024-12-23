@@ -14,6 +14,7 @@ import pysam
 import os
 import re
 import h5py
+import errno
 
 from .depth import (
     extractDepthRegion,
@@ -224,7 +225,7 @@ def callBam(params, processNo):
     nbams = params["normalBams"]
     regions = params["regions"]
     if params["germline"]:
-        germline = VCF(params["germline"], mode = "rb")
+        germline = VCF(params["germline"], mode="rb")
     else:
         germline = None
     all_chroms = [_[0] for _ in regions]
@@ -236,9 +237,13 @@ def callBam(params, processNo):
     pcut = params["pcutoff"]
     isLearn = params.get("isLearn", False)
     nn = processNo
-    output = os.path.join("tmp", params["output"].lstrip('/') + "_" + str(nn))
+    output = os.path.join("tmp", params["output"].lstrip("/") + "_" + str(nn))
     if not os.path.exists(os.path.dirname(output)):
-        os.makedirs(os.path.dirname(output))
+        try:
+            os.makedirs(os.path.dirname(output))
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
     if params["noise"]:
         noise = BED(params["noise"])
     else:
@@ -461,7 +466,9 @@ def callBam(params, processNo):
         )
         read_blacklist = set()
         rec_num = 0
-        for rec, region in bamIterateMultipleRegion(bam, regions, params.get("reference")):
+        for rec, region in bamIterateMultipleRegion(
+            bam, regions, params.get("reference")
+        ):
             rec_num += 1
             if rec.query_name in read_blacklist or rec.is_unmapped:
                 continue
@@ -553,70 +560,6 @@ def callBam(params, processNo):
                     currentReadDict[label]["F1R2"] += 1
                 else:
                     currentReadDict[label]["F2R1"] += 1
-
-            """
-            if currentReadDict.get(bc1 + "+" + bc2) != None:
-                if not currentReadDict[bc1 + "+" + bc2]["names"].get(rec.query_name):
-                    currentReadDict[bc1 + "+" + bc2]["seqs"].append(rec)
-                    currentReadDict[bc1 + "+" + bc2]["names"][rec.query_name] = (
-                        len(currentReadDict[bc1 + "+" + bc2]["seqs"]) - 1
-                    )
-                    if (rec.is_forward and rec.is_read1) or (
-                        rec.is_reverse and rec.is_read2
-                    ):
-                        currentReadDict[bc1 + "+" + bc2]["F1R2"] += 1
-                    else:
-                        currentReadDict[bc1 + "+" + bc2]["F2R1"] += 1
-                else:
-                    seq_ind = currentReadDict[bc1 + "+" + bc2]["names"][rec.query_name]
-                    seq1_Bq = currentReadDict[bc1 + "+" + bc2]["seqs"][
-                        seq_ind
-                    ].query_alignment_qualities
-                    seq1_meanBq = sum(seq1_Bq) / len(seq1_Bq)
-                    seq2_Bq = rec.query_alignment_qualities
-                    seq2_meanBq = sum(seq2_Bq) / len(seq2_Bq)
-                    if seq2_meanBq >= seq1_meanBq:
-                        currentReadDict[bc1 + "+" + bc2]["seqs"][seq_ind] = rec
-            elif currentReadDict.get(bc2 + "+" + bc1) != None:
-                if not currentReadDict[bc2 + "+" + bc1]["names"].get(rec.query_name):
-                    currentReadDict[bc2 + "+" + bc1]["seqs"].append(rec)
-                    currentReadDict[bc2 + "+" + bc1]["names"][rec.query_name] = (
-                        len(currentReadDict[bc2 + "+" + bc1]["seqs"]) - 1
-                    )
-                    if (rec.is_forward and rec.is_read1) or (
-                        rec.is_reverse and rec.is_read2
-                    ):
-                        currentReadDict[bc2 + "+" + bc1]["F1R2"] += 1
-                    else:
-                        currentReadDict[bc2 + "+" + bc1]["F2R1"] += 1
-                else:
-                    seq_ind = currentReadDict[bc2 + "+" + bc1]["names"][rec.query_name]
-                    seq1_Bq = currentReadDict[bc2 + "+" + bc1]["seqs"][
-                        seq_ind
-                    ].query_alignment_qualities
-                    seq1_meanBq = sum(seq1_Bq) / len(seq1_Bq)
-                    seq2_Bq = rec.query_alignment_qualities
-                    seq2_meanBq = sum(seq2_Bq) / len(seq2_Bq)
-                    if seq2_meanBq >= seq1_meanBq:
-                        currentReadDict[bc2 + "+" + bc1]["seqs"][seq_ind] = rec
-            else:
-                currentReadDict.update(
-                    {
-                        bc: {
-                            "seqs": [rec],
-                            "F1R2": 0,
-                            "F2R1": 0,
-                            "names": {rec.query_name: 0},
-                        }
-                    }
-                )
-                if (rec.is_forward and rec.is_read1) or (
-                    rec.is_reverse and rec.is_read2
-                ):
-                    currentReadDict[bc1 + "+" + bc2]["F1R2"] += 1
-                else:
-                    currentReadDict[bc1 + "+" + bc2]["F2R1"] += 1
-            """
         else:
             """
             Calling block starts
@@ -832,7 +775,7 @@ def callBam(params, processNo):
                             F2R1_BLR >= params["pcutoff"],
                         )
                         """
-                        pass_inds = np.nonzero(LR <= params["pcutoff"])[0].tolist()
+                        pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
                         indels_pass = [indels[_] for _ in pass_inds]
                         coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
                         for nn in range(len(indels_pass)):
@@ -944,8 +887,8 @@ def callBam(params, processNo):
                             indel_dict[indel_str] = 1
                     # else:
                     ### Calculate genotype probability
-                    if not any(indel_bool) or isLearn:
-                        # if 1:
+                    # if not any(indel_bool) or isLearn:
+                    if 1:
                         if isLearn:
                             (
                                 mismatch_now,
@@ -1329,7 +1272,7 @@ def callBam(params, processNo):
                     F2R1_BLR >= params["pcutoff"],
                 )
                 """
-                pass_inds = np.nonzero(LR <= params["pcutoff"])[0].tolist()
+                pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
                 indels_pass = [indels[_] for _ in pass_inds]
                 coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
                 for nn in range(len(indels_pass)):
@@ -1439,8 +1382,8 @@ def callBam(params, processNo):
                     indel_dict[indel_str] = 1
             # else:
             ### Calculate genotype probability
-            # if 1:
-            if not any(indel_bool) or isLearn:  # or len(indels_pass) == 0:
+            if 1:
+                # if not any(indel_bool) or isLearn:  # or len(indels_pass) == 0:
                 if isLearn:
                     (
                         mismatch_now,

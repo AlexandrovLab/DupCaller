@@ -170,4 +170,4 @@ RUN set -eux; \
 
 CMD ["python3"]
 
-CMD git clone https://github.com/AlexandrovLab/DupCaller.git && cd DupCaller && pip install .
+CMD git clone https://github.com/YuheCheng62/DupCaller.git && cd DupCaller && pip install .

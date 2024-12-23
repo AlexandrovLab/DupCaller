@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import h5py
-
+import gzip
 import numpy as np
 from Bio import SeqIO
 
 
 def do_index(args):
     ### Load Fasta
-    fasta = SeqIO.to_dict(SeqIO.parse(args.reference, "fasta"))
+    if args.reference.endswith(".gz"):
+        with gzip.open(args.reference, "rt") as handle:
+            fasta = SeqIO.to_dict(SeqIO.parse(handle, "fasta"))
+    else:
+        fasta = SeqIO.to_dict(SeqIO.parse(args.reference, "fasta"))
 
     ### Define trinuc order, including N bases
     trinuc2num = dict()

@@ -25,6 +25,14 @@ from .funcs.misc import getAlignmentObject as BAM
 
 # if __name__ == "__main__":
 def do_call(args):
+    if "/" not in args.output:
+        if not os.path.exists(args.output):
+            try:
+                os.mkdir(args.output)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+        args.output = args.output + "/" + args.output
     params = {
         "tumorBam": args.bam,
         "normalBams": args.normalBams,
@@ -44,7 +52,8 @@ def do_call(args):
         "dmgerr_file": args.output + ".dmg.tn.txt",
         "dmgerri_file": args.output + ".dmg.id.txt",
         "mutRate": args.mutRate,
-        "pcutoff": args.threshold,
+        "pcutoff": args.thresholdSnv,
+        "pcutoffi": args.thresholdIndel,
         "mapq": args.mapq,
         "noise": args.noise,
         "indel_bed": args.indelbed,
@@ -124,12 +133,6 @@ def do_call(args):
     if not os.path.exists("tmp"):
         try:
             os.mkdir("tmp")
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
-    if not os.path.exists(params["output"]):
-        try:
-            os.mkdir(params["output"])
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
@@ -526,13 +529,11 @@ def do_call(args):
         vcf.write(vcfLines)
 
     burden_naive = muts_num / (coverage)
-    indel_burden = indels_num / (coverage + coverage_indel)
+    indel_burden = indels_num / coverage
     efficiency = duplex_num / rec_num
     pass_duprate = unique_read_num / pass_read_num
 
-    with open(
-        args.output + "_duplex_group_stats.txt", "w"
-    ) as f:
+    with open(args.output + "_duplex_group_stats.txt", "w") as f:
         f.write(
             "duplex_group_strand_composition\tduplex_group_number\t\
             effective_coverage\tmutation_count\n"
@@ -574,64 +575,6 @@ def do_call(args):
         sep="\t",
         index=False,
     )
-
-    muts_by_group = np.loadtxt(
-        args.output + "_duplex_group_stats.txt",
-        skiprows=1,
-        dtype=float,
-        delimiter="\t",
-        usecols=(2, 3),
-        ndmin=2,
-    ).transpose()
-    x = muts_by_group[0, :]
-    y = muts_by_group[1, :]
-    burden_lstsq = x.dot(y) / x.dot(x)
-    bootstrap_lstsqs = []
-    for _ in range(10000):
-        muts_by_group_resampled = np.random.default_rng().choice(
-            muts_by_group, muts_by_group.shape[1], axis=1
-        )
-        x = muts_by_group_resampled[0, :]
-        y = muts_by_group_resampled[1, :]
-        burden_lstsq_resampled = x.dot(y) / x.dot(x)
-        bootstrap_lstsqs.append(burden_lstsq_resampled)
-    bootstrap_lstsqs.sort()
-    burden_lstsq_lci = bootstrap_lstsqs[250]
-    burden_lstsq_uci = bootstrap_lstsqs[9750]
-    x = np.linspace(0, muts_by_group[0, :].max() * 1.1)
-    plt.scatter(muts_by_group[0, :], muts_by_group[1, :])
-    plt.plot(x, burden_lstsq * x, color="r")
-    plt.plot(x, burden_lstsq_lci * x, color="r", linestyle="dashed")
-    plt.plot(x, burden_lstsq_uci * x, color="r", linestyle="dashed")
-    plt.plot(x, burden_naive * x, color="b")
-    plt.xlabel("Coverage")
-    plt.ylabel("Mutation Count")
-    lgd1 = mpatches.Patch(color="red", label="Least Square")
-    lgd2 = mpatches.Patch(color="blue", label="Naive")
-    plt.legend(handles=[lgd1, lgd2])
-    plt.savefig(
-        args.output + "_burden_by_duplex_group_size.png"
-    )
-    """
-    if len(FPAll + RPAll) != 0:
-        FPs_count = [0 for _ in range(max(FPAll + RPAll))]
-        RPs_count = [0 for _ in range(max(FPAll + RPAll))]
-        for nn in range(max(FPAll + RPAll)):
-            FPs_count[nn] = FPAll.count(nn + 1)
-            RPs_count[nn] = RPAll.count(nn + 1)
-        with open(
-            params["output"] + "/" + args.output + "_SBS_end_profile.txt", "w"
-        ) as f:
-            f.write("Distance\tMutations_fragment_end\tMutations_read_end\n")
-            for nn in range(max(FPAll + RPAll)):
-                f.write(f"{nn+1}\t{FPs_count[nn]}\t{RPs_count[nn]}\n")
-        ACs = [_["samples"][0][0] for _ in mutsAll]
-        ACs_clonal = [_ for _ in ACs if _ > 1]
-        clonal_num = len(ACs_clonal)
-    else:
-        print(f"No mutations detected.")
-        clonal_num = 0
-    """
 
     with open(args.output + "_stats.txt", "w") as f:
         f.write(f"Number of Read Families\t{unique_read_num}\n")

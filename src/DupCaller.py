@@ -151,8 +151,15 @@ if __name__ == "__main__":
         default=2.5e-7,
     )
     call_parser.add_argument(
-        "-t",
-        "--threshold",
+        "-ts",
+        "--thresholdSnv",
+        type=float,
+        help="log likelihood ratio threshold of making a mutation call",
+        default=1,
+    )
+    call_parser.add_argument(
+        "-ti",
+        "--thresholdIndel",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
         default=3,
@@ -217,7 +224,7 @@ if __name__ == "__main__":
         "--nmflt",
         type=int,
         help="if set to a number, any read group and half of reads has a higher NM will be filtered",
-        default=4,
+        default=None,
     )
     call_parser.add_argument(
         "-w",
