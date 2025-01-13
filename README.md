@@ -132,7 +132,8 @@ These are variant calling parameters and adjustment is unnecessary for general u
 | -DS | --amperrfile | pre-learned error profile for SBS damage | None | 
 | -DI | --amperri | pre-learned error profile for indel damage | None | 
 | -mr | --mutRate | prior somatic mutation rate per base | 2.5e-7 |
-| -t | --threshold | score threshold to call a mutation | 3 |
+| -ts | --thresholdSnv | score threshold to call a mutation | 1 |
+| -ts | --thresholdIndel | score threshold to call a mutation | 3 |
 | -mq | --mapq | minumum mapq for an alignment to be considered | 40 |
 | -d | --minNdepth | minumum coverage in normal for called variants | 10 |
 | -gaf | --germlineAfCutoff | locations at which there is a germline mutation with population af larger than this threshold will be skipped | 0.001 |

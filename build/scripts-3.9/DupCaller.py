@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!python
 import argparse
 from subcommands.Caller import do_call
 from subcommands.Trim import do_trim
@@ -155,14 +155,14 @@ if __name__ == "__main__":
         "--thresholdSnv",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.55,
+        default=1,
     )
     call_parser.add_argument(
         "-ti",
         "--thresholdIndel",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.55,
+        default=3,
     )
     call_parser.add_argument(
         "-mq",
@@ -175,7 +175,7 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "-n", "--normalBams", nargs="+", type=str, help="bam file of matched normal"
     )
-    call_parser.add_argument("-m", "--noise", nargs="+", type=str, help="noise mask")
+    call_parser.add_argument("-m", "--noise", type=str, help="noise mask")
     call_parser.add_argument(
         "-tt",
         "--trimF",
@@ -224,7 +224,7 @@ if __name__ == "__main__":
         "--nmflt",
         type=int,
         help="if set to a number, any read group and half of reads has a higher NM will be filtered",
-        default=10,
+        default=None,
     )
     call_parser.add_argument(
         "-w",

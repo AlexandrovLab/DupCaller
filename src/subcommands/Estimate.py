@@ -92,40 +92,84 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     n1 = np.array([int(_.split("+")[0]) for _ in n])
     n2 = np.array([int(_.split("+")[1]) for _ in n])
     nmin = np.vstack((n1, n2)).min(axis=0)
-    trinuc_rate = np.zeros(96)
-
-    trinuc_mut = trinuc_mut_by_rf[:, nmin >= 2].sum(axis=1)
-    trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 2].sum(axis=1)
-    trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
-    print(trinuc_rate)
-
-    mutnum_uncorrected = trinuc_mut.sum()
+    burden_uncorrected = np.zeros(10)
+    burden_uncorrected_ub = np.zeros(10)
+    burden_uncorrected_lb = np.zeros(10)
+    burden_corrected = np.zeros(10)
+    burden_corrected_ub = np.zeros(10)
+    burden_corrected_lb = np.zeros(10)
+    hap_trinuc = np.zeros([96, 10])
+    ## Calculate burden when take 10 as mininum
+    trinuc_mut = trinuc_mut_by_rf[:, nmin >= 10].sum(axis=1)
+    trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 10].sum(axis=1)
+    mutnum = trinuc_mut.sum()
     cov = trinuc_cov.sum() / 3
-    burden_uncorrected = mutnum_uncorrected / cov
-    print(mutnum_uncorrected, burden_uncorrected, cov)
-    burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(
-        mutnum_uncorrected, cov
-    )
-
+    burden_uncorrected[9] = mutnum / cov
+    burden_uncorrected_lb[9], burden_uncorrected_ub[9] = poisson_confint(mutnum, cov)
+    trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
-
-    burden = mutnum_corrected / ref_trinuc.sum()
-    burden_lb, burden_ub = poisson_confint(mutnum_corrected, ref_trinuc.sum())
-    hap_trinuc = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+    burden_corrected[9] = mutnum_corrected / ref_trinuc.sum()
+    burden_corrected_lb[9], burden_corrected_ub[9] = poisson_confint(
+        mutnum_corrected, ref_trinuc.sum()
+    )
+    hap_trinuc[:, 9] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+    # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    for nn in range(9, 0, -1):
+        trinuc_mut = trinuc_mut + trinuc_mut_by_rf[:, nmin == nn].sum(axis=1)
+        trinuc_cov = trinuc_cov + trinuc_mut_cov_by_rf[:, nmin == nn].sum(axis=1)
+        mutnum = trinuc_mut.sum()
+        cov = trinuc_cov.sum() / 3
+        burden_uncorrected[nn - 1] = mutnum / cov
+        burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
+            mutnum, cov
+        )
+        trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+        trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+        mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
+        burden_corrected[nn - 1] = mutnum_corrected / ref_trinuc.sum()
+        burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
+            mutnum_corrected, ref_trinuc.sum()
+        )
+        hap_trinuc[:, nn - 1] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
 
     return (
         hap_trinuc,
-        burden,
-        burden_lb,
-        burden_ub,
-        trinuc_rate,
+        burden_corrected,
+        burden_corrected_lb,
+        burden_corrected_ub,
         burden_uncorrected,
         burden_uncorrected_lb,
         burden_uncorrected_ub,
-        mutnum_uncorrected,
+        mutnum,
         mutnum_corrected,
         ref_trinuc.sum(),
     )
+
+
+def estimate_id(trinuc_cov_by_rf, muts_by_rf, n):
+    print("........Estimating indel rate")
+    trinuc_mut_cov_by_rf = np.repeat(trinuc_cov_by_rf, 3, axis=0)
+    n1 = np.array([int(_.split("+")[0]) for _ in n])
+    n2 = np.array([int(_.split("+")[1]) for _ in n])
+    nmin = np.vstack((n1, n2)).min(axis=0)
+    burden_indel = np.zeros(10)
+    burden_indel_ub = np.zeros(10)
+    burden_indel_lb = np.zeros(10)
+    ## Calculate burden when take 10 as mininum
+    trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 10].sum(axis=1)
+    mutnum = muts_by_rf[:, nmin >= 10].sum(axis=1).sum()
+    cov = trinuc_cov.sum() / 3
+    burden_indel[9] = mutnum / cov
+    burden_indel_lb[9], burden_indel_ub[9] = poisson_confint(mutnum, cov)
+    # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    for nn in range(9, 0, -1):
+        trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
+        mutnum = muts_by_rf[:, nmin >= nn].sum(axis=1).sum()
+        cov = trinuc_cov.sum() / 3
+        burden_indel[nn - 1] = mutnum / cov
+        burden_indel_lb[nn - 1], burden_indel_ub[nn - 1] = poisson_confint(mutnum, cov)
+
+    return (burden_indel, burden_indel_lb, burden_indel_ub, mutnum)
 
 
 def do_estimate(args):
@@ -138,6 +182,7 @@ def do_estimate(args):
     trinuc_by_rf = pd.read_csv(
         prefix + "/" + sample + "_trinuc_by_duplex_group.txt", sep="\t", index_col=0
     )
+    ###Estimate SNV burden
     vcf = VCF(prefix + "/" + sample + "_snv.vcf", "r")
     mut_by_rf = dict()
     trinuc_list = list()
@@ -176,7 +221,9 @@ def do_estimate(args):
         duplex_no_dict[duplex_no] = nn
 
     if args.dilute:
-        vcf_out = VCF(args.prefix + "/" + sample + "_flt.vcf", "w", header=vcf.header)
+        vcf_out = VCF(
+            args.prefix + "/" + sample + "_snv_flt.vcf", "w", header=vcf.header
+        )
     for rec in vcf.fetch():
         F1R2 = rec.info["F1R2"]
         F2R1 = rec.info["F2R1"]
@@ -215,7 +262,6 @@ def do_estimate(args):
         burden,
         burden_lb,
         burden_ub,
-        trinuc_rate,
         uburden,
         uburden_lb,
         uburden_ub,
@@ -223,94 +269,128 @@ def do_estimate(args):
         mutnum_per_genome,
         genome_cov,
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
-    corrected_trinuc_pd = pd.DataFrame(corrected_trinuc_num, index=num2trinucSbs)
+    corrected_trinuc_pd = pd.DataFrame(
+        corrected_trinuc_num[:, [0]], index=num2trinucSbs, columns=["number"]
+    )
     fig, ax = plt.subplots(figsize=(60, 10))
-    """
-    SBS96_order = sorted(corrected_trinuc_pd.index, key=lambda x: (x[2:5], x[0] + x[6]))
-    palette = OrderedDict(
-        {
-            "C>A": "#03BDEF",
-            "C>G": "#010101",
-            "C>T": "#E42926",
-            "T>A": "#CBCACA",
-            "T>C": "#A2CF63",
-            "T>G": "#ECC7C5",
-        }
-    )
-    palette_list = ["#03BDEF", "#010101", "#E42926", "#CBCACA", "#A2CF63", "#ECC7C5"]
-    palette_list = np.repeat(np.array(palette_list), 16).tolist()
-    ax.bar(
-        SBS96_order,
-        [
-            corrected_trinuc_pd.loc[
-                corrected_trinuc_pd.index == m, corrected_trinuc_pd.columns[0]
-            ].values[0]
-            for m in SBS96_order
-        ],
-        color=palette_list,
-    )
-    plt.yticks(size=60)
-    ax.set(ylabel=None)
-    ax.get_xaxis().get_label().set_visible(False)
-    for nnn, muttype in enumerate(palette.keys()):
-        rect = mpatches.Rectangle(
-            (-0.5 + nnn * 16, 1),
-            16,
-            0.2,
-            color=palette[muttype],
-            zorder=0,
-            transform=ax.get_xaxis_transform(),
-            clip_on=False,
-        )
-        ax.add_patch(rect)
-        ax.text(
-            -0.5 + nnn * 16 + 8,
-            1.065,
-            muttype,
-            color="#FFFFFF",
-            fontsize=100,
-            horizontalalignment="center",
-            transform=ax.get_xaxis_transform(),
-            verticalalignment="center",
-        )
-    labels = [label.get_text() for label in ax.get_xticklabels()]
-    new_labels = []
-    for label in SBS96_order:
-        new_label = label[0] + label[2] + label[6]
-        new_labels.append(new_label)
-    ax.set_xticklabels(new_labels, fontsize=30, rotation=90, weight="bold")
-    ax.set_xlabel(
-        "Trinucleotide Context", fontsize=100, weight="bold", fontname="Arial"
-    )
-    """
     ax = plot_96(ax, corrected_trinuc_pd)
     fig.savefig(args.prefix + "/" + sample + "_sbs_96_corrected.png", dpi=300)
-
-    fig, axs = plt.subplots(nrows=2, ncols=1)
-
-    # corrected_burden = corrected_trinuc_num.sum()/ref_trinuc.sum()
-    # original_burden = trinuc_rate
-    # print(corrected_burden)
-    """
-    fig, axs = plt.subplots(16, 6)
-    for nn in range(96):
-        nnn = math.floor(nn / 6)
-        mmm = nn - nnn * 6
-        axs[nnn, mmm].scatter(
-            trinuc_by_rf_np[int(np.floor(nn / 3)), :], trinuc_mut_np[nn, :]
-        )
-        x = np.linspace(0, trinuc_mut_np[nn, :].max() * 1.1)
-        axs[nnn, mmm].plot(x, trinuc_rate[nn] * x, color="r")
-        axs[nnn, mmm].set_title(num2trinucSbs[nn])
-    fig.savefig(args.prefix + "/" + sample + "_sbs96_mutrates.png", dpi=300)
-    """
-    with open(args.prefix + "/" + sample + "_burden.txt", "w") as f:
-        f.write(f"Uncorrected burden\t{uburden}\n")
-        f.write(f"Uncorrected burden 95% lower\t{uburden_lb}\n")
-        f.write(f"Uncorrected burden 95% upper\t{uburden_ub}\n")
+    fig, ax = plt.subplots(figsize=(20, 15))
+    ax.plot(range(1, 11), uburden)
+    ax.plot(range(1, 11), uburden_lb)
+    ax.plot(range(1, 11), uburden_ub)
+    ax.set_yscale("log")
+    fig.savefig(
+        args.prefix + "/" + sample + "_burden_by_min_read_group_size.png", dpi=300
+    )
+    with open(args.prefix + "/" + sample + "_snv_burden.txt", "w") as f:
+        f.write(f"Uncorrected burden\t{uburden[0]}\n")
+        f.write(f"Uncorrected burden 95% lower\t{uburden_lb[0]}\n")
+        f.write(f"Uncorrected burden 95% upper\t{uburden_ub[0]}\n")
         f.write(f"Uncorrected mutation number\t{mutnum_uncorrected}\n")
-        f.write(f"Corrected burden\t{burden}\n")
-        f.write(f"Corrected burden 95% lower\t{burden_lb}\n")
-        f.write(f"Corrected burden 95% upper\t{burden_ub}\n")
+        f.write(f"Corrected burden\t{burden[0]}\n")
+        f.write(f"Corrected burden 95% lower\t{burden_lb[0]}\n")
+        f.write(f"Corrected burden 95% upper\t{burden_ub[0]}\n")
         f.write(f"mutation number per genome\t{mutnum_per_genome}\n")
         f.write(f"genome coverage\t{genome_cov}\n")
+
+    table = pd.DataFrame(
+        np.hstack(
+            [
+                _.reshape(10, 1)
+                for _ in [
+                    np.arange(1, 11, 1, dtype=np.int16),
+                    uburden,
+                    uburden_lb,
+                    uburden_ub,
+                    burden,
+                    burden_lb,
+                    burden_ub,
+                ]
+            ]
+        ),
+        columns=[
+            "read number",
+            "Corrected_burden",
+            "Corrected_burden_lower",
+            "Corrected_burden_upper",
+            "Uncorrrected_burden",
+            "Uncorrected_burden_lower",
+            "Uncorrected_burden_upper",
+        ],
+    )
+    table.to_csv(
+        args.prefix + "/" + sample + "_snv_burden_by_min_group_size.txt",
+        sep="\t",
+        index=False,
+    )
+
+    prefix = args.prefix
+    if len(prefix.split("/")[-1]) == 0:
+        sample = prefix.split("/")[-2]
+    else:
+        sample = prefix.split("/")[-1]
+    trinuc_by_rf = pd.read_csv(
+        prefix + "/" + sample + "_trinuc_by_duplex_group.txt", sep="\t", index_col=0
+    )
+    ###Estimate INDEL burden
+    vcf = VCF(prefix + "/" + sample + "_indel.vcf", "r")
+    mutnum_by_rf = dict()
+    for n in trinuc_by_rf.columns:
+        mutnum_by_rf[n] = [0]
+
+    if args.dilute:
+        vcf_out = VCF(
+            args.prefix + "/" + sample + "_indel_flt.vcf", "w", header=vcf.header
+        )
+    for rec in vcf.fetch():
+        F1R2 = rec.info["F1R2"]
+        F2R1 = rec.info["F2R1"]
+        TAC = rec.samples["TUMOR"]["AC"]
+        if TAC > 1 and args.dilute:
+            TDP = rec.samples["TUMOR"]["DP"]
+            NAC = rec.samples["NORMAL"]["AC"]
+            NDP = rec.samples["NORMAL"]["DP"]
+            barnard_p = barnard_exact([[TAC, TDP - TAC], [NAC, NDP - NAC]]).pvalue
+            if barnard_p <= 0.05:
+                continue
+        if args.dilute:
+            vcf_out.write(rec)
+        # duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
+        duplex_no = str(F1R2) + "+" + str(F2R1)
+        mutnum_by_rf[duplex_no] = [1]
+    mutnum_by_rf_np = pd.DataFrame(mutnum_by_rf).to_numpy()
+    (burden, burden_lb, burden_ub, mutnum) = estimate_id(
+        trinuc_by_rf_np, mutnum_by_rf_np, trinuc_by_rf.columns
+    )
+
+    with open(args.prefix + "/" + sample + "_indel_burden.txt", "w") as f:
+        f.write(f"Indel burden\t{burden[0]}\n")
+        f.write(f"Indel burden 95% lower\t{burden_lb[0]}\n")
+        f.write(f"Indel burden 95% upper\t{burden_ub[0]}\n")
+        f.write(f"Indel number\t{mutnum}\n")
+
+    table = pd.DataFrame(
+        np.hstack(
+            [
+                _.reshape(10, 1)
+                for _ in [
+                    np.arange(1, 11, 1, dtype=np.int16),
+                    burden,
+                    burden_lb,
+                    burden_ub,
+                ]
+            ]
+        ),
+        columns=[
+            "read number",
+            "Indel_burden",
+            "Indel_burden_lower",
+            "Indel_burden_upper",
+        ],
+    )
+    table.to_csv(
+        args.prefix + "/" + sample + "_indel_burden_by_min_group_size.txt",
+        sep="\t",
+        index=False,
+    )

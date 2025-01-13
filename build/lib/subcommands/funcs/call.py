@@ -100,15 +100,12 @@ def prepare_reference_mats(
                         indel_mask[max(ind, 0) : ind + len(ref)] = True
     ### Prepare noise mask
     if noise_bed != None:
-        for n in noise_bed:
-            for rec in n.fetch(chrom, start, end, parser=pysam.asBed()):
-                interval_start = max(rec.start, start)
-                interval_end = min(rec.end, end)
-                interval_len = interval_end - interval_start
-                interval_start_ind = interval_start - start
-                noise_mask[
-                    interval_start_ind : interval_start_ind + interval_len
-                ] = True
+        for rec in noise_bed.fetch(chrom, start, end, parser=pysam.asBed()):
+            interval_start = max(rec.start, start)
+            interval_end = min(rec.end, end)
+            interval_len = interval_end - interval_start
+            interval_start_ind = interval_start - start
+            noise_mask[interval_start_ind : interval_start_ind + interval_len] = True
     if indel_bed != None:
         for rec in indel_bed.fetch(chrom, start, end, parser=pysam.asBed()):
             interval_start = max(rec.start, start)
@@ -248,9 +245,7 @@ def callBam(params, processNo):
             if e.errno != errno.EEXIST:
                 raise
     if params["noise"]:
-        noise = list()
-        for bb in params["noise"]:
-            noise.append(BED(bb))
+        noise = BED(params["noise"])
     else:
         noise = None
     if params["indel_bed"]:
@@ -316,6 +311,7 @@ def callBam(params, processNo):
     params["trinuc_convert"] = trinuc_convert_np
     params["trinuc2num_dict"] = trinuc2num
     params["num2trinuc_list"] = num2trinuc
+    print(params["amperr_file"])
     ### Load amp error matrix
     if not params["amperr_file"]:
         prob_amp = params["amperr"]
@@ -511,11 +507,9 @@ def callBam(params, processNo):
             or rec.is_qcfail
         ):
             continue
-        if rec.cigartuples[0][1] == 4:
-            continue
-        # if "I" in rec.cigarstring or "D" in rec.cigarstring:
-        # if len(findIndels(rec)) >= 2:
-        # continue
+        if "I" in rec.cigarstring or "D" in rec.cigarstring:
+            if len(findIndels(rec)) >= 2:
+                continue
         pass_read_num += 1
         start = rec.reference_start
         bc = rec.query_name.split("_")[1]
@@ -610,7 +604,7 @@ def callBam(params, processNo):
                                 duplex_no
                             ] = np.zeros(96, dtype=int)
                 unique_read_num += 1
-                if F2R1 >= 1 and F1R2 >= 1:
+                if setBc1 != setBc2 and F2R1 >= 1 and F1R2 >= 1:
                     rs_reference_end = max([r.reference_end for r in readSet])
                     chromNow = readSet[0].reference_name
                     if (
@@ -1136,7 +1130,7 @@ def callBam(params, processNo):
                         96, dtype=int
                     )
         unique_read_num += 1
-        if F2R1 >= 1 and F1R2 >= 1:
+        if setBc1 != setBc2 and F2R1 >= 1 and F1R2 >= 1:
             rs_reference_end = max([r.reference_end for r in readSet])
             chromNow = readSet[0].reference_name
             if chromNow != reference_mat_chrom or rs_reference_end >= reference_mat_end:

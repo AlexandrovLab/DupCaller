@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: DupCaller
-Version: 0.1.1
+Version: 0.1.2
 Summary: A variant caller for barcoded DNA sequencing
 Home-page: https://github.com/yuhecheng62/DupCaller
 Author: Yuhe Cheng
