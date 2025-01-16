@@ -155,14 +155,14 @@ if __name__ == "__main__":
         "--thresholdSnv",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.55,
+        default=0.5,
     )
     call_parser.add_argument(
         "-ti",
         "--thresholdIndel",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.55,
+        default=0.5,
     )
     call_parser.add_argument(
         "-mq",
