@@ -324,7 +324,7 @@ def do_estimate(args):
         sep="\t",
         index=False,
     )
-
+    """
     prefix = args.prefix
     if len(prefix.split("/")[-1]) == 0:
         sample = prefix.split("/")[-2]
@@ -394,3 +394,4 @@ def do_estimate(args):
         sep="\t",
         index=False,
     )
+    """
