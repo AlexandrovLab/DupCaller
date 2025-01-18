@@ -270,7 +270,12 @@ def do_estimate(args):
         genome_cov,
     ) = estimate_96(trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns)
     corrected_trinuc_pd = pd.DataFrame(
-        corrected_trinuc_num[:, [0]], index=num2trinucSbs, columns=["number"]
+        corrected_trinuc_num[:, [0]].astype(int),
+        index=num2trinucSbs,
+        columns=["number"],
+    )
+    corrected_trinuc_pd.to_csv(
+        args.prefix + "/" + sample + "_sbs_96_corrected.txt", sep="\t"
     )
     fig, ax = plt.subplots(figsize=(60, 10))
     ax = plot_96(ax, corrected_trinuc_pd)
@@ -281,9 +286,9 @@ def do_estimate(args):
     ax.plot(range(1, 11), uburden_ub)
     ax.set_yscale("log")
     fig.savefig(
-        args.prefix + "/" + sample + "_burden_by_min_read_group_size.png", dpi=300
+        args.prefix + "/" + sample + "_sbs_burden_by_min_read_group_size.png", dpi=300
     )
-    with open(args.prefix + "/" + sample + "_snv_burden.txt", "w") as f:
+    with open(args.prefix + "/" + sample + "_sbs_burden.txt", "w") as f:
         f.write(f"Uncorrected burden\t{uburden[0]}\n")
         f.write(f"Uncorrected burden 95% lower\t{uburden_lb[0]}\n")
         f.write(f"Uncorrected burden 95% upper\t{uburden_ub[0]}\n")
@@ -320,7 +325,7 @@ def do_estimate(args):
         ],
     )
     table.to_csv(
-        args.prefix + "/" + sample + "_snv_burden_by_min_group_size.txt",
+        args.prefix + "/" + sample + "_sbs_burden_by_min_read_group_size.txt",
         sep="\t",
         index=False,
     )
