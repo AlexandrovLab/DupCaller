@@ -67,7 +67,7 @@ where
 
 ### MarkDuplicates with optical duplicates tags and new read name configuration
 
-Run GATK MarkDuplicates on sample and matched-normal bams. Notice that optical duplicates and PCR duplicates should be treated differently in ecNGS variant calling, so the "TAGGING_POLICY" of GATK MarkDuplicates should be set to OpticalOnly to differentiate optical duplicate from PCR duplicate. Addtionally, DUPLEX_UMI option should be set to true, and since the read name of trimmed fastq is modified, the READ_NAME_REGEX option should also be set to "(?:.*:)?([0-9]+)[^:]_:([0-9]+)[^:]_:([0-9]+)[^:]\_$". **Outdated versions of GATK do not have the --DUPLEX_UMI tag. Please update gatk to latest version if this happens** The MarkDuplicates commands should be looking like this:
+Run GATK MarkDuplicates on sample and matched-normal bams. Notice that optical duplicates and PCR duplicates should be treated differently in ecNGS variant calling, so the "TAGGING_POLICY" of GATK MarkDuplicates should be set to OpticalOnly to differentiate optical duplicate from PCR duplicate. Addtionally, DUPLEX_UMI option should be set to true, and since the read name of trimmed fastq is modified, the READ_NAME_REGEX option should also be set to "(?:.*:)?([0-9]+)[^:]_:([0-9]+)[^:]_:([0-9]+)[^:]\*$". **Outdated versions of GATK do not have the --DUPLEX_UMI tag. Please update gatk to latest version if this happens** The MarkDuplicates commands should be looking like this:
 
 ```bash
 gatk MarkDuplicates -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" --DUPLEX_UMI --TAGGING_POLICY OpticalOnly
@@ -117,8 +117,8 @@ These options should be understood by user and customized accordingly. Some of t
 | -n | --normalBam | bam file of matched normals. When matched normal is not available, set the maximum allele frequency (-ma) to an appropriate value (e.x. 0.3) | None |
 | -m | --noise | a bed interval file that masked noisy positions | None |
 | -maf | --maxAF | maximum allele fraction to call a somatic mutation. Must be set to appropriate value when a matched normal (-n) is not available | 1 |
-| -tt | --trimF | ignore mutation if it is less than n bps from ends of template | 30 |
-| -tr | --trimR | ignore mutation if it is less than n bps from ends of read | 15 |
+| -tt | --trimF | ignore mutation if it is less than n bps from ends of template | 7 |
+| -tr | --trimR | ignore mutation if it is less than n bps from ends of read | 7 |
 | -id | --indelBed | an indel enhanced panel of normal (ePoN) used for indel calling | None | 
 
 **Advanced**
@@ -131,19 +131,18 @@ These are variant calling parameters and adjustment is unnecessary for general u
 | -AI | --amperri | pre-learned error profile for amplification indel error | None | 
 | -DS | --amperrfile | pre-learned error profile for SBS damage | None | 
 | -DI | --amperri | pre-learned error profile for indel damage | None | 
-| -mr | --mutRate | prior somatic mutation rate per base | 2.5e-7 |
-| -ts | --thresholdSnv | score threshold to call a mutation | 1 |
-| -ts | --thresholdIndel | score threshold to call a mutation | 3 |
+| -ts | --thresholdSnv | score threshold to call a mutation | 0.5 |
+| -ts | --thresholdIndel | score threshold to call a mutation | 0.5 |
 | -mq | --mapq | minumum mapq for an alignment to be considered | 40 |
 | -d | --minNdepth | minumum coverage in normal for called variants | 10 |
 | -gaf | --germlineAfCutoff | locations at which there is a germline mutation with population af larger than this threshold will be skipped | 0.001 |
-| -nm | --nmflt | filter out any reads that has a editing distance larger than this value | 4 |
+| -nm | --nmflt | filter out any reads that has a editing distance larger than this value | None |
 | -w | --windowSize | genomic window size when calculating rough coverage and split bam files into equal regions. Adjust for smaller panel | 100000 |
 | -bq | --minBq | bases with quality less than this number will be set to 6 | default=18 |
 | -aq | --minAltQual | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
-| --minRef | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
+| --minRef | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
 | --minAlt |
-| minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
+| minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
 
 ### Mutation burden estimation
 After mutation calling, mutational burden can be performed within the folder:
