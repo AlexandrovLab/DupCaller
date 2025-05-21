@@ -85,7 +85,7 @@ DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {thread
 DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -maf 0.1
 ```
 
-Note that since DupCaller partition jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panel. In this case we suggest to run at most one thread per distince targeted region
+Note that since DupCaller partition jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panel. In this case we suggest to run at most one thread per distinct targeted region
 
 Please see "Parameters" section for explanation of all parameters. See "Results" section for descriptions of all result files in the output folder
 
@@ -137,8 +137,7 @@ These are variant calling parameters and adjustment is unnecessary for general u
 | -bq | --minBq | bases with quality less than this number will be set to 6 | default=18 |
 | -aq | --minAltQual | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
 | --minRef | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
-| --minAlt |
-| minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
+| --minAlt | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
 
 ### Mutation burden estimation
 After mutation calling, mutational burden can be performed within the folder:
