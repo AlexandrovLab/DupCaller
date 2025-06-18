@@ -1,0 +1,4 @@
+build/
+src/DupCaller.egg-info
+.prettierignore
+.pre-commit-config.yaml

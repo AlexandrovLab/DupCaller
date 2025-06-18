@@ -224,7 +224,7 @@ if __name__ == "__main__":
         "--nmflt",
         type=int,
         help="if set to a number, any read group and half of reads has a higher NM will be filtered",
-        default=10,
+        default=5,
     )
     call_parser.add_argument(
         "-w",
@@ -289,7 +289,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         help="contigs to consider for variant calling",
-        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
+        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX","chrY"],
     )
     learn_parser.add_argument(
         "-p", "--threads", type=int, help="number of threads", default=1

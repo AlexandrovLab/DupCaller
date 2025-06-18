@@ -206,13 +206,6 @@ def do_estimate(args):
                     num2trinucSbs.append(
                         minus_base + "[" + ref_base + ">" + alt_base + "]" + plus_base
                     )
-    # rf_sizes = np.zeros(len(trinuc_by_rf.columns),dtype=int)
-    # for nn,rf in enumerate(trinuc_by_rf.columns):
-    # ts = int(rf.split("+")[0])
-    # bs = int(rf.split("+")[1])
-    # rf_sizes[nn] = ts+bs
-    # sorted_index = np.argsort(rf_sizes)
-    # rf_sizes_sorted = rf_sizes[sorted_index]
     trinuc_by_rf_np = trinuc_by_rf.to_numpy()
     trinuc_mut_np = np.zeros([96, len(trinuc_by_rf.columns)], dtype=int)
     duplex_no_dict = dict()

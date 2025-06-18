@@ -211,7 +211,7 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
             np.logical_and(F2R1_seq_mat == nn, F2R1_qual_mat != 0)
         ).sum(axis=0)
     total_count_mat = F1R2_count_mat + F2R1_count_mat
-    antimask[(total_count_mat >= 1).sum(axis=0) > 1] = False
+    antimask[(total_count_mat >= 1).sum(axis=0) > 2] = False
     base1_int = np.argmax(total_count_mat, axis=0)
     total_count_without_base1 = total_count_mat.copy()
     total_count_without_base1[base1_int, np.ogrid[:n]] = -1
