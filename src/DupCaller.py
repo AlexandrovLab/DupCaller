@@ -86,6 +86,13 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "-p", "--threads", type=int, help="number of threads", default=1
     )
+    call_parser.add_argument(
+        "-ax",
+        "--minMeanASXS",
+        type=int,
+        help="minimum mean AS-XS for a read group to be considered for calling",
+        default=50,
+    )
     ### Learning file locations
     """
     call_parser.add_argument(

@@ -592,7 +592,7 @@ def callBam(params, processNo):
                 meanASXS = sum(
                     [seq.get_tag("AS") - seq.get_tag("XS") for seq in readSet]
                 ) / len(readSet)
-                if meanASXS < 50:
+                if meanASXS < params["minMeanASXS"]:
                     continue
                 setBc = key.split(":")[0].split("+")
                 setBc1 = setBc[0]

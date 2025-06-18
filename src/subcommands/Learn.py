@@ -47,6 +47,7 @@ def do_learn(args):
         "minBq": args.minBq,
         "minAltQual": args.minAltQual,
         "maxNM": args.nmflt,
+        "minMeanASXS": args.minMeanASXS,
         "step": args.windowSize,
         "minRef": args.minRef,
         "minAlt": args.minAlt,

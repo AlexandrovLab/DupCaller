@@ -66,6 +66,7 @@ def do_call(args):
         "germline_cutoff": args.germlineAfCutoff,
         "maxNM": args.nmflt,
         "step": args.windowSize,
+        "minMeanASXS": args.minMeanASXS,
         "isLearn": None,
     }
     if args.amperrfile:
@@ -101,6 +102,7 @@ def do_call(args):
         "indel_bed": None,
         "trim5": args.trimF,
         "trim3": args.trimR,
+        "minMeanASXS": args.minMeanASXS,
         "germline_cutoff": args.germlineAfCutoff,
         "minBq": args.minBq,
         "minAltQual": args.minAltQual,
