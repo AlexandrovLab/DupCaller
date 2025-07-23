@@ -70,7 +70,7 @@ where
 Run GATK MarkDuplicates on sample and matched-normal bams. Notice that optical duplicates and PCR duplicates should be treated differently in ecNGS variant calling, so the "TAGGING_POLICY" of GATK MarkDuplicates should be set to OpticalOnly to differentiate optical duplicate from PCR duplicate. Addtionally, DUPLEX_UMI option should be set to true, and since the read name of trimmed fastq is modified, the READ_NAME_REGEX option should also be set to "(?:.*:)?([0-9]+)[^:]_:([0-9]+)[^:]_:([0-9]+)[^:]\_$". **Outdated versions of GATK do not have the --DUPLEX_UMI tag. Please update gatk to latest version if this happens** The MarkDuplicates commands should be looking like this:
 
 ```bash
-gatk MarkDuplicates -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" --DUPLEX_UMI --TAGGING_POLICY OpticalOnly
+gatk MarkDuplicates -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" --DUPLEX_UMI --TAGGING_POLICY OpticalOnly --BARCODE_TAG DB
 ```
 
 ### Variant Calling
