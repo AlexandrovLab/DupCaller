@@ -87,22 +87,6 @@ if __name__ == "__main__":
         "-p", "--threads", type=int, help="number of threads", default=1
     )
     ### Learning file locations
-    """
-    call_parser.add_argument(
-        "-as",
-        "--amperrs",
-        type=float,
-        help="estimated polymerase substitutionerror rate",
-        default=1e-5,
-    )
-    call_parser.add_argument(
-        "-ai",
-        "--amperri",
-        type=float,
-        help="estimated polymerase indel error rate",
-        default=5e-7,
-    )
-    """
     call_parser.add_argument(
         "-AS",
         "--amperrfile",
@@ -115,22 +99,6 @@ if __name__ == "__main__":
         type=str,
         help="amplification error matrix",
     )
-    """
-    call_parser.add_argument(
-        "-ds",
-        "--dmgerrs",
-        type=float,
-        help="estimated polymerase substitutionerror rate",
-        default=1e-5,
-    )
-    call_parser.add_argument(
-        "-di",
-        "--dmgerri",
-        type=float,
-        help="estimated polymerase indel error rate",
-        default=3e-7,
-    )
-    """
     call_parser.add_argument(
         "-DS",
         "--dmgerrfile",
@@ -204,6 +172,8 @@ if __name__ == "__main__":
         help="maximum allele fraction to call a somatic mutation",
         default=1,
     )
+
+    """
     call_parser.add_argument(
         "-mnv",
         "--maxMNVlen",
@@ -211,6 +181,7 @@ if __name__ == "__main__":
         help="maximum length of MNV to be considered a real mutation",
         default=2,
     )
+    """
 
     call_parser.add_argument(
         "-id",

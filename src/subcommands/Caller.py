@@ -62,7 +62,6 @@ def do_call(args):
         "minNdepth": args.minNdepth,
         "minBq": args.minBq,
         "maxAF": args.maxAF,
-        "maxMnv": args.maxMNVlen,
         "germline_cutoff": args.germlineAfCutoff,
         "maxNM": args.nmflt,
         "step": args.windowSize,

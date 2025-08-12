@@ -970,11 +970,6 @@ def callBam(params, processNo):
                             for mut_ind in muts_ind
                         ]
                         NMs = [seq.get_tag("NM") for seq in readSet]
-                        averageNM = sum(NMs) / len(NMs)
-                        # if averageNM - len(mut_positions) > 1:
-                        # continue
-                        # if len(mut_positions) > params["maxMnv"]:
-                        # continue
                         for nn in range(len(mut_positions)):
                             mut_chrom = reference_mat_chrom
                             mut_pos = mut_positions[nn]
@@ -1477,10 +1472,6 @@ def callBam(params, processNo):
                 ]
                 NMs = [seq.get_tag("NM") for seq in readSet]
                 averageNM = sum(NMs) / len(NMs)
-                # if averageNM - len(mut_positions) > 1:
-                # continue
-                # if len(mut_positions) > params["maxMnv"]:
-                # continue
                 for nn in range(len(mut_positions)):
                     mut_chrom = reference_mat_chrom
                     mut_pos = mut_positions[nn]
