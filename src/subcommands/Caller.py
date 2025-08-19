@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 from collections import OrderedDict
 from multiprocessing import Pool
@@ -25,8 +26,81 @@ from .funcs.misc import getAlignmentObject as BAM
 # from heapq import nlargest
 
 
+def check_input_files_exist(args):
+    """
+    Check if all required input files exist and exit gracefully if not.
+    """
+    missing_files = []
+    
+    # Required files
+    if not os.path.exists(args.bam):
+        missing_files.append(f"Tumor BAM file: {args.bam}")
+    
+    if not os.path.exists(args.reference):
+        missing_files.append(f"Reference genome: {args.reference}")
+    
+    # Check for associated reference files (h5 files)
+    ref_base = os.path.splitext(args.reference)[0]
+    ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.h5"]
+    tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
+    hp_h5_files = [f"{ref_base}.hp.h5", f"{args.reference}.hp.h5"]
+    
+    if not any(os.path.exists(f) for f in ref_h5_files):
+        missing_files.append(f"Reference h5 file: {ref_base}.h5 or {args.reference}.h5")
+    if not any(os.path.exists(f) for f in tn_h5_files):
+        missing_files.append(f"Trinucleotide h5 file: {ref_base}.tn.h5 or {args.reference}.tn.h5")
+    if not any(os.path.exists(f) for f in hp_h5_files):
+        missing_files.append(f"Homopolymer h5 file: {ref_base}.hp.h5 or {args.reference}.hp.h5")
+    
+    # Optional files that should be checked if provided
+    if args.normalBams:
+        for normal_bam in args.normalBams:
+            if not os.path.exists(normal_bam):
+                missing_files.append(f"Normal BAM file: {normal_bam}")
+    
+    if args.germline and not os.path.exists(args.germline):
+        missing_files.append(f"Germline VCF file: {args.germline}")
+    
+    if args.noise and not os.path.exists(args.noise):
+        missing_files.append(f"Noise mask BED file: {args.noise}")
+    
+    if args.regionfile and not os.path.exists(args.regionfile):
+        missing_files.append(f"Region file: {args.regionfile}")
+    
+    if args.indelbed and not os.path.exists(args.indelbed):
+        missing_files.append(f"Indel BED file: {args.indelbed}")
+    
+    if args.featurefiles:
+        for feature_file in args.featurefiles:
+            if not os.path.exists(feature_file):
+                missing_files.append(f"Feature file: {feature_file}")
+    
+    # Check optional error profile files
+    if args.amperrfile and not os.path.exists(args.amperrfile):
+        missing_files.append(f"Amplification error file: {args.amperrfile}")
+    
+    if args.amperrfileindel and not os.path.exists(args.amperrfileindel):
+        missing_files.append(f"Amplification indel error file: {args.amperrfileindel}")
+    
+    if args.dmgerrfile and not os.path.exists(args.dmgerrfile):
+        missing_files.append(f"Damage error file: {args.dmgerrfile}")
+    
+    if args.dmgerrfileindel and not os.path.exists(args.dmgerrfileindel):
+        missing_files.append(f"Damage indel error file: {args.dmgerrfileindel}")
+    
+    # If any files are missing, print error and exit
+    if missing_files:
+        print("ERROR: The following required input files are missing:")
+        for missing_file in missing_files:
+            print(f"  - {missing_file}")
+        print("\nPlease ensure all input files exist before running DupCaller.")
+        sys.exit(1)
+
+
 # if __name__ == "__main__":
 def do_call(args):
+    # Check if all input files exist before proceeding
+    check_input_files_exist(args)
     if "/" not in args.output:
         if not os.path.exists(args.output):
             try:

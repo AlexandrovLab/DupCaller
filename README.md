@@ -11,6 +11,7 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 
 - BWA version 0.7.17 (https://bio-bwa.sourceforge.net)
 - GATK version 4.2.6 (https://github.com/broadinstitute/gatk/releases)
+- Tabix for indexing compressed genomic files (recommended installation: `conda install bioconda::tabix`)
 
 ## Installation
 The tool uses pip for installing scripts and prerequisites. To install DupCaller, simply clone this repository and install via pip:
@@ -89,7 +90,9 @@ DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {thread
 DupCaller.py call -b ${sample}.bam -f reference.fa -o {output_predix} -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -maf 0.1
 ```
 
-Note that since DupCaller partition jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panel. In this case we suggest to run at most one thread per distince targeted region
+Note that since DupCaller partitions jobs based on genomic regions, multithreading capability will be significantly compromised for small targeted panels. In this case we suggest to run at most one thread per distinct targeted region. 
+
+**Multi-threading improvements**: Recent updates include enhanced coverage file handling for multi-threaded execution, with automatic merging of adjacent region coverage files and improved memory efficiency.
 
 Please see "Parameters" section for explanation of all parameters. See "Results" section for descriptions of all result files in the output folder
 
@@ -134,16 +137,16 @@ These are variant calling parameters and adjustment is unnecessary for general u
 | -mr | --mutRate | prior somatic mutation rate per base | 2.5e-7 |
 | -ts | --thresholdSnv | score threshold to call a mutation | 1 |
 | -ts | --thresholdIndel | score threshold to call a mutation | 3 |
-| -mq | --mapq | minumum mapq for an alignment to be considered | 40 |
-| -d | --minNdepth | minumum coverage in normal for called variants | 10 |
+| -mq | --mapq | minimum mapq for an alignment to be considered | 40 |
+| -d | --minNdepth | minimum coverage in normal for called variants | 10 |
 | -gaf | --germlineAfCutoff | locations at which there is a germline mutation with population af larger than this threshold will be skipped | 0.001 |
-| -nm | --nmflt | filter out any reads that has a editing distance larger than this value | 4 |
+| -nm | --nmflt | filter out any reads that have an edit distance larger than this value | 4 |
+| -ax | --minMeanASXS | minimum mean AS-XS alignment score difference for a read group to be considered for calling | 50 |
 | -w | --windowSize | genomic window size when calculating rough coverage and split bam files into equal regions. Adjust for smaller panel | 100000 |
 | -bq | --minBq | bases with quality less than this number will be set to 6 | default=18 |
 | -aq | --minAltQual | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 60 |
-| --minRef | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
-| --minAlt |
-| minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
+| --minRef | minimum consensus quality of ref allele, if not 0, in a read group to be considered for training | 2 |
+| --minAlt | minimum consensus quality of alt allele, if not 0, in a read group to be considered for training | 2 |
 
 ### Mutation burden estimation
 After mutation calling, mutational burden can be performed within the folder:
@@ -154,14 +157,20 @@ Adjust the region according to the reference genome used.
 
 
 #### Results
-snv.vcf:
-vcf of detected single nucleotide mutations in the sample. The vcf also includes multiple nucleotide mutations (MNVs).
+**snv.vcf**:
+VCF of detected single nucleotide mutations in the sample. The VCF also includes multiple nucleotide mutations (MNVs).
 
-snv_burden.txt:
-naive burden and least-square snv burden estimation of the samples with 95% confidence interval.
+**snv_burden.txt**:
+Naive burden and least-square SNV burden estimation of the samples with 95% confidence interval.
 
-indel.vcf:
-vcf of detected short insertion/deletion (indel) mutations in the sample.
+**indel.vcf**:
+VCF of detected short insertion/deletion (indel) mutations in the sample.
+
+**{sample_name}_coverage.bed.gz**:
+Coverage file in BED format showing duplex coverage depths across genomic positions. For multi-threaded runs, coverage files from different threads are automatically merged.
+
+**{sample_name}_trinuc_by_duplex_group.txt**:
+Trinucleotide context counts grouped by duplex read numbers for mutation burden estimation.
 
 ## Citation
 
