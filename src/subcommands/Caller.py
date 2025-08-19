@@ -5,6 +5,8 @@ from collections import OrderedDict
 from multiprocessing import Pool
 import errno
 import h5py
+import subprocess
+from Bio import bgzf
 
 
 import matplotlib.patches as mpatches
@@ -595,3 +597,133 @@ def do_call(args):
         + str((time.time() - startTime) / 60)
         + " minutes..............."
     )
+    
+    # Merge and combine coverage files after multi-threaded calling
+    if args.threads > 1:
+        mergeStartTime = time.time()
+        sample_name = os.path.basename(args.output)
+        sample_dir = os.path.join("tmp", sample_name)
+        merge_and_combine_coverage_files(sample_name, sample_dir, args.threads)
+        print(
+            "..............Completed coverage merging in "
+            + str((time.time() - mergeStartTime) / 60)
+            + " minutes..............."
+        )
+
+
+def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
+    """
+    1. Merge adjacent next_region and prev_region files by summing columns 4 and 5
+    2. Combine all files in the correct order using cat
+    """
+    print("Merging adjacent region files and combining coverage files...")
+    
+    # Step 1: Create overlap files by merging adjacent regions
+    for n in range(nprocess - 1):
+        next_file = os.path.join(sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz")
+        prev_file = os.path.join(sample_dir, f"{sample_name}_{n+1}_coverage_prev_region.tmp.bed.gz")
+        overlap_file = os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz")
+        
+        merge_adjacent_bed_files(next_file, prev_file, overlap_file)
+    
+    # Step 2: Create list of files in the correct order
+    files_to_combine = []
+    
+    for n in range(nprocess):
+        # Add main coverage file
+        main_file = os.path.join("tmp", f"{sample_name}_{n}_coverage.bed.gz")
+        if os.path.exists(main_file):
+            files_to_combine.append(main_file)
+        
+        # Add overlap file (except for the last process)
+        if n < nprocess - 1:
+            overlap_file = os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz")
+            if os.path.exists(overlap_file):
+                files_to_combine.append(overlap_file)
+    
+    # Step 3: Combine files using cat command
+    if files_to_combine:
+        final_output = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
+        
+        # Use cat to combine files
+        cmd = f"cat {' '.join(files_to_combine)} > {final_output}"
+        
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print(f"Combined coverage file created: {final_output}")
+            
+            # Index the combined bed file with tabix
+            index_cmd = f"tabix -p bed {final_output}"
+            try:
+                subprocess.run(index_cmd, shell=True, check=True)
+                print(f"Tabix index created for: {final_output}")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Could not create tabix index: {e}")
+                
+        except subprocess.CalledProcessError as e:
+            print(f"Error combining files: {e}")
+        
+        # Clean up temporary files
+        cleanup_temp_files(sample_name, sample_dir, nprocess)
+    else:
+        print("No coverage files found to combine")
+
+
+def merge_adjacent_bed_files(next_file, prev_file, output_file):
+    """
+    Merge two adjacent bed files by summing columns 4 and 5 for matching positions
+    """
+    coverage_dict = {}
+    
+    # Read next_region file
+    if os.path.exists(next_file):
+        with bgzf.open(next_file, 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 5:
+                        chrom, start, end, cov1, cov2 = parts[:5]
+                        key = (chrom, start, end)
+                        coverage_dict[key] = [int(cov1), int(cov2)]
+    
+    # Read prev_region file and merge
+    if os.path.exists(prev_file):
+        with bgzf.open(prev_file, 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 5:
+                        chrom, start, end, cov1, cov2 = parts[:5]
+                        key = (chrom, start, end)
+                        if key in coverage_dict:
+                            coverage_dict[key][0] += int(cov1)
+                            coverage_dict[key][1] += int(cov2)
+                        else:
+                            coverage_dict[key] = [int(cov1), int(cov2)]
+    
+    # Write merged result only if there's data
+    if coverage_dict:
+        with bgzf.open(output_file, 'wt') as f:
+            for (chrom, start, end), (cov1, cov2) in sorted(coverage_dict.items()):
+                f.write(f"{chrom}\t{start}\t{end}\t{cov1}\t{cov2}\n")
+
+
+def cleanup_temp_files(sample_name, sample_dir, nprocess):
+    """
+    Clean up temporary files
+    """
+    for n in range(nprocess):
+        temp_files = [
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage_prev_region.tmp.bed.gz"),
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz"),
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage.bed.gz"),
+        ]
+        
+        if n < nprocess - 1:
+            temp_files.append(os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"))
+        
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
