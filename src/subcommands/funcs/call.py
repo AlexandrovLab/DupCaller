@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import gzip
+from Bio import bgzf
 
 import time
 import math
@@ -212,6 +212,19 @@ def nums2str(nums, num2base="ATCG"):
     return "".join(bases)
 
 
+def get_bed_file_for_position(pos, chrom, regions_start_chrom, regions_start_pos, regions_end_chrom, regions_end_pos, locus_bed, locus_bed_prev, locus_bed_next):
+    """
+    Determine which bed file to write to based on position relative to region boundaries
+    Only compare positions within the same chromosome
+    """
+    if chrom == regions_start_chrom and pos < regions_start_pos:
+        return locus_bed_prev
+    elif chrom == regions_end_chrom and pos > regions_end_pos:
+        return locus_bed_next
+    else:
+        return locus_bed
+
+
 def bamIterateMultipleRegion(bam, regions, ref):
     bamObject = BAM(bam, "rb", ref)
     for region in regions:
@@ -227,6 +240,50 @@ def callBam(params, processNo):
     bam = params["tumorBam"]
     nbams = params["normalBams"]
     regions = params["regions"]
+    if len(regions[0]) == 1:
+        regions_start_chrom = regions[0][0]
+        regions_start_pos = 0
+    else:
+        regions_start_chrom = regions[0][0]
+        original_start_pos = regions[0][1]
+        
+        # If starting position is 0, skip modification and keep as 0
+        if original_start_pos == 0:
+            regions_start_pos = 0
+        else:
+            # Determine regions_start_pos using the specified approach:
+            # 1) Find locus 1bp before the starting position
+            target_position = original_start_pos - 1
+            
+            # 2) Fetch reads that contain that position
+            # 3) Find the last position in those reads  
+            # 4) Define regions_start_pos as position 1bp after that last position
+            try:
+                bamObject = BAM(bam, "rb", params.get("reference"))
+                max_reference_end = 0
+                
+                # Fetch reads overlapping the target position
+                for read in bamObject.fetch(regions_start_chrom, target_position, target_position + 1):
+                    if not read.is_unmapped and read.reference_end is not None:
+                        max_reference_end = max(max_reference_end, read.reference_end)
+                
+                # Set regions_start_pos as 1bp after the last position in those reads
+                if max_reference_end > 0:
+                    regions_start_pos = max_reference_end + 1
+                else:
+                    # Fallback to original position if no reads found
+                    regions_start_pos = original_start_pos
+                    
+                bamObject.close()
+            except Exception:
+                # Fallback to original position if BAM access fails
+                regions_start_pos = original_start_pos
+    if len(regions[-1]) <= 2:
+        regions_end_chrom = regions[-1][0]
+        regions_end_pos = 10E10
+    else:
+        regions_end_chrom = regions[-1][0]
+        regions_end_pos = regions[-1][2]
     if params["germline"]:
         germline = VCF(params["germline"], mode="rb")
     else:
@@ -241,9 +298,18 @@ def callBam(params, processNo):
     isLearn = params.get("isLearn", False)
     nn = processNo
     output = os.path.join("tmp", params["output"].lstrip("/") + "_" + str(nn))
+    # Extract sample name from output path
+    sample_name = os.path.basename(params["output"].lstrip("/"))
+    sample_dir = os.path.join("tmp", sample_name)
     if not os.path.exists(os.path.dirname(output)):
         try:
             os.makedirs(os.path.dirname(output))
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+    if not os.path.exists(sample_dir):
+        try:
+            os.makedirs(sample_dir)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
@@ -377,6 +443,7 @@ def callBam(params, processNo):
     else:
         dmgmat = pd.read_csv(params["dmgerr_file"], sep="\t", index_col=0).to_numpy()
         dmgmat += 1
+        
     dmgmat = dmgmat / dmgmat.sum(axis=1, keepdims=True)
     dmgmat_min_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_min_error], axis=1)
@@ -450,7 +517,9 @@ def callBam(params, processNo):
     duplex_count = 0
     reference_mat_chrom = "anyChrom"
     reference_mat_start = 0
-    locus_bed = gzip.open(output + "_coverage.bed.gz", "wb")
+    locus_bed = bgzf.open(output + "_coverage.bed.gz", "wt")
+    locus_bed_prev = bgzf.open(output + "_coverage_prev_region.tmp.bed.gz", "wt")
+    locus_bed_next = bgzf.open(output + "_coverage_next_region.tmp.bed.gz", "wt")
     processed_read_names = set()
     if len(regions[0]) == 1:
         region_start = regions[0][0] + ":0"
@@ -592,7 +661,7 @@ def callBam(params, processNo):
                 meanASXS = sum(
                     [seq.get_tag("AS") - seq.get_tag("XS") for seq in readSet]
                 ) / len(readSet)
-                if meanASXS < 50:
+                if meanASXS < params["minMeanASXS"]:
                     continue
                 setBc = key.split(":")[0].split("+")
                 setBc1 = setBc[0]
@@ -621,19 +690,26 @@ def callBam(params, processNo):
                         if "coverage" in locals():
                             non_zero_positions = np.nonzero(coverage + coverage_indel)
                             for pos in non_zero_positions[0].tolist():
-                                locus_bed.write(
+                                current_pos = pos + reference_mat_start
+                                bed_file = get_bed_file_for_position(
+                                    current_pos, reference_mat_chrom, 
+                                    regions_start_chrom, regions_start_pos, 
+                                    regions_end_chrom, regions_end_pos,
+                                    locus_bed, locus_bed_prev, locus_bed_next
+                                )
+                                bed_file.write(
                                     (
                                         "\t".join(
                                             [
                                                 reference_mat_chrom,
-                                                str(pos + reference_mat_start),
-                                                str(pos + 1 + reference_mat_start),
+                                                str(current_pos),
+                                                str(current_pos + 1),
                                                 str(coverage[pos]),
                                                 str(coverage_indel[pos]),
                                             ]
                                         )
                                         + "\n"
-                                    ).encode("utf-8")
+                                    )
                                 )
                             total_coverage += np.sum(coverage)
                             total_coverage_indel += np.sum(coverage_indel)
@@ -1139,19 +1215,26 @@ def callBam(params, processNo):
                 if "coverage" in locals():
                     non_zero_positions = np.nonzero(coverage + coverage_indel)
                     for pos in non_zero_positions[0].tolist():
-                        locus_bed.write(
+                        current_pos = pos + reference_mat_start
+                        bed_file = get_bed_file_for_position(
+                            current_pos, reference_mat_chrom, 
+                            regions_start_chrom, regions_start_pos, 
+                            regions_end_chrom, regions_end_pos,
+                            locus_bed, locus_bed_prev, locus_bed_next
+                        )
+                        bed_file.write(
                             (
                                 "\t".join(
                                     [
                                         reference_mat_chrom,
-                                        str(pos + reference_mat_start),
-                                        str(pos + 1 + reference_mat_start),
+                                        str(current_pos),
+                                        str(current_pos + 1),
                                         str(coverage[pos]),
                                         str(coverage_indel[pos]),
                                     ]
                                 )
                                 + "\n"
-                            ).encode("utf-8")
+                            )
                         )
                     total_coverage += np.sum(coverage)
                     total_coverage_indel += np.sum(coverage_indel)
@@ -1534,10 +1617,10 @@ def callBam(params, processNo):
                     }
                     muts_dict["_".join([mut_chrom, str(mut_pos), mut_ref, mut_alt])] = 0
                     muts.append(mut)
-                """
+
                 if isLearn:
                     continue
-                """
+
                 coverage[start_ind:end_ind][pass_bool] += 1
                 duplex_read_num_dict[duplex_no][1] += np.count_nonzero(pass_bool)
                 trinuc_pass = trinuc_np[start_ind:end_ind][pass_bool]
@@ -1698,22 +1781,35 @@ def callBam(params, processNo):
     if "coverage" in locals():
         non_zero_positions = np.nonzero(coverage + coverage_indel)
         for pos in non_zero_positions[0].tolist():
-            locus_bed.write(
+            current_pos = pos + reference_mat_start
+            bed_file = get_bed_file_for_position(
+                current_pos, reference_mat_chrom, 
+                regions_start_chrom, regions_start_pos, 
+                regions_end_chrom, regions_end_pos,
+                locus_bed, locus_bed_prev, locus_bed_next
+            )
+            bed_file.write(
                 (
                     "\t".join(
                         [
                             reference_mat_chrom,
-                            str(pos + reference_mat_start),
-                            str(pos + 1 + reference_mat_start),
+                            str(current_pos),
+                            str(current_pos + 1),
                             str(coverage[pos]),
                             str(coverage_indel[pos]),
                         ]
                     )
                     + "\n"
-                ).encode("utf-8")
+                )
             )
         total_coverage += np.sum(coverage)
         total_coverage_indel += np.sum(coverage_indel)
+    
+    # Close the bed files
+    locus_bed.close()
+    locus_bed_prev.close()
+    locus_bed_next.close()
+    
     print(
         f"Process {processNo} finished in {(time.time()-starttime)/60: .2f} minutes and processed {recCount} reads"
     )

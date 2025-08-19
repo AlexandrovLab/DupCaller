@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 from collections import OrderedDict
 from multiprocessing import Pool
 import errno
 import h5py
+import subprocess
+from Bio import bgzf
 
 
 import matplotlib.patches as mpatches
@@ -23,8 +26,81 @@ from .funcs.misc import getAlignmentObject as BAM
 # from heapq import nlargest
 
 
+def check_input_files_exist(args):
+    """
+    Check if all required input files exist and exit gracefully if not.
+    """
+    missing_files = []
+    
+    # Required files
+    if not os.path.exists(args.bam):
+        missing_files.append(f"Tumor BAM file: {args.bam}")
+    
+    if not os.path.exists(args.reference):
+        missing_files.append(f"Reference genome: {args.reference}")
+    
+    # Check for associated reference files (h5 files)
+    ref_base = os.path.splitext(args.reference)[0]
+    ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.h5"]
+    tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
+    hp_h5_files = [f"{ref_base}.hp.h5", f"{args.reference}.hp.h5"]
+    
+    if not any(os.path.exists(f) for f in ref_h5_files):
+        missing_files.append(f"Reference h5 file: {ref_base}.h5 or {args.reference}.h5")
+    if not any(os.path.exists(f) for f in tn_h5_files):
+        missing_files.append(f"Trinucleotide h5 file: {ref_base}.tn.h5 or {args.reference}.tn.h5")
+    if not any(os.path.exists(f) for f in hp_h5_files):
+        missing_files.append(f"Homopolymer h5 file: {ref_base}.hp.h5 or {args.reference}.hp.h5")
+    
+    # Optional files that should be checked if provided
+    if args.normalBams:
+        for normal_bam in args.normalBams:
+            if not os.path.exists(normal_bam):
+                missing_files.append(f"Normal BAM file: {normal_bam}")
+    
+    if args.germline and not os.path.exists(args.germline):
+        missing_files.append(f"Germline VCF file: {args.germline}")
+    
+    if args.noise and not os.path.exists(args.noise):
+        missing_files.append(f"Noise mask BED file: {args.noise}")
+    
+    if args.regionfile and not os.path.exists(args.regionfile):
+        missing_files.append(f"Region file: {args.regionfile}")
+    
+    if args.indelbed and not os.path.exists(args.indelbed):
+        missing_files.append(f"Indel BED file: {args.indelbed}")
+    
+    if args.featurefiles:
+        for feature_file in args.featurefiles:
+            if not os.path.exists(feature_file):
+                missing_files.append(f"Feature file: {feature_file}")
+    
+    # Check optional error profile files
+    if args.amperrfile and not os.path.exists(args.amperrfile):
+        missing_files.append(f"Amplification error file: {args.amperrfile}")
+    
+    if args.amperrfileindel and not os.path.exists(args.amperrfileindel):
+        missing_files.append(f"Amplification indel error file: {args.amperrfileindel}")
+    
+    if args.dmgerrfile and not os.path.exists(args.dmgerrfile):
+        missing_files.append(f"Damage error file: {args.dmgerrfile}")
+    
+    if args.dmgerrfileindel and not os.path.exists(args.dmgerrfileindel):
+        missing_files.append(f"Damage indel error file: {args.dmgerrfileindel}")
+    
+    # If any files are missing, print error and exit
+    if missing_files:
+        print("ERROR: The following required input files are missing:")
+        for missing_file in missing_files:
+            print(f"  - {missing_file}")
+        print("\nPlease ensure all input files exist before running DupCaller.")
+        sys.exit(1)
+
+
 # if __name__ == "__main__":
 def do_call(args):
+    # Check if all input files exist before proceeding
+    check_input_files_exist(args)
     if "/" not in args.output:
         if not os.path.exists(args.output):
             try:
@@ -65,6 +141,7 @@ def do_call(args):
         "germline_cutoff": args.germlineAfCutoff,
         "maxNM": args.nmflt,
         "step": args.windowSize,
+        "minMeanASXS": args.minMeanASXS,
         "isLearn": None,
     }
     if args.amperrfile:
@@ -100,6 +177,7 @@ def do_call(args):
         "indel_bed": None,
         "trim5": args.trimF,
         "trim3": args.trimR,
+        "minMeanASXS": args.minMeanASXS,
         "germline_cutoff": args.germlineAfCutoff,
         "minBq": args.minBq,
         "minAltQual": args.minAltQual,
@@ -592,3 +670,133 @@ def do_call(args):
         + str((time.time() - startTime) / 60)
         + " minutes..............."
     )
+    
+    # Merge and combine coverage files after multi-threaded calling
+    if args.threads > 1:
+        mergeStartTime = time.time()
+        sample_name = os.path.basename(args.output)
+        sample_dir = os.path.join("tmp", sample_name)
+        merge_and_combine_coverage_files(sample_name, sample_dir, args.threads)
+        print(
+            "..............Completed coverage merging in "
+            + str((time.time() - mergeStartTime) / 60)
+            + " minutes..............."
+        )
+
+
+def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
+    """
+    1. Merge adjacent next_region and prev_region files by summing columns 4 and 5
+    2. Combine all files in the correct order using cat
+    """
+    print("Merging adjacent region files and combining coverage files...")
+    
+    # Step 1: Create overlap files by merging adjacent regions
+    for n in range(nprocess - 1):
+        next_file = os.path.join(sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz")
+        prev_file = os.path.join(sample_dir, f"{sample_name}_{n+1}_coverage_prev_region.tmp.bed.gz")
+        overlap_file = os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz")
+        
+        merge_adjacent_bed_files(next_file, prev_file, overlap_file)
+    
+    # Step 2: Create list of files in the correct order
+    files_to_combine = []
+    
+    for n in range(nprocess):
+        # Add main coverage file
+        main_file = os.path.join("tmp", f"{sample_name}_{n}_coverage.bed.gz")
+        if os.path.exists(main_file):
+            files_to_combine.append(main_file)
+        
+        # Add overlap file (except for the last process)
+        if n < nprocess - 1:
+            overlap_file = os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz")
+            if os.path.exists(overlap_file):
+                files_to_combine.append(overlap_file)
+    
+    # Step 3: Combine files using cat command
+    if files_to_combine:
+        final_output = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
+        
+        # Use cat to combine files
+        cmd = f"cat {' '.join(files_to_combine)} > {final_output}"
+        
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print(f"Combined coverage file created: {final_output}")
+            
+            # Index the combined bed file with tabix
+            index_cmd = f"tabix -p bed {final_output}"
+            try:
+                subprocess.run(index_cmd, shell=True, check=True)
+                print(f"Tabix index created for: {final_output}")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Could not create tabix index: {e}")
+                
+        except subprocess.CalledProcessError as e:
+            print(f"Error combining files: {e}")
+        
+        # Clean up temporary files
+        cleanup_temp_files(sample_name, sample_dir, nprocess)
+    else:
+        print("No coverage files found to combine")
+
+
+def merge_adjacent_bed_files(next_file, prev_file, output_file):
+    """
+    Merge two adjacent bed files by summing columns 4 and 5 for matching positions
+    """
+    coverage_dict = {}
+    
+    # Read next_region file
+    if os.path.exists(next_file):
+        with bgzf.open(next_file, 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 5:
+                        chrom, start, end, cov1, cov2 = parts[:5]
+                        key = (chrom, start, end)
+                        coverage_dict[key] = [int(cov1), int(cov2)]
+    
+    # Read prev_region file and merge
+    if os.path.exists(prev_file):
+        with bgzf.open(prev_file, 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 5:
+                        chrom, start, end, cov1, cov2 = parts[:5]
+                        key = (chrom, start, end)
+                        if key in coverage_dict:
+                            coverage_dict[key][0] += int(cov1)
+                            coverage_dict[key][1] += int(cov2)
+                        else:
+                            coverage_dict[key] = [int(cov1), int(cov2)]
+    
+    # Write merged result only if there's data
+    if coverage_dict:
+        with bgzf.open(output_file, 'wt') as f:
+            for (chrom, start, end), (cov1, cov2) in sorted(coverage_dict.items()):
+                f.write(f"{chrom}\t{start}\t{end}\t{cov1}\t{cov2}\n")
+
+
+def cleanup_temp_files(sample_name, sample_dir, nprocess):
+    """
+    Clean up temporary files
+    """
+    for n in range(nprocess):
+        temp_files = [
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage_prev_region.tmp.bed.gz"),
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz"),
+            os.path.join(sample_dir, f"{sample_name}_{n}_coverage.bed.gz"),
+        ]
+        
+        if n < nprocess - 1:
+            temp_files.append(os.path.join(sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"))
+        
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)

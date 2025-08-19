@@ -217,16 +217,11 @@ def do_estimate(args):
         vcf_out = VCF(
             args.prefix + "/" + sample + "_snv_flt.vcf", "w", header=vcf.header
         )
-    rec_set = set()
     for rec in vcf.fetch():
         chrom = rec.chrom
         pos = rec.pos
         ref = rec.ref
         alt = rec.alts[0]
-        rec_str = chrom + str(pos) + ":" + ref + ">" + alt
-        if rec_str in rec_set:
-            continue
-        rec_set.add(rec_str)
         F1R2 = rec.info["F1R2"]
         F2R1 = rec.info["F2R1"]
         TAC = rec.samples["TUMOR"]["AC"]
@@ -318,12 +313,12 @@ def do_estimate(args):
         ),
         columns=[
             "read number",
-            "Corrected_burden",
-            "Corrected_burden_lower",
-            "Corrected_burden_upper",
-            "Uncorrrected_burden",
+            "Uncorrected_burden",
             "Uncorrected_burden_lower",
             "Uncorrected_burden_upper",
+            "Corrrected_burden",
+            "Corrected_burden_lower",
+            "Corrected_burden_upper",
         ],
     )
     table.to_csv(
@@ -331,74 +326,3 @@ def do_estimate(args):
         sep="\t",
         index=False,
     )
-    """
-    prefix = args.prefix
-    if len(prefix.split("/")[-1]) == 0:
-        sample = prefix.split("/")[-2]
-    else:
-        sample = prefix.split("/")[-1]
-    trinuc_by_rf = pd.read_csv(
-        prefix + "/" + sample + "_trinuc_by_duplex_group.txt", sep="\t", index_col=0
-    )
-    ###Estimate INDEL burden
-    vcf = VCF(prefix + "/" + sample + "_indel.vcf", "r")
-    mutnum_by_rf = dict()
-    for n in trinuc_by_rf.columns:
-        mutnum_by_rf[n] = [0]
-
-    if args.dilute:
-        vcf_out = VCF(
-            args.prefix + "/" + sample + "_indel_flt.vcf", "w", header=vcf.header
-        )
-    for rec in vcf.fetch():
-        F1R2 = rec.info["F1R2"]
-        F2R1 = rec.info["F2R1"]
-        TAC = rec.samples["TUMOR"]["AC"]
-        if TAC > 1 and args.dilute:
-            TDP = rec.samples["TUMOR"]["DP"]
-            NAC = rec.samples["NORMAL"]["AC"]
-            NDP = rec.samples["NORMAL"]["DP"]
-            barnard_p = barnard_exact([[TAC, TDP - TAC], [NAC, NDP - NAC]]).pvalue
-            if barnard_p <= 0.05:
-                continue
-        if args.dilute:
-            vcf_out.write(rec)
-        # duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
-        duplex_no = str(F1R2) + "+" + str(F2R1)
-        mutnum_by_rf[duplex_no] = [1]
-    mutnum_by_rf_np = pd.DataFrame(mutnum_by_rf).to_numpy()
-    (burden, burden_lb, burden_ub, mutnum) = estimate_id(
-        trinuc_by_rf_np, mutnum_by_rf_np, trinuc_by_rf.columns
-    )
-
-    with open(args.prefix + "/" + sample + "_indel_burden.txt", "w") as f:
-        f.write(f"Indel burden\t{burden[0]}\n")
-        f.write(f"Indel burden 95% lower\t{burden_lb[0]}\n")
-        f.write(f"Indel burden 95% upper\t{burden_ub[0]}\n")
-        f.write(f"Indel number\t{mutnum}\n")
-
-    table = pd.DataFrame(
-        np.hstack(
-            [
-                _.reshape(10, 1)
-                for _ in [
-                    np.arange(1, 11, 1, dtype=np.int16),
-                    burden,
-                    burden_lb,
-                    burden_ub,
-                ]
-            ]
-        ),
-        columns=[
-            "read number",
-            "Indel_burden",
-            "Indel_burden_lower",
-            "Indel_burden_upper",
-        ],
-    )
-    table.to_csv(
-        args.prefix + "/" + sample + "_indel_burden_by_min_group_size.txt",
-        sep="\t",
-        index=False,
-    )
-    """
