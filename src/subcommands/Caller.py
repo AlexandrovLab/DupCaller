@@ -41,12 +41,12 @@ def check_input_files_exist(args):
     
     # Check for associated reference files (h5 files)
     ref_base = os.path.splitext(args.reference)[0]
-    ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.h5"]
+    ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.ref.h5"]
     tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
     hp_h5_files = [f"{ref_base}.hp.h5", f"{args.reference}.hp.h5"]
     
     if not any(os.path.exists(f) for f in ref_h5_files):
-        missing_files.append(f"Reference h5 file: {ref_base}.h5 or {args.reference}.h5")
+        missing_files.append(f"Reference h5 file: {ref_base}.ref.h5 or {args.reference}.ref.h5")
     if not any(os.path.exists(f) for f in tn_h5_files):
         missing_files.append(f"Trinucleotide h5 file: {ref_base}.tn.h5 or {args.reference}.tn.h5")
     if not any(os.path.exists(f) for f in hp_h5_files):
@@ -61,12 +61,14 @@ def check_input_files_exist(args):
     if args.germline and not os.path.exists(args.germline):
         missing_files.append(f"Germline VCF file: {args.germline}")
     
-    if args.noise and not os.path.exists(args.noise):
-        missing_files.append(f"Noise mask BED file: {args.noise}")
-    
     if args.regionfile and not os.path.exists(args.regionfile):
         missing_files.append(f"Region file: {args.regionfile}")
     
+    if args.noise:
+        for noise_bedfile in args.noise:
+            if not os.path.exists(noise_bedfile):
+                missing_files.append(f"Noise mask BED file: {noise_bedfile}")
+
     if args.indelbed and not os.path.exists(args.indelbed):
         missing_files.append(f"Indel BED file: {args.indelbed}")
     
