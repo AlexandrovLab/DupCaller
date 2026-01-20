@@ -464,7 +464,6 @@ if __name__ == "__main__":
         help="Fasta file of reference. Either -f or -ft should be set",
     )
     args = master_parser.parse_args()
-
     """
     Store Parameters
     """

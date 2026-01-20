@@ -4,7 +4,6 @@ from Bio import bgzf
 
 import time
 import math
-
 import numpy as np
 import pandas as pd
 from pysam import FastaFile as FASTA
@@ -21,12 +20,14 @@ from .depth import (
     extractDepthRegion,
     extractDepthSnv,
     extractDepthIndel,
+    prepareAlignMask,
     detectOverlapDiscord,
 )
 from .prob import genotypeDSSnv, genotypeDSIndel
 from .learn import profileTriNucMismatches
 from .misc import getAlignmentObject as BAM
 from .indels import findIndels
+from .prob_old import genotypeDSSnv as oldDSSnv
 
 # from . misc import IndelFilterByWindows
 
@@ -56,6 +57,7 @@ def prepare_reference_mats(
     indel_mask = np.full(m, False, dtype=bool)
     noise_mask = np.full(m, False, dtype=bool)
     n_cov_mask = np.full(m, False, dtype=bool)
+    nm_mask = np.full(m, False, dtype=bool)
 
     ### Initialize prior mat as no germline resource
     noise_mask[reference_int == 4] = True
@@ -149,6 +151,11 @@ def prepare_reference_mats(
             min_depth = math.ceil(1 / ma)
             n_cov_mask = depth < min_depth
             indel_mask[indel_mask_out] = True
+
+        nm_mask = prepareAlignMask(tbam,chrom,start,end,params)
+        #nm_mask = nm_avg >= params["maxNM"]/2
+        
+        
     return (
         prior_mat,
         snp_mask,
@@ -156,6 +163,7 @@ def prepare_reference_mats(
         noise_mask,
         n_cov_mask,
         include_mask,
+        nm_mask
     )  # , reference_int, trinuc_int
 
 
@@ -179,7 +187,7 @@ def determineTrimLength(seq, params, processed_flag):
             )
             overlap = max(
                 0,
-                seq.reference_length + mate_reference_length - abs(seq.template_length),
+                seq.reference_length + mate_reference_length - abs(seq.template_length) - params["trim3"],
             )
         else:
             overlap = 0
@@ -553,10 +561,12 @@ def callBam(params, processNo):
             if rec.query_name in read_blacklist or rec.is_unmapped:
                 continue
             id_length = 0
+            id_num = 0
             for cigar in rec.cigartuples:
                 if cigar[0] == 1 or cigar[0] == 2:
                     id_length += cigar[1]
-            NM_no_id = rec.get_tag("NM") - id_length
+                    id_num += 1
+            NM_no_id = rec.get_tag("NM") - id_length + id_num
             if NM_no_id >= params["maxNM"]:
                 read_blacklist.add(rec.query_name)
         currentTime = (time.time() - starttime) / 60
@@ -582,11 +592,16 @@ def callBam(params, processNo):
         if (
             rec.is_supplementary
             or rec.is_secondary
-            or rec.has_tag("DT")
             or not rec.is_proper_pair
             or rec.is_qcfail
         ):
             continue
+        if rec.has_tag("DT"):
+            if rec.get_tag("DT") == "SQ":
+                continue
+        if rec.has_tag("dt"):
+            if rec.get_tag("dt") == "SQ":
+                continue
         # If 5 prime is soft clipped
         if (rec.is_forward and rec.cigartuples[0][0] == 4) or (
             rec.is_reverse and rec.cigartuples[-1][0] == 4
@@ -659,16 +674,9 @@ def callBam(params, processNo):
                         break
                 if all_dup:
                     continue
-                if params["maxNM"]:
-                    blacklist_num = 0
-                    for seq in readSet:
-                        if seq.query_name in read_blacklist:
-                            blacklist_num += 1
-                    if blacklist_num / len(readSet) >= 0.5:
-                        if params["rescue"]:
-                            flt_rs = "high_nm"
-                        else:
-                            continue
+                F2R1 = currentReadDict[key]["F2R1"]
+                F1R2 = currentReadDict[key]["F1R2"]
+                    
                 mean_mapq = sum([seq.mapping_quality for seq in readSet]) / len(readSet)
                 if mean_mapq < params["mapq"]:
                     if params["rescue"]:
@@ -684,8 +692,6 @@ def callBam(params, processNo):
                     else:
                         continue
                 setBc = key.split(":")[0].split("+")
-                setBc1 = setBc[0]
-                setBc2 = setBc[1]
                 F2R1 = currentReadDict[key]["F2R1"]
                 F1R2 = currentReadDict[key]["F1R2"]
                 duplex_no = f"{F1R2}+{F2R1}"
@@ -695,6 +701,25 @@ def callBam(params, processNo):
                     # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
                 unique_read_num += 1
                 if F2R1 >= 1 and F1R2 >= 1:
+                    if params["maxNM"]:
+                        f1r2_blacklist_num = 0
+                        f2r1_blacklist_num = 0
+                        f1r2_count = 0
+                        f2r1_count = 0
+                        for _ in readSet:
+                            if (_.is_forward and _.is_read1) or (_.is_reverse and _.is_read2):
+                                f1r2_count += 1
+                                if _.query_name in read_blacklist:
+                                    f1r2_blacklist_num += 1
+                            else:
+                                f2r1_count += 1
+                                if _.query_name in read_blacklist:
+                                    f2r1_blacklist_num += 1
+                        if ((f1r2_blacklist_num + f2r1_blacklist_num)/ len(readSet) >= 0.5) or f1r2_blacklist_num == f1r2_count or f2r1_blacklist_num == f2r1_count:
+                            if params["rescue"]:
+                                flt_rs = "high_nm"
+                            else:
+                                continue
                     rs_reference_end = max([r.reference_end for r in readSet])
                     rs_reference_start = readSet[0].reference_start
                     chromNow = readSet[0].reference_name
@@ -831,6 +856,7 @@ def callBam(params, processNo):
                             noise_mask,
                             n_cov_mask,
                             include_mask,
+                            nm_mask
                             # ref_np,
                             # trinuc_np
                         ) = prepare_reference_mats(
@@ -880,16 +906,17 @@ def callBam(params, processNo):
                         + reference_length_max
                         - reference_mat_start
                     )
-                    masks = np.zeros([5, end_ind - start_ind], dtype=bool)
+                    masks = np.zeros([6, end_ind - start_ind], dtype=bool)
                     masks[0, :] = snp_mask[start_ind:end_ind]
                     masks[1, :] = noise_mask[start_ind:end_ind]
                     masks[2, :] = n_cov_mask[start_ind:end_ind]
                     masks[3, :] = include_mask[start_ind:end_ind]
+                    masks[4, :] = nm_mask[start_ind:end_ind]
                     left, right = determineTrimLength(
                         readSet[0], params=params, processed_flag=processed_flag
                     )
-                    masks[4, :left] = True
-                    masks[4, -right:] = True
+                    masks[5, :left] = True
+                    masks[5, -right:] = True
                     antimask = np.all(~masks, axis=0)
                     antimask[trinuc_np[start_ind:end_ind] > 64] = False
 
@@ -905,7 +932,7 @@ def callBam(params, processNo):
                     ]
                     # if any(indel_bool):
                     if not isLearn:
-                        masks_indel = np.zeros([5, end_ind_max - start_ind], dtype=bool)
+                        masks_indel = np.zeros([6, end_ind_max - start_ind], dtype=bool)
                         masks_indel[0, :] = indel_mask[start_ind:end_ind_max]
                         masks_indel[1, :] = noise_mask[start_ind:end_ind_max]
                         masks_indel[2, :] = n_cov_mask[start_ind:end_ind_max]
@@ -915,6 +942,7 @@ def callBam(params, processNo):
                         masks_indel[3, :left] = True
                         masks_indel[3, -right:] = True
                         masks_indel[4, :] = include_mask[start_ind:end_ind_max]
+                        masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
                         antimask_indel = np.all(~masks_indel, axis=0)
                         unmasked_antimask_indel = np.all(~masks_indel[2:, :], axis=0)
                         (
@@ -940,6 +968,7 @@ def callBam(params, processNo):
                         """
                         # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
                         pass_inds = np.nonzero(LR >= params["pcutoffi"])[0].tolist()
+                        #print(LR)
                         indels_pass = [indels[_] for _ in pass_inds]
                         coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
                         unmasked_coverage_indel[start_ind:end_ind_max][
@@ -1032,7 +1061,7 @@ def callBam(params, processNo):
                                         + F2R1_ref_count[pass_inds[nn]]
                                     ),
                                     # "LR": LR[pass_inds[0]],
-                                    "LR": LR[pass_inds[0]],
+                                    "LR": LR[pass_inds[nn]],
                                     # "BLR": F2R1_LR[pass_inds[0]],
                                     "TC": ",".join(
                                         [
@@ -1096,6 +1125,30 @@ def callBam(params, processNo):
                             np.copy(unmasked_antimask),
                             params,
                         )
+                        """
+                        (
+                            LR_old,
+                            b1_int_old,
+                            unmasked_antimask_old,
+                            F1R2_count_old,
+                            F2R1_count_old,
+                            prob1_old,prob2_old,prob3_old,prob4_old
+                        ) = oldDSSnv(
+                            readSet,
+                            ref_np[start_ind:end_ind],
+                            trinuc_np[start_ind:end_ind],
+                            prior_mat[start_ind:end_ind, :],
+                            np.copy(unmasked_antimask),
+                            params,
+                        )
+                        """
+                        #prob1_diff = prob1-prob1_old
+                        #notice1 = np.abs(prob1_diff) >=1
+                        #prob3_diff = prob3-prob3_old
+                        #notice2 = np.abs(prob3_diff) >=1
+                        #if np.any(notice1):
+                            #print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
+
                         ref_int = ref_np[start_ind:end_ind]
                         """
                         refs_ind = np.nonzero(
@@ -1422,7 +1475,8 @@ def callBam(params, processNo):
                     indel_mask,
                     noise_mask,
                     n_cov_mask,
-                    include_mask
+                    include_mask,
+                    nm_mask
                     # ref_np,
                     # trinuc_np
                 ) = prepare_reference_mats(
@@ -1465,19 +1519,19 @@ def callBam(params, processNo):
             end_ind_max = (
                 readSet[0].reference_start + reference_length_max - reference_mat_start
             )
-            masks = np.zeros([5, end_ind - start_ind], dtype=bool)
+            masks = np.zeros([6, end_ind - start_ind], dtype=bool)
             masks[0, :] = snp_mask[start_ind:end_ind]
             masks[1, :] = noise_mask[start_ind:end_ind]
             masks[2, :] = n_cov_mask[start_ind:end_ind]
             masks[3, :] = include_mask[start_ind:end_ind]
+            masks[4, :] = nm_mask[start_ind:end_ind]
             left, right = determineTrimLength(
                 readSet[0], params=params, processed_flag=processed_flag
             )
-            masks[4, :left] = True
-            masks[4, -right:] = True
+            masks[5, :left] = True
+            masks[5, -right:] = True
             antimask = np.all(~masks, axis=0)
             antimask[trinuc_np[start_ind:end_ind] > 64] = False
-
             # Create unmasked version that only excludes trinuc > 64
             unmasked_antimask = np.all(~masks[2:, :], axis=0)
             unmasked_antimask[trinuc_np[start_ind:end_ind] > 64] = False
@@ -1490,7 +1544,7 @@ def callBam(params, processNo):
             ]
             # if any(indel_bool):
             if not isLearn:
-                masks_indel = np.zeros([5, end_ind_max - start_ind], dtype=bool)
+                masks_indel = np.zeros([6, end_ind_max - start_ind], dtype=bool)
                 masks_indel[0, :] = indel_mask[start_ind:end_ind_max]
                 masks_indel[1, :] = noise_mask[start_ind:end_ind_max]
                 masks_indel[2, :] = n_cov_mask[start_ind:end_ind_max]
@@ -1500,6 +1554,7 @@ def callBam(params, processNo):
                 masks_indel[3, :left] = True
                 masks_indel[3, -right:] = True
                 masks_indel[4, :] = include_mask[start_ind:end_ind_max]
+                masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
                 antimask_indel = np.all(~masks_indel, axis=0)
                 unmasked_antimask_indel = np.all(~masks_indel[2:, :], axis=0)
                 (
@@ -1517,129 +1572,130 @@ def callBam(params, processNo):
                     hp_np[0, start_ind:end_ind],
                     params,
                 )
-                """
-                DCS = np.logical_and(
-                    F1R2_BLR >= params["pcutoff"],
-                    F2R1_BLR >= params["pcutoff"],
-                )
-                """
-                # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
-                pass_inds = np.nonzero(LR >= params["pcutoffi"])[0].tolist()
-                indels_pass = [indels[_] for _ in pass_inds]
-                coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
-                unmasked_coverage_indel[start_ind:end_ind_max][
-                    unmasked_antimask_indel
-                ] += 1
-                for nn in range(len(indels_pass)):
-                    indel = indels_pass[nn]
-                    indel_chrom = chromNow
-                    indel_pos = int(indel.split(":")[0])
-                    indel_size = int(indel.split(":")[1])
-                    NMs = [seq.get_tag("NM") for seq in readSet]
-                    if indel_size < 0:
-                        indel_ref = nums2str(
-                            ref_np[
-                                indel_pos
-                                - reference_mat_start : indel_pos
-                                - reference_mat_start
-                                - indel_size
-                                + 1
-                            ]
-                        ).upper()
-                        indel_alt = nums2str(
-                            ref_np[[indel_pos - reference_mat_start]]
-                        ).upper()
-                    else:
-                        indel_ref = nums2str(
-                            ref_np[[indel_pos - reference_mat_start]]
-                        ).upper()
-                        indel_alt = indel_ref + indel.split(":")[2]
-                    indel_str = (
-                        str(indel_chrom)
-                        + ":"
-                        + str(indel_pos)
-                        + str(indel_ref)
-                        + ":"
-                        + str(indel_alt)
+                if len(LR) != 0: 
+                    """
+                    DCS = np.logical_and(
+                        F1R2_BLR >= params["pcutoff"],
+                        F2R1_BLR >= params["pcutoff"],
                     )
-                    readPos = indel_pos - readSet[0].reference_start
-                    if not processed_flag:
-                        readPos5p = min(
-                            readPos + 1,
-                            abs(readSet[0].template_length) - readPos,
-                        )
-                        readPos3p = min(
-                            abs(readSet[0].reference_length) - readPos,
-                            readPos + 1,
-                        )
-                    else:
-                        readPos5p = min(
-                            readSet[0].reference_length - readPos,
-                            abs(readSet[0].template_length)
-                            - readSet[0].reference_length
-                            + readPos,
-                        )
-                        readPos3p = min(
-                            abs(readSet[0].reference_length) - readPos,
-                            readPos + 1,
-                        )
-                    if (
-                        F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]]
-                        == 0
-                    ):
-                        continue
-                    if (
-                        F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]]
-                        == 0
-                    ):
-                        continue
-                    if antimask_indel[indel_pos - reference_mat_start - start_ind]:
-                        flt = flt_rs
-                    else:
-                        flt = "masked"
-                    indel_rec = {
-                        "chrom": chromNow,
-                        "pos": indel_pos + 1,
-                        "ref": indel_ref,
-                        "alt": indel_alt,
-                        "filter": flt,
-                        "infos": {
-                            "F1R2": int(
-                                F1R2_alt_count[pass_inds[nn]]
-                                + F1R2_ref_count[pass_inds[nn]]
-                            ),
-                            "F2R1": int(
-                                F2R1_alt_count[pass_inds[nn]]
-                                + F2R1_ref_count[pass_inds[nn]]
-                            ),
-                            # "LR": LR[pass_inds[0]],
-                            "LR": LR[pass_inds[0]],
-                            # "BLR": F2R1_LR[pass_inds[0]],
-                            "TC": ",".join(
-                                [
-                                    str(F1R2_alt_count[pass_inds[nn]]),
-                                    str(F1R2_ref_count[pass_inds[nn]]),
+                    """
+                    # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
+                    pass_inds = np.nonzero(LR >= params["pcutoffi"])[0].tolist()
+                    indels_pass = [indels[_] for _ in pass_inds]
+                    coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
+                    unmasked_coverage_indel[start_ind:end_ind_max][
+                        unmasked_antimask_indel
+                    ] += 1
+                    for nn in range(len(indels_pass)):
+                        indel = indels_pass[nn]
+                        indel_chrom = chromNow
+                        indel_pos = int(indel.split(":")[0])
+                        indel_size = int(indel.split(":")[1])
+                        NMs = [seq.get_tag("NM") for seq in readSet]
+                        if indel_size < 0:
+                            indel_ref = nums2str(
+                                ref_np[
+                                    indel_pos
+                                    - reference_mat_start : indel_pos
+                                    - reference_mat_start
+                                    - indel_size
+                                    + 1
                                 ]
-                            ),
-                            "BC": ",".join(
-                                [
-                                    str(F2R1_alt_count[pass_inds[nn]]),
-                                    str(F2R1_ref_count[pass_inds[nn]]),
-                                ]
-                            ),
-                            "TAG1": setBc[0],
-                            "TAG2": setBc[1],
-                            "SP": currentStart,
-                            "DF": readPos5p,
-                            "DR": readPos3p,
-                            "TN": ".",
-                            "HP": hps[pass_inds[nn]],
-                        },
-                        "formats": ["AC", "RC", "DP"],
-                        # "samples": [[ta, tr, tdp], [na, nr, ndp]],
-                    }
-                    muts_indels.append(indel_rec)
-                    indel_dict[indel_str] = 1
+                            ).upper()
+                            indel_alt = nums2str(
+                                ref_np[[indel_pos - reference_mat_start]]
+                            ).upper()
+                        else:
+                            indel_ref = nums2str(
+                                ref_np[[indel_pos - reference_mat_start]]
+                            ).upper()
+                            indel_alt = indel_ref + indel.split(":")[2]
+                        indel_str = (
+                            str(indel_chrom)
+                            + ":"
+                            + str(indel_pos)
+                            + str(indel_ref)
+                            + ":"
+                            + str(indel_alt)
+                        )
+                        readPos = indel_pos - readSet[0].reference_start
+                        if not processed_flag:
+                            readPos5p = min(
+                                readPos + 1,
+                                abs(readSet[0].template_length) - readPos,
+                            )
+                            readPos3p = min(
+                                abs(readSet[0].reference_length) - readPos,
+                                readPos + 1,
+                            )
+                        else:
+                            readPos5p = min(
+                                readSet[0].reference_length - readPos,
+                                abs(readSet[0].template_length)
+                                - readSet[0].reference_length
+                                + readPos,
+                            )
+                            readPos3p = min(
+                                abs(readSet[0].reference_length) - readPos,
+                                readPos + 1,
+                            )
+                        if (
+                            F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]]
+                            == 0
+                        ):
+                            continue
+                        if (
+                            F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]]
+                            == 0
+                        ):
+                            continue
+                        if antimask_indel[indel_pos - reference_mat_start - start_ind]:
+                            flt = flt_rs
+                        else:
+                            flt = "masked"
+                        indel_rec = {
+                            "chrom": chromNow,
+                            "pos": indel_pos + 1,
+                            "ref": indel_ref,
+                            "alt": indel_alt,
+                            "filter": flt,
+                            "infos": {
+                                "F1R2": int(
+                                    F1R2_alt_count[pass_inds[nn]]
+                                    + F1R2_ref_count[pass_inds[nn]]
+                                ),
+                                "F2R1": int(
+                                    F2R1_alt_count[pass_inds[nn]]
+                                    + F2R1_ref_count[pass_inds[nn]]
+                                ),
+                                # "LR": LR[pass_inds[0]],
+                                "LR": LR[pass_inds[nn]],
+                                # "BLR": F2R1_LR[pass_inds[0]],
+                                "TC": ",".join(
+                                    [
+                                        str(F1R2_alt_count[pass_inds[nn]]),
+                                        str(F1R2_ref_count[pass_inds[nn]]),
+                                    ]
+                                ),
+                                "BC": ",".join(
+                                    [
+                                        str(F2R1_alt_count[pass_inds[nn]]),
+                                        str(F2R1_ref_count[pass_inds[nn]]),
+                                    ]
+                                ),
+                                "TAG1": setBc[0],
+                                "TAG2": setBc[1],
+                                "SP": currentStart,
+                                "DF": readPos5p,
+                                "DR": readPos3p,
+                                "TN": ".",
+                                "HP": hps[pass_inds[nn]],
+                            },
+                            "formats": ["AC", "RC", "DP"],
+                            # "samples": [[ta, tr, tdp], [na, nr, ndp]],
+                        }
+                        muts_indels.append(indel_rec)
+                        indel_dict[indel_str] = 1
             # else:
             ### Calculate genotype probability
             # if not any(indel_bool) or isLearn:
@@ -1816,8 +1872,9 @@ def callBam(params, processNo):
         bc1 = mut["infos"]["TAG1"]
         bc2 = mut["infos"]["TAG2"]
         readStartCoord = mut["infos"]["SP"]
+        flt=mut["filter"]
 
-        if not mut_dict.get(":".join([chrom, str(pos), ref, alt])):
+        if not mut_dict.get(":".join([chrom, str(pos), ref, alt])) and (flt=="PASS" or flt=="masked"):
             ta, tr, ti, tdp = extractDepthSnv(
                 tumorBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
             )
@@ -1856,27 +1913,30 @@ def callBam(params, processNo):
                 ndp,
                 # window_filter,
             )
-        else:
+        elif (flt=="PASS" or flt=="masked"):
             ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[
                 ":".join([chrom, str(pos), ref, alt])
             ]
+        else:
+            ta, tr, ti, tdp, na, nr, ni, ndp = (0,0,0,0,0,0,0,0)
         # if window_filter:
         # continue
         # if ta > params["maxAltCount"]:
         # continue
-        if ta == 0:
-            continue
-        if ta / tdp > params["maxAF"]:
-            continue
-        if ti >= 1:
-            continue
-        # if overlap_error:
-        # continue
-        if normalBams:
-            if ndp < params["minNdepth"]:
+        if flt == 'PASS' or flt == 'masked':
+            if ta == 0:
                 continue
-            if na / ndp > params["normalVAF"]:
+            if ta / tdp > params["maxAF"]:
                 continue
+            if ti >= 1:
+                continue
+            # if overlap_error:
+            # continue
+            if normalBams:
+                if ndp < params["minNdepth"]:
+                    continue
+                if na / ndp > params["normalVAF"]:
+                    continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         mut_pass_filter.append(mut)
     muts_indels_dict = dict()
@@ -1886,8 +1946,9 @@ def callBam(params, processNo):
         pos = mut["pos"]
         ref = mut["ref"]
         alt = mut["alt"]
+        flt = mut["filter"]
 
-        if not muts_indels_dict.get(":".join([chrom, str(pos), ref, alt])):
+        if not muts_indels_dict.get(":".join([chrom, str(pos), ref, alt])) and (flt == 'PASS' or flt == 'masked'):
             ta, tr, ti, tdp = extractDepthIndel(tumorBam, chrom, pos, ref, alt, params)
             # window_filter = False
             # if IndelFilterByWindows(tumorBam, chrom, pos, 3, params):
@@ -1918,27 +1979,30 @@ def callBam(params, processNo):
                 ndp,
                 # window_filter,
             )
-        else:
+        elif (flt == "PASS" or flt == "masked"):
             ta, tr, tdp, na, nr, ndp = muts_indels_dict[
                 ":".join([chrom, str(pos), ref, alt])
             ]
+        else:
+            ta, tr, ti, tdp, na, nr, ni, ndp = (0,0,0,0,0,0,0,0)
         # if window_filter:
         # continue
         # if ta > params["maxAltCount"]:
         # continue
-        if ta == 0:
-            continue
-        if ti > 0:
-            continue
-        if ta / tdp > params["maxAF"]:
-            continue
-        if normalBams:
-            if ndp < params["minNdepth"]:
+        if flt == 'PASS' or flt == "masked":
+            if ta == 0:
                 continue
-            if na / ndp > params["normalVAF"]:
+            if ti > 0:
                 continue
-            if ni > 0:
+            if ta / tdp > params["maxAF"]:
                 continue
+            if normalBams:
+                if ndp < params["minNdepth"]:
+                    continue
+                if na / ndp > params["normalVAF"]:
+                    continue
+                if ni > 0:
+                    continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         muts_indels_pass_filter.append(mut)
 

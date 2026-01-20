@@ -25,14 +25,10 @@ def getIndelArr(seq, indels):
     refPosList = seq.get_reference_positions(full_length=True)
     refPosListNoNone = [_ if _ else -1 for _ in refPosList]
     reference_positions = np.array(refPosListNoNone, dtype=int)
-    """
     refQualArr = np.zeros(len(indels))
     altQualArr = np.zeros(len(indels))
     refCountArr = np.zeros(len(indels))
     altCountArr = np.zeros(len(indels))
-    """
-    seqArr = np.zeros(len(indels),dtype=int)
-    qualArr = np.zeros(len(indels))
     for nn, indel in enumerate(indels):
         refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
@@ -42,32 +38,28 @@ def getIndelArr(seq, indels):
         readPos = readPos[0]
         if indelLen > 0:
             if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
-                seqArr[nn] = 1
-                qualArr[nn] = np.average(
+                altQualArr[nn] = np.average(
                     seq.query_qualities[readPos + 1 : readPos + indelLen + 1]
                 )
+                altCountArr[nn] += 1
             elif reference_positions[readPos + 1] - reference_positions[readPos] != -1:
-                seqArr[nn] = 0
-                qualArr[nn] = seq.query_qualities[readPos + 1]
-            else:
-                seqArr[nn] = -1
+                refQualArr[nn] = seq.query_qualities[readPos + 1]
+                refCountArr[nn] += 1
         if indelLen < 0 and reference_positions.size > readPos:
             if (
                 reference_positions[readPos + 1] != -1
                 and (reference_positions[readPos + 1] - reference_positions[readPos])
                 == -indelLen + 1
             ):
-                seqArr[nn] = 1
-                qualArr[nn] = seq.query_qualities[readPos + 1]
+                altQualArr[nn] = seq.query_qualities[readPos + 1]
+                altCountArr[nn] += 1
             elif (
                 reference_positions[readPos + 1] != -1
                 and (reference_positions[readPos + 1] - reference_positions[readPos])
                 == 1
             ):
-                seqArr[nn] = 0
-                qualArr[nn] = np.average(
+                refQualArr[nn] = np.average(
                     seq.query_qualities[readPos + 1 : readPos - indelLen + 1]
                 )
-            else:
-                seqArr[nn] = -1
-    return seqArr,qualArr
+                refCountArr[nn] += 1
+    return altQualArr, refQualArr, altCountArr, refCountArr

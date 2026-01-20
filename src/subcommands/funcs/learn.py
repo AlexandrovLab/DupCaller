@@ -200,6 +200,7 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
 
     F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
     F1R2_trinuc_alt_count_mat = np.zeros([96, 4])
+    F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
     for mm in range(F1R2_seq_mat.shape[0]):
         F1R2_trinuc_alt_1Dmap = (
             F1R2_trinuc_masked + F1R2_seq_mat[mm, F1R2_antimask] * 96
@@ -292,13 +293,21 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     F2R1_alt_count = np.zeros(m)
     F2R1_ref_count = np.zeros(m)
     for seq in F1R2:
-        aq, rq, ac, rc = getIndelArr(seq, indels_masked)
+        seqArr,qualArr = getIndelArr(seq, indels_masked)
+        ac = np.count_nonzero(seqArr==1)
+        rc = np.count_nonzero(seqArr==0)
+        aq = np.sum(qualArr[seqArr==1])
+        rq = np.sum(qualArr[seqArr==0])
         F1R2_alt_qual += aq
         F1R2_ref_qual += rq
         F1R2_alt_count += ac
         F1R2_ref_count += rc
     for seq in F2R1:
-        aq, rq, ac, rc = getIndelArr(seq, indels_masked)
+        seqArr,qualArr = getIndelArr(seq, indels_masked)
+        ac = np.count_nonzero(seqArr==1)
+        rc = np.count_nonzero(seqArr==0)
+        aq = np.sum(qualArr[seqArr==1])
+        rq = np.sum(qualArr[seqArr==0])
         F2R1_alt_qual += aq
         F2R1_ref_qual += rq
         F2R1_alt_count += ac
