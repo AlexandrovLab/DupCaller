@@ -31,7 +31,7 @@ def getIndelArr(seq, indels):
     refCountArr = np.zeros(len(indels))
     altCountArr = np.zeros(len(indels))
     """
-    seqArr = np.zeros(len(indels),dtype=int)
+    seqArr = np.zeros(len(indels), dtype=int)
     qualArr = np.zeros(len(indels))
     for nn, indel in enumerate(indels):
         refPos = int(indel.split(":")[0])
@@ -70,4 +70,4 @@ def getIndelArr(seq, indels):
                 )
             else:
                 seqArr[nn] = -1
-    return seqArr,qualArr
+    return seqArr, qualArr

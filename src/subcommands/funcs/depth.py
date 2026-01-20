@@ -105,6 +105,7 @@ def extractDepthRegion(bam, chrom, start, end, params):
                 1
     return depth, indelmask
 
+
 def prepareAlignMask(bam, chrom, start, end, params):
     """
     sum_nm = np.zeros(end - start)
@@ -136,7 +137,7 @@ def prepareAlignMask(bam, chrom, start, end, params):
         sum_nm[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += NM_no_id
         count_nm[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += 1
 
-    
+
     sum_nm[count_nm == 0] = 200
     count_nm[count_nm == 0] = -1
 
@@ -147,20 +148,20 @@ def prepareAlignMask(bam, chrom, start, end, params):
             print(avg_nm[nn],nn+start)
     """
     sum_nm_f = np.zeros(end - start)
-    count_f = np.zeros(end - start,dtype=int)
+    count_f = np.zeros(end - start, dtype=int)
     sum_nm_r = np.zeros(end - start)
-    count_r = np.zeros(end - start,dtype=int)
-    
+    count_r = np.zeros(end - start, dtype=int)
+
     sum_asxs_f = np.zeros(end - start)
     sum_asxs_r = np.zeros(end - start)
-    
+
     max_nm_f = np.zeros(end - start)
     max_nm_r = np.zeros(end - start)
     min_asxs_f = np.zeros(end - start)
     min_asxs_r = np.zeros(end - start)
 
-    bam=BAM(bam,"rb")
-    for rec in bam.fetch(chrom,start,end):
+    bam = BAM(bam, "rb")
+    for rec in bam.fetch(chrom, start, end):
         if (
             rec.is_supplementary
             or rec.is_secondary
@@ -174,12 +175,9 @@ def prepareAlignMask(bam, chrom, start, end, params):
         ):
             continue
         ##Check covered base
-        #qualities_pass_with_indel = np.zeros(rec.reference_end-rec.reference_start,dtype=bool)
-        #qualities_pass = (np.array(rec.query_alignment_qualities) >= params["minBq"])
+        # qualities_pass_with_indel = np.zeros(rec.reference_end-rec.reference_start,dtype=bool)
+        # qualities_pass = (np.array(rec.query_alignment_qualities) >= params["minBq"])
 
-
-
-        
         ##NM average
         id_length = 0
         id_num = 0
@@ -204,8 +202,8 @@ def prepareAlignMask(bam, chrom, start, end, params):
                 current_seq_ind += ct[1]
 
         qualities_pass_trimmed = qualities_pass_with_indel[max(start - rec.reference_start,0):min(end - rec.reference_start,end-start)]
-        """    
-        
+        """
+
         NM_no_id = rec.get_tag("NM") - id_length + id_num
         asxs = rec.get_tag("AS") - rec.get_tag("XS")
         if rec.is_forward:
@@ -219,15 +217,47 @@ def prepareAlignMask(bam, chrom, start, end, params):
             min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
                 np.minimum(min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],asxs)
             """
-            sum_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += NM_no_id
-            sum_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += asxs
-            count_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += 1
-            
-            max_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] = \
-                np.maximum(max_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)],NM_no_id)
-            min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] = \
-                np.minimum(min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)],asxs)
-        
+            sum_nm_f[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += NM_no_id
+            sum_asxs_f[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += asxs
+            count_f[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += 1
+
+            max_nm_f[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] = np.maximum(
+                max_nm_f[
+                    max(rec.reference_start - start, 0) : min(
+                        rec.reference_end - start, end - start
+                    )
+                ],
+                NM_no_id,
+            )
+            min_asxs_f[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] = np.minimum(
+                min_asxs_f[
+                    max(rec.reference_start - start, 0) : min(
+                        rec.reference_end - start, end - start
+                    )
+                ],
+                asxs,
+            )
+
         if rec.is_reverse:
             """
             sum_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += NM_no_id
@@ -239,21 +269,53 @@ def prepareAlignMask(bam, chrom, start, end, params):
             min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
                 np.minimum(min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],asxs)
             """
-            sum_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += NM_no_id
-            sum_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += asxs
-            count_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += 1
-            
-            max_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] = \
-                np.maximum(max_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)],NM_no_id)
-            min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] = \
-                np.minimum(min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)],asxs)
+            sum_nm_r[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += NM_no_id
+            sum_asxs_r[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += asxs
+            count_r[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] += 1
+
+            max_nm_r[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] = np.maximum(
+                max_nm_r[
+                    max(rec.reference_start - start, 0) : min(
+                        rec.reference_end - start, end - start
+                    )
+                ],
+                NM_no_id,
+            )
+            min_asxs_r[
+                max(rec.reference_start - start, 0) : min(
+                    rec.reference_end - start, end - start
+                )
+            ] = np.minimum(
+                min_asxs_r[
+                    max(rec.reference_start - start, 0) : min(
+                        rec.reference_end - start, end - start
+                    )
+                ],
+                asxs,
+            )
     sum_nm_f[count_f > 1] = sum_nm_f[count_f > 1] - max_nm_f[count_f > 1]
     sum_nm_r[count_r > 1] = sum_nm_r[count_r > 1] - max_nm_r[count_r > 1]
     sum_asxs_f[count_f > 1] = sum_asxs_f[count_f > 1] - min_asxs_f[count_f > 1]
     sum_asxs_r[count_r > 1] = sum_asxs_r[count_r > 1] - min_asxs_r[count_r > 1]
     count_f[count_f > 1] -= 1
     count_r[count_r > 1] -= 1
-    
+
     sum_nm_f[count_f == 0] = 200
     sum_asxs_f[count_f == 0] = -np.inf
     count_f[count_f == 0] = -1
@@ -261,14 +323,14 @@ def prepareAlignMask(bam, chrom, start, end, params):
     sum_asxs_r[count_r == 0] = -np.inf
     count_r[count_r == 0] = -1
 
-    avg_nm_f = sum_nm_f/count_f
-    avg_nm_r = sum_nm_r/count_r
-    avg_nm = np.max(np.vstack([avg_nm_f,avg_nm_r]),axis=0)
-    avg_nm[avg_nm < 0] = np.inf 
+    avg_nm_f = sum_nm_f / count_f
+    avg_nm_r = sum_nm_r / count_r
+    avg_nm = np.max(np.vstack([avg_nm_f, avg_nm_r]), axis=0)
+    avg_nm[avg_nm < 0] = np.inf
 
-    avg_asxs_f = sum_asxs_f/count_f
-    avg_asxs_r = sum_asxs_r/count_r
-    avg_asxs = np.min(np.vstack([avg_asxs_f,avg_asxs_r]),axis=0)
+    avg_asxs_f = sum_asxs_f / count_f
+    avg_asxs_r = sum_asxs_r / count_r
+    avg_asxs = np.min(np.vstack([avg_asxs_f, avg_asxs_r]), axis=0)
     avg_asxs[avg_asxs == np.inf] = 0
     """
     for nn in range(avg_asxs.size):
@@ -278,7 +340,9 @@ def prepareAlignMask(bam, chrom, start, end, params):
             print(avg_nm[nn],avg_nm_f[nn],avg_nm_r[nn],nn+start)
     """
 
-    align_mask = np.logical_or(avg_nm >= params["maxNM"]/2,avg_asxs <= params["minMeanASXS"])
+    align_mask = np.logical_or(
+        avg_nm >= params["maxNM"] / 2, avg_asxs <= params["minMeanASXS"]
+    )
     return align_mask
 
 

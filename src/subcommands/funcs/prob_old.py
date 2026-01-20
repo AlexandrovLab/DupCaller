@@ -326,10 +326,10 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
         antimask,
         F1R2_count_mat,
         F2R1_count_mat,
-        #F1R2_b1_prob,
-        #F1R2_b2_prob,
-        #F2R1_b1_prob,
-        #F2R1_b2_prob
+        # F1R2_b1_prob,
+        # F1R2_b2_prob,
+        # F2R1_b1_prob,
+        # F2R1_b2_prob
     )
 
 

@@ -152,10 +152,9 @@ def prepare_reference_mats(
             n_cov_mask = depth < min_depth
             indel_mask[indel_mask_out] = True
 
-        nm_mask = prepareAlignMask(tbam,chrom,start,end,params)
-        #nm_mask = nm_avg >= params["maxNM"]/2
-        
-        
+        nm_mask = prepareAlignMask(tbam, chrom, start, end, params)
+        # nm_mask = nm_avg >= params["maxNM"]/2
+
     return (
         prior_mat,
         snp_mask,
@@ -163,7 +162,7 @@ def prepare_reference_mats(
         noise_mask,
         n_cov_mask,
         include_mask,
-        nm_mask
+        nm_mask,
     )  # , reference_int, trinuc_int
 
 
@@ -187,7 +186,10 @@ def determineTrimLength(seq, params, processed_flag):
             )
             overlap = max(
                 0,
-                seq.reference_length + mate_reference_length - abs(seq.template_length) - params["trim3"],
+                seq.reference_length
+                + mate_reference_length
+                - abs(seq.template_length)
+                - params["trim3"],
             )
         else:
             overlap = 0
@@ -676,7 +678,7 @@ def callBam(params, processNo):
                     continue
                 F2R1 = currentReadDict[key]["F2R1"]
                 F1R2 = currentReadDict[key]["F1R2"]
-                    
+
                 mean_mapq = sum([seq.mapping_quality for seq in readSet]) / len(readSet)
                 if mean_mapq < params["mapq"]:
                     if params["rescue"]:
@@ -707,7 +709,9 @@ def callBam(params, processNo):
                         f1r2_count = 0
                         f2r1_count = 0
                         for _ in readSet:
-                            if (_.is_forward and _.is_read1) or (_.is_reverse and _.is_read2):
+                            if (_.is_forward and _.is_read1) or (
+                                _.is_reverse and _.is_read2
+                            ):
                                 f1r2_count += 1
                                 if _.query_name in read_blacklist:
                                     f1r2_blacklist_num += 1
@@ -715,7 +719,14 @@ def callBam(params, processNo):
                                 f2r1_count += 1
                                 if _.query_name in read_blacklist:
                                     f2r1_blacklist_num += 1
-                        if ((f1r2_blacklist_num + f2r1_blacklist_num)/ len(readSet) >= 0.5) or f1r2_blacklist_num == f1r2_count or f2r1_blacklist_num == f2r1_count:
+                        if (
+                            (
+                                (f1r2_blacklist_num + f2r1_blacklist_num) / len(readSet)
+                                >= 0.5
+                            )
+                            or f1r2_blacklist_num == f1r2_count
+                            or f2r1_blacklist_num == f2r1_count
+                        ):
                             if params["rescue"]:
                                 flt_rs = "high_nm"
                             else:
@@ -968,7 +979,7 @@ def callBam(params, processNo):
                         """
                         # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
                         pass_inds = np.nonzero(LR >= params["pcutoffi"])[0].tolist()
-                        #print(LR)
+                        # print(LR)
                         indels_pass = [indels[_] for _ in pass_inds]
                         coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
                         unmasked_coverage_indel[start_ind:end_ind_max][
@@ -1142,12 +1153,12 @@ def callBam(params, processNo):
                             params,
                         )
                         """
-                        #prob1_diff = prob1-prob1_old
-                        #notice1 = np.abs(prob1_diff) >=1
-                        #prob3_diff = prob3-prob3_old
-                        #notice2 = np.abs(prob3_diff) >=1
-                        #if np.any(notice1):
-                            #print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
+                        # prob1_diff = prob1-prob1_old
+                        # notice1 = np.abs(prob1_diff) >=1
+                        # prob3_diff = prob3-prob3_old
+                        # notice2 = np.abs(prob3_diff) >=1
+                        # if np.any(notice1):
+                        # print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
 
                         ref_int = ref_np[start_ind:end_ind]
                         """
@@ -1572,7 +1583,7 @@ def callBam(params, processNo):
                     hp_np[0, start_ind:end_ind],
                     params,
                 )
-                if len(LR) != 0: 
+                if len(LR) != 0:
                     """
                     DCS = np.logical_and(
                         F1R2_BLR >= params["pcutoff"],
@@ -1640,12 +1651,14 @@ def callBam(params, processNo):
                                 readPos + 1,
                             )
                         if (
-                            F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]]
+                            F1R2_alt_count[pass_inds[nn]]
+                            + F1R2_ref_count[pass_inds[nn]]
                             == 0
                         ):
                             continue
                         if (
-                            F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]]
+                            F2R1_alt_count[pass_inds[nn]]
+                            + F2R1_ref_count[pass_inds[nn]]
                             == 0
                         ):
                             continue
@@ -1872,9 +1885,11 @@ def callBam(params, processNo):
         bc1 = mut["infos"]["TAG1"]
         bc2 = mut["infos"]["TAG2"]
         readStartCoord = mut["infos"]["SP"]
-        flt=mut["filter"]
+        flt = mut["filter"]
 
-        if not mut_dict.get(":".join([chrom, str(pos), ref, alt])) and (flt=="PASS" or flt=="masked"):
+        if not mut_dict.get(":".join([chrom, str(pos), ref, alt])) and (
+            flt == "PASS" or flt == "masked"
+        ):
             ta, tr, ti, tdp = extractDepthSnv(
                 tumorBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
             )
@@ -1913,17 +1928,17 @@ def callBam(params, processNo):
                 ndp,
                 # window_filter,
             )
-        elif (flt=="PASS" or flt=="masked"):
+        elif flt == "PASS" or flt == "masked":
             ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[
                 ":".join([chrom, str(pos), ref, alt])
             ]
         else:
-            ta, tr, ti, tdp, na, nr, ni, ndp = (0,0,0,0,0,0,0,0)
+            ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         # if window_filter:
         # continue
         # if ta > params["maxAltCount"]:
         # continue
-        if flt == 'PASS' or flt == 'masked':
+        if flt == "PASS" or flt == "masked":
             if ta == 0:
                 continue
             if ta / tdp > params["maxAF"]:
@@ -1948,7 +1963,9 @@ def callBam(params, processNo):
         alt = mut["alt"]
         flt = mut["filter"]
 
-        if not muts_indels_dict.get(":".join([chrom, str(pos), ref, alt])) and (flt == 'PASS' or flt == 'masked'):
+        if not muts_indels_dict.get(":".join([chrom, str(pos), ref, alt])) and (
+            flt == "PASS" or flt == "masked"
+        ):
             ta, tr, ti, tdp = extractDepthIndel(tumorBam, chrom, pos, ref, alt, params)
             # window_filter = False
             # if IndelFilterByWindows(tumorBam, chrom, pos, 3, params):
@@ -1979,17 +1996,17 @@ def callBam(params, processNo):
                 ndp,
                 # window_filter,
             )
-        elif (flt == "PASS" or flt == "masked"):
+        elif flt == "PASS" or flt == "masked":
             ta, tr, tdp, na, nr, ndp = muts_indels_dict[
                 ":".join([chrom, str(pos), ref, alt])
             ]
         else:
-            ta, tr, ti, tdp, na, nr, ni, ndp = (0,0,0,0,0,0,0,0)
+            ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         # if window_filter:
         # continue
         # if ta > params["maxAltCount"]:
         # continue
-        if flt == 'PASS' or flt == "masked":
+        if flt == "PASS" or flt == "masked":
             if ta == 0:
                 continue
             if ti > 0:
