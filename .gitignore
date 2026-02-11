@@ -34,3 +34,5 @@ MANIFEST
 # Temporary directories
 tmp/
 temp/
+
+CHANGES_SUMMARY.md
