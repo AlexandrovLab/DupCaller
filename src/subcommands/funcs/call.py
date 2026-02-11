@@ -429,7 +429,13 @@ def callBam(params, processNo):
 
     if params["amperri_file"]:
         ampmat_indel = np.loadtxt(params["amperri_file"], delimiter="\t")
-        ampmat_indel = ampmat_indel / np.sum(ampmat_indel, axis=1, keepdims=True)
+        row_non_zero = np.sum(ampmat_indel, axis=1, keepdims=False) != 0
+        ampmat_indel_new = np.zeros(ampmat_indel.shape)
+        ampmat_indel_new[row_non_zero, :] = ampmat_indel[row_non_zero, :] / np.sum(
+            ampmat_indel[row_non_zero, :], axis=1, keepdims=True
+        )
+        # ampmat_indel = ampmat_indel / np.sum(ampmat_indel, axis=1, keepdims=True)
+        ampmat_indel = ampmat_indel_new.copy()
         for nn in range(1, 40):
             current_row = ampmat_indel[nn, :]
             current_row[current_row == 0] = ampmat_indel[nn - 1, :][current_row == 0]
@@ -493,10 +499,20 @@ def callBam(params, processNo):
     params["dmgmat_rev_bot"] = dmgmat_rev_b
 
     if params["dmgerri_file"]:
-        dmgmat_indel = np.loadtxt(params["dmgerri_file"], delimiter="\t")
+        # dmgmat_indel = np.loadtxt(params["dmgerri_file"], delimiter="\t")
+        """
         dmgmat_indel[0, :] += 1
         dmgmat_indel[:, 5] += 1
         dmgmat_indel = dmgmat_indel / np.sum(dmgmat_indel, axis=1, keepdims=True)
+        """
+        dmgmat_indel = np.loadtxt(params["dmgerri_file"], delimiter="\t")
+        row_non_zero = np.sum(dmgmat_indel, axis=1, keepdims=False) != 0
+        dmgmat_indel_new = np.zeros(dmgmat_indel.shape)
+        dmgmat_indel_new[row_non_zero, :] = dmgmat_indel[row_non_zero, :] / np.sum(
+            dmgmat_indel[row_non_zero, :], axis=1, keepdims=True
+        )
+        # ampmat_indel = ampmat_indel / np.sum(ampmat_indel, axis=1, keepdims=True)
+        dmgmat_indel = dmgmat_indel_new.copy()
         for nn in range(1, 40):
             current_row = dmgmat_indel[nn, :]
             current_row[current_row == 0] = dmgmat_indel[nn - 1, :][current_row == 0]
@@ -527,7 +543,7 @@ def callBam(params, processNo):
     else:
         normalBams = None
     currentStart = -1
-    currentReadDict = {}
+    # currentReadDict = {}
     recCount = 0
     currentCheckPoint = 1000000
     lastTime = 0
@@ -580,6 +596,10 @@ def callBam(params, processNo):
         print(
             f"Process {str(processNo)}: finished screening highly damaged reads in {currentTime: .2f} minutes. Blacklisted {len(read_blacklist)} ({percent_blocked: .2f}%) possible highly damaged read and started variant calling."
         )
+    retain_base = 5
+    currentReadDictList = [
+        dict() for _ in range(retain_base)
+    ]  # Adjustable parameter pending
     for rec, region in bamIterateMultipleRegion(bam, regions, params.get("reference")):
         recCount += 1
         if recCount == currentCheckPoint:
@@ -619,34 +639,41 @@ def callBam(params, processNo):
         bc1 = bcsplit[0]
         bc2 = bcsplit[1]
         if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
-            label = bc1 + "+" + bc2  # + ":" + "f1r2"
-            # label = bc1 + "+" + bc2 + ":" + "f2r1"
+            label = bc1 + "+" + bc2 + "+" + str(rec.template_length)
         else:
-            label = bc2 + "+" + bc1  # + ":" + "f1r2"
+            label = bc2 + "+" + bc1 + "+" + str(rec.template_length)
         chrom = tumorBam.get_reference_name(rec.reference_id)
         if currentStart == -1:
             currentStart = start
         if start == currentStart:
-            if currentReadDict.get(label):
-                if currentReadDict[label]["names"].get(rec.query_name):
-                    if rec.is_read2:
-                        continue
+            has_same_label_flag = False
+            for rb in range(retain_base):
+                if currentReadDictList[rb].get(label):
+                    """
+                    if currentReadDictList[rb][label]["names"].get(rec.query_name):
+                        if rec.is_read2:
+                            continue
+                        else:
+                            ind = currentReadDictList[rb][label]["names"].get(rec.query_name)
+                            currentReadDictList[rb][label]["seqs"][ind] = rec
                     else:
-                        ind = currentReadDict[label]["names"].get(rec.query_name)
-                        currentReadDict[label]["seqs"][ind] = rec
-                else:
-                    currentReadDict[label]["seqs"].append(rec)
-                    currentReadDict[label]["names"][rec.query_name] = (
-                        len(currentReadDict[label]["seqs"]) - 1
+                    """
+                    currentReadDictList[rb][label]["seqs"].append(rec)
+                    currentReadDictList[rb][label]["names"][rec.query_name] = (
+                        len(currentReadDictList[rb][label]["seqs"]) - 1
                     )
                     if (rec.is_forward and rec.is_read1) or (
                         rec.is_reverse and rec.is_read2
                     ):
-                        currentReadDict[label]["F1R2"] += 1
+                        currentReadDictList[rb][label]["F1R2"] += 1
                     else:
-                        currentReadDict[label]["F2R1"] += 1
-            else:
-                currentReadDict.update(
+                        currentReadDictList[rb][label]["F2R1"] += 1
+                    has_same_label_flag = True
+                    break
+
+            if not has_same_label_flag:
+                # else:
+                currentReadDictList[-1].update(
                     {
                         label: {
                             "seqs": [rec],
@@ -659,13 +686,21 @@ def callBam(params, processNo):
                 if (rec.is_forward and rec.is_read1) or (
                     rec.is_reverse and rec.is_read2
                 ):
-                    currentReadDict[label]["F1R2"] += 1
+                    currentReadDictList[retain_base - 1][label]["F1R2"] += 1
                 else:
-                    currentReadDict[label]["F2R1"] += 1
+                    currentReadDictList[retain_base - 1][label]["F2R1"] += 1
+            # print(currentStart,start)
         else:
+            # print(currentReadDictList)
             """
             Calling block starts
             """
+            # print(currentReadDictList):
+            currentReadDict = dict()
+            for _ in range(min(start - currentStart, retain_base)):
+                currentReadDict |= currentReadDictList.pop(0)
+                currentReadDictList.append(dict())
+
             flt_rs = "PASS"
             for key in currentReadDict.keys():
                 readSet = currentReadDict[key]["seqs"]
@@ -732,7 +767,9 @@ def callBam(params, processNo):
                             else:
                                 continue
                     rs_reference_end = max([r.reference_end for r in readSet])
-                    rs_reference_start = readSet[0].reference_start
+                    # rs_reference_start = readSet[0].reference_start
+                    rs_reference_start = min([r.reference_start for r in readSet])
+
                     chromNow = readSet[0].reference_name
                     if (
                         chromNow != reference_mat_chrom
@@ -900,23 +937,20 @@ def callBam(params, processNo):
                     if processed_flag == 0:
                         processed_read_names.add(readSet[0].query_name)
                     start_ind = readSet[0].reference_start - reference_mat_start
-                    reference_length_min = min(
-                        [read.reference_length for read in readSet]
-                    )
-                    reference_length_max = max(
-                        [read.reference_length for read in readSet]
-                    )
-                    end_ind = (
-                        readSet[0].reference_start
-                        + reference_length_max
-                        - reference_mat_start
-                    )
+                    # reference_length_min = min(
+                    # [read.reference_length for read in readSet]
+                    # )
+                    # reference_length_max = max(
+                    # [read.reference_length for read in readSet]
+                    # )
+                    # end_ind = (
+                    # rs_reference_start
+                    # + reference_length_max
+                    # - reference_mat_start
+                    # )
+                    end_ind = rs_reference_end - reference_mat_start
 
-                    end_ind_max = (
-                        readSet[0].reference_start
-                        + reference_length_max
-                        - reference_mat_start
-                    )
+                    end_ind_max = end_ind
                     masks = np.zeros([6, end_ind - start_ind], dtype=bool)
                     masks[0, :] = snp_mask[start_ind:end_ind]
                     masks[1, :] = noise_mask[start_ind:end_ind]
@@ -966,6 +1000,8 @@ def callBam(params, processNo):
                             F2R1_alt_count,
                         ) = genotypeDSIndel(
                             readSet,
+                            rs_reference_start,
+                            rs_reference_end,
                             tumorBam,
                             unmasked_antimask_indel,
                             hp_np[0, start_ind:end_ind],
@@ -1130,6 +1166,7 @@ def callBam(params, processNo):
                             F2R1_count,
                         ) = genotypeDSSnv(
                             readSet,
+                            rs_reference_start,
                             ref_np[start_ind:end_ind],
                             trinuc_np[start_ind:end_ind],
                             prior_mat[start_ind:end_ind, :],
@@ -1186,7 +1223,6 @@ def callBam(params, processNo):
                         unmasked_pass_bool[muts_ind] = True
                         pass_bool = np.copy(unmasked_pass_bool)
                         pass_bool[~antimask] = False
-
                         pos = [
                             mut_ind + start_ind + reference_mat_start
                             for mut_ind in muts_ind
@@ -1295,32 +1331,63 @@ def callBam(params, processNo):
                         # Update unmasked coverage and trinuc counts (includes all passing sites)
 
                         unmasked_coverage[start_ind:end_ind][unmasked_pass_bool] += 1
-                        # unmasked_trinuc_pass = trinuc_np[start_ind:end_ind][unmasked_pass_bool]
-                        # unmasked_duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
-                        # unmasked_trinuc_pass, minlength=96
-                        # ).astype(int)
                         duplex_read_num_dict[duplex_no][0] += 1
                         duplex_count += 1
             """
             Calling block ends
             """
-            currentReadDict = {
-                label: {
-                    "seqs": [rec],
-                    "F1R2": 0,
-                    "F2R1": 0,
-                    "names": {rec.query_name: 0},
-                }
-            }
-            if (rec.is_forward and rec.is_read1) or (rec.is_reverse and rec.is_read2):
-                currentReadDict[label]["F1R2"] += 1
-            else:
-                currentReadDict[label]["F2R1"] += 1
+            has_same_label_flag = False
+            for rb in range(retain_base):
+                if currentReadDictList[rb].get(label):
+                    """
+                    if currentReadDictList[rb][label]["names"].get(rec.query_name):
+                        if rec.is_read2:
+                            continue
+                        else:
+                            ind = currentReadDictList[rb][label]["names"].get(rec.query_name)
+                            currentReadDictList[rb][label]["seqs"][ind] = rec
+                    else:
+                    """
+                    currentReadDictList[rb][label]["seqs"].append(rec)
+                    currentReadDictList[rb][label]["names"][rec.query_name] = (
+                        len(currentReadDictList[rb][label]["seqs"]) - 1
+                    )
+                    if (rec.is_forward and rec.is_read1) or (
+                        rec.is_reverse and rec.is_read2
+                    ):
+                        currentReadDictList[rb][label]["F1R2"] += 1
+                    else:
+                        currentReadDictList[rb][label]["F2R1"] += 1
+                    has_same_label_flag = True
+                    break
+
+            if not has_same_label_flag:
+                # else:
+                currentReadDictList[retain_base - 1].update(
+                    {
+                        label: {
+                            "seqs": [rec],
+                            "F1R2": 0,
+                            "F2R1": 0,
+                            "names": {rec.query_name: 0},
+                        }
+                    }
+                )
+                if (rec.is_forward and rec.is_read1) or (
+                    rec.is_reverse and rec.is_read2
+                ):
+                    currentReadDictList[retain_base - 1][label]["F1R2"] += 1
+                else:
+                    currentReadDictList[retain_base - 1][label]["F2R1"] += 1
             currentStart = start
     """
     Calling block starts
     """
+
     flt_rs = "PASS"
+    currentReadDict = dict()
+    for _ in currentReadDictList:
+        currentReadDict |= _
     for key in currentReadDict.keys():
         readSet = currentReadDict[key]["seqs"]
         all_dup = True
@@ -1355,19 +1422,17 @@ def callBam(params, processNo):
             else:
                 continue
         setBc = key.split(":")[0].split("+")
-        setBc1 = setBc[0]
-        setBc2 = setBc[1]
         F2R1 = currentReadDict[key]["F2R1"]
         F1R2 = currentReadDict[key]["F1R2"]
         duplex_no = f"{F1R2}+{F2R1}"
         if duplex_read_num_dict.get(duplex_no) is None:
             duplex_read_num_dict[duplex_no] = [0, 0]
             duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
-            # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
         unique_read_num += 1
         if F2R1 >= 1 and F1R2 >= 1:
             rs_reference_end = max([r.reference_end for r in readSet])
-            rs_reference_start = readSet[0].reference_start
+            # rs_reference_start = readSet[0].reference_start
+            rs_reference_start = min([r.reference_start for r in readSet])
             chromNow = readSet[0].reference_name
             if chromNow != reference_mat_chrom or rs_reference_end > reference_mat_end:
                 ### Output coverage
@@ -1487,9 +1552,7 @@ def callBam(params, processNo):
                     noise_mask,
                     n_cov_mask,
                     include_mask,
-                    nm_mask
-                    # ref_np,
-                    # trinuc_np
+                    nm_mask,
                 ) = prepare_reference_mats(
                     reference_mat_chrom,
                     reference_mat_start,
@@ -1520,16 +1583,10 @@ def callBam(params, processNo):
                     break
             if processed_flag == 0:
                 processed_read_names.add(readSet[0].query_name)
-            start_ind = readSet[0].reference_start - reference_mat_start
-            reference_length_min = min([read.reference_length for read in readSet])
-            reference_length_max = max([read.reference_length for read in readSet])
-            end_ind = (
-                readSet[0].reference_start + reference_length_max - reference_mat_start
-            )
+            start_ind = rs_reference_start - reference_mat_start
+            end_ind = rs_reference_end - reference_mat_start
+            end_ind_max = end_ind
 
-            end_ind_max = (
-                readSet[0].reference_start + reference_length_max - reference_mat_start
-            )
             masks = np.zeros([6, end_ind - start_ind], dtype=bool)
             masks[0, :] = snp_mask[start_ind:end_ind]
             masks[1, :] = noise_mask[start_ind:end_ind]
@@ -1553,7 +1610,6 @@ def callBam(params, processNo):
             indel_bool = [
                 ("I" in seq.cigarstring or "D" in seq.cigarstring) for seq in readSet
             ]
-            # if any(indel_bool):
             if not isLearn:
                 masks_indel = np.zeros([6, end_ind_max - start_ind], dtype=bool)
                 masks_indel[0, :] = indel_mask[start_ind:end_ind_max]
@@ -1578,6 +1634,8 @@ def callBam(params, processNo):
                     F2R1_alt_count,
                 ) = genotypeDSIndel(
                     readSet,
+                    rs_reference_start,
+                    rs_reference_end,
                     tumorBam,
                     unmasked_antimask_indel,
                     hp_np[0, start_ind:end_ind],
@@ -1681,9 +1739,7 @@ def callBam(params, processNo):
                                     F2R1_alt_count[pass_inds[nn]]
                                     + F2R1_ref_count[pass_inds[nn]]
                                 ),
-                                # "LR": LR[pass_inds[0]],
                                 "LR": LR[pass_inds[nn]],
-                                # "BLR": F2R1_LR[pass_inds[0]],
                                 "TC": ",".join(
                                     [
                                         str(F1R2_alt_count[pass_inds[nn]]),
@@ -1740,6 +1796,7 @@ def callBam(params, processNo):
                     F2R1_count,
                 ) = genotypeDSSnv(
                     readSet,
+                    rs_reference_start,
                     ref_np[start_ind:end_ind],
                     trinuc_np[start_ind:end_ind],
                     prior_mat[start_ind:end_ind, :],
@@ -1747,15 +1804,6 @@ def callBam(params, processNo):
                     params,
                 )
                 ref_int = ref_np[start_ind:end_ind]
-                """
-                refs_ind = np.nonzero(
-                    np.logical_and(
-                        LR
-                        <= params["pcutoff"],  # - np.log10(params["mutRate"]),
-                        b1_int == ref_int,
-                    )
-                )[0].tolist()
-                """
                 # Find all mutations and references from unmasked results
                 refs_ind = np.nonzero(
                     np.logical_and(
@@ -1864,10 +1912,6 @@ def callBam(params, processNo):
                 # Update unmasked coverage and trinuc counts (includes all passing sites)
 
                 unmasked_coverage[start_ind:end_ind][unmasked_pass_bool] += 1
-                # unmasked_trinuc_pass = trinuc_np[start_ind:end_ind][unmasked_pass_bool]
-                # unmasked_duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
-                # unmasked_trinuc_pass, minlength=96
-                # ).astype(int)
                 duplex_read_num_dict[duplex_no][0] += 1
                 duplex_count += 1
     """
@@ -1893,12 +1937,6 @@ def callBam(params, processNo):
             ta, tr, ti, tdp = extractDepthSnv(
                 tumorBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
             )
-            # overlap_error = detectOverlapDiscord(
-            # tumorBam, chrom, pos, ref, alt, params, bc1, bc2, readStartCoord
-            # )
-            # window_filter = False
-            # if IndelFilterByWindows(tumorBam, chrom, pos, 3, params):
-            # window_filter = True
             if normalBams:
                 na = 0
                 nr = 0
@@ -1912,8 +1950,6 @@ def callBam(params, processNo):
                     nr += nr_now
                     ni += ni_now
                     ndp += ndp_now
-                # if IndelFilterByWindows(normalBam, chrom, pos, 3, params):
-                # window_filter = True
             else:
                 na, nr, ni, ndp = (0, 0, 0, 0)
             mut_dict[":".join([chrom, str(pos), ref, alt])] = (
@@ -1921,12 +1957,10 @@ def callBam(params, processNo):
                 tr,
                 ti,
                 tdp,
-                # overlap_error,
                 na,
                 nr,
                 ni,
                 ndp,
-                # window_filter,
             )
         elif flt == "PASS" or flt == "masked":
             ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[
@@ -1943,9 +1977,7 @@ def callBam(params, processNo):
                 continue
             if ta / tdp > params["maxAF"]:
                 continue
-            if ti >= 1:
-                continue
-            # if overlap_error:
+            # if ti >= 1:
             # continue
             if normalBams:
                 if ndp < params["minNdepth"]:
@@ -1967,9 +1999,6 @@ def callBam(params, processNo):
             flt == "PASS" or flt == "masked"
         ):
             ta, tr, ti, tdp = extractDepthIndel(tumorBam, chrom, pos, ref, alt, params)
-            # window_filter = False
-            # if IndelFilterByWindows(tumorBam, chrom, pos, 3, params):
-            # window_filter = True
             if normalBams:
                 na = 0
                 nr = 0
@@ -1983,8 +2012,6 @@ def callBam(params, processNo):
                     nr += nr_now
                     ni += ni_now
                     ndp += ndp_now
-                # if IndelFilterByWindows(normalBam, chrom, pos, 3, params):
-                # window_filter = True
             else:
                 na, nr, ndp = (0, 0, 0)
             muts_indels_dict[":".join([chrom, str(pos), ref, alt])] = (
@@ -2002,15 +2029,11 @@ def callBam(params, processNo):
             ]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
-        # if window_filter:
-        # continue
-        # if ta > params["maxAltCount"]:
-        # continue
         if flt == "PASS" or flt == "masked":
             if ta == 0:
                 continue
-            if ti > 0:
-                continue
+            # if ti > 0:
+            # continue
             if ta / tdp > params["maxAF"]:
                 continue
             if normalBams:
@@ -2088,6 +2111,5 @@ def callBam(params, processNo):
         FPs,
         RPs,
         total_unmasked_coverage,
-        # unmasked_duplex_read_num_dict_trinuc,
         total_unmasked_coverage_indel,
     )

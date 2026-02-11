@@ -99,6 +99,7 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     burden_corrected = np.zeros(5)
     burden_corrected_ub = np.zeros(5)
     burden_corrected_lb = np.zeros(5)
+    covs = np.zeros(5)
     hap_trinuc = np.zeros([96, 5])
     ## Calculate burden when take 5 as mininum
     trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)
@@ -113,7 +114,9 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
         mutnum_corrected, ref_trinuc.sum()
     )
-    hap_trinuc[:, 4] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+    # hap_trinuc[:, 4] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+    hap_trinuc[:, 4] = trinuc_rate * np.repeat(ref_trinuc, 3)
+    covs[4] = cov
     # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     for nn in range(4, 0, -1):
         trinuc_mut = trinuc_mut + trinuc_mut_by_rf[:, nmin == nn].sum(axis=1)
@@ -124,13 +127,15 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
             mutnum, cov
         )
+        covs[nn - 1] = cov
         trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
         mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
         burden_corrected[nn - 1] = mutnum_corrected / ref_trinuc.sum()
         burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
             mutnum_corrected, ref_trinuc.sum()
         )
-        hap_trinuc[:, nn - 1] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+        # hap_trinuc[:, nn - 1] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+        hap_trinuc[:, nn - 1] = trinuc_rate * np.repeat(ref_trinuc, 3)
 
     return (
         hap_trinuc,
@@ -143,6 +148,7 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         mutnum,
         mutnum_corrected,
         ref_trinuc.sum(),
+        covs,
     )
 
 
@@ -309,6 +315,7 @@ def do_estimate(args):
             mutnum_uncorrected,
             mutnum_per_genome,
             genome_cov,
+            cov_by_minread,
         ) = estimate_96(
             trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns
         )
@@ -356,6 +363,7 @@ def do_estimate(args):
                         uburden,
                         uburden_lb,
                         uburden_ub,
+                        cov_by_minread,
                         burden,
                         burden_lb,
                         burden_ub,
@@ -367,6 +375,7 @@ def do_estimate(args):
                 "Uncorrected_burden",
                 "Uncorrected_burden_lower",
                 "Uncorrected_burden_upper",
+                "Coverage base",
                 "Corrrected_burden",
                 "Corrected_burden_lower",
                 "Corrected_burden_upper",

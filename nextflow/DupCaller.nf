@@ -5,7 +5,6 @@
  *
  * A pipeline for calling somatic mutations from barcoded error-corrected NGS data
  *
- * Author: DupCaller team
  */
 
 nextflow.enable.dsl=2
@@ -143,29 +142,6 @@ if (!params.reference) {
 }
 
 /*
- * Process: Index reference genome
- */
-process INDEX_REFERENCE {
-    tag "${reference.baseName}"
-
-    input:
-    path reference
-
-    output:
-    tuple path(reference), path("${reference}.h5"), path("${reference.baseName}.tn.h5"), path("${reference.baseName}.hp.h5")
-
-    script:
-    """
-    # Check if index files already exist
-    if [ ! -f "${reference}.h5" ] || [ ! -f "${reference.baseName}.tn.h5" ] || [ ! -f "${reference.baseName}.hp.h5" ]; then
-        DupCaller.py index -f ${reference}
-    else
-        echo "Index files already exist, skipping indexing"
-    fi
-    """
-}
-
-/*
  * Process: Trim barcodes from fastq files
  */
 process TRIM_BARCODES {
@@ -197,7 +173,7 @@ process BWA_ALIGN {
     cpus params.threads
 
     input:
-    tuple val(sample_name), path(read1), path(read2), path(reference), path(ref_h5), path(tn_h5), path(hp_h5)
+    tuple val(sample_name), path(read1), path(read2), path(reference)
 
     output:
     tuple val(sample_name), path("${sample_name}.bam"), path("${sample_name}.bam.bai")
@@ -369,9 +345,10 @@ process ESTIMATE_BURDEN {
 workflow {
     // Check reference files
     ref_ch = Channel.fromPath(params.reference, checkIfExists: true)
+    ref_h5 = params.reference+".ref.h5"
+    tn_h5 = params.reference+".tn.h5"
+    hp_h5 = params.reference+".hp.h5"
 
-    // Index reference genome
-    indexed_ref = INDEX_REFERENCE(ref_ch)
 
     // Handle optional files
     germline_ch = params.germline_vcf ? Channel.fromPath(params.germline_vcf, checkIfExists: true) : Channel.value(file('NO_FILE'))
@@ -386,7 +363,7 @@ workflow {
         trimmed = TRIM_BARCODES(reads_ch)
 
         // Combine with reference
-        align_input = trimmed.combine(indexed_ref)
+        align_input = trimmed.combine(ref_ch)
         aligned = BWA_ALIGN(align_input)
     } else if (params.skip_trim) {
         error "BAM file input not yet implemented. Please provide --read1 and --read2"
@@ -410,7 +387,7 @@ workflow {
     }
 
     // Variant calling
-    call_input = markdup.combine(indexed_ref)
+    call_input = markdup.combine(ref_ch)
     variants = CALL_VARIANTS(
         call_input,
         normal_ch,
@@ -420,7 +397,7 @@ workflow {
     )
 
     // Burden estimation
-    burden_input = variants.combine(indexed_ref)
+    burden_input = variants.combine(ref_ch)
     burden = ESTIMATE_BURDEN(burden_input, gene_ch)
 }
 

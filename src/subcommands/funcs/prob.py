@@ -49,40 +49,6 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
 
 
 def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2):
-    # binom_b1 = log(sp.binom(countb1 + countb2, countb1))
-    # binom_b2 = binom_b1
-    # log10_P = log(P)
-    # log10_P_rev = log(P_rev)
-    # log10_1_P = log(1 - P)
-    # log10_1_P_rev = log(1 - P_rev)
-    # log10_1_Pseq = log(1 - exp(Pseq))
-    # log10_1_Pb2 = log(1 - exp(Pb2))
-    # count_t = countb1 + countb2
-    """
-    probb1_b1b2 = (
-        binom_b2 + log10_P * countb2 + log10_1_P * countb1 + log10_1_Pb1 + log10_1_Pb2
-    )
-    probb1_b1b1 = log10_1_P * count_t + log10_1_Pb1 + Pb2
-    probb1_b2b1 = binom_b1 + log10_P * countb1 + log10_1_P * countb2 + Pb1 + Pb2
-    probb1_b2b2 = log10_P * count_t + Pb1 + log10_1_Pb2
-
-    probb2_b1b2 = (
-        binom_b1
-        + log10_P_rev * countb1
-        + log10_1_P_rev * countb2
-        + log10_1_Pb1
-        + log10_1_Pb2
-    )
-    probb2_b1b1 = log10_P_rev * count_t + log10_1_Pb1 + Pb2
-    probb2_b2b1 = binom_b2 + log10_P_rev * countb2 + log10_1_P_rev * countb1 + Pb1 + Pb2
-    probb2_b2b2 = log10_1_P_rev * count_t + Pb1 + log10_1_Pb2
-    prob1 = sp.logsumexp(
-        np.vstack((probb1_b1b2, probb1_b1b1, probb1_b2b1, probb1_b2b2)), axis=0
-    )
-    prob2 = sp.logsumexp(
-        np.vstack((probb2_b1b2, probb2_b1b1, probb2_b2b1, probb2_b2b2)), axis=0
-    )"""
-
     Pseq[Pseq == 0] = log(0.5)
     bin_seq = bin_seq.astype(bool, copy=False)
 
@@ -112,34 +78,12 @@ def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2
 
     prob2 = logB_rev.sum(axis=0)
     np.add.at(prob2, cols, -delta_rev[rows, cols])
-    # main computation
-    # prob1 = np.sum(logB + bin_seq * (logA - logB), axis=0)
-    # prob1 = np.sum(bin_seq*log((1-P)*(1-exp(Pseq))+P*exp(Pseq)) + (1 - bin_seq) * log((1-P)*exp(Pseq)+P*(1-exp(Pseq))),axis=0)
-    # precompute exp
-
-    # expP = np.exp(Pseq)
-
-    # precompute the two mixture terms
-    # A = (1 - P) * (1 - expP) + P * expP
-    # B = (1 - P) * expP + P * (1 - expP)
-
-    # precompute logs
-    # logA = np.log(A)
-    # logB = np.log(B)
-
-    # main computation
-    # A_rev = (1 - P_rev) * (1 - expP) + P_rev * expP
-    # B_rev = (1 - P_rev) * expP + P_rev * (1 - expP)
-
-    # logA_rev = np.log(A_rev)
-    # logB_rev = np.log(B_rev)
-    # prob2 = np.sum((1-bin_seq)*log((1-P_rev)*(1-exp(Pseq))+P_rev*exp(Pseq)) + bin_seq * log((1-P_rev)*exp(Pseq)+P_rev*(1-exp(Pseq))),axis=0)
-    # prob2 = np.sum(logA_rev + bin_seq * (logB_rev - logA_rev),axis=0)
-
     return prob1, prob2
 
 
-def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
+def genotypeDSSnv(
+    seqs, reference_start, reference_int, trinuc_int, prior_mat, antimask, params
+):
     prob_amp_mat = params["ampmat"]
     prob_amp_mat_rev = params["ampmat_rev"]
     prob_dmg_mat_top = params["dmgmat_top"]
@@ -168,20 +112,32 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
     F1R2_qual_mat = np.zeros([m_F1R2, n])
     F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # Base(ATCG) x reads x pos
     F2R1_qual_mat = np.zeros([m_F2R1, n])
-    # del_rows = list()
     for mm, seq in enumerate(F1R2):
         qualities = seq.query_alignment_qualities
         sequence = np.array(list(seq.query_alignment_sequence))
         cigartuples = seq.cigartuples
         current_seq_ind = 0
-        current_mat_ind = 0
-        reference_ind = 0
+        current_mat_ind = seq.reference_start - reference_start
+        reference_ind = seq.reference_start - reference_start
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                F1R2_seq_mat[
-                    mm, current_mat_ind : current_mat_ind + ct[1]
-                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
+                try:
+                    F1R2_seq_mat[
+                        mm, current_mat_ind : current_mat_ind + ct[1]
+                    ] = base2num_npfunc(
+                        sequence[current_seq_ind : current_seq_ind + ct[1]]
+                    )
+                except:
+                    print(
+                        current_mat_ind,
+                        current_seq_ind,
+                        ct[1],
+                        sequence.shape,
+                        F1R2_seq_mat.shape,
+                    )
+                    for seq in seqs:
+                        print(seq.cigarstring, seq.reference_start)
                 F1R2_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
@@ -193,24 +149,19 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
             elif ct[0] == 2:
                 F1R2_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F1R2_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                antimask[reference_ind : reference_ind + ct[1]] = False
+                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
         F1R2_seq_mat[mm, current_mat_ind:n] = 4
         F1R2_qual_mat[mm, current_mat_ind:n] = 0
-        # if ref_length_plus_del / n <= 0.8:
-        # del_rows.append(mm)
-    # F1R2_seq_mat = np.delete(F1R2_seq_mat, del_rows, 0)
-    # F1R2_qual_mat = np.delete(F1R2_qual_mat, del_rows, 0)
-    del_rows = list()
     for mm, seq in enumerate(F2R1):
         qualities = seq.query_alignment_qualities
         sequence = np.array(list(seq.query_alignment_sequence))
         cigartuples = seq.cigartuples
         current_seq_ind = 0
-        current_mat_ind = 0
-        reference_ind = 0
+        current_mat_ind = seq.reference_start - reference_start
+        reference_ind = seq.reference_start - reference_start
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
@@ -228,16 +179,12 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
             elif ct[0] == 2:
                 F2R1_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F2R1_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                antimask[reference_ind : reference_ind + ct[1]] = False
+                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
         F2R1_seq_mat[mm, current_mat_ind:n] = 4
         F2R1_qual_mat[mm, current_mat_ind:n] = 0
-        # if ref_length_plus_del / n <= 0.8:
-        # del_rows.append(mm)
-    # F2R1_seq_mat = np.delete(F2R1_seq_mat, del_rows, 0)
-    # F2R1_qual_mat = np.delete(F2R1_qual_mat, del_rows, 0)
 
     F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 0
     F2R1_qual_mat[F2R1_qual_mat <= params["minBq"]] = 0
@@ -287,20 +234,6 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
     F1R2_bin_seq_mat = F1R2_masked_seq_mat == base1_int_masked
     F2R1_bin_seq_mat = F2R1_masked_seq_mat == base1_int_masked
     trinuc_converted_masked = trinuc_convert_np[trinuc_int[antimask], base1_int_masked]
-    """
-    F1R2_b1_prob_mat = (
-        -F1R2_masked_qual_mat[base1_int_masked, np.ogrid[: base1_int_masked.size]] / 10
-    )  # + np.log10(0.5)
-    F1R2_b2_prob_mat = (
-        -F1R2_masked_qual_mat[base2_int_masked, np.ogrid[: base2_int_masked.size]] / 10
-    )  # + np.log10(0.5)
-    F2R1_b1_prob_mat = (
-        -F2R1_masked_qual_mat[base1_int_masked, np.ogrid[: base1_int_masked.size]] / 10
-    )  # + np.log10(0.5)
-    F2R1_b2_prob_mat = (
-        -F2R1_masked_qual_mat[base2_int_masked, np.ogrid[: base2_int_masked.size]] / 10
-    )  # + np.log10(0.5)
-    """
     ref_int_masked = reference_int[antimask]
     base2_int_masked[
         np.logical_and(
@@ -373,11 +306,8 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
     LR_score = -log10(LR_diff / LR_max)
     LR_abs = np.zeros(n)
     LR_abs[antimask] = LR_masked
-    # LR = np.ones(n) * np.inf
     LR = np.zeros(n)
-    # LR[antimask] = LR_diff
     LR[antimask] = LR_score
-    # LR[LR_abs <= 0] = np.inf
     LR[LR_abs <= 0] = 0
     return (
         LR,
@@ -388,7 +318,9 @@ def genotypeDSSnv(seqs, reference_int, trinuc_int, prior_mat, antimask, params):
     )
 
 
-def genotypeDSIndel(seqs, bam, antimask, hp_int, params):
+def genotypeDSIndel(
+    seqs, reference_start, reference_end, bam, antimask, hp_int, params
+):
     prob_amp = params["ampmat_indel"]
     prob_amp_rev = params["ampmat_indel_rev"]
     prob_dmg = params["dmgmat_indel"]
@@ -401,13 +333,17 @@ def genotypeDSIndel(seqs, bam, antimask, hp_int, params):
         if (seq.is_read2 and seq.is_forward) or (seq.is_read1 and seq.is_reverse):
             F2R1.append(seq)
     chrom = seqs[0].reference_name
-    start = seqs[0].reference_start
-    end = seqs[0].reference_end
+    # start = seqs[0].reference_start
+    # end = seqs[0].reference_end
+    start = reference_start
+    end = reference_end
     indels = set()
     ### Geonotype indel for all found indels
     for seq in F1R2:
         indels.update(findIndels(seq))
-    start = seqs[0].reference_start
+    for seq in F2R1:
+        indels.update(findIndels(seq))
+    # start = seqs[0].reference_start
     indels = list(indels)
     indels_masked = list()
     pos_masked = list()
@@ -444,30 +380,12 @@ def genotypeDSIndel(seqs, bam, antimask, hp_int, params):
     f2r1_seq = np.zeros([n_f2r1, m])
     f1r2_prob = np.zeros([n_f1r2, m])
     f2r1_prob = np.zeros([n_f2r1, m])
-    """
-    f1r2_alt_seq_prob = np.zeros(m)
-    f1r2_ref_seq_prob = np.zeros(m)
-    f2r1_alt_seq_prob = np.zeros(m)
-    f2r1_ref_seq_prob = np.zeros(m)
-    """
+
     f1r2_alt_count = np.zeros(m)
     f1r2_ref_count = np.zeros(m)
     f2r1_alt_count = np.zeros(m)
     f2r1_ref_count = np.zeros(m)
-    """
-    for seq in F1R2:
-        aq, rq, ac, rc = getIndelArr(seq, indels_masked)
-        f1r2_alt_seq_prob += aq
-        f1r2_ref_seq_prob += rq
-        f1r2_alt_count += ac
-        f1r2_ref_count += rc
-    for seq in F2R1:
-        aq, rq, ac, rc = getIndelArr(seq, indels_masked)
-        f2r1_alt_seq_prob += aq
-        f2r1_ref_seq_prob += rq
-        f2r1_alt_count += ac
-        f2r1_ref_count += rc
-    """
+
     for nn, seq in enumerate(F1R2):
         seqArr, qualArr = getIndelArr(seq, indels_masked)
         mask_multiallele[seqArr == -1] = 0
@@ -484,12 +402,7 @@ def genotypeDSIndel(seqs, bam, antimask, hp_int, params):
         f2r1_ref_count += (seqArr == 0).astype(int)
     f1r2_prob = -f1r2_prob / 10
     f2r1_prob = -f2r1_prob / 10
-    """
-    f1r2_alt_seq_prob = -f1r2_alt_seq_prob / 10  # + np.log10(0.5)
-    f1r2_ref_seq_prob = -f1r2_ref_seq_prob / 10  # + np.log10(0.5)
-    f2r1_alt_seq_prob = -f2r1_alt_seq_prob / 10  # + np.log10(0.5)
-    f2r1_ref_seq_prob = -f2r1_ref_seq_prob / 10  # + np.log10(0.5)
-    """
+
     offset = -indelLen_masked
     offset[offset < 0] = 0
     hps = np.zeros(pos_masked.size, dtype=int)

@@ -151,6 +151,7 @@ def do_call(args):
         "normalVAF": args.naf,
         "rescue": args.rescue,
         "maxZeroQualFrac": args.maxZeroQualFrac,
+        "maxDepth": args.maxPileupDepth,
     }
     if args.amperrfile:
         params["amperr_file"] = args.amperrfile
@@ -814,7 +815,7 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
             print(f"Combined coverage file created: {final_output}")
 
             # Index the combined bed file with tabix
-            index_cmd = f"tabix -p bed {final_output}"
+            index_cmd = f"tabix -f -p bed {final_output}"
             try:
                 subprocess.run(index_cmd, shell=True, check=True)
                 print(f"Tabix index created for: {final_output}")

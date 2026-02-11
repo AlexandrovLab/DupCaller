@@ -10,7 +10,12 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=1):
     indelAlleleCount = 0
     processed_read_names = dict()
     for pileupcolumn in bam.pileup(
-        chrom, pos - 1, pos, min_base_quality=minbq, truncated=True
+        chrom,
+        pos - 1,
+        pos,
+        min_base_quality=minbq,
+        truncated=True,
+        max_depth=params["maxDepth"],
     ):
         if pileupcolumn.pos == pos - 1:
             for pileupread in pileupcolumn.pileups:

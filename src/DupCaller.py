@@ -251,6 +251,13 @@ if __name__ == "__main__":
         help="Maximum fraction of bases in a read family that has 0 quality",
         default=0.5,
     )
+    call_parser.add_argument(
+        "--maxPileupDepth",
+        "-pd",
+        type=float,
+        help="Maximum depth for samtools mpileup",
+        default=1000000,
+    )
     ###########
     """
     Learn Arguments
@@ -413,7 +420,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         help="contigs to consider for trinucleotide calculation",
-        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
+        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX", "chrY"],
     )
     estimate_parser.add_argument(
         "-c",

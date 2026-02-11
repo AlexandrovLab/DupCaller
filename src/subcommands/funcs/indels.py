@@ -36,6 +36,9 @@ def getIndelArr(seq, indels):
     for nn, indel in enumerate(indels):
         refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
+        if refPos >= seq.reference_end or refPos < seq.reference_start:
+            seqArr[nn] = -1
+            continue
         readPos = np.where(reference_positions == refPos)[0]
         if len(readPos) == 0 or readPos >= seq.query_length - 1:
             continue
