@@ -2,7 +2,9 @@ import numpy as np
 from .indels import findIndels, getIndelArr
 
 
-def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, params):
+def profileTriNucMismatches(
+    seqs, reference_start, reference_int, trinuc_int, hp_int, antimask, params
+):
     # fasta = params["reference"]
     reverse_comp = {"A": "T", "T": "A", "C": "G", "G": "C"}
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
@@ -35,16 +37,13 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     F1R2_qual_mat = np.zeros([m_F1R2, n])
     F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # Base(ATCG) x reads x pos
     F2R1_qual_mat = np.zeros([m_F2R1, n])
-
-    del_rows = list()
     for mm, seq in enumerate(F1R2):
         qualities = seq.query_alignment_qualities
         sequence = np.array(list(seq.query_alignment_sequence))
         cigartuples = seq.cigartuples
-        # seq_mask = np.zeros(sequence.size,dtype = bool)
         current_seq_ind = 0
-        current_mat_ind = 0
-        reference_ind = 0
+        current_mat_ind = seq.reference_start - reference_start
+        reference_ind = seq.reference_start - reference_start
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
@@ -54,7 +53,6 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
                 F1R2_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
-                # seq_mask[current_seq_ind:current_seq_ind + ct[1]] = True
                 current_seq_ind += ct[1]
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
@@ -63,26 +61,19 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
             elif ct[0] == 2:
                 F1R2_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F1R2_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                antimask[reference_ind : reference_ind + ct[1]] = False
+                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
         F1R2_seq_mat[mm, current_mat_ind:n] = 4
         F1R2_qual_mat[mm, current_mat_ind:n] = 0
-        if ref_length_plus_del / n <= 0.8:
-            del_rows.append(mm)
-    F1R2_seq_mat = np.delete(F1R2_seq_mat, del_rows, 0)
-    F1R2_qual_mat = np.delete(F1R2_qual_mat, del_rows, 0)
-    del_rows = list()
-    F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 6
     for mm, seq in enumerate(F2R1):
         qualities = seq.query_alignment_qualities
         sequence = np.array(list(seq.query_alignment_sequence))
         cigartuples = seq.cigartuples
-        # seq_mask = np.zeros(sequence.size,dtype = bool)
         current_seq_ind = 0
-        current_mat_ind = 0
-        reference_ind = 0
+        current_mat_ind = seq.reference_start - reference_start
+        reference_ind = seq.reference_start - reference_start
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
@@ -92,7 +83,6 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
                 F2R1_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
-                # seq_mask[current_seq_ind:current_seq_ind + ct[1]] = True
                 current_seq_ind += ct[1]
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
@@ -101,17 +91,16 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
             elif ct[0] == 2:
                 F2R1_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F2R1_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                antimask[reference_ind : reference_ind + ct[1]] = False
+                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
         F2R1_seq_mat[mm, current_mat_ind:n] = 4
         F2R1_qual_mat[mm, current_mat_ind:n] = 0
-        if ref_length_plus_del / n <= 0.8:
-            del_rows.append(mm)
-    F2R1_seq_mat = np.delete(F2R1_seq_mat, del_rows, 0)
-    F2R1_qual_mat = np.delete(F2R1_qual_mat, del_rows, 0)
-    F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 6
+
+    F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 0
+    F2R1_qual_mat[F2R1_qual_mat <= params["minBq"]] = 0
+
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
 
@@ -184,14 +173,14 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
         ]
     )
 
-    F1R2_antimask[F1R2_count_mat.sum(axis=0) < 2] = False
+    F1R2_antimask[F1R2_count_mat.sum(axis=0) < 3] = False
     F1R2_ref_count = F1R2_count_mat[reference_int, np.ogrid[: reference_int.size]]
     F1R2_antimask[
         np.logical_and((F1R2_count_mat >= 1).sum(axis=0) < 2, F1R2_ref_count == 0)
     ] = False
     F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
 
-    F2R1_antimask[F2R1_count_mat.sum(axis=0) < 2] = False
+    F2R1_antimask[F2R1_count_mat.sum(axis=0) < 3] = False
     F2R1_ref_count = F2R1_count_mat[reference_int, np.ogrid[: reference_int.size]]
     F2R1_antimask[
         np.logical_and((F2R1_count_mat >= 1).sum(axis=0) < 2, F2R1_ref_count == 0)
@@ -202,6 +191,8 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     F1R2_trinuc_alt_count_mat = np.zeros([96, 4])
     F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
     for mm in range(F1R2_seq_mat.shape[0]):
+        if (F1R2_seq_mat[mm, F1R2_antimask] != reference_int[F1R2_antimask]).sum() > 1:
+            continue
         F1R2_trinuc_alt_1Dmap = (
             F1R2_trinuc_masked + F1R2_seq_mat[mm, F1R2_antimask] * 96
         )
@@ -227,6 +218,8 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     F2R1_trinuc_masked = trinuc_int[F2R1_antimask]
     # F1R2_alt_masked = F1R2_alt_int[F1R2_antimask]
     for mm in range(F2R1_seq_mat.shape[0]):
+        if (F2R1_seq_mat[mm, F2R1_antimask] != reference_int[F2R1_antimask]).sum() > 1:
+            continue
         F2R1_trinuc_alt_1Dmap = (
             F2R1_trinuc_masked + F2R1_seq_mat[mm, F2R1_antimask] * 96
         )
@@ -261,9 +254,15 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     ###INDEL LEARN
     indels = set()
     for seq in F1R2:
-        indels.update(findIndels(seq))
+        current_indels = findIndels(seq)
+        if len(current_indels) > 1:
+            continue
+        indels.update(current_indels)
     for seq in F2R1:
-        indels.update(findIndels(seq))
+        current_indels = findIndels(seq)
+        if len(current_indels) > 1:
+            continue
+        indels.update(current_indels)
     start = seqs[0].reference_start
     indels = list(indels)
     indels_masked = list()
@@ -329,10 +328,10 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
     F2R1_antimask = np.ones(m, dtype=bool)
 
     F1R2_antimask[F1R2_ref_count == 0] = False
-    F1R2_antimask[F1R2_ref_count + F1R2_alt_count < 2] = False
+    F1R2_antimask[F1R2_ref_count + F1R2_alt_count < 3] = False
 
     F2R1_antimask[F2R1_ref_count == 0] = False
-    F2R1_antimask[F2R1_ref_count + F2R1_alt_count < 2] = False
+    F2R1_antimask[F2R1_ref_count + F2R1_alt_count < 3] = False
 
     for mm, indel in enumerate(indels_masked):
         pos = int(indel.split(":")[0]) - 1 - start
@@ -354,7 +353,10 @@ def profileTriNucMismatches(seqs, reference_int, trinuc_int, hp_int, antimask, p
             )
         if dmg_antimask[mm]:
             hpindel_dmg_count[hp - 1, indelLen + 5] += 1
-
+        # trinuc_alt_count = F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm
+        # if trinuc_alt_count[3,1] !=0 or trinuc_alt_count[11,1]!=0 or trinuc_alt_count[19,1]!=0 or trinuc_alt_count[27,1]!=0:
+        # print([(_.get_tag("MD"),_.mapping_quality,_.get_tag("NM")) for _ in seqs])
+        # print(trinuc_alt_count)
         return (
             F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
             hpindel_alt_count,

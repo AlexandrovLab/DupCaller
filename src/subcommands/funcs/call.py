@@ -1147,6 +1147,7 @@ def callBam(params, processNo):
                                 indel_dmg_now,
                             ) = profileTriNucMismatches(
                                 readSet,
+                                rs_reference_start,
                                 ref_np[start_ind:end_ind],
                                 trinuc_np[start_ind:end_ind],
                                 hp_np[0, start_ind:end_ind],
@@ -1777,6 +1778,7 @@ def callBam(params, processNo):
                         indel_dmg_now,
                     ) = profileTriNucMismatches(
                         readSet,
+                        rs_reference_start,
                         ref_np[start_ind:end_ind],
                         trinuc_np[start_ind:end_ind],
                         hp_np[0, start_ind:end_ind],

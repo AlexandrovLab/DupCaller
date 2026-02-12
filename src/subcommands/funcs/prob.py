@@ -122,22 +122,9 @@ def genotypeDSSnv(
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                try:
-                    F1R2_seq_mat[
-                        mm, current_mat_ind : current_mat_ind + ct[1]
-                    ] = base2num_npfunc(
-                        sequence[current_seq_ind : current_seq_ind + ct[1]]
-                    )
-                except:
-                    print(
-                        current_mat_ind,
-                        current_seq_ind,
-                        ct[1],
-                        sequence.shape,
-                        F1R2_seq_mat.shape,
-                    )
-                    for seq in seqs:
-                        print(seq.cigarstring, seq.reference_start)
+                F1R2_seq_mat[
+                    mm, current_mat_ind : current_mat_ind + ct[1]
+                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
                 F1R2_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
