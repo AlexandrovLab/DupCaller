@@ -44,7 +44,7 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 The tool uses pip for installing scripts and prerequisites. We recommend creating a new environment to install DupCaller:
 
 ```bash
-conda create -n DupCaller python=3.12
+conda create -n DupCaller python=3.12 bioconda::tabix
 ```
 
 To install DupCaller, simply clone this repository and install via pip:
