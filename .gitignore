@@ -45,7 +45,5 @@ nextflow/
 nextflow/test/
 nextflow/test_pipeline.sh
 
-# GitHub Actions (not part of published package)
-.github/
 .pre-commit-config.yaml
 .prettierignore
