@@ -20,6 +20,8 @@ def calculate_ref_trinuc(args):
 
 
 def poisson_confint(k, cov, alpha=0.05):
+    if cov == 0:
+        return float("nan"), float("nan")
     low = chi2.ppf(alpha / 2, 2 * k) / 2
     high = chi2.ppf(1 - alpha / 2, 2 * (k + 1)) / 2
     if k == 0:
@@ -103,16 +105,22 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     hap_trinuc = np.zeros([96, 5])
     ## Calculate burden when take 5 as mininum
     trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)
-    trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 5].sum(axis=1)
+    trinuc_cov = trinuc_cov_by_rf[:, nmin >= 5].sum(axis=1)
     mutnum = trinuc_mut.sum()
-    cov = trinuc_cov.sum() / 3
+    cov = trinuc_cov.sum()
     burden_uncorrected[4] = mutnum / cov
     burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
-    trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
-    mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
-    burden_corrected[4] = mutnum_corrected / ref_trinuc.sum()
+    # trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (trinuc_cov / trinuc_cov.sum())
+    correction_ratio = np.repeat(correction_ratio, 3)
+    mutnum_corrected = correction_ratio * trinuc_mut
+    # burden_corrected[4] = mutnum_corrected / ref_trinuc.sum()
+    burden_corrected[4] = mutnum_corrected.sum() / cov
+    # burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
+    # mutnum_corrected, ref_trinuc.sum()
+    # )
     burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
-        mutnum_corrected, ref_trinuc.sum()
+        mutnum_corrected.sum(), cov
     )
     # hap_trinuc[:, 4] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
     hap_trinuc[:, 4] = trinuc_rate * np.repeat(ref_trinuc, 3)
@@ -120,21 +128,28 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     for nn in range(4, 0, -1):
         trinuc_mut = trinuc_mut + trinuc_mut_by_rf[:, nmin == nn].sum(axis=1)
-        trinuc_cov = trinuc_cov + trinuc_mut_cov_by_rf[:, nmin == nn].sum(axis=1)
+        trinuc_cov = trinuc_cov + trinuc_cov_by_rf[:, nmin == nn].sum(axis=1)
         mutnum = trinuc_mut.sum()
-        cov = trinuc_cov.sum() / 3
+        cov = trinuc_cov.sum()
         burden_uncorrected[nn - 1] = mutnum / cov
         burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
             mutnum, cov
         )
         covs[nn - 1] = cov
-        trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
-        mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
-        burden_corrected[nn - 1] = mutnum_corrected / ref_trinuc.sum()
-        burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
-            mutnum_corrected, ref_trinuc.sum()
+        correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (
+            trinuc_cov / trinuc_cov.sum()
         )
-        # hap_trinuc[:, nn - 1] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
+        correction_ratio = np.repeat(correction_ratio, 3)
+        # mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
+        mutnum_corrected = trinuc_mut * correction_ratio
+        # burden_corrected[4] = mutnum_corrected / ref_trinuc.sum()
+        burden_corrected[nn - 1] = mutnum_corrected.sum() / cov
+        # burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
+        # mutnum_corrected, ref_trinuc.sum()
+        # )
+        burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
+            mutnum_corrected.sum(), cov
+        )
         hap_trinuc[:, nn - 1] = trinuc_rate * np.repeat(ref_trinuc, 3)
 
     return (
@@ -146,7 +161,7 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         burden_uncorrected_lb,
         burden_uncorrected_ub,
         mutnum,
-        mutnum_corrected,
+        mutnum_corrected.sum(),
         ref_trinuc.sum(),
         covs,
     )
@@ -250,7 +265,11 @@ def do_estimate(args):
             if "PASS" not in rec.filter and "masked" not in rec.filter:
                 continue
             unmasked_mut_count += 1
-        unmasked_sbs_burden = float(unmasked_mut_count) / float(unmasked_cov)
+        unmasked_sbs_burden = (
+            float(unmasked_mut_count) / float(unmasked_cov)
+            if unmasked_cov > 0
+            else float("nan")
+        )
         unmasked_sbs_burden_lb, unmasked_sbs_burden_ub = poisson_confint(
             unmasked_mut_count, unmasked_cov
         )
@@ -405,11 +424,15 @@ def do_estimate(args):
             if not unique_mutations.get(mutation_key):
                 unique_mutations[mutation_key] = [0, TAC, TDP]
             unique_mutations[mutation_key][0] += 1
-        unmasked_indel_burden = unmasked_indel_count / unmasked_indel_cov
+        unmasked_indel_burden = (
+            unmasked_indel_count / unmasked_indel_cov
+            if unmasked_indel_cov > 0
+            else float("nan")
+        )
         unmasked_indel_burden_lb, unmasked_indel_burden_ub = poisson_confint(
             unmasked_indel_count, unmasked_indel_cov
         )
-        indel_burden = indel_count / indel_cov
+        indel_burden = indel_count / indel_cov if indel_cov > 0 else float("nan")
         indel_burden_lb, indel_burden_ub = poisson_confint(indel_count, indel_cov)
         with open(args.prefix + "/" + sample + "_indel_burden.txt", "w") as f:
             f.write(f"Indel burden\t{indel_burden}\n")
@@ -549,6 +572,8 @@ def do_estimate(args):
                         )
         revcomp = {"A": "T", "T": "A", "C": "G", "G": "C"}
         vcf = VCF(prefix + "/" + sample + "_snv.vcf", "r")
+        vcf_indel = VCF(prefix + "/" + sample + "_indel.vcf", "r")
+        indel_count = 0
         for interval in TabixFile(args.reestimatebed, parser=pysam.asBed()).fetch():
             for loc in TabixFile(f"{sample}/{sample}_coverage.bed.gz").fetch(
                 interval.contig, interval.start, interval.end
@@ -558,6 +583,14 @@ def do_estimate(args):
                 trinuc_count[trinuc] += int(cov)
                 cov_total += int(cov)
                 indel_cov_total += int(indel_cov)
+            for rec in vcf_indel.fetch():
+                if "PASS" not in rec.filter:
+                    continue
+                if rec.chrom != interval.contig:
+                    continue
+                if rec.pos <= interval.start or rec.pos > interval.end:
+                    continue
+                indel_count += 1
             for rec in vcf.fetch():
                 if "PASS" not in rec.filter:
                     continue
@@ -623,6 +656,22 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% upper\t{burden_ub}\n")
             f.write(f"mutation number per genome\t{mutnum_corrected}\n")
             f.write(f"genome coverage\t{genome_cov}\n")
+        indel_burden_re = (
+            indel_count / float(indel_cov_total)
+            if indel_cov_total > 0
+            else float("nan")
+        )
+        indel_burden_re_lb, indel_burden_re_ub = poisson_confint(
+            indel_count, indel_cov_total
+        )
+        with open(
+            args.prefix + "/" + sample + "_indel_burden_re_estimate.txt", "w"
+        ) as f:
+            f.write(f"Indel burden\t{indel_burden_re}\n")
+            f.write(f"Indel burden 95% lower\t{indel_burden_re_lb}\n")
+            f.write(f"Indel burden 95% upper\t{indel_burden_re_ub}\n")
+            f.write(f"Indel number\t{indel_count}\n")
+            f.write(f"Indel coverage\t{indel_cov_total}\n")
         corrected_trinuc_pd = pd.DataFrame(
             corrected_trinuc_num,
             index=num2trinucSbs,

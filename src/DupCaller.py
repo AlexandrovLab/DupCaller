@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-from subcommands.Caller import do_call
-from subcommands.Trim import do_trim
-from subcommands.Summarize import do_summarize
-from subcommands.Learn import do_learn
-from subcommands.AggregateProfile import do_aggregate
-from subcommands.Estimate import do_estimate
-from subcommands.Index import do_index
+from DupCaller_sub.Caller import do_call
+from DupCaller_sub.Trim import do_trim
+from DupCaller_sub.Summarize import do_summarize
+from DupCaller_sub.Learn import do_learn
+from DupCaller_sub.AggregateProfile import do_aggregate
+from DupCaller_sub.Estimate import do_estimate
+from DupCaller_sub.Index import do_index
 
 # from Estimate import do_estimate
 if __name__ == "__main__":
@@ -88,49 +88,72 @@ if __name__ == "__main__":
     )
     ### Learning file locations
     call_parser.add_argument(
+        "-e",
+        "--errprefix",
+        type=str,
+        help="prefix for all four error files ({prefix}.amp.tn.txt, {prefix}.amp.id.txt, "
+        "{prefix}.dmg.tn.txt, {prefix}.dmg.id.txt); overrides the default (output prefix); "
+        "individual -AS/-AI/-DS/-DI arguments take priority over this prefix",
+    )
+    call_parser.add_argument(
         "-AS",
         "--amperrfile",
         type=str,
-        help="amplification error matrix",
+        help="amplification SBS error matrix (overrides -e)",
     )
     call_parser.add_argument(
         "-AI",
         "--amperrfileindel",
         type=str,
-        help="amplification error matrix",
+        help="amplification indel error matrix (overrides -e)",
     )
     call_parser.add_argument(
         "-DS",
         "--dmgerrfile",
         type=str,
-        help="amplification error matrix",
+        help="damage SBS error matrix (overrides -e)",
     )
     call_parser.add_argument(
         "-DI",
         "--dmgerrfileindel",
         type=str,
-        help="amplification error matrix",
+        help="damage indel error matrix (overrides -e)",
     )
     call_parser.add_argument(
         "-mr",
         "--mutRate",
         type=float,
         help="estimated somatic mutation rate per base",
-        default=2.5e-7,
+        default=3e-10,
     )
     call_parser.add_argument(
         "-ts",
         "--thresholdSnv",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.5,
+        default=8.5,
     )
     call_parser.add_argument(
         "-ti",
         "--thresholdIndel",
+        nargs=3,
+        type=float,
+        help="log likelihood ratio threshold of making a mutation call, given 1-5 homopolymer, 6-10 homopolymer, and 11+ homopolymer",
+        default=[10.3, 8.5, 7],
+    )
+    call_parser.add_argument(
+        "-cs",
+        "--scoreSnv",
         type=float,
         help="log likelihood ratio threshold of making a mutation call",
-        default=0.5,
+        default=0.3,
+    )
+    call_parser.add_argument(
+        "-ci",
+        "--scoreIndel",
+        type=float,
+        help="log likelihood ratio threshold of making a mutation call",
+        default=0.3,
     )
     call_parser.add_argument(
         "-mq",
@@ -388,6 +411,12 @@ if __name__ == "__main__":
         type=str,
         help="folder where DupCallerCall results are stored",
     )
+    aggregate_parser.add_argument(
+        "-f",
+        "--input-file",
+        type=str,
+        help="file with one error file prefix per line",
+    )
     aggregate_parser.add_argument("-o", "--output", type=str, help="output filename")
 
     estimate_parser = subparsers.add_parser(
@@ -420,7 +449,7 @@ if __name__ == "__main__":
         nargs="+",
         type=str,
         help="contigs to consider for trinucleotide calculation",
-        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX", "chrY"],
+        default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
     )
     estimate_parser.add_argument(
         "-c",
@@ -467,6 +496,12 @@ if __name__ == "__main__":
     index_parser.add_argument(
         "-f",
         "--reference",
+        type=str,
+        help="Fasta file of reference. Either -f or -ft should be set",
+    )
+    index_parser.add_argument(
+        "-s",
+        "--strbed",
         type=str,
         help="Fasta file of reference. Either -f or -ft should be set",
     )

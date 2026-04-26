@@ -4,7 +4,6 @@
  * DupCaller Nextflow Pipeline
  *
  * A pipeline for calling somatic mutations from barcoded error-corrected NGS data
- *
  */
 
 nextflow.enable.dsl=2
@@ -22,6 +21,7 @@ params.read2 = null
 params.normal_read1 = null
 params.normal_read2 = null
 params.normal_bam = null
+params.tumor_bam = null         // pre-aligned tumor BAM (when skipping trim/align)
 
 // Reference files
 params.reference = null
@@ -37,7 +37,7 @@ params.threads = 4
 params.read_group_id = null
 params.platform = "ILLUMINA"
 
-// DupCaller parameters
+// DupCaller calling parameters
 params.regions = "chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY"
 params.max_af = 1.0
 params.germline_af_cutoff = 0.001
@@ -72,20 +72,19 @@ def helpMessage() {
       --reference           Reference genome fasta file (must be indexed with DupCaller.py index)
 
     Input options (choose one):
-      --read1               Read 1 fastq file (paired with --read2)
-      --read2               Read 2 fastq file (paired with --read1)
-      --skip_trim           Skip trimming step if BAM already exists
-      --skip_align          Skip alignment step if BAM already exists
+      --read1               Read 1 fastq file (start from FASTQ)
+      --read2               Read 2 fastq file (start from FASTQ)
+      --tumor_bam           Pre-aligned/markdup tumor BAM file (skip trim and align)
 
-    Normal sample:
+    Normal sample (choose one, or use --skip_normal):
       --normal_read1        Normal sample read 1 fastq
       --normal_read2        Normal sample read 2 fastq
-      --normal_bam          Pre-aligned normal BAM file
-      --skip_normal         Run without matched normal (requires --max_af)
+      --normal_bam          Pre-aligned normal BAM file (must have .bai index)
+      --skip_normal         Run without matched normal (set --max_af appropriately)
 
     Reference resources:
       --germline_vcf        Indexed germline VCF with AF field
-      --noise_mask          BED file(s) for noise masking (space-separated if multiple)
+      --noise_mask          BED file for noise masking
       --indel_bed           Enhanced panel of normal for indels
 
     Barcode trimming:
@@ -97,13 +96,14 @@ def helpMessage() {
 
     Variant calling:
       --regions             Contigs for variant calling (default: chr1-22,X,Y)
-      --max_af              Maximum allele frequency (default: 1.0, set to 0.1 for panel without normal)
+      --max_af              Maximum allele frequency (default: 1.0)
       --germline_af_cutoff  Germline AF cutoff (default: 0.001)
       --min_n_depth         Minimum normal depth (default: 10)
       --max_zero_qual_frac  Maximum zero quality fraction (default: 0.5)
       --trim_template       Template end trim distance (default: 7)
       --trim_read           Read end trim distance (default: 7)
       --mapq                Minimum mapping quality (default: 40)
+      --window_size         Genomic window size (default: 100000)
 
     Burden estimation:
       --estimate_clonal     Consider clonal mutations (default: false)
@@ -136,9 +136,11 @@ if (params.help) {
 if (!params.sample_name) {
     error "Error: --sample_name is required"
 }
-
 if (!params.reference) {
     error "Error: --reference is required"
+}
+if (!params.read1 && !params.read2 && !params.tumor_bam) {
+    error "Error: provide --read1/--read2 (start from FASTQ) or --tumor_bam (pre-aligned BAM)"
 }
 
 /*
@@ -153,6 +155,11 @@ process TRIM_BARCODES {
 
     output:
     tuple val(sample_name), path("${sample_name}_1.fastq"), path("${sample_name}_2.fastq")
+
+    stub:
+    """
+    touch ${sample_name}_1.fastq ${sample_name}_2.fastq
+    """
 
     script:
     """
@@ -177,6 +184,11 @@ process BWA_ALIGN {
 
     output:
     tuple val(sample_name), path("${sample_name}.bam"), path("${sample_name}.bam.bai")
+
+    stub:
+    """
+    touch ${sample_name}.bam ${sample_name}.bam.bai
+    """
 
     script:
     def rg_id = params.read_group_id ?: sample_name
@@ -205,6 +217,11 @@ process MARK_DUPLICATES {
     output:
     tuple val(sample_name), path("${sample_name}.mkdped.bam"), path("${sample_name}.mkdped.bam.bai"), path("${sample_name}.mkdp_metrics.txt")
 
+    stub:
+    """
+    touch ${sample_name}.mkdped.bam ${sample_name}.mkdped.bam.bai ${sample_name}.mkdp_metrics.txt
+    """
+
     script:
     """
     gatk MarkDuplicates \\
@@ -221,6 +238,31 @@ process MARK_DUPLICATES {
 }
 
 /*
+ * Process: Index a pre-existing BAM file
+ */
+process INDEX_BAM {
+    tag "${sample_name}"
+    publishDir "${params.outdir}/${sample_name}/bam", mode: 'copy'
+
+    input:
+    tuple val(sample_name), path(bam)
+
+    output:
+    tuple val(sample_name), path("${bam}"), path("${bam}.bai"), path("${sample_name}.metrics_placeholder.txt")
+
+    stub:
+    """
+    touch ${bam}.bai ${sample_name}.metrics_placeholder.txt
+    """
+
+    script:
+    """
+    samtools index ${bam}
+    touch ${sample_name}.metrics_placeholder.txt
+    """
+}
+
+/*
  * Process: Call variants with DupCaller
  */
 process CALL_VARIANTS {
@@ -229,8 +271,9 @@ process CALL_VARIANTS {
     cpus params.threads
 
     input:
-    tuple val(sample_name), path(bam), path(bai), path(metrics), path(reference), path(ref_h5), path(tn_h5), path(hp_h5)
-    path(normal_bam)
+    tuple val(sample_name), path(bam), path(bai), path(metrics),
+          path(reference), path(ref_h5), path(tn_h5), path(hp_h5)
+    tuple path(normal_bam), path(normal_bai)
     path(germline_vcf)
     path(noise_mask)
     path(indel_bed)
@@ -240,19 +283,31 @@ process CALL_VARIANTS {
           path("${sample_name}_snv.vcf"),
           path("${sample_name}_indel.vcf"),
           path("${sample_name}_coverage.bed.gz"),
+          path("${sample_name}_coverage.bed.gz.tbi"),
           path("${sample_name}_trinuc_by_duplex_group.txt"),
           path("${sample_name}_duplex_group_stats.txt"),
           path("${sample_name}_stats.txt"),
           path("${sample_name}.amp.tn.txt"),
           path("${sample_name}.amp.id.txt"),
           path("${sample_name}.dmg.tn.txt"),
-          path("${sample_name}.dmg.id.txt")
+          path("${sample_name}.dmg.id.txt"),
+          path("${sample_name}_call_params.log")
+
+    stub:
+    """
+    touch ${sample_name}_snv.vcf ${sample_name}_indel.vcf
+    touch ${sample_name}_coverage.bed.gz ${sample_name}_coverage.bed.gz.tbi
+    touch ${sample_name}_trinuc_by_duplex_group.txt ${sample_name}_duplex_group_stats.txt ${sample_name}_stats.txt
+    touch ${sample_name}.amp.tn.txt ${sample_name}.amp.id.txt
+    touch ${sample_name}.dmg.tn.txt ${sample_name}.dmg.id.txt
+    touch ${sample_name}_call_params.log
+    """
 
     script:
-    def normal_arg = normal_bam.name != 'NO_FILE' ? "-n ${normal_bam}" : ""
-    def germline_arg = germline_vcf.name != 'NO_FILE' ? "-g ${germline_vcf}" : ""
-    def noise_arg = noise_mask.name != 'NO_FILE' ? "-m ${noise_mask}" : ""
-    def indel_arg = indel_bed.name != 'NO_FILE' ? "-id ${indel_bed}" : ""
+    def normal_arg = normal_bam.name != 'NO_NORMAL_BAM' ? "-n ${normal_bam}" : ""
+    def germline_arg = germline_vcf.name != 'NO_GERMLINE_VCF' ? "-g ${germline_vcf}" : ""
+    def noise_arg = noise_mask.name != 'NO_NOISE_MASK' ? "-m ${noise_mask}" : ""
+    def indel_arg = indel_bed.name != 'NO_INDEL_BED' ? "-id ${indel_bed}" : ""
 
     """
     DupCaller.py call \\
@@ -273,6 +328,7 @@ process CALL_VARIANTS {
         -tr ${params.trim_read} \\
         -mq ${params.mapq} \\
         -w ${params.window_size}
+    mv ${sample_name}/* .
     """
 }
 
@@ -288,6 +344,7 @@ process ESTIMATE_BURDEN {
           path(snv_vcf),
           path(indel_vcf),
           path(coverage),
+          path(coverage_tbi),
           path(trinuc),
           path(duplex_stats),
           path(stats),
@@ -295,6 +352,7 @@ process ESTIMATE_BURDEN {
           path(amp_id),
           path(dmg_tn),
           path(dmg_id),
+          path(call_params_log),
           path(reference),
           path(ref_h5),
           path(tn_h5),
@@ -311,24 +369,24 @@ process ESTIMATE_BURDEN {
           path("${sample_name}_sbs_burden_by_min_read_group_size.png"),
           path("${sample_name}_duplex_allele_counts.txt")
 
+    stub:
+    """
+    touch ${sample_name}_sbs_burden.txt ${sample_name}_indel_burden.txt
+    touch ${sample_name}_sbs_96_corrected.txt ${sample_name}_sbs_96_corrected.png
+    touch ${sample_name}_sbs_burden_by_min_read_group_size.txt ${sample_name}_sbs_burden_by_min_read_group_size.png
+    touch ${sample_name}_duplex_allele_counts.txt
+    """
+
     script:
-    def gene_arg = gene_bed.name != 'NO_FILE' ? "-gb ${gene_bed}" : ""
+    def gene_arg = gene_bed.name != 'NO_GENE_BED' ? "-gb ${gene_bed}" : ""
     def clonal_arg = params.estimate_clonal ? "-c true" : ""
     def dilute_arg = params.estimate_dilute ? "-d true" : ""
 
     """
-    # Copy variant call outputs to current directory for estimate command
-    ln -s ${snv_vcf} .
-    ln -s ${indel_vcf} .
-    ln -s ${coverage} .
-    ln -s ${trinuc} .
-    ln -s ${duplex_stats} .
-    ln -s ${stats} .
-    ln -s ${amp_tn} .
-    ln -s ${amp_id} .
-    ln -s ${dmg_tn} .
-    ln -s ${dmg_id} .
-
+    mkdir -p ${sample_name}
+    for f in \$(ls ${sample_name}_* ${sample_name}.* 2>/dev/null); do
+        ln -sf \$(realpath \$f) ${sample_name}/
+    done
     DupCaller.py estimate \\
         -i ${sample_name} \\
         -f ${reference} \\
@@ -336,6 +394,14 @@ process ESTIMATE_BURDEN {
         ${gene_arg} \\
         ${clonal_arg} \\
         ${dilute_arg}
+    mv ${sample_name}/${sample_name}_sbs_burden.txt \\
+       ${sample_name}/${sample_name}_indel_burden.txt \\
+       ${sample_name}/${sample_name}_sbs_96_corrected.txt \\
+       ${sample_name}/${sample_name}_sbs_96_corrected.png \\
+       ${sample_name}/${sample_name}_sbs_burden_by_min_read_group_size.txt \\
+       ${sample_name}/${sample_name}_sbs_burden_by_min_read_group_size.png \\
+       ${sample_name}/${sample_name}_duplex_allele_counts.txt \\
+       .
     """
 }
 
@@ -343,51 +409,72 @@ process ESTIMATE_BURDEN {
  * Main workflow
  */
 workflow {
-    // Check reference files
-    ref_ch = Channel.fromPath(params.reference, checkIfExists: true)
-    ref_h5 = params.reference+".ref.h5"
-    tn_h5 = params.reference+".tn.h5"
-    hp_h5 = params.reference+".hp.h5"
 
+    // Reference file channels — all four files must exist (created by DupCaller.py index)
+    ref_ch    = Channel.fromPath(params.reference,              checkIfExists: true)
+    ref_h5_ch = Channel.fromPath(params.reference + ".ref.h5", checkIfExists: true)
+    tn_h5_ch  = Channel.fromPath(params.reference + ".tn.h5",  checkIfExists: true)
+    hp_h5_ch  = Channel.fromPath(params.reference + ".hp.h5",  checkIfExists: true)
 
-    // Handle optional files
-    germline_ch = params.germline_vcf ? Channel.fromPath(params.germline_vcf, checkIfExists: true) : Channel.value(file('NO_FILE'))
-    noise_ch = params.noise_mask ? Channel.fromPath(params.noise_mask, checkIfExists: true) : Channel.value(file('NO_FILE'))
-    indel_ch = params.indel_bed ? Channel.fromPath(params.indel_bed, checkIfExists: true) : Channel.value(file('NO_FILE'))
-    gene_ch = params.gene_bed ? Channel.fromPath(params.gene_bed, checkIfExists: true) : Channel.value(file('NO_FILE'))
+    // Optional input channels
+    germline_ch = params.germline_vcf
+        ? Channel.fromPath(params.germline_vcf, checkIfExists: true)
+        : Channel.value(file('NO_GERMLINE_VCF'))
+    noise_ch = params.noise_mask
+        ? Channel.fromPath(params.noise_mask, checkIfExists: true)
+        : Channel.value(file('NO_NOISE_MASK'))
+    indel_ch = params.indel_bed
+        ? Channel.fromPath(params.indel_bed, checkIfExists: true)
+        : Channel.value(file('NO_INDEL_BED'))
+    gene_ch = params.gene_bed
+        ? Channel.fromPath(params.gene_bed, checkIfExists: true)
+        : Channel.value(file('NO_GENE_BED'))
 
-    // Tumor sample processing
-    if (!params.skip_trim && params.read1 && params.read2) {
+    // -----------------------------------------------------------------------
+    // Tumor sample: produce markdup channel
+    //   emits: tuple val(sample_name), path(bam), path(bai), path(metrics)
+    // -----------------------------------------------------------------------
+    if (params.tumor_bam) {
+        // Pre-aligned BAM provided — index it and create a placeholder metrics file
+        bam_ch = Channel.of([params.sample_name, file(params.tumor_bam)])
+        markdup = INDEX_BAM(bam_ch)
+    } else {
         // Start from FASTQ
         reads_ch = Channel.of([params.sample_name, file(params.read1), file(params.read2)])
-        trimmed = TRIM_BARCODES(reads_ch)
-
-        // Combine with reference
-        align_input = trimmed.combine(ref_ch)
-        aligned = BWA_ALIGN(align_input)
-    } else if (params.skip_trim) {
-        error "BAM file input not yet implemented. Please provide --read1 and --read2"
+        trimmed  = TRIM_BARCODES(reads_ch)
+        aligned  = BWA_ALIGN(trimmed.combine(ref_ch))
+        markdup  = MARK_DUPLICATES(aligned)
     }
 
-    // Mark duplicates
-    markdup = MARK_DUPLICATES(aligned)
-
-    // Normal sample handling
+    // -----------------------------------------------------------------------
+    // Normal sample channel
+    //   emits: tuple path(normal_bam), path(normal_bai)
+    // -----------------------------------------------------------------------
     if (params.normal_bam) {
-        normal_ch = Channel.fromPath(params.normal_bam, checkIfExists: true)
+        normal_ch = Channel.value([
+            file(params.normal_bam),
+            file(params.normal_bam + ".bai")
+        ])
     } else if (params.normal_read1 && params.normal_read2 && !params.skip_normal) {
-        normal_reads = Channel.of(["normal_${params.sample_name}", file(params.normal_read1), file(params.normal_read2)])
+        normal_reads   = Channel.of(["normal_${params.sample_name}", file(params.normal_read1), file(params.normal_read2)])
         normal_trimmed = TRIM_BARCODES(normal_reads)
-        normal_align_input = normal_trimmed.combine(indexed_ref)
-        normal_aligned = BWA_ALIGN(normal_align_input)
+        normal_aligned = BWA_ALIGN(normal_trimmed.combine(ref_ch))
         normal_markdup = MARK_DUPLICATES(normal_aligned)
-        normal_ch = normal_markdup.map { it[1] }
+        normal_ch      = normal_markdup.map { _sn, bam, bai, _m -> [bam, bai] }
     } else {
-        normal_ch = Channel.value(file('NO_FILE'))
+        normal_ch = Channel.value([file('NO_NORMAL_BAM'), file('NO_NORMAL_BAI')])
     }
 
+    // -----------------------------------------------------------------------
     // Variant calling
-    call_input = markdup.combine(ref_ch)
+    // call_input: tuple(sample_name, bam, bai, metrics, ref, ref_h5, tn_h5, hp_h5)
+    // -----------------------------------------------------------------------
+    call_input = markdup
+        .combine(ref_ch)
+        .combine(ref_h5_ch)
+        .combine(tn_h5_ch)
+        .combine(hp_h5_ch)
+
     variants = CALL_VARIANTS(
         call_input,
         normal_ch,
@@ -396,9 +483,17 @@ workflow {
         indel_ch
     )
 
+    // -----------------------------------------------------------------------
     // Burden estimation
-    burden_input = variants.combine(ref_ch)
-    burden = ESTIMATE_BURDEN(burden_input, gene_ch)
+    // burden_input: variants tuple + ref + ref_h5 + tn_h5 + hp_h5
+    // -----------------------------------------------------------------------
+    burden_input = variants
+        .combine(ref_ch)
+        .combine(ref_h5_ch)
+        .combine(tn_h5_ch)
+        .combine(hp_h5_ch)
+
+    ESTIMATE_BURDEN(burden_input, gene_ch)
 }
 
 workflow.onComplete {

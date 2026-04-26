@@ -22,11 +22,22 @@ def sum_dataframes(dfs):
 
 
 def do_aggregate(args):
+    if not args.input and not args.input_file:
+        raise ValueError("Either -i/--input or -f/--input-file must be provided")
+
+    samples = list(args.input) if args.input else []
+    if args.input_file:
+        with open(args.input_file) as fh:
+            for line in fh:
+                prefix = line.strip()
+                if prefix:
+                    samples.append(prefix)
+
     dmg_id = list()
     dmg_tn = list()
     amp_id = list()
     amp_tn = list()
-    for sample in args.input:
+    for sample in samples:
         dmg_id.append(pd.read_csv(sample + "/" + sample + ".dmg.id.txt", sep="\t"))
         dmg_tn.append(pd.read_csv(sample + "/" + sample + ".dmg.tn.txt", sep="\t"))
         amp_id.append(pd.read_csv(sample + "/" + sample + ".amp.id.txt", sep="\t"))

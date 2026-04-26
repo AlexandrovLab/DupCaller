@@ -1,7 +1,5 @@
 build/
 src/DupCaller.egg-info
-.prettierignore
-.pre-commit-config.yaml
 
 # Python cache files
 __pycache__/
@@ -36,3 +34,16 @@ tmp/
 temp/
 
 CHANGES_SUMMARY.md
+
+# Singularity images (large binaries)
+*.sif
+
+# Test data and local test runs
+test/
+test2/
+nextflow/
+nextflow/test/
+nextflow/test_pipeline.sh
+
+# GitHub Actions (not part of published package)
+.github/

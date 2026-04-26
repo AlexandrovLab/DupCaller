@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import shutil
 from collections import OrderedDict
 from multiprocessing import Pool
 import errno
@@ -82,14 +83,25 @@ def check_input_files_exist(args):
         missing_files.append(f"Indel BED file: {args.indelbed}")
 
     # Check optional error profile files
+    if args.errprefix:
+        for suffix, label in [
+            (".amp.tn.txt", "Amplification SBS error file"),
+            (".amp.id.txt", "Amplification indel error file"),
+            (".dmg.tn.txt", "Damage SBS error file"),
+            (".dmg.id.txt", "Damage indel error file"),
+        ]:
+            path = args.errprefix + suffix
+            if not os.path.exists(path):
+                missing_files.append(f"{label} (from -e): {path}")
+
     if args.amperrfile and not os.path.exists(args.amperrfile):
-        missing_files.append(f"Amplification error file: {args.amperrfile}")
+        missing_files.append(f"Amplification SBS error file: {args.amperrfile}")
 
     if args.amperrfileindel and not os.path.exists(args.amperrfileindel):
         missing_files.append(f"Amplification indel error file: {args.amperrfileindel}")
 
     if args.dmgerrfile and not os.path.exists(args.dmgerrfile):
-        missing_files.append(f"Damage error file: {args.dmgerrfile}")
+        missing_files.append(f"Damage SBS error file: {args.dmgerrfile}")
 
     if args.dmgerrfileindel and not os.path.exists(args.dmgerrfileindel):
         missing_files.append(f"Damage indel error file: {args.dmgerrfileindel}")
@@ -128,13 +140,13 @@ def do_call(args):
         # "amperri": args.amperri,
         "amperr_file": args.output + ".amp.tn.txt",
         "amperri_file": args.output + ".amp.id.txt",
-        # "dmgerr": args.dmgerrs,
-        # "dmgerri": args.dmgerri,
         "dmgerr_file": args.output + ".dmg.tn.txt",
         "dmgerri_file": args.output + ".dmg.id.txt",
         "mutRate": args.mutRate,
         "pcutoff": args.thresholdSnv,
         "pcutoffi": args.thresholdIndel,
+        "cscutoff": args.scoreSnv,
+        "cscutoffi": args.scoreIndel,
         "mapq": args.mapq,
         "noise": args.noise,
         "indel_bed": args.indelbed,
@@ -153,14 +165,36 @@ def do_call(args):
         "maxZeroQualFrac": args.maxZeroQualFrac,
         "maxDepth": args.maxPileupDepth,
     }
+    if args.errprefix:
+        params["amperr_file"] = args.errprefix + ".amp.tn.txt"
+        params["amperri_file"] = args.errprefix + ".amp.id.txt"
+        params["dmgerr_file"] = args.errprefix + ".dmg.tn.txt"
+        params["dmgerri_file"] = args.errprefix + ".dmg.id.txt"
     if args.amperrfile:
         params["amperr_file"] = args.amperrfile
     if args.amperrfileindel:
         params["amperri_file"] = args.amperrfileindel
     if args.dmgerrfile:
         params["dmgerr_file"] = args.dmgerrfile
-    if args.dmgerrfile:
+    if args.dmgerrfileindel:
         params["dmgerri_file"] = args.dmgerrfileindel
+
+    # Write parameter log to the results folder
+    log_path = args.output + "_call_params.log"
+    with open(log_path, "w") as log:
+        log.write(f"DupCaller call — parameter log\n")
+        log.write(f"Run time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Command:  {' '.join(sys.argv)}\n")
+        log.write("\n--- All parameters (resolved values) ---\n")
+        arg_dict = vars(args)
+        for key, value in sorted(arg_dict.items()):
+            log.write(f"  {key}: {value}\n")
+        log.write("\n--- Resolved error file paths ---\n")
+        log.write(f"  amperr_file:  {params['amperr_file']}\n")
+        log.write(f"  amperri_file: {params['amperri_file']}\n")
+        log.write(f"  dmgerr_file:  {params['dmgerr_file']}\n")
+        log.write(f"  dmgerri_file: {params['dmgerri_file']}\n")
+
     params_learn = {
         "tumorBam": args.bam,
         "normalBams": None,
@@ -216,12 +250,11 @@ def do_call(args):
     # print("..............Loading reference genome.....................")
     # fasta = SeqIO.to_dict(SeqIO.parse(args.reference, "fasta"))
     startTime = time.time()
-    if not os.path.exists("tmp"):
-        try:
-            os.mkdir("tmp")
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
+    results_dir = os.path.dirname(args.output)
+    tmp_dir = os.path.join(results_dir, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    params["tmp_dir"] = tmp_dir
+    params_learn["tmp_dir"] = tmp_dir
     bamObject = BAM(args.bam, "rb", args.reference)
     if params["region_file"]:
         regionfile = params["region_file"]
@@ -263,6 +296,7 @@ def do_call(args):
                 mismatch_dmg_profile,
                 indelerr_dmg_profile,
             ) = callBam(paramsNow, 0)
+
         else:
             """
             Multi-thread execution
@@ -352,7 +386,7 @@ def do_call(args):
             pool.terminate()
             pool.join()
 
-            mismatch_profile = sum([_[0] for _ in results]).astype(int)
+            mismatch_profile = sum([_[0] for _ in results])
             indelerr_profile = sum([_[1] for _ in results]).astype(int)
             mismatch_dmg_profile = sum([_[2] for _ in results]).astype(int)
             indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)
@@ -448,6 +482,9 @@ def do_call(args):
         )
         duplex_coverage_by_group = OrderedDict(
             {num: duplex_read_num_single[num][1] for num in duplex_combinations}
+        )
+        total_family_num = OrderedDict(
+            {num: duplex_read_num_single[num][2] for num in duplex_combinations}
         )
         duplex_read_num_trinuc = OrderedDict(
             {num: duplex_read_num_trinuc_single[num] for num in duplex_combinations}
@@ -583,13 +620,19 @@ def do_call(args):
         duplex_combinations.sort()
         duplex_read_num = OrderedDict(
             {
-                num: sum([d.get(num, [0, 0])[0] for d in duplex_read_nums])
+                num: sum([d.get(num, [0, 0, 0])[0] for d in duplex_read_nums])
                 for num in duplex_combinations
             }
         )
         duplex_coverage_by_group = OrderedDict(
             {
-                num: sum([d.get(num, [0, 0])[1] for d in duplex_read_nums])
+                num: sum([d.get(num, [0, 0, 0])[1] for d in duplex_read_nums])
+                for num in duplex_combinations
+            }
+        )
+        total_family_num = OrderedDict(
+            {
+                num: sum([d.get(num, [0, 0, 0])[2] for d in duplex_read_nums])
                 for num in duplex_combinations
             }
         )
@@ -622,7 +665,13 @@ def do_call(args):
         "F2R1": [1, "Integer", "Number of F2R1 read(s) in the read bundle"],
         # "TLR": [1, "Float", "Alt/Ref log likelihood ratio of top strand"],
         # "BLR": [1, "Float", "Alt/Ref log likelihood ratio of bottom strand"],
+        "CS": [1, "Float", "confidence score of major base over minor base"],
         "LR": [1, "Float", "Log-Likelihood ratio of major base over minor base"],
+        "LM": [
+            1,
+            "Float",
+            "maximum log-Likelihood ratio of major base over minor base",
+        ],
         "TC": [4, "Integer", "Top strand base count"],
         "BC": [4, "Float", "Bottom strand base count"],
         "DF": [1, "Integer", "Distance from fragment end"],
@@ -631,7 +680,12 @@ def do_call(args):
         "TAG2": [1, "String", "Barcode of bottom strand 5 prime"],
         "SP": [1, "Integer", "Read family reference start position"],
         "TN": [1, "String", "trinucleotide context"],
-        "HP": [1, "Integer", "Homopolymer length"],
+        "HP": [1, "Integer", "Homopolymer length. Always 0 for SBS"],
+        "STR": [
+            1,
+            "Integer",
+            "reference allele length bin of short tandem repeats. 0: no STR or less than 10bp. 1: 10-24bp. 2: 25-39bp. 3: 40bp+. Always 0 for SBS",
+        ],
     }
     formatDict = {
         "AC": [1, "Integer", "Count of alt allele"],
@@ -641,6 +695,8 @@ def do_call(args):
     filterDict = {
         "PASS": "All filter Passed",
         "masked": "Mutation filtered by noise mask",
+        "underpowered": "Mutation that are underpowered under set threshold",
+        "high_nm": "Mutation filtered by high NM tag filter",
     }
 
     # Separate mutations by filter type
@@ -665,33 +721,71 @@ def do_call(args):
     efficiency = duplex_num / rec_num
     pass_duprate = unique_read_num / pass_read_num
 
-    with open(args.output + "_duplex_group_stats.txt", "w") as f:
-        f.write(
-            "duplex_group_strand_composition\tduplex_group_number\t\
-            effective_coverage\tmutation_count\n"
-        )
-        muts_by_duplex_group = OrderedDict()
-        non_zero_keys = []
-        for read_num in duplex_read_num.keys():
-            if duplex_read_num[read_num] != 0:
-                non_zero_keys.append(read_num)
-            muts_by_duplex_group[read_num] = 0
-        for mut in mutsAll:
-            TC_total = int(mut["infos"]["F1R2"])
-            BC_total = int(mut["infos"]["F2R1"])
-            if (
-                muts_by_duplex_group.get(str(TC_total) + "+" + str(BC_total))
-                is not None
-            ):
-                muts_by_duplex_group[str(TC_total) + "+" + str(BC_total)] += 1
-            else:
-                muts_by_duplex_group[str(BC_total) + "+" + str(TC_total)] += 1
+    # Build muts_by_duplex_group over all keys (including 0+n / n+0)
+    muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
+    for mut in mutsAll:
+        TC_total = int(mut["infos"]["F1R2"])
+        BC_total = int(mut["infos"]["F2R1"])
+        key_fwd = str(TC_total) + "+" + str(BC_total)
+        key_rev = str(BC_total) + "+" + str(TC_total)
+        if key_fwd in muts_by_duplex_group:
+            muts_by_duplex_group[key_fwd] += 1
+        elif key_rev in muts_by_duplex_group:
+            muts_by_duplex_group[key_rev] += 1
 
-        for read_num in non_zero_keys:
+    # All keys, including 0+n and n+0 (read_set_count may be 0 for duplex-only counts
+    # but the read set itself exists); include every key present in duplex_read_num
+    all_keys = sorted(
+        duplex_read_num.keys(),
+        key=lambda s: (int(s.split("+")[0]), int(s.split("+")[1])),
+    )
+    with open(args.output + "_duplex_family_strand_composition.txt", "w") as f:
+        f.write(
+            "duplex_group_strand_composition\tread_family_number\tduplex_group_number\teffective_coverage\n"
+        )
+        for read_num in all_keys:
             f.write(
-                f"{read_num}\t{duplex_read_num[read_num]}\t\
-                {duplex_coverage_by_group[read_num]}\t{muts_by_duplex_group[read_num]}\n"
+                f"{read_num}\t{total_family_num[read_num]}\t{duplex_read_num[read_num]}\t{duplex_coverage_by_group[read_num]}\n"
             )
+
+    # Heatmap: x = F1R2 count, y = F2R1 count, value = proportion of read sets
+    max_val = max(
+        (max(int(k.split("+")[0]), int(k.split("+")[1])) for k in all_keys),
+        default=0,
+    )
+    total_read_sets = sum(total_family_num.values())
+    # Determine n such that families with either strand > n are < 1% of the library
+    n = 0
+    if total_read_sets > 0:
+        for candidate in range(max_val + 1):
+            outlier_count = sum(
+                v
+                for k, v in total_family_num.items()
+                if max(int(k.split("+")[0]), int(k.split("+")[1])) > candidate
+            )
+            if outlier_count / total_read_sets < 0.01:
+                n = candidate
+                break
+        else:
+            n = max_val
+    heatmap_data = np.zeros((n + 1, n + 1), dtype=float)
+    for k in all_keys:
+        x, y = int(k.split("+")[0]), int(k.split("+")[1])
+        if x <= n and y <= n:
+            heatmap_data[y, x] = total_family_num[k] / total_read_sets
+    fig, ax = plt.subplots(figsize=(max(6, n + 2), max(5, n + 1)))
+    im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="YlOrRd")
+    ax.set_xlabel("F1R2 read count (top strand)")
+    ax.set_ylabel("F2R1 read count (bottom strand)")
+    ax.set_title("Proportion of read sets by duplex group composition")
+    ax.set_xticks(range(n + 1))
+    ax.set_yticks(range(n + 1))
+    plt.colorbar(im, ax=ax, label="Proportion of read sets")
+    plt.tight_layout()
+    fig.savefig(args.output + "_duplex_family_strand_composition_heatmap.pdf")
+    plt.close(fig)
+
+    non_zero_keys = [k for k in all_keys if duplex_read_num[k] != 0]
     trinuc_list = list()
     trinuc2num = dict()
     for minus_base in ["A", "T", "C", "G"]:
@@ -739,26 +833,33 @@ def do_call(args):
     )
 
     # Merge and combine coverage files after multi-threaded calling
+    mergeStartTime = time.time()
+    sample_name = os.path.basename(args.output)
+    sample_dir = params["tmp_dir"]
     if args.threads > 1:
-        mergeStartTime = time.time()
-        sample_name = os.path.basename(args.output)
-        sample_dir = os.path.join("tmp", sample_name)
         merge_and_combine_coverage_files(sample_name, sample_dir, args.threads)
-        subprocess.run(
-            f"mv {os.path.join(sample_dir, f'{sample_name}_coverage.bed.gz')} {sample_name}/",
-            shell=True,
-            check=True,
-        )
-        subprocess.run(
-            f"mv {os.path.join(sample_dir, f'{sample_name}_coverage.bed.gz.tbi')} {sample_name}/",
-            shell=True,
-            check=True,
-        )
-        print(
-            "..............Completed coverage merging in "
-            + str((time.time() - mergeStartTime) / 60)
-            + " minutes..............."
-        )
+    else:
+        # Single-threaded: rename the single coverage file and index it
+        single_cov = os.path.join(sample_dir, f"{sample_name}_0_coverage.bed.gz")
+        merged_cov = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
+        subprocess.run(f"mv {single_cov} {merged_cov}", shell=True, check=True)
+        subprocess.run(f"tabix -f -p bed {merged_cov}", shell=True, check=True)
+    subprocess.run(
+        f"mv {os.path.join(sample_dir, f'{sample_name}_coverage.bed.gz')} {os.path.dirname(args.output)}/",
+        shell=True,
+        check=True,
+    )
+    subprocess.run(
+        f"mv {os.path.join(sample_dir, f'{sample_name}_coverage.bed.gz.tbi')} {os.path.dirname(args.output)}/",
+        shell=True,
+        check=True,
+    )
+    shutil.rmtree(params["tmp_dir"])
+    print(
+        "..............Completed coverage merging in "
+        + str((time.time() - mergeStartTime) / 60)
+        + " minutes..............."
+    )
 
 
 def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):

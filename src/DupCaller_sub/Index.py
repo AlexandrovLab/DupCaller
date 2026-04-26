@@ -4,6 +4,8 @@ import gzip
 import numpy as np
 import os
 from Bio import SeqIO
+import pysam
+from pysam import TabixFile as TABIX
 
 
 def do_index(args):
@@ -67,6 +69,7 @@ def do_index(args):
     ref_h5 = h5py.File(args.reference + ".ref.h5", "w")
     tn_h5 = h5py.File(args.reference + ".tn.h5", "w")
     hp_h5 = h5py.File(args.reference + ".hp.h5", "w")
+    str_bed = TABIX(args.strbed, "r")
     for chrom in fasta.keys():
         print(f"Currently processing:{chrom}")
         print(f"Creating reference sequence index")
@@ -84,16 +87,29 @@ def do_index(args):
         ]
         trinuc_int = np.array([trinuc2num.get(_, 96) for _ in trinucs], dtype="uint8")
         print(f"Creating homopolymer index")
-        hp_lens_forw = np.ones(len(reference_seq), dtype=int)
+        hp_lens_cut = np.zeros(len(reference_seq), dtype="uint8")
         hp_lens_rev = np.ones(len(reference_seq), dtype=int)
-        for nn, b in enumerate(reference_int[1:]):
-            if reference_int[nn] == reference_int[nn + 1]:
-                hp_lens_forw[nn + 1] = hp_lens_forw[nn] + 1
+        hp_lens_str = np.zeros(len(reference_seq), dtype="uint8")
+        hp_lens_str_cut = np.zeros(len(reference_seq), dtype="uint8")
+        # for nn, b in enumerate(reference_int[1:]):
+        # if reference_int[nn] == reference_int[nn + 1]:
+        # hp_lens_forw[nn + 1] = hp_lens_forw[nn] + 1
         ref_len = reference_int.size
         for nn, b in enumerate(reference_int[:-1]):
             if reference_int[ref_len - nn - 1] == reference_int[ref_len - nn - 2]:
                 hp_lens_rev[ref_len - nn - 2] = hp_lens_rev[ref_len - nn - 1] + 1
-        hp_lens = np.vstack((hp_lens_forw, hp_lens_rev))
+            else:
+                hp_lens_cut[ref_len - nn - 1] = 1
+        if chrom in str_bed.contigs:
+            for rec in str_bed.fetch(chrom, parser=pysam.asBed()):
+                ref_len = rec.end - rec.start
+                if ref_len > 40:
+                    ref_len = 40
+                ref_len_idx = np.floor((ref_len - 10) / 15) + 1
+                hp_lens_str[rec.start : rec.end] = ref_len_idx
+                hp_lens_str_cut[rec.start] = 1
+
+        hp_lens = np.vstack((hp_lens_rev, hp_lens_cut, hp_lens_str, hp_lens_str_cut))
         hp_lens[hp_lens > 127] = 127
         hp_lens = hp_lens.astype(np.uint8)
         idx = ref_h5.create_dataset(chrom, data=reference_int)

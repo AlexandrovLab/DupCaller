@@ -3,7 +3,7 @@ import pysam
 from .misc import getAlignmentObject as BAM
 
 
-def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=1):
+def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):
     altAlleleCount = 0
     refAlleleCount = 0
     otherAlleleCount = 0
@@ -52,7 +52,7 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=1):
     return altAlleleCount, refAlleleCount, indelAlleleCount, depth
 
 
-def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=1):
+def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=18):
     indel_size = len(alt) - len(ref)
     altAlleleCount = 0
     refAlleleCount = 0
@@ -60,7 +60,12 @@ def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=1):
     otherIndelCount = 0
     processed_read_names = dict()
     for pileupcolumn in bam.pileup(
-        chrom, pos - 1, pos, min_base_quality=minbq, truncate=True
+        chrom,
+        pos - 1,
+        pos,
+        min_base_quality=minbq,
+        truncate=True,
+        max_depth=params["maxDepth"],
     ):
         if pileupcolumn.pos == pos - 1:
             for pileupread in pileupcolumn.pileups:
@@ -337,13 +342,6 @@ def prepareAlignMask(bam, chrom, start, end, params):
     avg_asxs_r = sum_asxs_r / count_r
     avg_asxs = np.min(np.vstack([avg_asxs_f, avg_asxs_r]), axis=0)
     avg_asxs[avg_asxs == np.inf] = 0
-    """
-    for nn in range(avg_asxs.size):
-        if avg_asxs[nn] != 0:
-            print(avg_asxs[nn],avg_asxs_f[nn],avg_asxs_r[nn],nn+start)
-        if avg_nm[nn] != np.inf:
-            print(avg_nm[nn],avg_nm_f[nn],avg_nm_r[nn],nn+start)
-    """
 
     align_mask = np.logical_or(
         avg_nm >= params["maxNM"] / 2, avg_asxs <= params["minMeanASXS"]
@@ -351,8 +349,9 @@ def prepareAlignMask(bam, chrom, start, end, params):
     return align_mask
 
 
-def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2, start):
-    discord_num = 0
+def detectOverlapDiscord(
+    bam, chrom, pos, ref, alt, params, bc1, bc2, start, template_length
+):
     for pileupcolumn in bam.pileup(
         chrom,
         pos - 1,
@@ -360,7 +359,9 @@ def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2, start):
         min_base_quality=0,
         truncated=True,
         stepper="samtools",
-        flag_filter=2828,
+        flag_filter=3852,
+        maxdepth=100000,
+        ignore_overlaps=False,
     ):
         if pileupcolumn.pos == pos - 1:
             for pileupread in pileupcolumn.pileups:
@@ -368,7 +369,7 @@ def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2, start):
                     pileupread.is_refskip
                     or pileupread.alignment.is_secondary
                     or pileupread.alignment.is_supplementary
-                    # or pileupread.alignment.is_duplicate
+                    or pileupread.alignment.is_duplicate
                     or pileupread.alignment.has_tag("DT")
                     or pileupread.alignment.mapping_quality <= params["mapq"]
                     or pileupread.is_del
@@ -377,16 +378,23 @@ def detectOverlapDiscord(bam, chrom, pos, ref, alt, params, bc1, bc2, start):
                 read_name = pileupread.alignment.query_name
                 read_bc1 = (read_name.split("_")[1].split("+"))[0]
                 read_bc2 = (read_name.split("_")[1].split("+"))[1]
-                qual = pileupread.alignment.query_qualities[pileupread.query_position]
                 if (
                     (
                         (read_bc1 == bc1 and read_bc2 == bc2)
                         or (read_bc1 == bc2 and read_bc2 == bc1)
                     )
-                    and qual == 0
-                    and pileupread.alignment.reference_start == start
+                    and pileupread.alignment.template_length == template_length
+                    and pileupread.alignment.reference_start - start <= 5
                 ):
-                    discord_num += 1
-                    if discord_num >= 2:
-                        return True
+                    if len(ref) == len(alt):
+                        if (
+                            pileupread.alignment.query_sequence[
+                                pileupread.query_position
+                            ]
+                            != alt
+                        ):
+                            return True
+                    else:
+                        if pileupread.indel != (len(alt) - len(ref)):
+                            return True
     return False

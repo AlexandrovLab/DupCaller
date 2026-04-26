@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import time
 from multiprocessing import Pool
 import errno
@@ -57,18 +58,15 @@ def do_learn(args):
     """
     print("..............Loading reference genome.....................")
     startTime = time.time()
-    if not os.path.exists("tmp"):
-        try:
-            os.mkdir("tmp")
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
     if not os.path.exists(params["output"]):
         try:
             os.mkdir(params["output"])
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
+    tmp_dir = os.path.join(params["output"], "tmp")
+    params["tmp_dir"] = tmp_dir
+    os.makedirs(tmp_dir, exist_ok=True)
     bamObject = BAM(args.bam, args.reference, "rb")
 
     """
@@ -223,6 +221,7 @@ def do_learn(args):
         delimiter="\t",
         fmt="%d",
     )
+    shutil.rmtree(tmp_dir)
     print(
         "..............Completed error learning "
         + str((time.time() - startTime) / 60)
