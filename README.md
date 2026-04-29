@@ -111,12 +111,18 @@ We have built indexes for human reference genome GRCh38/hg38 and mouse reference
 For other reference genomes, a BED file of simple repeats is needed to build the index. The file can be obtained from the UCSC Table Browser (https://genome.ucsc.edu/cgi-bin/hgTables) with the following steps:
 
 1. For **Genome**, select the reference genome.
-2. For **Group**, select "Variation and Repeats".
+2. For **Group**, select "Repeats","Variation and Repeats".
 3. For **Table**, select "repeat masker" or similar table.
+(Tips: the actual path to repeat masker may be different for different reference genome. Look for a table named "rmsk")
 4. Add filter: "repClass Does match Simple_repeat".
 5. For **Output format**, select "BED - browser extensible data".
 6. Input desired filename (e.g. `mm39_str.bed`) and download the output BED file.
-
+7. Sort the output bed file with your reference genome (Use bedtools or similar) and compress and index with bgzip:
+```bash
+sortBed -i str.bed -faidx reference.fa.fai > str_sorted.bed
+bgzip str_sorted.bed
+tabix str_sorted.bed.gz
+```
 ---
 
 ### Step 2: Trim Barcodes
