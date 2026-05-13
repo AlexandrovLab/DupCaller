@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="DupCaller",
-    version="1.1.0",
+    version="1.1.1",
     description="A variant caller for barcoded DNA sequencing",
     url="https://github.com/yuhecheng62/DupCaller",
     author="Yuhe Cheng",
