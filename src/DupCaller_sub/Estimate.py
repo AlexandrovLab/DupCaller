@@ -110,7 +110,9 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     cov = trinuc_cov.sum()
     burden_uncorrected[4] = mutnum / cov
     burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
-    # trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    trinuc_rate = np.where(
+        np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
+    )
     correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (trinuc_cov / trinuc_cov.sum())
     correction_ratio = np.repeat(correction_ratio, 3)
     mutnum_corrected = correction_ratio * trinuc_mut
@@ -135,6 +137,9 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
             mutnum, cov
         )
+        trinuc_rate = np.where(
+            np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
+        )
         covs[nn - 1] = cov
         correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (
             trinuc_cov / trinuc_cov.sum()
@@ -151,6 +156,7 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
             mutnum_corrected.sum(), cov
         )
         hap_trinuc[:, nn - 1] = trinuc_rate * np.repeat(ref_trinuc, 3)
+        # hap_trinuc[:, nn - 1] = mutnum_corrected
 
     return (
         hap_trinuc,
@@ -676,6 +682,9 @@ def do_estimate(args):
             corrected_trinuc_num,
             index=num2trinucSbs,
             columns=["number"],
+        )
+        corrected_trinuc_pd.to_csv(
+            args.prefix + "/" + sample + "_sbs_96_corrected_re_estimate.txt", sep="\t"
         )
         fig, ax = plt.subplots(figsize=(60, 10))
         ax = plot_96(ax, corrected_trinuc_pd)
