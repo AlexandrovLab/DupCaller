@@ -24,6 +24,7 @@ from .funcs.call import callBam  # , output_masked_mutations
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import getAlignmentObject as BAM
+from .funcs.misc import check_h5_usable
 from pysam import TabixFile as BED
 import pysam
 
@@ -49,18 +50,31 @@ def check_input_files_exist(args):
     tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
     hp_h5_files = [f"{ref_base}.hp.h5", f"{args.reference}.hp.h5"]
 
-    if not any(os.path.exists(f) for f in ref_h5_files):
-        missing_files.append(
-            f"Reference h5 file: {ref_base}.ref.h5 or {args.reference}.ref.h5"
+    bad_h5_files = []
+    for label, candidates, expected_ndim in [
+        ("Reference", ref_h5_files, 1),
+        ("Trinucleotide", tn_h5_files, 1),
+        ("Homopolymer", hp_h5_files, 2),
+    ]:
+        found = next((f for f in candidates if os.path.exists(f)), None)
+        if found is None:
+            missing_files.append(f"{label} h5 file: {candidates[0]} or {candidates[1]}")
+        else:
+            ok, msg = check_h5_usable(found, expected_ndim=expected_ndim)
+            if not ok:
+                bad_h5_files.append(msg)
+
+    if bad_h5_files:
+        print(
+            "ERROR: One or more reference index files are unreadable or incompatible:"
         )
-    if not any(os.path.exists(f) for f in tn_h5_files):
-        missing_files.append(
-            f"Trinucleotide h5 file: {ref_base}.tn.h5 or {args.reference}.tn.h5"
+        for msg in bad_h5_files:
+            print(f"  - {msg}")
+        print(
+            "\nPlease re-index the reference genome with the current version of DupCaller:\n"
+            f"  DupCaller.py index -f {args.reference} -s <str_regions.bed.gz>"
         )
-    if not any(os.path.exists(f) for f in hp_h5_files):
-        missing_files.append(
-            f"Homopolymer h5 file: {ref_base}.hp.h5 or {args.reference}.hp.h5"
-        )
+        sys.exit(1)
 
     # Optional files that should be checked if provided
     if args.normalBams:
@@ -119,14 +133,10 @@ def check_input_files_exist(args):
 def do_call(args):
     # Check if all input files exist before proceeding
     check_input_files_exist(args)
-    if "/" not in args.output:
-        if not os.path.exists(args.output):
-            try:
-                os.mkdir(args.output)
-            except OSError as e:
-                if e.errno != errno.EEXIST:
-                    raise
-        args.output = args.output + "/" + args.output
+    output_dir = args.output
+    sample_name = os.path.basename(args.output)
+    os.makedirs(output_dir, exist_ok=True)
+    args.output = os.path.join(output_dir, sample_name)
     params = {
         "tumorBam": args.bam,
         "normalBams": args.normalBams,
@@ -716,10 +726,10 @@ def do_call(args):
     with open(args.output + "_indel.vcf", "w") as vcf:
         vcf.write(vcfLines)
 
-    burden_naive = muts_num / (coverage)
-    indel_burden = indels_num / coverage
-    efficiency = duplex_num / rec_num
-    pass_duprate = unique_read_num / pass_read_num
+    burden_naive = muts_num / coverage if coverage > 0 else 0.0
+    indel_burden = indels_num / coverage if coverage > 0 else 0.0
+    efficiency = duplex_num / rec_num if rec_num > 0 else 0.0
+    pass_duprate = unique_read_num / pass_read_num if pass_read_num > 0 else 0.0
 
     # Build muts_by_duplex_group over all keys (including 0+n / n+0)
     muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
@@ -819,10 +829,12 @@ def do_call(args):
         f.write(f"Unmasked Coverage\t{unmasked_coverage}\n")
         f.write(f"Effective Indel Coverage\t{coverage_indel}\n")
         f.write(f"Unmasked Indel Coverage\t{unmasked_coverage_indel}\n")
-        f.write(f"Per Read Family Coverage \t{coverage/duplex_num}\n")
+        f.write(
+            f"Per Read Family Coverage \t{coverage/duplex_num if duplex_num > 0 else 0.0}\n"
+        )
         f.write(
             f"Pass-filter Duplication Rate\t\
-        {1-unique_read_num/pass_read_num}\n"
+        {1-unique_read_num/pass_read_num if pass_read_num > 0 else 0.0}\n"
         )
         f.write(f"Efficiency\t{efficiency}\n")
 

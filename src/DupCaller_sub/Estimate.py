@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 from collections import OrderedDict
+import sys
 import h5py
 import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from pysam import VariantFile as VCF, TabixFile
 from scipy.stats import chi2, barnard_exact
 import pysam
+from .funcs.misc import check_h5_usable
 
 
 def calculate_ref_trinuc(args):
@@ -103,6 +106,8 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     burden_corrected_lb = np.zeros(5)
     covs = np.zeros(5)
     hap_trinuc = np.zeros([96, 5])
+    trinuc_mut_by_nmin = np.zeros([96, 5])
+    mutnum_corrected_by_nmin = np.zeros([96, 5])
     ## Calculate burden when take 5 as mininum
     trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)
     trinuc_cov = trinuc_cov_by_rf[:, nmin >= 5].sum(axis=1)
@@ -116,16 +121,13 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (trinuc_cov / trinuc_cov.sum())
     correction_ratio = np.repeat(correction_ratio, 3)
     mutnum_corrected = correction_ratio * trinuc_mut
-    # burden_corrected[4] = mutnum_corrected / ref_trinuc.sum()
     burden_corrected[4] = mutnum_corrected.sum() / cov
-    # burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
-    # mutnum_corrected, ref_trinuc.sum()
-    # )
     burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
         mutnum_corrected.sum(), cov
     )
-    # hap_trinuc[:, 4] = np.ceil(trinuc_rate * np.repeat(ref_trinuc, 3))
     hap_trinuc[:, 4] = trinuc_rate * np.repeat(ref_trinuc, 3)
+    # trinuc_mut_by_nmin[:, 4] = trinuc_mut
+    # mutnum_corrected_by_nmin[:, 4] = mutnum_corrected
     covs[4] = cov
     # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     for nn in range(4, 0, -1):
@@ -145,31 +147,30 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
             trinuc_cov / trinuc_cov.sum()
         )
         correction_ratio = np.repeat(correction_ratio, 3)
-        # mutnum_corrected = trinuc_rate.dot(np.repeat(ref_trinuc, 3))
         mutnum_corrected = trinuc_mut * correction_ratio
-        # burden_corrected[4] = mutnum_corrected / ref_trinuc.sum()
         burden_corrected[nn - 1] = mutnum_corrected.sum() / cov
-        # burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
-        # mutnum_corrected, ref_trinuc.sum()
-        # )
         burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
             mutnum_corrected.sum(), cov
         )
         hap_trinuc[:, nn - 1] = trinuc_rate * np.repeat(ref_trinuc, 3)
-        # hap_trinuc[:, nn - 1] = mutnum_corrected
+        # trinuc_mut_by_nmin[:, nn - 1] = trinuc_mut
+        # mutnum_corrected_by_nmin[:, nn - 1] = mutnum_corrected
 
     return (
-        hap_trinuc,
+        trinuc_mut,
+        mutnum_corrected,
+        correction_ratio,
+        hap_trinuc[:, 0],
         burden_corrected,
         burden_corrected_lb,
         burden_corrected_ub,
         burden_uncorrected,
         burden_uncorrected_lb,
         burden_uncorrected_ub,
-        mutnum,
-        mutnum_corrected.sum(),
         ref_trinuc.sum(),
         covs,
+        # trinuc_mut_by_nmin,
+        # mutnum_corrected_by_nmin,
     )
 
 
@@ -200,6 +201,18 @@ def estimate_id(trinuc_cov_by_rf, muts_by_rf, n):
 
 
 def do_estimate(args):
+    if args.reference:
+        tn_h5_path = args.reference + ".tn.h5"
+        ok, msg = check_h5_usable(tn_h5_path, expected_ndim=1)
+        if not ok:
+            print("ERROR: Reference index file is unreadable or incompatible:")
+            print(f"  - {msg}")
+            print(
+                "\nPlease re-index the reference genome with the current version of DupCaller:\n"
+                f"  DupCaller.py index -f {args.reference} -s <str_regions.bed.gz>"
+            )
+            sys.exit(1)
+
     if not args.reestimatebed:
         ref_trinuc = calculate_ref_trinuc(args)
         prefix = args.prefix
@@ -260,7 +273,7 @@ def do_estimate(args):
             vcf_out = VCF(
                 args.prefix + "/" + sample + "_snv_flt.vcf", "w", header=vcf.header
             )
-        with open(f"{sample}/{sample}_stats.txt") as st:
+        with open(f"{prefix}/{sample}_stats.txt") as st:
             lines = st.readlines()
             unmasked_cov = int(lines[4].split("\t")[1])
             unmasked_indel_cov = int(lines[6].split("\t")[1])
@@ -330,6 +343,9 @@ def do_estimate(args):
         base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
         print("......Estimating mutational burden and SBS96 profile........")
         (
+            mutnum,
+            mutnum_corrected,
+            correction_ratio,
             corrected_trinuc_num,
             burden,
             burden_lb,
@@ -337,24 +353,46 @@ def do_estimate(args):
             uburden,
             uburden_lb,
             uburden_ub,
-            mutnum_uncorrected,
-            mutnum_per_genome,
             genome_cov,
             cov_by_minread,
         ) = estimate_96(
             trinuc_by_rf_np, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns
         )
         corrected_trinuc_pd = pd.DataFrame(
-            corrected_trinuc_num[:, [0]],  # .astype(int),
+            np.stack(
+                [
+                    mutnum,
+                    mutnum_corrected,
+                    correction_ratio,
+                    corrected_trinuc_num,
+                    np.repeat(ref_trinuc, 3),
+                ],
+                axis=1,
+            ),
             index=num2trinucSbs,
-            columns=["number"],
+            columns=[
+                "mutation_number_uncorrected",
+                "mutation_number_corrected",
+                "correction_ratio",
+                "mutation_number_genome",
+                "trinuc_number_genome",
+            ],
         )
         corrected_trinuc_pd.to_csv(
             args.prefix + "/" + sample + "_sbs_96_corrected.txt", sep="\t"
         )
-        fig, ax = plt.subplots(figsize=(60, 10))
-        ax = plot_96(ax, corrected_trinuc_pd)
-        fig.savefig(args.prefix + "/" + sample + "_sbs_96_corrected.png", dpi=300)
+        pdf_path = args.prefix + "/" + sample + f"_sbs_96.pdf"
+        with PdfPages(pdf_path) as pdf:
+            for col_name in [
+                "mutation_number_uncorrected",
+                "mutation_number_corrected",
+                "mutation_number_genome",
+            ]:
+                fig, ax = plt.subplots(figsize=(60, 10))
+                ax = plot_96(ax, corrected_trinuc_pd[[col_name]])
+                ax.set_title(f"{col_name}", fontsize=80, y=1.3)
+                pdf.savefig(fig, dpi=300, bbox_inches="tight")
+                plt.close(fig)
         fig, ax = plt.subplots(figsize=(20, 15))
         ax.plot(range(1, 6), uburden)
         ax.plot(range(1, 6), uburden_lb)
@@ -369,12 +407,13 @@ def do_estimate(args):
             f.write(f"Uncorrected burden\t{uburden[0]}\n")
             f.write(f"Uncorrected burden 95% lower\t{uburden_lb[0]}\n")
             f.write(f"Uncorrected burden 95% upper\t{uburden_ub[0]}\n")
-            f.write(f"Uncorrected mutation number\t{mutnum_uncorrected}\n")
+            f.write(f"Uncorrected mutation number\t{mutnum.sum()}\n")
             f.write(f"Corrected burden\t{burden[0]}\n")
             f.write(f"Corrected burden 95% lower\t{burden_lb[0]}\n")
             f.write(f"Corrected burden 95% upper\t{burden_ub[0]}\n")
-            f.write(f"mutation number per genome\t{mutnum_per_genome}\n")
-            f.write(f"genome coverage\t{genome_cov}\n")
+            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
+            f.write(f"Mutation number per genome\t{corrected_trinuc_num.sum()}\n")
+            f.write(f"Genome coverage\t{genome_cov}\n")
             f.write(f"Unmasked burden\t{unmasked_sbs_burden}\n")
             f.write(f"Unmasked burden 95% lower\t{unmasked_sbs_burden_lb}\n")
             f.write(f"Unmasked burden 95% upper\t{unmasked_sbs_burden_ub}\n")
@@ -414,7 +453,7 @@ def do_estimate(args):
         vcf.close()
         ###Calculate indel burdens
         print("......Estimating Indel Burden.......")
-        vcf_indel = VCF(f"{sample}/{sample}_indel.vcf", "r")
+        vcf_indel = VCF(f"{prefix}/{sample}_indel.vcf", "r")
         unmasked_indel_count = 0
         indel_count = 0
         for rec in vcf_indel.fetch():
@@ -450,7 +489,7 @@ def do_estimate(args):
             f.write(f"Unmasked Indel burden 95% upper\t{unmasked_indel_burden_ub}\n")
         # Process unique mutations to extract duplex depths and create allele counts table
         print("......Processing unique mutations for duplex allele counts.......")
-        coverage_file = f"{sample}/{sample}_coverage.bed.gz"
+        coverage_file = f"{prefix}/{sample}_coverage.bed.gz"
         allele_counts_data = []
 
         # Open the coverage file using TabixFile
@@ -523,7 +562,7 @@ def do_estimate(args):
                 end = int(end)
                 gene = gene_exon.split("_")[0]
                 gene_exon_cov = 0
-                for loc in TabixFile(f"{sample}/{sample}_coverage.bed.gz").fetch(
+                for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
                     chrom, start, end
                 ):
                     gene_exon_cov += int(loc.split("\t")[3])
@@ -581,7 +620,7 @@ def do_estimate(args):
         vcf_indel = VCF(prefix + "/" + sample + "_indel.vcf", "r")
         indel_count = 0
         for interval in TabixFile(args.reestimatebed, parser=pysam.asBed()).fetch():
-            for loc in TabixFile(f"{sample}/{sample}_coverage.bed.gz").fetch(
+            for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
                 interval.contig, interval.start, interval.end
             ):
                 chrom, start, end, cov, indel_cov = loc.split("\t")[0:5]
@@ -642,25 +681,40 @@ def do_estimate(args):
         trinucSbs_count = trinucSbs_count.astype(float)
         trinuc_mut_cov = trinuc_mut_cov.astype(float)
         trinuc_rate = np.where(trinuc_mut_cov > 0, trinucSbs_count / trinuc_mut_cov, 0)
-        corrected_trinuc_num = np.repeat(ref_trinuc, 3, axis=0) * trinuc_rate
-        mutnum_corrected = corrected_trinuc_num.sum()
         ref_trinuc_sum = ref_trinuc.sum()
-        burden = mutnum_corrected / ref_trinuc_sum
-        burden_lb, burden_ub = poisson_confint(mutnum_corrected, ref_trinuc_sum)
-        mutnum = trinucSbs_count.sum()
-        uburden = mutnum / float(cov_total)
-        uburden_lb, uburden_ub = poisson_confint(mutnum, float(cov_total))
         genome_cov = ref_trinuc_sum
 
+        trinuc_mut = trinucSbs_count
+        trinuc_cov = trinuc_cov_32
+        mutnum = trinuc_mut.sum()
+        cov = trinuc_cov_32.sum()
+        burden_uncorrected = mutnum / cov
+        burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(mutnum, cov)
+        trinuc_rate = np.where(
+            np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
+        )
+        correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (
+            trinuc_cov / trinuc_cov.sum()
+        )
+        correction_ratio = np.repeat(correction_ratio, 3)
+        mutnum_corrected = correction_ratio * trinuc_mut
+        burden_corrected = mutnum_corrected.sum() / cov
+        burden_corrected_lb, burden_corrected_ub = poisson_confint(
+            mutnum_corrected.sum(), cov
+        )
+        hap_trinuc = trinuc_rate * np.repeat(ref_trinuc, 3)
+        mut_per_genome = hap_trinuc.sum()
+
         with open(args.prefix + "/" + sample + "_sbs_burden_re_estimate.txt", "w") as f:
-            f.write(f"Uncorrected burden\t{uburden}\n")
-            f.write(f"Uncorrected burden 95% lower\t{uburden_lb}\n")
-            f.write(f"Uncorrected burden 95% upper\t{uburden_ub}\n")
+            f.write(f"Uncorrected burden\t{burden_uncorrected}\n")
+            f.write(f"Uncorrected burden 95% lower\t{burden_uncorrected_lb}\n")
+            f.write(f"Uncorrected burden 95% upper\t{burden_uncorrected_ub}\n")
             f.write(f"Uncorrected mutation number\t{int(mutnum)}\n")
-            f.write(f"Corrected burden\t{burden}\n")
-            f.write(f"Corrected burden 95% lower\t{burden_lb}\n")
-            f.write(f"Corrected burden 95% upper\t{burden_ub}\n")
-            f.write(f"mutation number per genome\t{mutnum_corrected}\n")
+            f.write(f"Corrected burden\t{burden_corrected}\n")
+            f.write(f"Corrected burden 95% lower\t{burden_corrected_lb}\n")
+            f.write(f"Corrected burden 95% upper\t{burden_corrected_ub}\n")
+            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
+            f.write(f"mutation number per genome\t{mut_per_genome}\n")
             f.write(f"genome coverage\t{genome_cov}\n")
         indel_burden_re = (
             indel_count / float(indel_cov_total)
@@ -679,15 +733,37 @@ def do_estimate(args):
             f.write(f"Indel number\t{indel_count}\n")
             f.write(f"Indel coverage\t{indel_cov_total}\n")
         corrected_trinuc_pd = pd.DataFrame(
-            corrected_trinuc_num,
+            np.stack(
+                [
+                    trinuc_mut,
+                    mutnum_corrected,
+                    correction_ratio,
+                    hap_trinuc,
+                    np.repeat(ref_trinuc, 3),
+                ],
+                axis=1,
+            ),
             index=num2trinucSbs,
-            columns=["number"],
+            columns=[
+                "mutation_number_uncorrected",
+                "mutation_number_corrected",
+                "correction_ratio",
+                "mutation_number_genome",
+                "trinuc_number_genome",
+            ],
         )
         corrected_trinuc_pd.to_csv(
             args.prefix + "/" + sample + "_sbs_96_corrected_re_estimate.txt", sep="\t"
         )
-        fig, ax = plt.subplots(figsize=(60, 10))
-        ax = plot_96(ax, corrected_trinuc_pd)
-        fig.savefig(
-            args.prefix + "/" + sample + "_sbs_96_corrected_re_estimate.png", dpi=300
-        )
+        pdf_path = args.prefix + "/" + sample + "_sbs_96_corrected_re_estimate.pdf"
+        with PdfPages(pdf_path) as pdf:
+            for col_name in [
+                "mutation_number_uncorrected",
+                "mutation_number_corrected",
+                "mutation_number_genome",
+            ]:
+                fig, ax = plt.subplots(figsize=(60, 10))
+                ax = plot_96(ax, corrected_trinuc_pd[[col_name]])
+                ax.set_title(col_name, fontsize=80, y=1.3)
+                pdf.savefig(fig, dpi=300, bbox_inches="tight")
+                plt.close(fig)

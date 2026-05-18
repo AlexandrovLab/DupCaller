@@ -289,7 +289,7 @@ def genotypeDSSnv(
     )
     LR_diff = LR_max - LR_masked
     # LR_diff[LR_diff < 0] = 0
-    LR_diff[LR_diff < 0] = np.finfo(float).eps
+    LR_diff[LR_diff <= 0] = np.finfo(float).eps
     LR_score = -log10(LR_diff / LR_max)
     LR_abs = np.zeros(n)
     LR_abs[antimask] = LR_masked

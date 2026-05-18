@@ -17,6 +17,7 @@ DupCaller is a universal tool for calling somatic mutations and calculating soma
   - [Step 4: Mark Duplicates](#step-4-mark-duplicates)
   - [Step 5: Call Variants](#step-5-call-variants)
   - [Step 6: Estimate Mutational Burden](#step-6-estimate-mutational-burden)
+  - [Step 7: Summarize Across Samples](#step-7-summarize-across-samples)
 - [Results](#results)
 - [End-to-End Examples](#end-to-end-examples)
 - [Resources](#resources)
@@ -74,7 +75,7 @@ singularity exec dupcaller-1.1.0.sif DupCaller.py --help
 
 For installation-free execution of DupCaller commands, run all DupCaller.py commands with `singularity exec` and binding of current directories:
 ```bash
-singularity exec dupcaller-1.1.0.sif --bind $(pwd):$(pwd) DupCaller.py {your commands}
+singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your commands}
 ```
 
 ---
@@ -89,7 +90,7 @@ DupCaller uses a numpyrized reference genome to perform memory-efficient referen
 DupCaller.py index -f reference.fa -s str_regions.bed.gz
 ```
 
-The command will generate three h5 files in the same folder: `ref.h5`, `tn.h5` and `hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and homopolymer/STR annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
+The command will generate three h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5` and `{reference}.hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and homopolymer/STR annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
 
 The STR BED file must be tabix-indexed (`.bed.gz` with a `.tbi` index).
 
@@ -217,10 +218,10 @@ These options should be understood and customized accordingly.
 
 | Short | Long | Description | Default |
 | --- | --- | --- | --- |
-| -r | --regions | Contigs to consider for variant calling. For non-human species, set accordingly (e.g. for mouse: `-r chr{1..19} chrX chrY`) | chr{1..22} chrX chrY |
+| -r | --regions | Contigs to consider for variant calling. For non-human species, set accordingly (e.g. for mouse: `-r chr{1..19} chrX`) | chr{1..22} chrX|
 | -g | --germline | Indexed germline VCF with AF field | None |
 | -p | --threads | Number of threads | 1 |
-| -n | --normalBam | BAM file(s) of matched normals. When unavailable, set `-maf` to an appropriate value (e.g. 0.1) | None |
+| -n | --normalBams | BAM file(s) of matched normals. When unavailable, set `-maf` to an appropriate value (e.g. 0.1) | None |
 | -m | --noise | BED interval file(s) masking noisy positions | None |
 | -R | --regionfile | Inclusive BED file specifying target regions | None |
 | -maf | --maxAF | Maximum allele fraction to call a somatic mutation. Must be set when matched normal (`-n`) is unavailable | 1 |
@@ -250,16 +251,15 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 | -AI | --amperrfileindel | Pre-learned error profile for amplification indel error | None |
 | -DS | --dmgerrfile | Pre-learned error profile for SBS damage | None |
 | -DI | --dmgerrfileindel | Pre-learned error profile for indel damage | None |
-| -mr | --mutRate | Prior somatic mutation rate per base | 2.5e-7 |
-| -ts | --thresholdSnv | Log likelihood ratio threshold for SNV calls | 0.5 |
-| -ti | --thresholdIndel | Log likelihood ratio threshold for indel calls | 0.5 |
+| -ts | --thresholdSnv | Log likelihood ratio threshold for SNV calls | 8.5 |
+| -ti | --thresholdIndel | Log likelihood ratio threshold for indel calls. Three values corresponds to the threshold for 1. homopolymer length less than 5; 2. homopolymer length 6 to 10; 3. homopolymer length more than 10 or are in STR regions.  | 10.3,8.5,7 |
 | -mq | --mapq | Minimum MAPQ for an alignment to be considered | 40 |
 | -w | --windowSize | Genomic window size for coverage calculation and BAM partitioning | 100000 |
 | -bq | --minBq | Bases with quality below this value will be set to 6 | 18 |
 | -aq | --minAltQual | Minimum consensus quality of alt allele in a read group | 60 |
 | --minRef | | Minimum consensus quality of ref allele in a read group | 2 |
 | --minAlt | | Minimum consensus quality of alt allele in a read group | 2 |
-| -z | --maxZeroQualFrac | Maximum fraction of zero-quality bases in a read family | 0.5 |
+| -z | --maxZeroQualFrac | Maximum fraction of zero-quality bases in a read family. Set to 0.1 if a noise mask is not available | 0.5 |
 | -id | --indelBed | Indel enhanced Panel of Normals (ePoN) for indel calling | None |
 
 #### Germline and Noise Masks
@@ -318,13 +318,44 @@ DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estim
 | -r | --regions | Contigs to consider for trinucleotide calculation | chr{1..22} chrX |
 | -ot | --outTrinuc | Output the computed trinucleotide composition file for future use | None |
 | -c | --clonal | Treat mutations detected in more than one molecule as one mutation | False |
-| -d | --dilute | Set to true when sample and matched normal are from the same starting DNA | False |
+| -d | --dilute | **Archived — not needed in the latest version.** Previously used when sample and matched normal originated from the same starting DNA material | False |
 | -gb | --genebed | Gene BED file for per-gene coverage calculation | None |
 | -rb | --reestimatebed | BED file for burden re-estimation in specific regions | None |
 
 ---
 
+### Step 7: Summarize Across Samples
+
+After running `estimate` on all samples, use `DupCaller.py summarize` to collate burden metrics and SBS96 profiles into multi-sample tables:
+
+```bash
+DupCaller.py summarize -i sample1 sample2 sample3 -o cohort_summary.txt
+```
+
+This reads `{sample}_stats.txt`, `{sample}_sbs_burden.txt`, `{sample}_indel_burden.txt`, and `{sample}_sbs_96_corrected.txt` from each sample folder and writes four output files:
+
+| File | Description |
+| --- | --- |
+| `cohort_summary.txt` | One row per sample with burden metrics and library statistics |
+| `cohort_summary_SBS96_uncorrected.txt` | 96-context raw mutation counts across all samples (SigProfiler-compatible format) |
+| `cohort_summary_SBS96_corrected.txt` | 96-context trinucleotide-corrected counts across all samples |
+| `cohort_summary_SBS96_genome.txt` | 96-context estimated mutations per genome across all samples |
+
+All SBS96 file can be directly input into [SigProfilerPlotting](https://github.com/SigProfilerSuite/SigProfilerPlotting)
+#### Parameters
+
+| Short | Long | Description |
+| --- | --- | --- |
+| -i | --input | One or more sample folders (space-separated) |
+| -o | --output | Output filename for the summary table (e.g. `cohort_summary.txt`) |
+
+---
+
 ## Results
+
+For detailed column-by-column and field-by-field descriptions of every output file, see the [`docs/`](docs/) folder:
+- [`docs/call_outputs.md`](docs/call_outputs.md) — all files from `DupCaller.py call`
+- [`docs/estimate_outputs.md`](docs/estimate_outputs.md) — all files from `DupCaller.py estimate`
 
 ### Core Output Files
 
@@ -333,8 +364,11 @@ DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estim
 | `{sample}_snv.vcf` | VCF of detected SNVs and MNVs |
 | `{sample}_indel.vcf` | VCF of detected short indel mutations |
 | `{sample}_coverage.bed.gz` | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
+| `{sample}_coverage.bed.gz.tbi` | Tabix index for the coverage BED file |
 | `{sample}_trinuc_by_duplex_group.txt` | Trinucleotide context counts grouped by duplex read number, used for burden estimation |
-| `{sample}_duplex_group_stats.txt` | Statistics for duplex groups including read counts and quality metrics |
+| `{sample}_duplex_family_strand_composition.txt` | Strand composition statistics for duplex read families |
+| `{sample}_duplex_family_strand_composition_heatmap.pdf` | Heatmap visualization of duplex family strand composition |
+| `{sample}_call_params.log` | Full record of all resolved parameters used for the `call` run |
 | `{sample}_stats.txt` | Overall sequencing and analysis metrics |
 
 ### Error Profile Files
@@ -360,17 +394,16 @@ DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estim
 
 | File | Description |
 | --- | --- |
-| `{sample}_sbs_96_corrected.png` | 96-context mutational signature plot |
+| `{sample}_sbs_96.pdf` | 96-context mutational signature plots (3 pages: uncorrected counts, corrected counts, estimated mutations per genome) |
 | `{sample}_sbs_burden_by_min_read_group_size.png` | Burden estimates across minimum read group sizes |
 
 ### Optional / Conditional Files
 
 | File | Condition | Description |
 | --- | --- | --- |
-| `{sample}_snv_flt.vcf` | Dilute mode | Filtered SNV VCF from dilute analysis |
 | `{sample}_gene_coverage.txt` | `-gb` option | Mean duplex coverage per gene for dNdScv correction |
 | `{sample}_sbs_burden_re_estimate.txt` | `-rb` option | Re-estimated burden for specific regions |
-| `{sample}_sbs_96_corrected_re_estimate.png` | `-rb` option | Signature plot for re-estimated regions |
+| `{sample}_sbs_96_corrected_re_estimate.pdf` | `-rb` option | Signature plots for re-estimated regions |
 
 ---
 

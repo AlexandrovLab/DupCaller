@@ -1,8 +1,31 @@
 import math
 from multiprocessing import Pool
 import numpy as np
+import h5py
 from pysam import AlignmentFile as BAM
 from pysam import TabixFile as BED
+
+
+def check_h5_usable(h5_path, expected_ndim=None):
+    """Try to open and read from an h5 file; return (ok, error_message)."""
+    try:
+        with h5py.File(h5_path, "r") as f:
+            keys = list(f.keys())
+            if not keys:
+                return False, f"{h5_path}: file contains no chromosome datasets"
+            data = f[keys[0]]
+            ndim = len(data.shape)
+            if expected_ndim is not None and ndim != expected_ndim:
+                return False, (
+                    f"{h5_path}: expected {expected_ndim}D data, found {ndim}D — "
+                    "file may be from an incompatible version of DupCaller"
+                )
+            _ = data[tuple(slice(0, min(s, 10)) for s in data.shape)]
+    except Exception as e:
+        return False, f"{h5_path}: could not read h5 file ({e})"
+    return True, None
+
+
 import pysam
 
 
