@@ -91,10 +91,48 @@ def plot_96(ax, trinuc_pd):
     return ax
 
 
+def _build_sbs96_to_128_map():
+    """Build a length-96 index array mapping each SBS96 class to its row in the
+    128-row trinuc coverage matrix (row = 32 * base_idx[alt] + trinuc_idx,
+    alt order A=0, T=1, C=2, G=3)."""
+    trinuc_list = []
+    for minus_base in ["A", "T", "C", "G"]:
+        for ref_base in ["C", "T"]:
+            for plus_base in ["A", "T", "C", "G"]:
+                trinuc_list.append(minus_base + ref_base + plus_base)
+    base2idx = {"A": 0, "T": 1, "C": 2, "G": 3}
+    sbs96_to_128 = np.zeros(96, dtype=int)
+    k = 0
+    for i, trinuc in enumerate(trinuc_list):
+        ref_base = trinuc[1]
+        for alt in "ATCG":
+            if alt == ref_base:
+                continue
+            sbs96_to_128[k] = 32 * base2idx[alt] + i
+            k += 1
+    return sbs96_to_128
+
+
+_SBS96_TO_128 = _build_sbs96_to_128_map()
+
+
 def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
+    """Estimate SBS96 mutation rates with per-class correction ratios.
+
+    trinuc_cov_by_rf : (128, n_groups) — alt-base-specific L-weighted coverage;
+        row  32*j + i  holds coverage for (trinuc_list[i], alt=ATCG[j]).
+    trinuc_mut_by_rf : (96, n_groups) — observed mutation counts per SBS96 class.
+    ref_trinuc       : (32,) — trinucleotide counts in the reference genome.
+    """
     print("........Estimating mutation rate for each trinucleotide context.......")
-    trinuc_mut_cov_by_rf = np.repeat(trinuc_cov_by_rf, 3, axis=0)
-    trinuc_rate = np.zeros(96)
+    # Extract per-SBS96-class coverage: each row corresponds to one mutation class
+    # (specific trinuc context AND specific alt base), not the whole trinuc context.
+    trinuc_cov_96_by_rf = trinuc_cov_by_rf[_SBS96_TO_128, :]  # (96, n_groups)
+
+    ref_trinuc_96 = np.repeat(
+        ref_trinuc, 3
+    )  # (96,) — same ref count for 3 alts of each trinuc
+
     n1 = np.array([int(_.split("+")[0]) for _ in n])
     n2 = np.array([int(_.split("+")[1]) for _ in n])
     nmin = np.vstack((n1, n2)).min(axis=0)
@@ -106,55 +144,49 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
     burden_corrected_lb = np.zeros(5)
     covs = np.zeros(5)
     hap_trinuc = np.zeros([96, 5])
-    trinuc_mut_by_nmin = np.zeros([96, 5])
-    mutnum_corrected_by_nmin = np.zeros([96, 5])
-    ## Calculate burden when take 5 as mininum
-    trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)
-    trinuc_cov = trinuc_cov_by_rf[:, nmin >= 5].sum(axis=1)
+
+    ## Calculate burden when minimum strand depth >= 5
+    trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)  # (96,)
+    trinuc_cov = trinuc_cov_96_by_rf[:, nmin >= 5].sum(
+        axis=1
+    )  # (96,) — alt-base-specific
     mutnum = trinuc_mut.sum()
-    cov = trinuc_cov.sum()
+    cov = trinuc_cov.sum() / 3  # divide by 3 to get per-locus-equivalent coverage
     burden_uncorrected[4] = mutnum / cov
     burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
-    trinuc_rate = np.where(
-        np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
+    trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+    # Alt-base-specific correction: each of the 96 classes gets its own ratio
+    correction_ratio = (ref_trinuc_96 / ref_trinuc_96.sum()) / (
+        trinuc_cov / trinuc_cov.sum()
     )
-    correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (trinuc_cov / trinuc_cov.sum())
-    correction_ratio = np.repeat(correction_ratio, 3)
     mutnum_corrected = correction_ratio * trinuc_mut
     burden_corrected[4] = mutnum_corrected.sum() / cov
     burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
         mutnum_corrected.sum(), cov
     )
-    hap_trinuc[:, 4] = trinuc_rate * np.repeat(ref_trinuc, 3)
-    # trinuc_mut_by_nmin[:, 4] = trinuc_mut
-    # mutnum_corrected_by_nmin[:, 4] = mutnum_corrected
+    hap_trinuc[:, 4] = trinuc_rate * ref_trinuc_96
     covs[4] = cov
-    # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
+
     for nn in range(4, 0, -1):
         trinuc_mut = trinuc_mut + trinuc_mut_by_rf[:, nmin == nn].sum(axis=1)
-        trinuc_cov = trinuc_cov + trinuc_cov_by_rf[:, nmin == nn].sum(axis=1)
+        trinuc_cov = trinuc_cov + trinuc_cov_96_by_rf[:, nmin == nn].sum(axis=1)
         mutnum = trinuc_mut.sum()
-        cov = trinuc_cov.sum()
+        cov = trinuc_cov.sum() / 3
         burden_uncorrected[nn - 1] = mutnum / cov
         burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
             mutnum, cov
         )
-        trinuc_rate = np.where(
-            np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
-        )
+        trinuc_rate = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
         covs[nn - 1] = cov
-        correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (
+        correction_ratio = (ref_trinuc_96 / ref_trinuc_96.sum()) / (
             trinuc_cov / trinuc_cov.sum()
         )
-        correction_ratio = np.repeat(correction_ratio, 3)
         mutnum_corrected = trinuc_mut * correction_ratio
         burden_corrected[nn - 1] = mutnum_corrected.sum() / cov
         burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
             mutnum_corrected.sum(), cov
         )
-        hap_trinuc[:, nn - 1] = trinuc_rate * np.repeat(ref_trinuc, 3)
-        # trinuc_mut_by_nmin[:, nn - 1] = trinuc_mut
-        # mutnum_corrected_by_nmin[:, nn - 1] = mutnum_corrected
+        hap_trinuc[:, nn - 1] = trinuc_rate * ref_trinuc_96
 
     return (
         trinuc_mut,
@@ -169,8 +201,6 @@ def estimate_96(trinuc_cov_by_rf, trinuc_mut_by_rf, ref_trinuc, n):
         burden_uncorrected_ub,
         ref_trinuc.sum(),
         covs,
-        # trinuc_mut_by_nmin,
-        # mutnum_corrected_by_nmin,
     )
 
 
@@ -263,6 +293,7 @@ def do_estimate(args):
         trinuc_mut_np = np.zeros([96, len(trinuc_by_rf.columns)], dtype=int)
         duplex_no_dict = dict()
         revcomp = {"A": "T", "T": "A", "C": "G", "G": "C"}
+        base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
         for nn, duplex_no in enumerate(trinuc_by_rf.columns):
             duplex_no_dict[duplex_no] = nn
 
@@ -275,9 +306,9 @@ def do_estimate(args):
             )
         with open(f"{prefix}/{sample}_stats.txt") as st:
             lines = st.readlines()
-            unmasked_cov = int(lines[4].split("\t")[1])
-            unmasked_indel_cov = int(lines[6].split("\t")[1])
-            indel_cov = int(lines[5].split("\t")[1])
+            unmasked_cov = int(float(lines[4].split("\t")[1]))
+            unmasked_indel_cov = int(float(lines[6].split("\t")[1]))
+            indel_cov = int(float(lines[5].split("\t")[1]))
         ###Calculate masked mutation rate
         unmasked_mut_count = 0
         for rec in vcf.fetch():
@@ -338,9 +369,11 @@ def do_estimate(args):
                 alt = revcomp[rec.alts[0]]
             trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
             trinuc_mut_np[trinucSbs2num[trinucSbs], duplex_no_dict[duplex_no]] += 1
-            trinuc_by_rf_np[trinuc2num[trinuc], duplex_no_dict[duplex_no]] -= 1
+            # Subtract from the alt-base-specific coverage row (not the trinuc-only row)
+            # so this mutant locus is not counted as effective non-mutant coverage.
+            row_128 = 32 * base2num[alt] + trinuc2num[trinuc]
+            trinuc_by_rf_np[row_128, duplex_no_dict[duplex_no]] -= 1
 
-        base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
         print("......Estimating mutational burden and SBS96 profile........")
         (
             mutnum,
@@ -499,22 +532,19 @@ def do_estimate(args):
             duplex_depth = 0
 
             try:
-                # Query the coverage file for this position
+                # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov indel_cov
+                # Columns 3-6 are per-alt-base L-weighted coverage (floats);
+                # column 7 is indel coverage.
+                alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
                 for row in tbx.fetch(chrom, pos - 1, pos):
                     parts = row.split("\t")
-                    if len(parts) >= 5:
-                        # For SNVs, duplex depth is 4th column (index 3)
-                        # For INDELs, duplex depth is 5th column (index 4)
-                        if len(ref) == 1 and len(alt) == 1:
-                            # SNV case
-                            duplex_depth = int(parts[3]) if parts[3].isdigit() else 0
+                    if len(parts) >= 8:
+                        if len(ref) == 1 and len(alt) == 1 and alt in alt_col:
+                            # SNV: use the coverage column for this mutation's alt base
+                            duplex_depth = int(float(parts[alt_col[alt]]))
                         else:
-                            # INDEL case
-                            duplex_depth = (
-                                int(parts[4])
-                                if len(parts) > 4 and parts[4].isdigit()
-                                else 0
-                            )
+                            # INDEL: use the indel coverage column
+                            duplex_depth = int(float(parts[7]))
                         break
                 gene_name = "."
                 if args.genebed:
@@ -585,9 +615,10 @@ def do_estimate(args):
         else:
             sample = prefix.split("/")[-1]
         tn_int = h5py.File(args.reference + ".tn.h5", "r")
-        trinuc_count = np.zeros(97)
+        # trinuc_sbs_cov[t, b]: L-weighted coverage for C/T-ref trinuc context t, alt base b.
+        # G/A-ref positions are complement-mapped into this (32, 4) matrix.
+        trinuc_sbs_cov = np.zeros((32, 4))
         trinucSbs_count = np.zeros(96)
-        cov_total = 0
         indel_cov_total = 0
         trinucSbs2num = dict()
         num2trinucSbs = list()
@@ -616,6 +647,9 @@ def do_estimate(args):
                             + plus_base
                         )
         revcomp = {"A": "T", "T": "A", "C": "G", "G": "C"}
+        base2num_re = {"A": 0, "T": 1, "C": 2, "G": 3}
+        # Complement alt-base mapping: A(0)↔T(1), C(2)↔G(3)
+        comp_b = [1, 0, 3, 2]
         vcf = VCF(prefix + "/" + sample + "_snv.vcf", "r")
         vcf_indel = VCF(prefix + "/" + sample + "_indel.vcf", "r")
         indel_count = 0
@@ -623,11 +657,27 @@ def do_estimate(args):
             for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
                 interval.contig, interval.start, interval.end
             ):
-                chrom, start, end, cov, indel_cov = loc.split("\t")[0:5]
-                trinuc = tn_int[chrom][int(start)]
-                trinuc_count[trinuc] += int(cov)
-                cov_total += int(cov)
-                indel_cov_total += int(indel_cov)
+                # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov indel_cov
+                parts = loc.split("\t")
+                a_cov = float(parts[3])
+                t_cov = float(parts[4])
+                c_cov = float(parts[5])
+                g_cov = float(parts[6])
+                indel_cov_total += int(float(parts[7]))
+                trinuc_idx = int(tn_int[parts[0]][int(parts[1])])
+                if trinuc_idx < 32:
+                    # C/T ref: attribute coverage directly
+                    trinuc_sbs_cov[trinuc_idx, 0] += a_cov
+                    trinuc_sbs_cov[trinuc_idx, 1] += t_cov
+                    trinuc_sbs_cov[trinuc_idx, 2] += c_cov
+                    trinuc_sbs_cov[trinuc_idx, 3] += g_cov
+                elif trinuc_idx < 64:
+                    # G/A ref: complement-map to partner C/T-ref trinuc
+                    ct_idx = trinuc_idx - 32
+                    trinuc_sbs_cov[ct_idx, comp_b[0]] += a_cov
+                    trinuc_sbs_cov[ct_idx, comp_b[1]] += t_cov
+                    trinuc_sbs_cov[ct_idx, comp_b[2]] += c_cov
+                    trinuc_sbs_cov[ct_idx, comp_b[3]] += g_cov
             for rec in vcf_indel.fetch():
                 if "PASS" not in rec.filter:
                     continue
@@ -661,8 +711,6 @@ def do_estimate(args):
                         continue
                 if args.dilute:
                     vcf_out.write(rec)
-                # duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
-                duplex_no = str(F1R2) + "+" + str(F2R1)
                 if ref == "C" or ref == "T":
                     trinuc = rec.info["TN"]
                     alt = rec.alts[0]
@@ -676,33 +724,30 @@ def do_estimate(args):
                     alt = revcomp[rec.alts[0]]
                 trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
                 trinucSbs_count[trinucSbs2num[trinucSbs]] += 1
-        trinuc_cov_32 = trinuc_count[0:32] + trinuc_count[32:64]
-        trinuc_mut_cov = np.repeat(trinuc_cov_32, 3, axis=0)
+
+        # Build 96-class coverage by selecting non-ref alt-base rows from (32, 4) matrix
+        trinuc_cov_96 = trinuc_sbs_cov.flatten(order="F")[_SBS96_TO_128]  # (96,)
+        ref_trinuc_96 = np.repeat(ref_trinuc, 3)  # (96,)
         trinucSbs_count = trinucSbs_count.astype(float)
-        trinuc_mut_cov = trinuc_mut_cov.astype(float)
-        trinuc_rate = np.where(trinuc_mut_cov > 0, trinucSbs_count / trinuc_mut_cov, 0)
         ref_trinuc_sum = ref_trinuc.sum()
         genome_cov = ref_trinuc_sum
 
         trinuc_mut = trinucSbs_count
-        trinuc_cov = trinuc_cov_32
         mutnum = trinuc_mut.sum()
-        cov = trinuc_cov_32.sum()
+        cov = trinuc_cov_96.sum() / 3  # per-locus-equivalent coverage
         burden_uncorrected = mutnum / cov
         burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(mutnum, cov)
-        trinuc_rate = np.where(
-            np.repeat(trinuc_cov, 3) > 0, trinuc_mut / np.repeat(trinuc_cov, 3), 0
+        trinuc_rate = np.where(trinuc_cov_96 > 0, trinuc_mut / trinuc_cov_96, 0)
+        # Per-SBS96-class correction ratio — no np.repeat needed
+        correction_ratio = (ref_trinuc_96 / ref_trinuc_96.sum()) / (
+            trinuc_cov_96 / trinuc_cov_96.sum()
         )
-        correction_ratio = (ref_trinuc / ref_trinuc.sum()) / (
-            trinuc_cov / trinuc_cov.sum()
-        )
-        correction_ratio = np.repeat(correction_ratio, 3)
         mutnum_corrected = correction_ratio * trinuc_mut
         burden_corrected = mutnum_corrected.sum() / cov
         burden_corrected_lb, burden_corrected_ub = poisson_confint(
             mutnum_corrected.sum(), cov
         )
-        hap_trinuc = trinuc_rate * np.repeat(ref_trinuc, 3)
+        hap_trinuc = trinuc_rate * ref_trinuc_96
         mut_per_genome = hap_trinuc.sum()
 
         with open(args.prefix + "/" + sample + "_sbs_burden_re_estimate.txt", "w") as f:

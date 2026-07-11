@@ -649,7 +649,9 @@ def do_call(args):
 
         duplex_read_num_trinuc = OrderedDict(
             {
-                num: sum([d.get(num, np.zeros(32)) for d in duplex_read_nums_trinuc])
+                num: sum(
+                    [d.get(num, np.zeros((32, 4))) for d in duplex_read_nums_trinuc]
+                )
                 for num in duplex_combinations
             }
         )
@@ -796,20 +798,19 @@ def do_call(args):
     plt.close(fig)
 
     non_zero_keys = [k for k in all_keys if duplex_read_num[k] != 0]
-    trinuc_list = list()
-    trinuc2num = dict()
+    trinuc_list = []
     for minus_base in ["A", "T", "C", "G"]:
         for ref_base in ["C", "T"]:
             for plus_base in ["A", "T", "C", "G"]:
-                trinuc2num[minus_base + ref_base + plus_base] = len(trinuc_list)
                 trinuc_list.append(minus_base + ref_base + plus_base)
+    index_128 = [f"{trinuc}>{base}" for base in "ATCG" for trinuc in trinuc_list]
     duplex_read_num_trinuc = {_: duplex_read_num_trinuc[_] for _ in non_zero_keys}
-    trinuc_by_duplex_group = pd.DataFrame(duplex_read_num_trinuc)
-    trinuc_by_duplex_group.insert(0, "", trinuc_list)
+    data_128 = {k: v.flatten(order="F") for k, v in duplex_read_num_trinuc.items()}
+    trinuc_by_duplex_group = pd.DataFrame(data_128, index=index_128)
     trinuc_by_duplex_group.to_csv(
         args.output + "_trinuc_by_duplex_group.txt",
         sep="\t",
-        index=False,
+        index=True,
     )
 
     # Also output unmasked trinucleotide counts
@@ -961,7 +962,7 @@ def merge_adjacent_bed_files(next_file, prev_file, output_file):
                 if len(parts) >= 5:
                     chrom, start, end, cov1, cov2 = parts[:5]
                     key = (chrom, start, end)
-                    coverage_dict[key] = [int(cov1), int(cov2)]
+                    coverage_dict[key] = [float(cov1), float(cov2)]
 
     # Read prev_region file and merge
     if not os.path.exists(prev_file):
@@ -975,10 +976,10 @@ def merge_adjacent_bed_files(next_file, prev_file, output_file):
                     chrom, start, end, cov1, cov2 = parts[:5]
                     key = (chrom, start, end)
                     if key in coverage_dict:
-                        coverage_dict[key][0] += int(cov1)
-                        coverage_dict[key][1] += int(cov2)
+                        coverage_dict[key][0] += float(cov1)
+                        coverage_dict[key][1] += float(cov2)
                     else:
-                        coverage_dict[key] = [int(cov1), int(cov2)]
+                        coverage_dict[key] = [float(cov1), float(cov2)]
 
     # Write merged result only if there's data
     with bgzf.open(output_file, "wt") as f:

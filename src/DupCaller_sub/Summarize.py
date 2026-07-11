@@ -48,8 +48,8 @@ def do_summarize(args):
                 uniq_reads = int(lines[0].strip("\n").split("\t")[1])
                 pf_reads = int(lines[1].strip("\n").split("\t")[1])
                 pf_read_family = int(lines[2].strip("\n").split("\t")[1])
-                eff_cov = int(lines[3].strip("\n").split("\t")[1])
-                indel_eff_cov = int(lines[5].strip("\n").split("\t")[1])
+                eff_cov = int(float(lines[3].strip("\n").split("\t")[1]))
+                indel_eff_cov = int(float(lines[5].strip("\n").split("\t")[1]))
                 dup_rate = float(lines[8].strip("\n").split("\t")[1])
                 read_efficiency = float(lines[9].strip("\n").split("\t")[1])
 

@@ -293,12 +293,29 @@ def profileTriNucMismatches(
     if m_F1R2 < 3 or m_F2R1 < 3:
         dmg_antimask[:] = False
 
-    hp_F1R2 = hp_int[0, F1R2_antimask][hp_int[1, F1R2_antimask] == 1]
-    hp_F2R1 = hp_int[0, F2R1_antimask][hp_int[1, F2R1_antimask] == 1]
+    # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
+    # 2 = repeat count downstream. Homopolymers are unit length 1 runs;
+    # STRs are unit length >1 runs, binned into the same length bins
+    # (1: 10-24bp, 2: 25-39bp, 3: 40bp+) the calibrated tables expect.
+    unit_len = hp_int[0].astype(int)
+    count_down = hp_int[2].astype(int)
+    is_start = hp_int[1] == 1
+    hp_mask = is_start & (unit_len == 1)
+    hp_len_arr = count_down
+
+    total_len = unit_len * count_down
+    str_bin_arr = np.zeros_like(total_len)
+    str_bin_arr[total_len >= 10] = 1
+    str_bin_arr[total_len >= 25] = 2
+    str_bin_arr[total_len >= 40] = 3
+    str_mask = is_start & (unit_len > 1) & (str_bin_arr > 0)
+
+    hp_F1R2 = hp_len_arr[F1R2_antimask][hp_mask[F1R2_antimask]]
+    hp_F2R1 = hp_len_arr[F2R1_antimask][hp_mask[F2R1_antimask]]
     hp_F1R2[hp_F1R2 > 20] = 20
     hp_F2R1[hp_F2R1 > 20] = 20
 
-    ref_F1R2 = reference_int[F1R2_antimask][hp_int[1, F1R2_antimask] == 1]
+    ref_F1R2 = reference_int[F1R2_antimask][hp_mask[F1R2_antimask]]
     F1R2_id_alt_1Dmap = hp_F1R2 - 1 + ref_F1R2 * 20
     hpindel_alt_count[0:20, 5] += np.bincount(hp_F1R2 - 1, minlength=20) * m_F1R2
     F1R2_hpindel_1bp = (
@@ -307,7 +324,7 @@ def profileTriNucMismatches(
     F1R2_hpindel_1bp += F1R2_hpindel_1bp[0:20, [1, 0, 3, 2]]
     hpindel_alt_count[0:20, [12, 15, 18, 21]] += F1R2_hpindel_1bp
 
-    ref_F2R1 = reference_int[F2R1_antimask][hp_int[1, F2R1_antimask] == 1]
+    ref_F2R1 = reference_int[F2R1_antimask][hp_mask[F2R1_antimask]]
     F2R1_id_alt_1Dmap = hp_F2R1 - 1 + ref_F2R1 * 20
     hpindel_alt_count[0:20, 5] += np.bincount(hp_F2R1 - 1, minlength=20) * m_F2R1
     F2R1_hpindel_1bp = (
@@ -316,11 +333,11 @@ def profileTriNucMismatches(
     F2R1_hpindel_1bp += F2R1_hpindel_1bp[0:20, [1, 0, 3, 2]]
     hpindel_alt_count[0:20, [12, 15, 18, 21]] += F2R1_hpindel_1bp
 
-    hp_dmg = hp_int[0, dmg_antimask][hp_int[1, dmg_antimask] == 1]
+    hp_dmg = hp_len_arr[dmg_antimask][hp_mask[dmg_antimask]]
     hp_dmg[hp_dmg > 20] = 20
     hpindel_dmg_count[0:20, 5] += np.bincount(hp_dmg - 1, minlength=20) * 2
 
-    ref_dmg = reference_int[dmg_antimask][hp_int[1, dmg_antimask] == 1]
+    ref_dmg = reference_int[dmg_antimask][hp_mask[dmg_antimask]]
     F1R2_dmg_id_alt_1Dmap = hp_dmg - 1 + ref_dmg * 20
     F1R2_dmg_hpindel_1bp = (
         np.bincount(F1R2_dmg_id_alt_1Dmap, minlength=20 * 4).reshape(4, 20).T
@@ -329,15 +346,12 @@ def profileTriNucMismatches(
     hpindel_dmg_count[0:20, [12, 15, 18, 21]] += F1R2_dmg_hpindel_1bp
     hpindel_dmg_count[0:20, [12, 15, 18, 21]] += F2R1_dmg_hpindel_1bp
 
-    str_dmg = hp_int[2, dmg_antimask][hp_int[3, dmg_antimask] == 1]
-    str_dmg = str_dmg[str_dmg != 0]
+    str_dmg = str_bin_arr[dmg_antimask][str_mask[dmg_antimask]]
     hpindel_dmg_count[20:23, 5] += np.bincount(str_dmg - 1, minlength=3) * 2
 
-    str_F1R2 = hp_int[2, F1R2_antimask][hp_int[3, F1R2_antimask] == 1]
-    str_F1R2 = str_F1R2[str_F1R2 != 0]
+    str_F1R2 = str_bin_arr[F1R2_antimask][str_mask[F1R2_antimask]]
     hpindel_alt_count[20:23, 5] += np.bincount(str_F1R2 - 1, minlength=3) * m_F1R2
-    str_F2R1 = hp_int[2, F1R2_antimask][hp_int[3, F1R2_antimask] == 1]
-    str_F2R1 = str_F2R1[str_F2R1 != 0]
+    str_F2R1 = str_bin_arr[F1R2_antimask][str_mask[F1R2_antimask]]
     hpindel_alt_count[20:23, 5] += np.bincount(str_F2R1 - 1, minlength=3) * m_F2R1
 
     if m == 0:
@@ -414,8 +428,25 @@ def profileTriNucMismatches(
         offset = -indelLen
         if offset < 0:
             offset = 0
-        hp = np.max(hp_int[0, pos + 1 + offset])
-        hp = int(hp)
+        # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
+        # 2 = repeat count downstream
+        anchor = pos + 1 + offset
+        unit_len_here = int(hp_int[0, anchor])
+        count_here = int(hp_int[2, anchor])
+        if unit_len_here <= 1:
+            hp = count_here
+            str_bin_here = 0
+        else:
+            hp = 1
+            total_len_here = unit_len_here * count_here
+            if total_len_here >= 40:
+                str_bin_here = 3
+            elif total_len_here >= 25:
+                str_bin_here = 2
+            elif total_len_here >= 10:
+                str_bin_here = 1
+            else:
+                str_bin_here = 0
         if hp > 20:
             hp = 20
         if indelLen > 5:
@@ -458,33 +489,27 @@ def profileTriNucMismatches(
 
         else:
             if F1R2_antimask[mm]:
-                if hp_int[2, pos + 1 + offset] != 0:
+                if str_bin_here != 0:
                     hpindel_alt_count[
-                        19 + hp_int[2, pos + 1 + offset], indelLen + 5
+                        19 + str_bin_here, indelLen + 5
                     ] += F1R2_alt_count[mm]
-                    hpindel_alt_count[
-                        19 + hp_int[2, pos + 1 + offset], 5
-                    ] += F1R2_alt_count[mm]
+                    hpindel_alt_count[19 + str_bin_here, 5] += F1R2_alt_count[mm]
                 else:
                     hpindel_alt_count[hp - 1, indelLen + 5] += F1R2_alt_count[mm]
                     hpindel_alt_count[hp - 1, 5] -= F1R2_alt_count[mm]
             if F2R1_antimask[mm]:
-                if hp_int[2, pos + 1 + offset] != 0:
+                if str_bin_here != 0:
                     hpindel_alt_count[
-                        19 + hp_int[2, pos + 1 + offset], indelLen + 5
+                        19 + str_bin_here, indelLen + 5
                     ] += F2R1_alt_count[mm]
-                    hpindel_alt_count[
-                        19 + hp_int[2, pos + 1 + offset], 5
-                    ] -= F2R1_alt_count[mm]
+                    hpindel_alt_count[19 + str_bin_here, 5] -= F2R1_alt_count[mm]
                 else:
                     hpindel_alt_count[hp - 1, indelLen + 5] += F2R1_alt_count[mm]
                     hpindel_alt_count[hp - 1, 5] -= F2R1_alt_count[mm]
             if dmg_antimask[mm]:
-                if hp_int[2, pos + 1 + offset] != 0:
-                    hpindel_dmg_count[
-                        19 + hp_int[2, pos + 1 + offset], indelLen + 5
-                    ] += 1
-                    hpindel_dmg_count[19 + hp_int[2, pos + 1 + offset], 5] -= 1
+                if str_bin_here != 0:
+                    hpindel_dmg_count[19 + str_bin_here, indelLen + 5] += 1
+                    hpindel_dmg_count[19 + str_bin_here, 5] -= 1
                 else:
                     hpindel_dmg_count[hp - 1, indelLen + 5] += 1
                     hpindel_dmg_count[hp - 1, 5] -= 1

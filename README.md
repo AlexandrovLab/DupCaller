@@ -84,15 +84,15 @@ singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your com
 
 ### Step 1: Index Reference Genome
 
-DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching and trinucleotide context indexing. Indexing requires a tabix-indexed BED file of short tandem repeat (STR) regions, which is used to annotate STR loci for improved indel calling near repetitive regions. To index the reference genome, run:
+DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching and trinucleotide context indexing. Indexing requires two tabix-indexed BED files of repeat regions (including homopolymers and short tandem repeats, STRs), split by total repeat length: repeats 12bp or shorter (`-rb`/`--repeatBed`) and repeats longer than 12bp (`-s`/`--strbed`). Both files annotate repeat loci for improved indel calling near repetitive regions. To index the reference genome, run:
 
 ```bash
-DupCaller.py index -f reference.fa -s str_regions.bed.gz
+DupCaller.py index -f reference.fa -rb repeat_regions.bed.gz -s str_regions.bed.gz
 ```
 
-The command will generate three h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5` and `{reference}.hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and homopolymer/STR annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
+The command will generate three h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5` and `{reference}.hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and repeat (homopolymer/STR) annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
 
-The STR BED file must be tabix-indexed (`.bed.gz` with a `.tbi` index).
+Both BED files must be tabix-indexed (`.bed.gz` with a `.tbi` index) and have at least 5 columns: chrom, start, end, repeat unit length, and repeat length. Every repeat in the genome (including single-base homopolymers) should be covered by one of the two files, split by whether its total repeat length is <=12bp (`--repeatBed`) or >12bp (`--strbed`).
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
@@ -101,7 +101,8 @@ For human reference genome hg38 and mouse reference genome mm39, we provided pre
 | Short | Long | Description |
 | --- | --- | --- |
 | -f | --reference | Reference genome fasta file (required) |
-| -s | --strbed | Tabix-indexed BED file of STR regions (required) |
+| -rb | --repeatBed | Tabix-indexed BED file of repeats 12bp or shorter, incl. homopolymers (required) |
+| -s | --strbed | Tabix-indexed BED file of repeats longer than 12bp (required) |
 
 #### Pre-built Indexes
 
@@ -118,7 +119,8 @@ For other reference genomes, a BED file of simple repeats is needed to build the
 4. Add filter: "repClass Does match Simple_repeat".
 5. For **Output format**, select "BED - browser extensible data".
 6. Input desired filename (e.g. `mm39_str.bed`) and download the output BED file.
-7. Sort the output bed file with your reference genome (Use bedtools or similar) and compress and index with bgzip:
+7. Add repeat unit length and repeat length as columns 4 and 5 (the UCSC `rmsk`/simple-repeat table reports the repeat unit and its period; derive these two columns from it), then split the records into two files by total repeat length: <=12bp goes into the file passed to `--repeatBed`, and >12bp goes into the file passed to `--strbed`.
+8. Sort each bed file with your reference genome (Use bedtools or similar) and compress and index with bgzip:
 ```bash
 sortBed -i str.bed -faidx reference.fa.fai > str_sorted.bed
 bgzip str_sorted.bed

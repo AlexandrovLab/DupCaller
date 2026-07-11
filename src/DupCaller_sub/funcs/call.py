@@ -23,7 +23,12 @@ from .depth import (
     prepareAlignMask,
     detectOverlapDiscord,
 )
-from .prob import genotypeDSSnv, genotypeDSIndel
+from .prob import (
+    genotypeDSSnv,
+    genotypeDSIndel,
+    calculateSSPosterior,
+    calculateDSPosterior,
+)
 from .learn import profileTriNucMismatches
 from .misc import getAlignmentObject as BAM
 from .indels import findIndels
@@ -560,9 +565,9 @@ def callBam(params, processNo):
         params["dmgmat_indel_rev"] = dmgmat_indel_rev
     # Initialize
 
-    total_coverage = 0
+    total_coverage = np.zeros(4)
     total_coverage_indel = 0
-    total_unmasked_coverage = 0
+    total_unmasked_coverage = np.zeros(4)
     total_unmasked_coverage_indel = 0
     starttime = time.time()
     tumorBam = BAM(bam, "rb", params.get("reference"))
@@ -625,6 +630,93 @@ def callBam(params, processNo):
         print(
             f"Process {str(processNo)}: finished screening highly damaged reads in {currentTime: .2f} minutes. Blacklisted {len(read_blacklist)} ({percent_blocked: .2f}%) possible highly damaged read and started variant calling."
         )
+    # Build 10x10x64x4 LR lookup matrix L for coverage/power calculation.
+    # Axis 0: top strand (F1R2) read count 0-9
+    # Axis 1: bottom strand (F2R1) read count 0-9
+    # Axis 2: trinuc context index 0-63
+    # Axis 3: converted (alt) base index 0-3 (A/T/C/G)
+    L = np.zeros([10, 10, 64, 4])
+
+    # Sample base quality distribution from the BAM regions
+    all_quals = []
+    reads_sampled = 0
+    max_qual_reads = 1000
+    for region in regions:
+        for read in tumorBam.fetch(*region):
+            if not read.is_unmapped and read.query_alignment_qualities is not None:
+                quals = np.array(read.query_alignment_qualities, dtype=float)
+                valid_quals = quals[quals > params["minBq"]]
+                all_quals.extend(valid_quals.tolist())
+                reads_sampled += 1
+                if reads_sampled >= max_qual_reads:
+                    break
+        if reads_sampled >= max_qual_reads:
+            break
+    if not all_quals:
+        all_quals = [30]
+    all_quals = np.array(all_quals, dtype=float)
+
+    prob_amp_mat_L = params["ampmat"]
+    prob_amp_mat_rev_L = params["ampmat_rev"]
+    prob_dmg_t_L = params["dmgmat_top"]
+    prob_dmg_rev_t_L = params["dmgmat_rev_top"]
+    prob_dmg_b_L = params["dmgmat_bot"]
+    prob_dmg_rev_b_L = params["dmgmat_rev_bot"]
+    trinuc_conv_np_L = params["trinuc_convert"]
+    ln10_L = np.log(10)
+    N_SIM = 100
+    rng_L = np.random.default_rng()
+
+    for t in range(64):
+        ref_base_idx_L = base2num[num2trinuc[t][1]]
+        for b in range(4):
+            tc = int(trinuc_conv_np_L[t, b])
+            P_arr = np.full(N_SIM, prob_amp_mat_L[tc, ref_base_idx_L])
+            P_rev_arr = np.full(N_SIM, prob_amp_mat_rev_L[tc, ref_base_idx_L])
+            Pt_arr = np.full(N_SIM, prob_dmg_t_L[tc, ref_base_idx_L])
+            Prev_t_arr = np.full(N_SIM, prob_dmg_rev_t_L[tc, ref_base_idx_L])
+            Pb_arr = np.full(N_SIM, prob_dmg_b_L[tc, ref_base_idx_L])
+            Prev_b_arr = np.full(N_SIM, prob_dmg_rev_b_L[tc, ref_base_idx_L])
+
+            for i in range(10):
+                for j in range(10):
+                    if i == 0 and j == 0:
+                        continue
+
+                    if i > 0:
+                        q_top = rng_L.choice(all_quals, size=(i, N_SIM), replace=True)
+                        F1R2_Pseq = -q_top / 10 * ln10_L
+                        F1R2_bin = np.ones([i, N_SIM], dtype=bool)
+                    else:
+                        F1R2_Pseq = np.zeros([0, N_SIM])
+                        F1R2_bin = np.zeros([0, N_SIM], dtype=bool)
+
+                    if j > 0:
+                        q_bot = rng_L.choice(all_quals, size=(j, N_SIM), replace=True)
+                        F2R1_Pseq = -q_bot / 10 * ln10_L
+                        F2R1_bin = np.ones([j, N_SIM], dtype=bool)
+                    else:
+                        F2R1_Pseq = np.zeros([0, N_SIM])
+                        F2R1_bin = np.zeros([0, N_SIM], dtype=bool)
+
+                    F1R2_b1, F1R2_b2 = calculateSSPosterior(
+                        P_arr, P_rev_arr, F1R2_bin, F1R2_Pseq
+                    )
+                    F2R1_b1, F2R1_b2 = calculateSSPosterior(
+                        P_arr, P_rev_arr, F2R1_bin, F2R1_Pseq
+                    )
+                    LL_B1, LL_B2 = calculateDSPosterior(
+                        Pt_arr,
+                        Prev_t_arr,
+                        Pb_arr,
+                        Prev_b_arr,
+                        F1R2_b1,
+                        F2R1_b1,
+                        F1R2_b2,
+                        F2R1_b2,
+                    )
+                    L[i, j, t, b] = ((LL_B1 - LL_B2) >= pcut).mean()
+
     retain_base = 5
     currentReadDictList = [
         dict() for _ in range(retain_base)
@@ -750,7 +842,7 @@ def callBam(params, processNo):
                 duplex_no = f"{F1R2}+{F2R1}"
                 if duplex_read_num_dict.get(duplex_no) is None:
                     duplex_read_num_dict[duplex_no] = [0, 0, 0]
-                    duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
+                    duplex_read_num_dict_trinuc[duplex_no] = np.zeros((96, 4))
                     # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
                 duplex_read_num_dict[duplex_no][2] += 1
                 unique_read_num += 1
@@ -795,22 +887,22 @@ def callBam(params, processNo):
                         if "coverage" in locals():
                             if "coverage_leftover" in locals():
                                 coverage[
-                                    0 : coverage_leftover.size
+                                    0 : coverage_leftover.shape[0]
                                 ] += coverage_leftover
                                 coverage_indel[
-                                    0 : coverage_leftover.size
+                                    0 : coverage_leftover.shape[0]
                                 ] += coverage_indel_leftover
                                 unmasked_coverage[
-                                    0 : coverage_leftover.size
+                                    0 : coverage_leftover.shape[0]
                                 ] += unmasked_coverage_leftover
                                 unmasked_coverage_indel[
-                                    0 : coverage_leftover.size
+                                    0 : coverage_leftover.shape[0]
                                 ] += unmasked_coverage_indel_leftover
-                                unmasked_coverage_leftover = np.zeros(1, dtype=int)
+                                unmasked_coverage_leftover = np.zeros((1, 4))
                                 unmasked_coverage_indel_leftover = np.zeros(
                                     1, dtype=int
                                 )
-                                coverage_leftover = np.zeros(1, dtype=int)
+                                coverage_leftover = np.zeros((1, 4))
                                 coverage_indel_leftover = np.zeros(1, dtype=int)
                             if chromNow == reference_mat_chrom:
                                 coverage_leftover = copy.deepcopy(
@@ -844,14 +936,14 @@ def callBam(params, processNo):
                                 non_zero_positions = np.nonzero(
                                     coverage[
                                         0 : (rs_reference_start - reference_mat_start)
-                                    ]
+                                    ].sum(axis=1)
                                     + coverage_indel[
                                         0 : (rs_reference_start - reference_mat_start)
                                     ]
                                 )
                             else:
                                 non_zero_positions = np.nonzero(
-                                    coverage + coverage_indel
+                                    coverage.sum(axis=1) + coverage_indel
                                 )
                             for pos in non_zero_positions[0].tolist():
                                 current_pos = pos + reference_mat_start
@@ -872,7 +964,7 @@ def callBam(params, processNo):
                                             reference_mat_chrom,
                                             str(current_pos),
                                             str(current_pos + 1),
-                                            str(coverage[pos]),
+                                            "\t".join(str(v) for v in coverage[pos]),
                                             str(coverage_indel[pos]),
                                         ]
                                     )
@@ -939,9 +1031,9 @@ def callBam(params, processNo):
                             params,
                         )
                         # print(ref_np,reference_mat_start)
-                        coverage = np.zeros(1000000, dtype=int)
+                        coverage = np.zeros((1000000, 4))
                         coverage_indel = np.zeros(1000000, dtype=int)
-                        unmasked_coverage = np.zeros(1000000, dtype=int)
+                        unmasked_coverage = np.zeros((1000000, 4))
                         unmasked_coverage_indel = np.zeros(1000000, dtype=int)
                     ### Record read names to check if mate has been processed
                     processed_flag = 0
@@ -1241,9 +1333,11 @@ def callBam(params, processNo):
                         if isLearn:
                             continue
                         (
-                            CS,
-                            LR_raw,
-                            LR_max,
+                            cov_mat,
+                            CS_mut,
+                            LR_raw_mut,
+                            LR_max_mut,
+                            mut_mask,
                             b1_int,
                             unmasked_antimask,
                             F1R2_count,
@@ -1256,6 +1350,7 @@ def callBam(params, processNo):
                             prior_mat[start_ind:end_ind, :],
                             np.copy(unmasked_antimask),
                             params,
+                            L,
                         )
                         """
                         (
@@ -1282,19 +1377,23 @@ def callBam(params, processNo):
                         # print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
 
                         ref_int = ref_np[start_ind:end_ind]
-                        # Find all mutations and references from unmasked results
+                        n_win = ref_int.size
+                        mut_pos_in_win = np.nonzero(mut_mask)[0]
+                        if CS_mut.size > 0:
+                            muts_ind_compressed = np.nonzero(
+                                CS_mut >= params["cscutoff"]
+                            )[0]
+                            muts_ind = mut_pos_in_win[muts_ind_compressed].tolist()
+                        else:
+                            muts_ind_compressed = np.zeros(0, dtype=int)
+                            muts_ind = []
                         refs_ind = np.nonzero(
-                            np.logical_and(
-                                LR_raw >= params["pcutoff"],
-                                b1_int == ref_int,
-                            )
+                            np.logical_and(unmasked_antimask, b1_int == ref_int)
                         )[0].tolist()
-                        LR_pass_bool = LR_raw >= params["pcutoff"]
-                        muts_ind = np.nonzero(
-                            np.logical_and(CS >= params["cscutoff"], b1_int != ref_int)
-                        )[0].tolist()
+                        LR_pass_bool = np.zeros(n_win, dtype=bool)
+                        LR_pass_bool[mut_mask] = LR_raw_mut >= params["pcutoff"]
                         alt_int = b1_int
-                        unmasked_pass_bool = np.full(LR_raw.size, False, dtype=bool)
+                        unmasked_pass_bool = np.full(n_win, False, dtype=bool)
                         unmasked_pass_bool[refs_ind] = True
                         unmasked_pass_bool[muts_ind] = True
                         pass_bool = np.copy(unmasked_pass_bool)
@@ -1344,10 +1443,9 @@ def callBam(params, processNo):
                                 continue
                             if F2R1_count[:, muts_ind[nn]].sum() == 0:
                                 continue
-                            _idx = mut_pos - 1 - reference_mat_start - start_ind
-                            if pass_bool[_idx] and LR_pass_bool[_idx]:
+                            if pass_bool[muts_ind[nn]] and LR_pass_bool[muts_ind[nn]]:
                                 flt = flt_rs
-                            elif pass_bool[_idx]:
+                            elif pass_bool[muts_ind[nn]]:
                                 flt = "underpowered"
                             else:
                                 flt = "masked"
@@ -1360,9 +1458,9 @@ def callBam(params, processNo):
                                 "infos": {
                                     "F1R2": F1R2,
                                     "F2R1": F2R1,
-                                    "CS": CS[muts_ind[nn]],
-                                    "LR": LR_raw[muts_ind[nn]],
-                                    "LM": LR_max[muts_ind[nn]],
+                                    "CS": CS_mut[muts_ind_compressed[nn]],
+                                    "LR": LR_raw_mut[muts_ind_compressed[nn]],
+                                    "LM": LR_max_mut[muts_ind_compressed[nn]],
                                     # "BLR": F2R1_LR[muts_ind[nn]],
                                     # "LR": LR[muts_ind[nn]],
                                     "TC": ",".join(
@@ -1403,20 +1501,24 @@ def callBam(params, processNo):
                             continue
                         """
                         if flt_rs == "PASS":
-                            coverage[start_ind:end_ind][pass_bool] += 1
+                            coverage[start_ind:end_ind][pass_bool] += cov_mat[pass_bool]
                             duplex_read_num_dict[duplex_no][1] += np.count_nonzero(
                                 pass_bool
                             )
                             trinuc_pass = trinuc_np[start_ind:end_ind][pass_bool]
-                            duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
-                                trinuc_pass, minlength=96
-                            ).astype(int)
+                            cov_pass = cov_mat[pass_bool]
+                            for b in range(4):
+                                duplex_read_num_dict_trinuc[duplex_no][
+                                    :, b
+                                ] += np.bincount(
+                                    trinuc_pass, weights=cov_pass[:, b], minlength=96
+                                )
 
                             # Update unmasked coverage and trinuc counts (includes all passing sites)
 
                             unmasked_coverage[start_ind:end_ind][
                                 unmasked_pass_bool
-                            ] += 1
+                            ] += cov_mat[unmasked_pass_bool]
                             if pass_bool.any():
                                 duplex_read_num_dict[duplex_no][0] += 1
                                 duplex_count += 1
@@ -1509,7 +1611,7 @@ def callBam(params, processNo):
         duplex_no = f"{F1R2}+{F2R1}"
         if duplex_read_num_dict.get(duplex_no) is None:
             duplex_read_num_dict[duplex_no] = [0, 0, 0]
-            duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
+            duplex_read_num_dict_trinuc[duplex_no] = np.zeros((96, 4))
             # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
         duplex_read_num_dict[duplex_no][2] += 1
         unique_read_num += 1
@@ -1545,19 +1647,19 @@ def callBam(params, processNo):
                 ### Output coverage
                 if "coverage" in locals():
                     if "coverage_leftover" in locals():
-                        coverage[0 : coverage_leftover.size] += coverage_leftover
+                        coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
                         coverage_indel[
-                            0 : coverage_leftover.size
+                            0 : coverage_leftover.shape[0]
                         ] += coverage_indel_leftover
                         unmasked_coverage[
-                            0 : coverage_leftover.size
+                            0 : coverage_leftover.shape[0]
                         ] += unmasked_coverage_leftover
                         unmasked_coverage_indel[
-                            0 : coverage_leftover.size
+                            0 : coverage_leftover.shape[0]
                         ] += unmasked_coverage_indel_leftover
-                        unmasked_coverage_leftover = np.zeros(1, dtype=int)
+                        unmasked_coverage_leftover = np.zeros((1, 4))
                         unmasked_coverage_indel_leftover = np.zeros(1, dtype=int)
-                        coverage_leftover = np.zeros(1, dtype=int)
+                        coverage_leftover = np.zeros((1, 4))
                         coverage_indel_leftover = np.zeros(1, dtype=int)
                     if chromNow == reference_mat_chrom:
                         coverage_leftover = copy.deepcopy(
@@ -1589,13 +1691,17 @@ def callBam(params, processNo):
                             ]
                         )
                         non_zero_positions = np.nonzero(
-                            coverage[0 : (rs_reference_start - reference_mat_start)]
+                            coverage[
+                                0 : (rs_reference_start - reference_mat_start)
+                            ].sum(axis=1)
                             + coverage_indel[
                                 0 : (rs_reference_start - reference_mat_start)
                             ]
                         )
                     else:
-                        non_zero_positions = np.nonzero(coverage + coverage_indel)
+                        non_zero_positions = np.nonzero(
+                            coverage.sum(axis=1) + coverage_indel
+                        )
                     for pos in non_zero_positions[0].tolist():
                         current_pos = pos + reference_mat_start
                         bed_file = get_bed_file_for_position(
@@ -1615,7 +1721,7 @@ def callBam(params, processNo):
                                     reference_mat_chrom,
                                     str(current_pos),
                                     str(current_pos + 1),
-                                    str(coverage[pos]),
+                                    "\t".join(str(v) for v in coverage[pos]),
                                     str(coverage_indel[pos]),
                                 ]
                             )
@@ -1678,9 +1784,9 @@ def callBam(params, processNo):
                     params,
                 )
                 # print(ref_np,reference_mat_start)
-                coverage = np.zeros(1000000, dtype=int)
+                coverage = np.zeros((1000000, 4))
                 coverage_indel = np.zeros(1000000, dtype=int)
-                unmasked_coverage = np.zeros(1000000, dtype=int)
+                unmasked_coverage = np.zeros((1000000, 4))
                 unmasked_coverage_indel = np.zeros(1000000, dtype=int)
             ### Record read names to check if mate has been processed
             processed_flag = 0
@@ -1949,9 +2055,11 @@ def callBam(params, processNo):
                 if isLearn:
                     continue
                 (
-                    CS,
-                    LR_raw,
-                    LR_max,
+                    cov_mat,
+                    CS_mut,
+                    LR_raw_mut,
+                    LR_max_mut,
+                    mut_mask,
                     b1_int,
                     unmasked_antimask,
                     F1R2_count,
@@ -1964,6 +2072,7 @@ def callBam(params, processNo):
                     prior_mat[start_ind:end_ind, :],
                     np.copy(unmasked_antimask),
                     params,
+                    L,
                 )
                 """
                 (
@@ -1990,19 +2099,21 @@ def callBam(params, processNo):
                 # print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
 
                 ref_int = ref_np[start_ind:end_ind]
-                # Find all mutations and references from unmasked results
+                n_win = ref_int.size
+                mut_pos_in_win = np.nonzero(mut_mask)[0]
+                if CS_mut.size > 0:
+                    muts_ind_compressed = np.nonzero(CS_mut >= params["cscutoff"])[0]
+                    muts_ind = mut_pos_in_win[muts_ind_compressed].tolist()
+                else:
+                    muts_ind_compressed = np.zeros(0, dtype=int)
+                    muts_ind = []
                 refs_ind = np.nonzero(
-                    np.logical_and(
-                        LR_raw >= params["pcutoff"],
-                        b1_int == ref_int,
-                    )
+                    np.logical_and(unmasked_antimask, b1_int == ref_int)
                 )[0].tolist()
-                LR_pass_bool = LR_raw >= params["pcutoff"]
-                muts_ind = np.nonzero(
-                    np.logical_and(CS >= params["cscutoff"], b1_int != ref_int)
-                )[0].tolist()
+                LR_pass_bool = np.zeros(n_win, dtype=bool)
+                LR_pass_bool[mut_mask] = LR_raw_mut >= params["pcutoff"]
                 alt_int = b1_int
-                unmasked_pass_bool = np.full(LR_raw.size, False, dtype=bool)
+                unmasked_pass_bool = np.full(n_win, False, dtype=bool)
                 unmasked_pass_bool[refs_ind] = True
                 unmasked_pass_bool[muts_ind] = True
                 pass_bool = np.copy(unmasked_pass_bool)
@@ -2049,12 +2160,9 @@ def callBam(params, processNo):
                         continue
                     if F2R1_count[:, muts_ind[nn]].sum() == 0:
                         continue
-                    if (
-                        pass_bool[mut_pos - 1 - reference_mat_start - start_ind]
-                        and LR_pass_bool[mut_pos - 1 - reference_mat_start - start_ind]
-                    ):
+                    if pass_bool[muts_ind[nn]] and LR_pass_bool[muts_ind[nn]]:
                         flt = flt_rs
-                    elif pass_bool[mut_pos - 1 - reference_mat_start - start_ind]:
+                    elif pass_bool[muts_ind[nn]]:
                         flt = "underpowered"
                     else:
                         flt = "masked"
@@ -2067,9 +2175,9 @@ def callBam(params, processNo):
                         "infos": {
                             "F1R2": F1R2,
                             "F2R1": F2R1,
-                            "CS": CS[muts_ind[nn]],
-                            "LR": LR_raw[muts_ind[nn]],
-                            "LM": LR_max[muts_ind[nn]],
+                            "CS": CS_mut[muts_ind_compressed[nn]],
+                            "LR": LR_raw_mut[muts_ind_compressed[nn]],
+                            "LM": LR_max_mut[muts_ind_compressed[nn]],
                             # "BLR": F2R1_LR[muts_ind[nn]],
                             # "LR": LR[muts_ind[nn]],
                             "TC": ",".join(
@@ -2098,16 +2206,20 @@ def callBam(params, processNo):
                     continue
                 """
                 if flt_rs == "PASS":
-                    coverage[start_ind:end_ind][pass_bool] += 1
+                    coverage[start_ind:end_ind][pass_bool] += cov_mat[pass_bool]
                     duplex_read_num_dict[duplex_no][1] += np.count_nonzero(pass_bool)
                     trinuc_pass = trinuc_np[start_ind:end_ind][pass_bool]
-                    duplex_read_num_dict_trinuc[duplex_no] += np.bincount(
-                        trinuc_pass, minlength=96
-                    ).astype(int)
+                    cov_pass = cov_mat[pass_bool]
+                    for b in range(4):
+                        duplex_read_num_dict_trinuc[duplex_no][:, b] += np.bincount(
+                            trinuc_pass, weights=cov_pass[:, b], minlength=96
+                        )
 
                     # Update unmasked coverage and trinuc counts (includes all passing sites)
 
-                    unmasked_coverage[start_ind:end_ind][unmasked_pass_bool] += 1
+                    unmasked_coverage[start_ind:end_ind][unmasked_pass_bool] += cov_mat[
+                        unmasked_pass_bool
+                    ]
                     if pass_bool.any():
                         duplex_read_num_dict[duplex_no][0] += 1
                         duplex_count += 1
@@ -2244,13 +2356,15 @@ def callBam(params, processNo):
 
     if "coverage" in locals():
         if "coverage_leftover" in locals():
-            coverage[0 : coverage_leftover.size] += coverage_leftover
-            coverage_indel[0 : coverage_leftover.size] += coverage_indel_leftover
-            unmasked_coverage[0 : coverage_leftover.size] += unmasked_coverage_leftover
+            coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
+            coverage_indel[0 : coverage_leftover.shape[0]] += coverage_indel_leftover
+            unmasked_coverage[
+                0 : coverage_leftover.shape[0]
+            ] += unmasked_coverage_leftover
             unmasked_coverage_indel[
-                0 : coverage_leftover.size
+                0 : coverage_leftover.shape[0]
             ] += unmasked_coverage_indel_leftover
-        non_zero_positions = np.nonzero(coverage + coverage_indel)
+        non_zero_positions = np.nonzero(coverage.sum(axis=1) + coverage_indel)
         for pos in non_zero_positions[0].tolist():
             current_pos = pos + reference_mat_start
             bed_file = get_bed_file_for_position(
@@ -2270,7 +2384,7 @@ def callBam(params, processNo):
                         reference_mat_chrom,
                         str(current_pos),
                         str(current_pos + 1),
-                        str(coverage[pos]),
+                        "\t".join(str(v) for v in coverage[pos]),
                         str(coverage_indel[pos]),
                     ]
                 )
@@ -2291,14 +2405,14 @@ def callBam(params, processNo):
     )
 
     for duplex_no in duplex_read_num_dict_trinuc.keys():
-        trinuc_profile = (
-            duplex_read_num_dict_trinuc[duplex_no][:32]
-            + duplex_read_num_dict_trinuc[duplex_no][32:64]
+        duplex_read_num_dict_trinuc[duplex_no] = (
+            duplex_read_num_dict_trinuc[duplex_no][:32, :]
+            + duplex_read_num_dict_trinuc[duplex_no][32:64][:, [1, 0, 3, 2]]
         )
-        duplex_read_num_dict_trinuc[duplex_no] = trinuc_profile
+
     return (
         mut_pass_filter,
-        total_coverage,
+        total_coverage.sum(),
         recCount,
         duplex_count,
         duplex_read_num_dict,
@@ -2309,6 +2423,6 @@ def callBam(params, processNo):
         pass_read_num,
         FPs,
         RPs,
-        total_unmasked_coverage,
+        total_unmasked_coverage.sum(),
         total_unmasked_coverage_indel,
     )

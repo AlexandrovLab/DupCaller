@@ -503,7 +503,13 @@ if __name__ == "__main__":
         "-s",
         "--strbed",
         type=str,
-        help="Fasta file of reference. Either -f or -ft should be set",
+        help="Tabix-indexed BED file of repeats longer than 12bp. Column 4 is repeat unit length, column 5 is repeat length",
+    )
+    index_parser.add_argument(
+        "-rb",
+        "--repeatBed",
+        type=str,
+        help="Tabix-indexed BED file of repeats 12bp or shorter (including homopolymers). Column 4 is repeat unit length, column 5 is repeat length",
     )
     args = master_parser.parse_args()
     """

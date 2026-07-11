@@ -1,508 +1,351 @@
 #!/usr/bin/env nextflow
 
-/*
- * DupCaller Nextflow Pipeline
- *
- * A pipeline for calling somatic mutations from barcoded error-corrected NGS data
- */
-
 nextflow.enable.dsl=2
 
-/*
- * Pipeline parameters with default values
- */
-params.help = false
-params.outdir = "./results"
+if (!params.sample_map) error "params.sample_map is required"
+if (!params.reference)  error "params.reference is required"
 
-// Input files
-params.sample_name = null
-params.read1 = null
-params.read2 = null
-params.normal_read1 = null
-params.normal_read2 = null
-params.normal_bam = null
-params.tumor_bam = null         // pre-aligned tumor BAM (when skipping trim/align)
-
-// Reference files
-params.reference = null
-params.germline_vcf = null
-params.noise_mask = null
-params.indel_bed = null
-
-// Barcode trimming parameters
-params.barcode_pattern = "NNNXXXX"
-
-// Alignment parameters
-params.threads = 4
-params.read_group_id = null
-params.platform = "ILLUMINA"
-
-// DupCaller calling parameters
-params.regions = "chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY"
-params.max_af = 1.0
-params.germline_af_cutoff = 0.001
-params.min_n_depth = 10
-params.max_zero_qual_frac = 0.5
-params.trim_template = 7
-params.trim_read = 7
-params.mapq = 40
-params.window_size = 100000
-
-// Burden estimation parameters
-params.estimate_clonal = false
-params.estimate_dilute = false
-params.gene_bed = null
-
-// Skip options
-params.skip_trim = false
-params.skip_align = false
-params.skip_normal = false
-
-def helpMessage() {
-    log.info"""
-    ================================================================
-    DupCaller Pipeline
-    ================================================================
-
-    Usage:
-    nextflow run DupCaller.nf --sample_name SAMPLE --read1 R1.fq.gz --read2 R2.fq.gz --reference ref.fa [options]
-
-    Required arguments:
-      --sample_name         Sample name for output files
-      --reference           Reference genome fasta file (must be indexed with DupCaller.py index)
-
-    Input options (choose one):
-      --read1               Read 1 fastq file (start from FASTQ)
-      --read2               Read 2 fastq file (start from FASTQ)
-      --tumor_bam           Pre-aligned/markdup tumor BAM file (skip trim and align)
-
-    Normal sample (choose one, or use --skip_normal):
-      --normal_read1        Normal sample read 1 fastq
-      --normal_read2        Normal sample read 2 fastq
-      --normal_bam          Pre-aligned normal BAM file (must have .bai index)
-      --skip_normal         Run without matched normal (set --max_af appropriately)
-
-    Reference resources:
-      --germline_vcf        Indexed germline VCF with AF field
-      --noise_mask          BED file for noise masking
-      --indel_bed           Enhanced panel of normal for indels
-
-    Barcode trimming:
-      --barcode_pattern     Barcode pattern (default: NNNXXXX for NanoSeq)
-
-    Alignment:
-      --threads             Number of threads (default: 4)
-      --platform            Sequencing platform (default: ILLUMINA)
-
-    Variant calling:
-      --regions             Contigs for variant calling (default: chr1-22,X,Y)
-      --max_af              Maximum allele frequency (default: 1.0)
-      --germline_af_cutoff  Germline AF cutoff (default: 0.001)
-      --min_n_depth         Minimum normal depth (default: 10)
-      --max_zero_qual_frac  Maximum zero quality fraction (default: 0.5)
-      --trim_template       Template end trim distance (default: 7)
-      --trim_read           Read end trim distance (default: 7)
-      --mapq                Minimum mapping quality (default: 40)
-      --window_size         Genomic window size (default: 100000)
-
-    Burden estimation:
-      --estimate_clonal     Consider clonal mutations (default: false)
-      --estimate_dilute     Dilute mode for same starting material (default: false)
-      --gene_bed            Gene BED file for coverage calculation
-
-    Output:
-      --outdir              Output directory (default: ./results)
-
-    Example:
-      nextflow run DupCaller.nf \\
-        --sample_name sample1 \\
-        --read1 sample1_R1.fq.gz \\
-        --read2 sample1_R2.fq.gz \\
-        --normal_bam normal.bam \\
-        --reference hg38.fa \\
-        --germline_vcf gnomad.vcf.gz \\
-        --noise_mask noise.bed.gz \\
-        --threads 8
-
-    """.stripIndent()
-}
-
-if (params.help) {
-    helpMessage()
-    exit 0
-}
-
-// Validate required parameters
-if (!params.sample_name) {
-    error "Error: --sample_name is required"
-}
-if (!params.reference) {
-    error "Error: --reference is required"
-}
-if (!params.read1 && !params.read2 && !params.tumor_bam) {
-    error "Error: provide --read1/--read2 (start from FASTQ) or --tumor_bam (pre-aligned BAM)"
-}
-
-/*
- * Process: Trim barcodes from fastq files
- */
-process TRIM_BARCODES {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/trimmed", mode: 'copy'
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 1: Index reference genome
+// ─────────────────────────────────────────────────────────────────────────────
+process INDEX_REFERENCE {
+    container 'yuhecheng62/dupcaller:1.1.0-amd64'
 
     input:
-    tuple val(sample_name), path(read1), path(read2)
+    path reference
+    path repeat_bed
+    path repeat_bed_tbi
+    path str_bed
+    path str_bed_tbi
 
     output:
-    tuple val(sample_name), path("${sample_name}_1.fastq"), path("${sample_name}_2.fastq")
-
-    stub:
-    """
-    touch ${sample_name}_1.fastq ${sample_name}_2.fastq
-    """
+    path "${reference}.ref.h5", emit: ref_h5
+    path "${reference}.tn.h5",  emit: tn_h5
+    path "${reference}.hp.h5",  emit: hp_h5
 
     script:
     """
-    DupCaller.py trim \\
-        -i ${read1} \\
-        -i2 ${read2} \\
-        -p ${params.barcode_pattern} \\
-        -o ${sample_name}
+    DupCaller.py index -f ${reference} -rb ${repeat_bed} -s ${str_bed}
     """
 }
 
-/*
- * Process: Align reads with BWA-MEM
- */
-process BWA_ALIGN {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/aligned", mode: 'copy'
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 2: Trim barcodes
+// ─────────────────────────────────────────────────────────────────────────────
+process TRIM_BARCODES {
+    tag "${sample_id}:${type}"
+    container 'yuhecheng62/dupcaller:1.1.0-amd64'
+
+    input:
+    tuple val(sample_id), val(type), path(read1), path(read2)
+
+    output:
+    tuple val(sample_id), val(type),
+          path("${sample_id}_${type}_trm_1.fastq"),
+          path("${sample_id}_${type}_trm_2.fastq")
+
+    script:
+    """
+    DupCaller.py trim \
+        -i  ${read1} \
+        -i2 ${read2} \
+        -p  ${params.barcode_pattern} \
+        -o  ${sample_id}_${type}_trm
+    """
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 3: Align reads
+// ─────────────────────────────────────────────────────────────────────────────
+process BWA_MEM {
+    tag "${sample_id}:${type}"
+    container 'biocontainers/bwa:v0.7.17_cv1'
     cpus params.threads
 
     input:
-    tuple val(sample_name), path(read1), path(read2), path(reference)
+    tuple val(sample_id), val(type), path(read1), path(read2)
+    path bwa_index  // reference FASTA + all BWA index files staged together
 
     output:
-    tuple val(sample_name), path("${sample_name}.bam"), path("${sample_name}.bam.bai")
-
-    stub:
-    """
-    touch ${sample_name}.bam ${sample_name}.bam.bai
-    """
+    tuple val(sample_id), val(type), path("${sample_id}_${type}.sam")
 
     script:
-    def rg_id = params.read_group_id ?: sample_name
+    def ref_name = file(params.reference).name
     """
-    bwa mem -C \\
-        -t ${params.threads} \\
-        -R "@RG\\tID:${rg_id}\\tSM:${sample_name}\\tPL:${params.platform}" \\
-        ${reference} \\
-        ${read1} ${read2} | \\
-    samtools sort -@ ${params.threads} -o ${sample_name}.bam
-
-    samtools index -@ ${params.threads} ${sample_name}.bam
+    bwa mem -C \
+        -t ${task.cpus} \
+        -R "@RG\\tID:${sample_id}_${type}\\tSM:${sample_id}\\tPL:ILLUMINA" \
+        ${ref_name} ${read1} ${read2} \
+        > ${sample_id}_${type}.sam
     """
 }
 
-/*
- * Process: Mark duplicates with GATK
- */
-process MARK_DUPLICATES {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/markdup", mode: 'copy'
+// Step 3b: sort + index (samtools lives in the GATK image)
+process SAMTOOLS_SORT {
+    tag "${sample_id}:${type}"
+    container 'broadinstitute/gatk:4.2.6.0'
+    cpus params.threads
 
     input:
-    tuple val(sample_name), path(bam), path(bai)
+    tuple val(sample_id), val(type), path(sam)
 
     output:
-    tuple val(sample_name), path("${sample_name}.mkdped.bam"), path("${sample_name}.mkdped.bam.bai"), path("${sample_name}.mkdp_metrics.txt")
-
-    stub:
-    """
-    touch ${sample_name}.mkdped.bam ${sample_name}.mkdped.bam.bai ${sample_name}.mkdp_metrics.txt
-    """
+    tuple val(sample_id), val(type),
+          path("${sample_id}_${type}.bam"),
+          path("${sample_id}_${type}.bam.bai")
 
     script:
     """
-    gatk MarkDuplicates \\
-        -I ${bam} \\
-        -O ${sample_name}.mkdped.bam \\
-        -M ${sample_name}.mkdp_metrics.txt \\
-        --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*\$" \\
-        --DUPLEX_UMI \\
-        --TAGGING_POLICY OpticalOnly \\
+    samtools sort -@ ${task.cpus} -o ${sample_id}_${type}.bam ${sam}
+    samtools index ${sample_id}_${type}.bam
+    """
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 4: Mark duplicates
+// ─────────────────────────────────────────────────────────────────────────────
+process MARK_DUPLICATES {
+    tag "${sample_id}:${type}"
+    container 'broadinstitute/gatk:4.2.6.0'
+
+    input:
+    tuple val(sample_id), val(type), path(bam), path(bai)
+
+    output:
+    tuple val(sample_id), val(type),
+          path("${sample_id}_${type}.mkdped.bam"),
+          path("${sample_id}_${type}.mkdped.bam.bai")
+
+    script:
+    """
+    gatk MarkDuplicates \
+        -I ${bam} \
+        -O ${sample_id}_${type}.mkdped.bam \
+        -M ${sample_id}_${type}.mkdp_metrics.txt \
+        --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*\$" \
+        --DUPLEX_UMI \
+        --TAGGING_POLICY OpticalOnly \
         --BARCODE_TAG DB
 
-    samtools index ${sample_name}.mkdped.bam
+    samtools index ${sample_id}_${type}.mkdped.bam
     """
 }
 
-/*
- * Process: Index a pre-existing BAM file
- */
-process INDEX_BAM {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/bam", mode: 'copy'
-
-    input:
-    tuple val(sample_name), path(bam)
-
-    output:
-    tuple val(sample_name), path("${bam}"), path("${bam}.bai"), path("${sample_name}.metrics_placeholder.txt")
-
-    stub:
-    """
-    touch ${bam}.bai ${sample_name}.metrics_placeholder.txt
-    """
-
-    script:
-    """
-    samtools index ${bam}
-    touch ${sample_name}.metrics_placeholder.txt
-    """
-}
-
-/*
- * Process: Call variants with DupCaller
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 5: Call variants
+// ─────────────────────────────────────────────────────────────────────────────
 process CALL_VARIANTS {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/variants", mode: 'copy'
+    tag "${sample_id}"
+    container 'yuhecheng62/dupcaller:1.1.0-amd64'
     cpus params.threads
+    publishDir "${params.outdir}", mode: 'copy'
 
     input:
-    tuple val(sample_name), path(bam), path(bai), path(metrics),
-          path(reference), path(ref_h5), path(tn_h5), path(hp_h5)
-    tuple path(normal_bam), path(normal_bai)
-    path(germline_vcf)
-    path(noise_mask)
-    path(indel_bed)
+    tuple val(sample_id),
+          path(tumor_bam),  path(tumor_bai),
+          path(normal_bam), path(normal_bai)
+    path dc_ref             // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5
+    tuple path(germline_vcf), path(germline_tbi)
+    tuple path(noise_mask),   path(noise_tbi)
+    path target_bed
+    path indel_bed
 
     output:
-    tuple val(sample_name),
-          path("${sample_name}_snv.vcf"),
-          path("${sample_name}_indel.vcf"),
-          path("${sample_name}_coverage.bed.gz"),
-          path("${sample_name}_coverage.bed.gz.tbi"),
-          path("${sample_name}_trinuc_by_duplex_group.txt"),
-          path("${sample_name}_duplex_group_stats.txt"),
-          path("${sample_name}_stats.txt"),
-          path("${sample_name}.amp.tn.txt"),
-          path("${sample_name}.amp.id.txt"),
-          path("${sample_name}.dmg.tn.txt"),
-          path("${sample_name}.dmg.id.txt"),
-          path("${sample_name}_call_params.log")
-
-    stub:
-    """
-    touch ${sample_name}_snv.vcf ${sample_name}_indel.vcf
-    touch ${sample_name}_coverage.bed.gz ${sample_name}_coverage.bed.gz.tbi
-    touch ${sample_name}_trinuc_by_duplex_group.txt ${sample_name}_duplex_group_stats.txt ${sample_name}_stats.txt
-    touch ${sample_name}.amp.tn.txt ${sample_name}.amp.id.txt
-    touch ${sample_name}.dmg.tn.txt ${sample_name}.dmg.id.txt
-    touch ${sample_name}_call_params.log
-    """
+    tuple val(sample_id), path("${sample_id}", type: 'dir')
 
     script:
-    def normal_arg = normal_bam.name != 'NO_NORMAL_BAM' ? "-n ${normal_bam}" : ""
-    def germline_arg = germline_vcf.name != 'NO_GERMLINE_VCF' ? "-g ${germline_vcf}" : ""
-    def noise_arg = noise_mask.name != 'NO_NOISE_MASK' ? "-m ${noise_mask}" : ""
-    def indel_arg = indel_bed.name != 'NO_INDEL_BED' ? "-id ${indel_bed}" : ""
-
+    def ref_name     = file(params.reference).name
+    def normal_arg   = (normal_bam.name   != 'NO_FILE')        ? "-n ${normal_bam}"    : ""
+    def germline_arg = (germline_vcf.name != 'NO_GERMLINE_VCF') ? "-g ${germline_vcf}" : ""
+    def noise_arg    = (noise_mask.name   != 'NO_NOISE_MASK')   ? "-m ${noise_mask}"   : ""
+    def target_arg   = (target_bed.name   != 'NO_TARGET_BED')   ? "-R ${target_bed}"   : ""
+    def indel_arg    = (indel_bed.name    != 'NO_INDEL_BED')    ? "-id ${indel_bed}"   : ""
     """
-    DupCaller.py call \\
-        -b ${bam} \\
-        -f ${reference} \\
-        -o ${sample_name} \\
-        -p ${params.threads} \\
-        -r ${params.regions} \\
-        ${normal_arg} \\
-        ${germline_arg} \\
-        ${noise_arg} \\
-        ${indel_arg} \\
-        -maf ${params.max_af} \\
-        -gaf ${params.germline_af_cutoff} \\
-        -d ${params.min_n_depth} \\
-        -z ${params.max_zero_qual_frac} \\
-        -tt ${params.trim_template} \\
-        -tr ${params.trim_read} \\
-        -mq ${params.mapq} \\
-        -w ${params.window_size}
-    mv ${sample_name}/* .
+    DupCaller.py call \
+        -b  ${tumor_bam} \
+        -f  ${ref_name} \
+        -o  ${sample_id} \
+        -p  ${task.cpus} \
+        -r  ${params.regions} \
+        ${normal_arg} \
+        ${germline_arg} \
+        ${noise_arg} \
+        ${target_arg} \
+        ${indel_arg} \
+        -maf ${params.max_af} \
+        -gaf ${params.germline_af_cutoff} \
+        -d   ${params.min_n_depth} \
+        -tt  ${params.trim_template} \
+        -tr  ${params.trim_read} \
+        -mq  ${params.mapq}
     """
 }
 
-/*
- * Process: Estimate mutation burden
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 6: Estimate mutational burden
+// ─────────────────────────────────────────────────────────────────────────────
 process ESTIMATE_BURDEN {
-    tag "${sample_name}"
-    publishDir "${params.outdir}/${sample_name}/burden", mode: 'copy'
+    tag "${sample_id}"
+    container 'yuhecheng62/dupcaller:1.1.0-amd64'
+    publishDir "${params.outdir}", mode: 'copy'
 
     input:
-    tuple val(sample_name),
-          path(snv_vcf),
-          path(indel_vcf),
-          path(coverage),
-          path(coverage_tbi),
-          path(trinuc),
-          path(duplex_stats),
-          path(stats),
-          path(amp_tn),
-          path(amp_id),
-          path(dmg_tn),
-          path(dmg_id),
-          path(call_params_log),
-          path(reference),
-          path(ref_h5),
-          path(tn_h5),
-          path(hp_h5)
-    path(gene_bed)
+    tuple val(sample_id), path(call_dir)
+    path dc_ref        // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5
+    path gene_bed
 
     output:
-    tuple val(sample_name),
-          path("${sample_name}_sbs_burden.txt"),
-          path("${sample_name}_indel_burden.txt"),
-          path("${sample_name}_sbs_96_corrected.txt"),
-          path("${sample_name}_sbs_96_corrected.png"),
-          path("${sample_name}_sbs_burden_by_min_read_group_size.txt"),
-          path("${sample_name}_sbs_burden_by_min_read_group_size.png"),
-          path("${sample_name}_duplex_allele_counts.txt")
-
-    stub:
-    """
-    touch ${sample_name}_sbs_burden.txt ${sample_name}_indel_burden.txt
-    touch ${sample_name}_sbs_96_corrected.txt ${sample_name}_sbs_96_corrected.png
-    touch ${sample_name}_sbs_burden_by_min_read_group_size.txt ${sample_name}_sbs_burden_by_min_read_group_size.png
-    touch ${sample_name}_duplex_allele_counts.txt
-    """
+    tuple val(sample_id), path("${sample_id}", type: 'dir')
 
     script:
-    def gene_arg = gene_bed.name != 'NO_GENE_BED' ? "-gb ${gene_bed}" : ""
-    def clonal_arg = params.estimate_clonal ? "-c true" : ""
-    def dilute_arg = params.estimate_dilute ? "-d true" : ""
-
+    def ref_name   = file(params.reference).name
+    def gene_arg   = (gene_bed.name != 'NO_GENE_BED') ? "-gb ${gene_bed}" : ""
+    def clonal_arg = params.estimate_clonal ? "-c True" : ""
+    def dilute_arg = params.estimate_dilute ? "-d True" : ""
     """
-    mkdir -p ${sample_name}
-    for f in \$(ls ${sample_name}_* ${sample_name}.* 2>/dev/null); do
-        ln -sf \$(realpath \$f) ${sample_name}/
-    done
-    DupCaller.py estimate \\
-        -i ${sample_name} \\
-        -f ${reference} \\
-        -r ${params.regions} \\
-        ${gene_arg} \\
-        ${clonal_arg} \\
+    DupCaller.py estimate \
+        -i ${call_dir} \
+        -f ${ref_name} \
+        -r ${params.regions} \
+        ${gene_arg} \
+        ${clonal_arg} \
         ${dilute_arg}
-    mv ${sample_name}/${sample_name}_sbs_burden.txt \\
-       ${sample_name}/${sample_name}_indel_burden.txt \\
-       ${sample_name}/${sample_name}_sbs_96_corrected.txt \\
-       ${sample_name}/${sample_name}_sbs_96_corrected.png \\
-       ${sample_name}/${sample_name}_sbs_burden_by_min_read_group_size.txt \\
-       ${sample_name}/${sample_name}_sbs_burden_by_min_read_group_size.png \\
-       ${sample_name}/${sample_name}_duplex_allele_counts.txt \\
-       .
     """
 }
 
-/*
- * Main workflow
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Main workflow
+// ─────────────────────────────────────────────────────────────────────────────
 workflow {
 
-    // Reference file channels — all four files must exist (created by DupCaller.py index)
-    ref_ch    = Channel.fromPath(params.reference,              checkIfExists: true)
-    ref_h5_ch = Channel.fromPath(params.reference + ".ref.h5", checkIfExists: true)
-    tn_h5_ch  = Channel.fromPath(params.reference + ".tn.h5",  checkIfExists: true)
-    hp_h5_ch  = Channel.fromPath(params.reference + ".hp.h5",  checkIfExists: true)
+    // ── Reference file channels ──────────────────────────────────────────────
 
-    // Optional input channels
+    // All BWA index files staged together so 'bwa mem' finds them in the work dir
+    bwa_ref_ch = Channel.fromPath([
+        params.reference,
+        "${params.reference}.fai",
+        "${params.reference}.bwt",
+        "${params.reference}.pac",
+        "${params.reference}.ann",
+        "${params.reference}.amb",
+        "${params.reference}.sa"
+    ], checkIfExists: true).collect()
+
+    // DupCaller h5 index files — may be produced by INDEX_REFERENCE or pre-existing
+    if (!params.skip_index) {
+        if (!params.repeat_bed) error "params.repeat_bed is required when skip_index = false"
+        if (!params.str_bed) error "params.str_bed is required when skip_index = false"
+        repeat_ch  = Channel.fromPath(params.repeat_bed, checkIfExists: true)
+        repeat_tbi = Channel.fromPath("${params.repeat_bed}.tbi", checkIfExists: true)
+        str_ch  = Channel.fromPath(params.str_bed, checkIfExists: true)
+        str_tbi = Channel.fromPath("${params.str_bed}.tbi", checkIfExists: true)
+        ref_fa  = Channel.fromPath(params.reference, checkIfExists: true)
+        idx     = INDEX_REFERENCE(ref_fa, repeat_ch, repeat_tbi, str_ch, str_tbi)
+        dc_ref_ch = Channel.fromPath([
+            params.reference,
+            "${params.reference}.fai"
+        ], checkIfExists: true)
+            .concat(idx.ref_h5)
+            .concat(idx.tn_h5)
+            .concat(idx.hp_h5)
+            .collect()
+    } else {
+        dc_ref_ch = Channel.fromPath([
+            params.reference,
+            "${params.reference}.fai",
+            "${params.reference}.ref.h5",
+            "${params.reference}.tn.h5",
+            "${params.reference}.hp.h5"
+        ], checkIfExists: true).collect()
+    }
+
+    // ── Optional resource file channels ─────────────────────────────────────
+
     germline_ch = params.germline_vcf
-        ? Channel.fromPath(params.germline_vcf, checkIfExists: true)
-        : Channel.value(file('NO_GERMLINE_VCF'))
+        ? Channel.value([
+            file(params.germline_vcf,           checkIfExists: true),
+            file("${params.germline_vcf}.tbi",  checkIfExists: true)
+          ])
+        : Channel.value([file('NO_GERMLINE_VCF'), file('NO_GERMLINE_TBI')])
+
     noise_ch = params.noise_mask
-        ? Channel.fromPath(params.noise_mask, checkIfExists: true)
-        : Channel.value(file('NO_NOISE_MASK'))
+        ? Channel.value([
+            file(params.noise_mask,             checkIfExists: true),
+            file("${params.noise_mask}.tbi",    checkIfExists: true)
+          ])
+        : Channel.value([file('NO_NOISE_MASK'), file('NO_NOISE_TBI')])
+
+    target_ch = params.target_bed
+        ? Channel.value(file(params.target_bed, checkIfExists: true))
+        : Channel.value(file('NO_TARGET_BED'))
+
     indel_ch = params.indel_bed
-        ? Channel.fromPath(params.indel_bed, checkIfExists: true)
+        ? Channel.value(file(params.indel_bed,  checkIfExists: true))
         : Channel.value(file('NO_INDEL_BED'))
+
     gene_ch = params.gene_bed
-        ? Channel.fromPath(params.gene_bed, checkIfExists: true)
+        ? Channel.value(file(params.gene_bed,   checkIfExists: true))
         : Channel.value(file('NO_GENE_BED'))
 
-    // -----------------------------------------------------------------------
-    // Tumor sample: produce markdup channel
-    //   emits: tuple val(sample_name), path(bam), path(bai), path(metrics)
-    // -----------------------------------------------------------------------
-    if (params.tumor_bam) {
-        // Pre-aligned BAM provided — index it and create a placeholder metrics file
-        bam_ch = Channel.of([params.sample_name, file(params.tumor_bam)])
-        markdup = INDEX_BAM(bam_ch)
-    } else {
-        // Start from FASTQ
-        reads_ch = Channel.of([params.sample_name, file(params.read1), file(params.read2)])
-        trimmed  = TRIM_BARCODES(reads_ch)
-        aligned  = BWA_ALIGN(trimmed.combine(ref_ch))
-        markdup  = MARK_DUPLICATES(aligned)
-    }
+    // ── Parse sample map ─────────────────────────────────────────────────────
+    // Emits (sample_id, type, fq1, fq2) for both tumor and normal per row
 
-    // -----------------------------------------------------------------------
-    // Normal sample channel
-    //   emits: tuple path(normal_bam), path(normal_bai)
-    // -----------------------------------------------------------------------
-    if (params.normal_bam) {
-        normal_ch = Channel.value([
-            file(params.normal_bam),
-            file(params.normal_bam + ".bai")
-        ])
-    } else if (params.normal_read1 && params.normal_read2 && !params.skip_normal) {
-        normal_reads   = Channel.of(["normal_${params.sample_name}", file(params.normal_read1), file(params.normal_read2)])
-        normal_trimmed = TRIM_BARCODES(normal_reads)
-        normal_aligned = BWA_ALIGN(normal_trimmed.combine(ref_ch))
-        normal_markdup = MARK_DUPLICATES(normal_aligned)
-        normal_ch      = normal_markdup.map { _sn, bam, bai, _m -> [bam, bai] }
-    } else {
-        normal_ch = Channel.value([file('NO_NORMAL_BAM'), file('NO_NORMAL_BAI')])
-    }
+    Channel.fromPath(params.sample_map, checkIfExists: true)
+        .splitCsv(header: true, sep: '\t', strip: true)
+        .flatMap { row ->
+            [
+                [row.sample_id, 'tumor',
+                 file(row.tumor_fastq_1,  checkIfExists: true),
+                 file(row.tumor_fastq_2,  checkIfExists: true)],
+                [row.sample_id, 'normal',
+                 file(row.normal_fastq_1, checkIfExists: true),
+                 file(row.normal_fastq_2, checkIfExists: true)]
+            ]
+        }
+        .set { reads_ch }
 
-    // -----------------------------------------------------------------------
-    // Variant calling
-    // call_input: tuple(sample_name, bam, bai, metrics, ref, ref_h5, tn_h5, hp_h5)
-    // -----------------------------------------------------------------------
-    call_input = markdup
-        .combine(ref_ch)
-        .combine(ref_h5_ch)
-        .combine(tn_h5_ch)
-        .combine(hp_h5_ch)
+    // ── Steps 2–4: trim → align → mark-dup (tumor and normal in parallel) ───
 
-    variants = CALL_VARIANTS(
-        call_input,
-        normal_ch,
+    trimmed_ch = TRIM_BARCODES(reads_ch)
+    sam_ch     = BWA_MEM(trimmed_ch, bwa_ref_ch)
+    aligned_ch = SAMTOOLS_SORT(sam_ch)
+    markdup_ch = MARK_DUPLICATES(aligned_ch)
+
+    // ── Rejoin tumor and normal by sample_id ─────────────────────────────────
+
+    tumor_md  = markdup_ch
+        .filter { it[1] == 'tumor' }
+        .map    { sid, _type, bam, bai -> [sid, bam, bai] }
+
+    normal_md = markdup_ch
+        .filter { it[1] == 'normal' }
+        .map    { sid, _type, bam, bai -> [sid, bam, bai] }
+
+    // join emits: [sample_id, tumor_bam, tumor_bai, normal_bam, normal_bai]
+    call_input_ch = tumor_md.join(normal_md)
+
+    // ── Step 5: Call variants ────────────────────────────────────────────────
+
+    variants_ch = CALL_VARIANTS(
+        call_input_ch,
+        dc_ref_ch,
         germline_ch,
         noise_ch,
+        target_ch,
         indel_ch
     )
 
-    // -----------------------------------------------------------------------
-    // Burden estimation
-    // burden_input: variants tuple + ref + ref_h5 + tn_h5 + hp_h5
-    // -----------------------------------------------------------------------
-    burden_input = variants
-        .combine(ref_ch)
-        .combine(ref_h5_ch)
-        .combine(tn_h5_ch)
-        .combine(hp_h5_ch)
+    // ── Step 6: Estimate burden ──────────────────────────────────────────────
 
-    ESTIMATE_BURDEN(burden_input, gene_ch)
+    ESTIMATE_BURDEN(variants_ch, dc_ref_ch, gene_ch)
 }
 
 workflow.onComplete {
     log.info """
     ================================================================
-    Pipeline completed at: ${workflow.complete}
-    Execution status: ${workflow.success ? 'SUCCESS' : 'FAILED'}
-    Duration: ${workflow.duration}
-    Output directory: ${params.outdir}
+    DupCaller pipeline ${workflow.success ? 'completed' : 'FAILED'}
+    Duration : ${workflow.duration}
+    Output   : ${params.outdir}
     ================================================================
     """.stripIndent()
 }

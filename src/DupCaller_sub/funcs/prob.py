@@ -82,7 +82,14 @@ def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2
 
 
 def genotypeDSSnv(
-    seqs, reference_start, reference_int, trinuc_int, prior_mat, antimask, params
+    seqs,
+    reference_start,
+    reference_int,
+    trinuc_int,
+    prior_mat,
+    antimask,
+    params,
+    L=None,
 ):
     prob_amp_mat = params["ampmat"]
     prob_amp_mat_rev = params["ampmat_rev"]
@@ -210,22 +217,49 @@ def genotypeDSSnv(
     total_count_without_base1[base1_int, np.ogrid[:n]] = -1
     base2_int = np.argmax(total_count_without_base1, axis=0)
     base2_int[base1_int != reference_int] = reference_int[base1_int != reference_int]
-    F1R2_masked_qual_mat = F1R2_qual_mat[:, antimask]
-    F2R1_masked_qual_mat = F2R1_qual_mat[:, antimask]
-    F1R2_masked_seq_mat = F1R2_seq_mat[:, antimask]
-    F2R1_masked_seq_mat = F2R1_seq_mat[:, antimask]
+    # Empirical duplex coverage matrix [n, 4]: L lookup per unmasked position per alt base
+    cov_mat = np.zeros([n, 4])
+    if L is not None:
+        n_top_L = np.minimum(F1R2_count_mat.sum(axis=0), 9).astype(int)
+        n_bot_L = np.minimum(F2R1_count_mat.sum(axis=0), 9).astype(int)
+        valid_idx_L = np.nonzero(np.logical_and(antimask, trinuc_int < 64))[0]
+        if valid_idx_L.size > 0:
+            cov_mat[valid_idx_L] = L[
+                n_top_L[valid_idx_L], n_bot_L[valid_idx_L], trinuc_int[valid_idx_L]
+            ]
+
+    mut_antimask = np.logical_and(antimask, base1_int != reference_int)
+    if not mut_antimask.any():
+        return (
+            cov_mat,
+            np.zeros(0),
+            np.zeros(0),
+            np.zeros(0),
+            mut_antimask,
+            base1_int,
+            antimask,
+            F1R2_count_mat,
+            F2R1_count_mat,
+        )
+
+    F1R2_masked_qual_mat = F1R2_qual_mat[:, mut_antimask]
+    F2R1_masked_qual_mat = F2R1_qual_mat[:, mut_antimask]
+    F1R2_masked_seq_mat = F1R2_seq_mat[:, mut_antimask]
+    F2R1_masked_seq_mat = F2R1_seq_mat[:, mut_antimask]
     F1R2_prob = -F1R2_masked_qual_mat / 10
     F2R1_prob = -F2R1_masked_qual_mat / 10
-    base1_int_masked = base1_int[antimask]
-    base2_int_masked = base2_int[antimask]
+    base1_int_masked = base1_int[mut_antimask]
+    base2_int_masked = base2_int[mut_antimask]
     F1R2_bin_seq_mat = F1R2_masked_seq_mat == base1_int_masked
     F2R1_bin_seq_mat = F2R1_masked_seq_mat == base1_int_masked
-    trinuc_converted_masked = trinuc_convert_np[trinuc_int[antimask], base1_int_masked]
-    ref_int_masked = reference_int[antimask]
+    trinuc_converted_masked = trinuc_convert_np[
+        trinuc_int[mut_antimask], base1_int_masked
+    ]
+    ref_int_masked = reference_int[mut_antimask]
     base2_int_masked[
         np.logical_and(
             base1_int_masked == ref_int_masked,
-            total_count_mat[:, antimask][
+            total_count_mat[:, mut_antimask][
                 base2_int_masked, np.ogrid[: base2_int_masked.size]
             ]
             == 0,
@@ -243,20 +277,20 @@ def genotypeDSSnv(
     Pdmg_b[Pdmg_b == 0] = 1e-9
     Pdmg_rev_b[Pdmg_rev_b == 0] = 1e-9
 
-    F1R2_count_b1 = F1R2_count_mat[:, antimask][
+    F1R2_count_b1 = F1R2_count_mat[:, mut_antimask][
         base1_int_masked, np.ogrid[: base1_int_masked.size]
     ]
     F1R2_count_b2 = np.zeros(F1R2_count_b1.size)
     alt_pos = base2_int_masked != 4
-    F1R2_count_b2[alt_pos] = F1R2_count_mat[:, antimask][:, alt_pos][
+    F1R2_count_b2[alt_pos] = F1R2_count_mat[:, mut_antimask][:, alt_pos][
         base2_int_masked[alt_pos], np.ogrid[: np.count_nonzero(alt_pos)]
     ]
-    F2R1_count_b1 = F2R1_count_mat[:, antimask][
+    F2R1_count_b1 = F2R1_count_mat[:, mut_antimask][
         base1_int_masked, np.ogrid[: base1_int_masked.size]
     ]
     F2R1_count_b2 = np.zeros(F2R1_count_b1.size)
     alt_pos = base2_int_masked != 4
-    F2R1_count_b2[alt_pos] = F2R1_count_mat[:, antimask][:, alt_pos][
+    F2R1_count_b2[alt_pos] = F2R1_count_mat[:, mut_antimask][:, alt_pos][
         base2_int_masked[alt_pos], np.ogrid[: np.count_nonzero(alt_pos)]
     ]
     ln10 = np.log(10)
@@ -288,26 +322,15 @@ def genotypeDSSnv(
         log10(1 - Pdmg_t) + log10(1 - Pdmg_b) - log10(Pdmg_rev_t) - log10(Pdmg_rev_b)
     )
     LR_diff = LR_max - LR_masked
-    # LR_diff[LR_diff < 0] = 0
     LR_diff[LR_diff <= 0] = np.finfo(float).eps
     LR_score = -log10(LR_diff / LR_max)
-    LR_abs = np.zeros(n)
-    LR_abs[antimask] = LR_masked
-    LR = np.zeros(n)
-    LR[antimask] = LR_score
-    LR_raw = np.zeros(n)
-    LR_raw[antimask] = LR_masked
-    LR_max_all = np.zeros(n)
-    LR_max_all[antimask] = LR_max
-    LR[LR_abs <= 0] = 0
-    LL_B1_all = np.zeros(n)
-    LL_B2_all = np.zeros(n)
-    LL_B1_all[antimask] = LL_B1
-    LL_B2_all[antimask] = LL_B2
+    LR_score[LR_masked <= 0] = 0
     return (
-        LR,
-        LR_raw,
-        LR_max_all,
+        cov_mat,
+        LR_score,
+        LR_masked,
+        LR_max,
+        mut_antimask,
         base1_int,
         antimask,
         F1R2_count_mat,
@@ -415,17 +438,35 @@ def genotypeDSIndel(
     Pdmg_bot = np.zeros(pos_masked.size)
     Pdmg_rev_bot = np.zeros(pos_masked.size)
     for nn in range(pos_masked.size):
-        hps[nn] = np.max(
-            hp_int[
-                0,
-                max(0, pos_masked[nn] - start) : pos_masked[nn]
-                + offset[nn]
-                - start
-                + 2,
-            ]
-        )
-        strs[nn] = hp_int[2, pos_masked[nn] - start + offset[nn] + 1]
-        strs[nn] = hp_int[2, pos_masked[nn] - start + offset[nn] + 1]
+        # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
+        # 2 = repeat count downstream
+        anchor = pos_masked[nn] - start + offset[nn] + 1
+        unit_len = hp_int[0, anchor]
+        if unit_len <= 1:
+            # Homopolymer (or no repeat, unit length 0/1): hps is the
+            # homopolymer run length in bases
+            hps[nn] = np.max(
+                hp_int[
+                    2,
+                    max(0, pos_masked[nn] - start) : pos_masked[nn]
+                    + offset[nn]
+                    - start
+                    + 2,
+                ]
+            )
+            strs[nn] = 0
+        else:
+            # STR: bin the total repeat length (unit length * count downstream)
+            hps[nn] = 1
+            total_len = unit_len * hp_int[2, anchor]
+            if total_len >= 40:
+                strs[nn] = 3
+            elif total_len >= 25:
+                strs[nn] = 2
+            elif total_len >= 10:
+                strs[nn] = 1
+            else:
+                strs[nn] = 0
         idLen = indelLen_masked[nn]
         pos = pos_masked[nn]
         if hps[nn] > 20:

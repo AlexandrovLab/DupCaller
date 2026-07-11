@@ -4,7 +4,6 @@ import gzip
 import numpy as np
 import os
 from Bio import SeqIO
-import pysam
 from pysam import TabixFile as TABIX
 
 
@@ -69,7 +68,22 @@ def do_index(args):
     ref_h5 = h5py.File(args.reference + ".ref.h5", "w")
     tn_h5 = h5py.File(args.reference + ".tn.h5", "w")
     hp_h5 = h5py.File(args.reference + ".hp.h5", "w")
+    repeat_bed = TABIX(args.repeatBed, "r")
     str_bed = TABIX(args.strbed, "r")
+
+    def apply_repeat_bed(bed, chrom, unit_len, is_start, count_down):
+        if chrom not in bed.contigs:
+            return
+        for line in bed.fetch(chrom):
+            fields = line.split("\t")
+            start = int(fields[1])
+            end = int(fields[2])
+            unit_length = int(fields[3])
+            unit_len[start:end] = unit_length
+            is_start[start] = 1
+            bases_to_end = end - np.arange(start, end)
+            count_down[start:end] = -(-bases_to_end // unit_length)
+
     for chrom in fasta.keys():
         print(f"Currently processing:{chrom}")
         print(f"Creating reference sequence index")
@@ -86,30 +100,17 @@ def do_index(args):
             a + b + c for a, b, c in zip(reference_minus, reference_seq, reference_plus)
         ]
         trinuc_int = np.array([trinuc2num.get(_, 96) for _ in trinucs], dtype="uint8")
-        print(f"Creating homopolymer index")
-        hp_lens_cut = np.zeros(len(reference_seq), dtype="uint8")
-        hp_lens_rev = np.ones(len(reference_seq), dtype=int)
-        hp_lens_str = np.zeros(len(reference_seq), dtype="uint8")
-        hp_lens_str_cut = np.zeros(len(reference_seq), dtype="uint8")
-        # for nn, b in enumerate(reference_int[1:]):
-        # if reference_int[nn] == reference_int[nn + 1]:
-        # hp_lens_forw[nn + 1] = hp_lens_forw[nn] + 1
-        ref_len = reference_int.size
-        for nn, b in enumerate(reference_int[:-1]):
-            if reference_int[ref_len - nn - 1] == reference_int[ref_len - nn - 2]:
-                hp_lens_rev[ref_len - nn - 2] = hp_lens_rev[ref_len - nn - 1] + 1
-            else:
-                hp_lens_cut[ref_len - nn - 1] = 1
-        if chrom in str_bed.contigs:
-            for rec in str_bed.fetch(chrom, parser=pysam.asBed()):
-                ref_len = rec.end - rec.start
-                if ref_len > 40:
-                    ref_len = 40
-                ref_len_idx = np.floor((ref_len - 10) / 15) + 1
-                hp_lens_str[rec.start : rec.end] = ref_len_idx
-                hp_lens_str_cut[rec.start] = 1
+        print(f"Creating repeat index")
+        ref_len = len(reference_seq)
+        unit_len = np.zeros(ref_len, dtype="uint8")
+        is_start = np.zeros(ref_len, dtype="uint8")
+        count_down = np.zeros(ref_len, dtype=int)
+        # Repeats <=12bp (including homopolymers) come from --repeatBed,
+        # repeats >12bp come from --strbed
+        apply_repeat_bed(repeat_bed, chrom, unit_len, is_start, count_down)
+        apply_repeat_bed(str_bed, chrom, unit_len, is_start, count_down)
 
-        hp_lens = np.vstack((hp_lens_rev, hp_lens_cut, hp_lens_str, hp_lens_str_cut))
+        hp_lens = np.vstack((unit_len, is_start, count_down))
         hp_lens[hp_lens > 127] = 127
         hp_lens = hp_lens.astype(np.uint8)
         idx = ref_h5.create_dataset(chrom, data=reference_int)
