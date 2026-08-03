@@ -1,9 +1,9 @@
 import numpy as np
-from .indels import findIndels, getIndelArr
+from .indels import findIndels, getIndelArr, left_align_indel
 
 
 def profileTriNucMismatches(
-    seqs, reference_start, reference_int, trinuc_int, hp_int, antimask, params
+    seqs, reference_start, reference_int, trinuc_int, hp_raw, str_raw, antimask, params
 ):
     # fasta = params["reference"]
     reverse_comp = [1, 0, 3, 2]
@@ -261,12 +261,16 @@ def profileTriNucMismatches(
         current_indels = findIndels(seq)
         if len(current_indels) > 1:
             continue
-        indels.update(current_indels)
+        indels.update(
+            left_align_indel(i, reference_int, reference_start) for i in current_indels
+        )
     for seq in F2R1:
         current_indels = findIndels(seq)
         if len(current_indels) > 1:
             continue
-        indels.update(current_indels)
+        indels.update(
+            left_align_indel(i, reference_int, reference_start) for i in current_indels
+        )
     start = seqs[0].reference_start
     indels = list(indels)
     indels_masked = list()
@@ -293,22 +297,26 @@ def profileTriNucMismatches(
     if m_F1R2 < 3 or m_F2R1 < 3:
         dmg_antimask[:] = False
 
-    # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
-    # 2 = repeat count downstream. Homopolymers are unit length 1 runs;
-    # STRs are unit length >1 runs, binned into the same length bins
-    # (1: 10-24bp, 2: 25-39bp, 3: 40bp+) the calibrated tables expect.
-    unit_len = hp_int[0].astype(int)
-    count_down = hp_int[2].astype(int)
-    is_start = hp_int[1] == 1
-    hp_mask = is_start & (unit_len == 1)
-    hp_len_arr = count_down
+    # hp_raw (hp.h5): row0 = self-derived homopolymer run length, row1 =
+    # start-of-run bool. str_raw (str.h5): row0 = repeat unit length,
+    # row1 = number of times the unit repeats, row2 = start-of-repeat
+    # bool. These are two independent sources, matching main's original
+    # single combined hp.h5 (rows 0-3: hp_lens_rev, hp_lens_cut,
+    # hp_lens_str, hp_lens_str_cut) — a position inside an annotated STR
+    # interval that also starts an embedded run of identical bases (e.g.
+    # the "AA" in a (AAT)n repeat) is credited to BOTH the homopolymer
+    # and the STR opportunity/error tables, never mutually exclusive.
+    hp_len_arr = hp_raw[0].astype(int)
+    hp_mask = hp_raw[1] == 1
 
-    total_len = unit_len * count_down
+    unit_len = str_raw[0].astype(int)
+    repeat_count = str_raw[1].astype(int)
+    total_len = unit_len * repeat_count
     str_bin_arr = np.zeros_like(total_len)
     str_bin_arr[total_len >= 10] = 1
     str_bin_arr[total_len >= 25] = 2
     str_bin_arr[total_len >= 40] = 3
-    str_mask = is_start & (unit_len > 1) & (str_bin_arr > 0)
+    str_mask = (str_raw[2] == 1) & (str_bin_arr > 0)
 
     hp_F1R2 = hp_len_arr[F1R2_antimask][hp_mask[F1R2_antimask]]
     hp_F2R1 = hp_len_arr[F2R1_antimask][hp_mask[F2R1_antimask]]
@@ -428,17 +436,18 @@ def profileTriNucMismatches(
         offset = -indelLen
         if offset < 0:
             offset = 0
-        # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
-        # 2 = repeat count downstream
         anchor = pos + 1 + offset
-        unit_len_here = int(hp_int[0, anchor])
-        count_here = int(hp_int[2, anchor])
-        if unit_len_here <= 1:
-            hp = count_here
-            str_bin_here = 0
-        else:
-            hp = 1
-            total_len_here = unit_len_here * count_here
+        # hp is always the self-derived homopolymer run length at the
+        # anchor base (hp_raw row0), independent of whether that base
+        # also falls inside an annotated STR interval — matches main's
+        # `hp = int(hp_int[0, anchor])`. STR classification (str_bin_here)
+        # is a separate, independent lookup against the BED-derived STR
+        # annotation (str_raw), not a fallback gated by unit_len.
+        hp = int(hp_raw[0, anchor])
+        unit_len_here = int(str_raw[0, anchor])
+        repeat_count_here = int(str_raw[1, anchor])
+        if unit_len_here >= 2:
+            total_len_here = unit_len_here * repeat_count_here
             if total_len_here >= 40:
                 str_bin_here = 3
             elif total_len_here >= 25:
@@ -447,6 +456,8 @@ def profileTriNucMismatches(
                 str_bin_here = 1
             else:
                 str_bin_here = 0
+        else:
+            str_bin_here = 0
         if hp > 20:
             hp = 20
         if indelLen > 5:

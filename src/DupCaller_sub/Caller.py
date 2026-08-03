@@ -25,6 +25,11 @@ from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import getAlignmentObject as BAM
 from .funcs.misc import check_h5_usable
+from .funcs.misc import INDEL_COVERAGE_CATEGORY_LABELS
+from .funcs.misc import build_trinuc64_order, build_trinuc192_labels
+from .funcs.misc import build_indel100_labels
+from .funcs.misc import build_dbs_raw144_labels
+from .funcs.misc import _ensure_type_subdirs
 from pysam import TabixFile as BED
 import pysam
 
@@ -49,12 +54,14 @@ def check_input_files_exist(args):
     ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.ref.h5"]
     tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
     hp_h5_files = [f"{ref_base}.hp.h5", f"{args.reference}.hp.h5"]
+    str_h5_files = [f"{ref_base}.str.h5", f"{args.reference}.str.h5"]
 
     bad_h5_files = []
     for label, candidates, expected_ndim in [
         ("Reference", ref_h5_files, 1),
         ("Trinucleotide", tn_h5_files, 1),
         ("Homopolymer", hp_h5_files, 2),
+        ("STR repeat", str_h5_files, 2),
     ]:
         found = next((f for f in candidates if os.path.exists(f)), None)
         if found is None:
@@ -465,14 +472,17 @@ def do_call(args):
             duplex_read_num_single,
             duplex_read_num_trinuc_single,
             indelsAll,
-            coverage_indel,
             unique_read_num,
             pass_read_num,
             FPAll,
             RPAll,
             unmasked_coverage,
             # unmasked_duplex_read_num_dict_trinuc,
-            unmasked_coverage_indel,
+            coverage_indel_cat,
+            unmasked_coverage_indel_cat,
+            duplex_read_num_indel_single,
+            dbsAll,
+            duplex_read_num_dbs_single,
         ) = callBam(paramsNow, 0)
         muts_positions = [
             mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
@@ -498,6 +508,12 @@ def do_call(args):
         )
         duplex_read_num_trinuc = OrderedDict(
             {num: duplex_read_num_trinuc_single[num] for num in duplex_combinations}
+        )
+        duplex_read_num_indel = OrderedDict(
+            {num: duplex_read_num_indel_single[num] for num in duplex_combinations}
+        )
+        duplex_read_num_dbs = OrderedDict(
+            {num: duplex_read_num_dbs_single[num] for num in duplex_combinations}
         )
 
     else:
@@ -586,14 +602,17 @@ def do_call(args):
         duplex_read_nums = [_[4] for _ in results]
         duplex_read_nums_trinuc = [_[5] for _ in results]
         indels = [_[6] for _ in results]
-        coverages_indels = [_[7] for _ in results]
-        unique_read_nums = [_[8] for _ in results]
-        pass_read_nums = [_[9] for _ in results]
-        FPs = [_[10] for _ in results]
-        RPs = [_[11] for _ in results]
-        unmasked_coverages = [_[12] for _ in results]
-        # unmasked_duplex_read_nums_trinuc = [_[13] for _ in results]
-        unmasked_coverages_indels = [_[13] for _ in results]
+        unique_read_nums = [_[7] for _ in results]
+        pass_read_nums = [_[8] for _ in results]
+        FPs = [_[9] for _ in results]
+        RPs = [_[10] for _ in results]
+        unmasked_coverages = [_[11] for _ in results]
+        coverages_indels_cat = [_[12] for _ in results]
+        unmasked_coverages_indels_cat = [_[13] for _ in results]
+        duplex_read_nums_indel = [_[14] for _ in results]
+        dbs_muts = [_[15] for _ in results]
+        duplex_read_nums_dbs = [_[16] for _ in results]
+        dbsAll = sum(dbs_muts, [])
         print(
             "..............Completed bam calling in "
             + str((time.time() - startTime2) / 60)
@@ -610,9 +629,9 @@ def do_call(args):
         take_ind = list()
         muts_num = len(mutsAll)
         coverage = sum(coverages)
-        coverage_indel = sum(coverages_indels)
+        coverage_indel_cat = sum(coverages_indels_cat)
         unmasked_coverage = sum(unmasked_coverages)
-        unmasked_coverage_indel = sum(unmasked_coverages_indels)
+        unmasked_coverage_indel_cat = sum(unmasked_coverages_indels_cat)
         rec_num = sum(rec_nums)
         duplex_num = sum(duplex_nums)
         unique_read_num = sum(unique_read_nums)
@@ -650,8 +669,20 @@ def do_call(args):
         duplex_read_num_trinuc = OrderedDict(
             {
                 num: sum(
-                    [d.get(num, np.zeros((32, 4))) for d in duplex_read_nums_trinuc]
+                    [d.get(num, np.zeros((64, 4))) for d in duplex_read_nums_trinuc]
                 )
+                for num in duplex_combinations
+            }
+        )
+        duplex_read_num_indel = OrderedDict(
+            {
+                num: sum([d.get(num, np.zeros(100)) for d in duplex_read_nums_indel])
+                for num in duplex_combinations
+            }
+        )
+        duplex_read_num_dbs = OrderedDict(
+            {
+                num: sum([d.get(num, np.zeros(144)) for d in duplex_read_nums_dbs])
                 for num in duplex_combinations
             }
         )
@@ -699,6 +730,14 @@ def do_call(args):
             "reference allele length bin of short tandem repeats. 0: no STR or less than 10bp. 1: 10-24bp. 2: 25-39bp. 3: 40bp+. Always 0 for SBS",
         ],
     }
+    dbsInfoDict = {
+        "F1R2": infoDict["F1R2"],
+        "F2R1": infoDict["F2R1"],
+        "TAG1": infoDict["TAG1"],
+        "TAG2": infoDict["TAG2"],
+        "SP": infoDict["SP"],
+        "TL": [1, "Integer", "Template length of the read pair"],
+    }
     formatDict = {
         "AC": [1, "Integer", "Count of alt allele"],
         "RC": [1, "Integer", "Count of ref allele"],
@@ -719,13 +758,21 @@ def do_call(args):
     ]
     masked_indels = [indel for indel in indelsAll if indel.get("filter") == "masked"]
 
-    # Create VCF with all mutations (PASS and masked)
+    # Create VCF with all mutations (PASS and masked), one per mutation
+    # type, each written into its own SBS/INDEL/DBS subfolder (matching
+    # where Estimate.py writes every downstream per-type output) rather
+    # than the sample's top-level output directory.
+    sbs_dir, indel_dir, dbs_dir = _ensure_type_subdirs(output_dir)
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, mutsAll)
-    with open(args.output + "_snv.vcf", "w") as vcf:
+    with open(os.path.join(sbs_dir, sample_name + "_sbs.vcf"), "w") as vcf:
         vcf.write(vcfLines)
 
     vcfLines = createVcfStrings(chromDict, infoDict, formatDict, filterDict, indelsAll)
-    with open(args.output + "_indel.vcf", "w") as vcf:
+    with open(os.path.join(indel_dir, sample_name + "_indel.vcf"), "w") as vcf:
+        vcf.write(vcfLines)
+
+    vcfLines = createVcfStrings(chromDict, dbsInfoDict, formatDict, filterDict, dbsAll)
+    with open(os.path.join(dbs_dir, sample_name + "_dbs.vcf"), "w") as vcf:
         vcf.write(vcfLines)
 
     burden_naive = muts_num / coverage if coverage > 0 else 0.0
@@ -798,17 +845,55 @@ def do_call(args):
     plt.close(fig)
 
     non_zero_keys = [k for k in all_keys if duplex_read_num[k] != 0]
-    trinuc_list = []
-    for minus_base in ["A", "T", "C", "G"]:
-        for ref_base in ["C", "T"]:
-            for plus_base in ["A", "T", "C", "G"]:
-                trinuc_list.append(minus_base + ref_base + plus_base)
-    index_128 = [f"{trinuc}>{base}" for base in "ATCG" for trinuc in trinuc_list]
+    # duplex_read_num_trinuc[key] is a raw (64, 4) matrix: 64 trinuc contexts
+    # (un-folded by reverse complement) x 4 alt bases, with the context's own
+    # reference-base column always 0 (see call.py's L-table self-skip).
+    # Select the 192 valid (context, alt) cells, in the same order the
+    # labels are built in, rather than flattening all 256.
+    trinuc2num_64, num2trinuc_64 = build_trinuc64_order()
+    _, index_192 = build_trinuc192_labels(num2trinuc_64)
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    row_idx_192 = np.array([trinuc2num_64[label.split(">")[0]] for label in index_192])
+    col_idx_192 = np.array([base2num[label.split(">")[1]] for label in index_192])
     duplex_read_num_trinuc = {_: duplex_read_num_trinuc[_] for _ in non_zero_keys}
-    data_128 = {k: v.flatten(order="F") for k, v in duplex_read_num_trinuc.items()}
-    trinuc_by_duplex_group = pd.DataFrame(data_128, index=index_128)
+    data_192 = {
+        k: v[row_idx_192, col_idx_192] for k, v in duplex_read_num_trinuc.items()
+    }
+    trinuc_by_duplex_group = pd.DataFrame(data_192, index=index_192)
     trinuc_by_duplex_group.to_csv(
         args.output + "_trinuc_by_duplex_group.txt",
+        sep="\t",
+        index=True,
+    )
+
+    # duplex_read_num_indel[key] is already a raw (100,) vector per
+    # duplex-group (fine-grained indel classification, mirroring the SBS
+    # 192-class scheme) — no selection/flattening needed, unlike the trinuc
+    # (64,4) matrices above.
+    _, index_indel100 = build_indel100_labels()
+    duplex_read_num_indel = {_: duplex_read_num_indel[_] for _ in non_zero_keys}
+    data_indel100 = {k: v for k, v in duplex_read_num_indel.items()}
+    indel_by_duplex_group = pd.DataFrame(data_indel100, index=index_indel100)
+    indel_by_duplex_group.to_csv(
+        args.output + "_indel_by_duplex_group.txt",
+        sep="\t",
+        index=True,
+    )
+
+    # duplex_read_num_dbs[key] is already a raw (144,) vector per
+    # duplex-group (16 raw reference dinucleotides x 9 alts each, from
+    # _compute_dbs_opportunity in call.py) — no selection/flattening
+    # needed, same as the indel100 case above. Estimate.py reads this file
+    # directly for genome-wide DBS opportunity instead of approximating it
+    # post-hoc from the single-base coverage bed (calculate_dbs_opportunity),
+    # and gets true per-duplex-group resolution for a group-size-stratified
+    # DBS burden breakdown that wasn't possible before.
+    _, index_dbs144 = build_dbs_raw144_labels()
+    duplex_read_num_dbs = {_: duplex_read_num_dbs[_] for _ in non_zero_keys}
+    data_dbs144 = {k: v for k, v in duplex_read_num_dbs.items()}
+    dbs_by_duplex_group = pd.DataFrame(data_dbs144, index=index_dbs144)
+    dbs_by_duplex_group.to_csv(
+        args.output + "_dbs_by_duplex_group.txt",
         sep="\t",
         index=True,
     )
@@ -828,8 +913,6 @@ def do_call(args):
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
         f.write(f"Effective Coverage\t{coverage}\n")
         f.write(f"Unmasked Coverage\t{unmasked_coverage}\n")
-        f.write(f"Effective Indel Coverage\t{coverage_indel}\n")
-        f.write(f"Unmasked Indel Coverage\t{unmasked_coverage_indel}\n")
         f.write(
             f"Per Read Family Coverage \t{coverage/duplex_num if duplex_num > 0 else 0.0}\n"
         )
@@ -838,6 +921,12 @@ def do_call(args):
         {1-unique_read_num/pass_read_num if pass_read_num > 0 else 0.0}\n"
         )
         f.write(f"Efficiency\t{efficiency}\n")
+        for label, value in zip(INDEL_COVERAGE_CATEGORY_LABELS, coverage_indel_cat):
+            f.write(f"Effective Indel Coverage ({label})\t{value}\n")
+        for label, value in zip(
+            INDEL_COVERAGE_CATEGORY_LABELS, unmasked_coverage_indel_cat
+        ):
+            f.write(f"Unmasked Indel Coverage ({label})\t{value}\n")
 
     print(
         "..............Completed variant calling "
@@ -877,7 +966,7 @@ def do_call(args):
 
 def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
     """
-    1. Merge adjacent next_region and prev_region files by summing columns 4 and 5
+    1. Merge adjacent next_region and prev_region files by summing all numeric columns
     2. Combine all files in the correct order using cat
     """
     print("Merging adjacent region files and combining coverage files...")
@@ -947,44 +1036,43 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
 
 def merge_adjacent_bed_files(next_file, prev_file, output_file):
     """
-    Merge two adjacent bed files by summing columns 4 and 5 for matching positions
+    Merge two adjacent bed files by summing every numeric column (everything
+    after chrom/start/end) for matching positions. Column count is read from
+    the data rather than hardcoded, so this stays correct as the coverage
+    bed schema grows (currently: cov_A/T/C/G and 6 indel category coverage
+    columns).
     """
     coverage_dict = {}
 
-    # Read next_region file
-    if not os.path.exists(next_file):
-        raise FileNotFoundError(f"Expected file for merging not found: {next_file}")
-    with bgzf.open(next_file, "rt") as f:
-        for line in f:
-            line = line.strip()
-            if line:
+    def accumulate(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Expected file for merging not found: {path}")
+        with bgzf.open(path, "rt") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 parts = line.split("\t")
-                if len(parts) >= 5:
-                    chrom, start, end, cov1, cov2 = parts[:5]
-                    key = (chrom, start, end)
-                    coverage_dict[key] = [float(cov1), float(cov2)]
+                if len(parts) < 4:
+                    continue
+                chrom, start, end = parts[:3]
+                values = [float(v) for v in parts[3:]]
+                key = (chrom, start, end)
+                if key in coverage_dict:
+                    coverage_dict[key] = [
+                        existing + new
+                        for existing, new in zip(coverage_dict[key], values)
+                    ]
+                else:
+                    coverage_dict[key] = values
 
-    # Read prev_region file and merge
-    if not os.path.exists(prev_file):
-        raise FileNotFoundError(f"Expected file for merging not found: {prev_file}")
-    with bgzf.open(prev_file, "rt") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                parts = line.split("\t")
-                if len(parts) >= 5:
-                    chrom, start, end, cov1, cov2 = parts[:5]
-                    key = (chrom, start, end)
-                    if key in coverage_dict:
-                        coverage_dict[key][0] += float(cov1)
-                        coverage_dict[key][1] += float(cov2)
-                    else:
-                        coverage_dict[key] = [float(cov1), float(cov2)]
+    accumulate(next_file)
+    accumulate(prev_file)
 
     # Write merged result only if there's data
     with bgzf.open(output_file, "wt") as f:
-        for (chrom, start, end), (cov1, cov2) in sorted(coverage_dict.items()):
-            f.write(f"{chrom}\t{start}\t{end}\t{cov1}\t{cov2}\n")
+        for (chrom, start, end), values in sorted(coverage_dict.items()):
+            f.write("\t".join([chrom, start, end] + [str(v) for v in values]) + "\n")
 
 
 def cleanup_temp_files(sample_name, sample_dir, nprocess):

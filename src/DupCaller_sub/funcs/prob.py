@@ -1,6 +1,5 @@
 import numpy as np
-from .indels import findIndels, getIndelArr
-import scipy.special as sp
+from .indels import findIndels, getIndelArr, left_align_indel
 
 
 def log10(mat):
@@ -27,6 +26,25 @@ def exp(mat):
     return np.exp(np.where(mat >= np.log10(np.finfo(float).eps), mat, -np.inf))
 
 
+def _logsumexp4(terms):
+    """Numerically stable log(sum(exp(terms), axis=0)) for a fixed 4-row
+    stack — equivalent to scipy.special.logsumexp(terms, axis=0), but
+    calculateDSPosterior calls this on tiny arrays hundreds of thousands
+    of times (both per-family and while precomputing the indel power grid
+    in call.py), and scipy's generic array-API dispatch/dtype-promotion
+    layer (xp_promote/isdtype/_preprocess_dtype) dominates cost at that
+    call volume. Since the input is always exactly 4 rows, a direct
+    numpy implementation of the same max-subtraction trick skips that
+    overhead entirely while returning bit-for-bit the same values,
+    including scipy's -inf (not nan) result when every row is -inf.
+    """
+    m = np.max(terms, axis=0)
+    finite_m = np.where(np.isfinite(m), m, 0)
+    with np.errstate(divide="ignore"):
+        out = np.log(np.sum(np.exp(terms - finite_m), axis=0)) + finite_m
+    return np.where(np.isfinite(m), out, m)
+
+
 def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
     PA_At = PAt + log(1 - Pt)
     PA_Ab = PAb + log(1 - Pb)
@@ -39,11 +57,11 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
 
     # ll1 = log10(power10(PA_At+PA_Ab) + power10(PA_Bt+PA_Ab) + power10(PA_At+PA_Bb) + power10(PA_Bt+PA_Bb))
     # ll2 = log10(power10(PB_At+PB_Ab) + power10(PB_Bt+PB_Ab) + power10(PB_At+PB_Bb) + power10(PB_Bt+PB_Bb))
-    ll1 = sp.logsumexp(
-        np.vstack((PA_At + PA_Ab, PA_Bt + PA_Ab, PA_At + PA_Bb, PA_Bt + PA_Bb)), axis=0
+    ll1 = _logsumexp4(
+        np.vstack((PA_At + PA_Ab, PA_Bt + PA_Ab, PA_At + PA_Bb, PA_Bt + PA_Bb))
     ) / np.log(10)
-    ll2 = sp.logsumexp(
-        np.vstack((PB_At + PB_Ab, PB_Bt + PB_Ab, PB_At + PB_Bb, PB_Bt + PB_Bb)), axis=0
+    ll2 = _logsumexp4(
+        np.vstack((PB_At + PB_Ab, PB_Bt + PB_Ab, PB_At + PB_Bb, PB_Bt + PB_Bb))
     ) / np.log(10)
     return ll1, ll2
 
@@ -338,14 +356,93 @@ def genotypeDSSnv(
     )
 
 
+def indelErrorProbs(
+    hps, strs, idLen, ref_allele, prob_amp, prob_amp_rev, prob_dmg, prob_dmg_rev
+):
+    """Select Pamp/Pdmg values for a candidate indel from the loaded 23x23
+    error matrices, given its repeat context (hps/strs) and length (idLen).
+    Verbatim port of the per-candidate branch previously inlined in
+    genotypeDSIndel's loop; also reused to build the indel coverage-power
+    tables in call.py, so both use identical math.
+
+    Note: when hps==0 (no repeat nearby, the common case since repeatBed/
+    strbed only annotate actual repeats), the STR-less branches below index
+    prob_amp/prob_dmg with a negative row (hps-1 or hps-2), which via numpy
+    wraparound silently reads an STR row (22 or 21) instead of a "no repeat"
+    rate. This is a pre-existing behavior of the real caller, preserved here
+    intentionally rather than fixed, so this function's output matches what
+    genotypeDSIndel actually does.
+    """
+    rc = [1, 0, 3, 2]
+    if strs > 0 and (idLen >= 2 or idLen <= -2):
+        Pamp = prob_amp[19 + strs, -idLen + 5]
+        Pamp_rev = prob_amp[19 + strs, idLen + 5]
+        Pdmg = prob_dmg[19 + strs, -idLen + 5]
+        Pdmg_rev = prob_dmg[19 + strs, idLen + 5]
+        Pdmg_bot = Pdmg
+        Pdmg_rev_bot = Pdmg_rev
+    elif idLen == 1:
+        ref_allele_rc = rc[ref_allele]
+        if hps < 20:
+            Pamp = prob_amp[hps, 12 + ref_allele * 3 - 1]
+            Pdmg = prob_dmg[hps, 12 + ref_allele * 3 - 1]
+            Pdmg_bot = prob_dmg[hps, 12 + ref_allele_rc * 3 - 1]
+            Pamp_rev = prob_amp[hps - 1, 12 + ref_allele * 3 + 1]
+            Pdmg_rev = prob_dmg[hps - 1, 12 + ref_allele * 3 + 1]
+            Pdmg_rev_bot = prob_dmg[hps - 1, 12 + ref_allele_rc * 3 + 1]
+        else:
+            Pamp = prob_amp[19, 12 + ref_allele * 3 - 1]
+            Pdmg = prob_dmg[19, 12 + ref_allele * 3 - 1]
+            Pdmg_bot = prob_dmg[19, 12 + ref_allele_rc * 3 - 1]
+            Pamp_rev = prob_amp[19, 12 + ref_allele * 3 + 1]
+            Pdmg_rev = prob_dmg[19, 12 + ref_allele * 3 + 1]
+            Pdmg_rev_bot = prob_dmg[19, 12 + ref_allele_rc * 3 + 1]
+    elif idLen == -1:
+        ref_allele_rc = rc[ref_allele]
+        if hps == 1:
+            Pamp = prob_amp[0, 12 + ref_allele * 3 + 1]
+            Pdmg = prob_dmg[0, 12 + ref_allele * 3 + 1]
+            Pdmg_bot = prob_dmg[0, 12 + ref_allele_rc * 3 + 1]
+            Pamp_rev = prob_amp[0, 12 + ref_allele * 3 - 1]
+            Pdmg_rev = prob_dmg[0, 12 + ref_allele * 3 - 1]
+            Pdmg_rev_bot = prob_dmg[0, 12 + ref_allele_rc * 3 - 1]
+        else:
+            Pamp = prob_amp[hps - 2, 12 + ref_allele * 3 + 1]
+            Pdmg = prob_dmg[hps - 2, 12 + ref_allele * 3 + 1]
+            Pdmg_bot = prob_dmg[hps - 2, 12 + ref_allele_rc * 3 + 1]
+            Pamp_rev = prob_amp[hps - 1, 12 + ref_allele * 3 - 1]
+            Pdmg_rev = prob_dmg[hps - 1, 12 + ref_allele * 3 - 1]
+            Pdmg_rev_bot = prob_dmg[hps - 1, 12 + ref_allele_rc * 3 - 1]
+    else:
+        Pamp = prob_amp[hps - 1, -idLen + 5]
+        Pamp_rev = prob_amp[hps - 1, idLen + 5]
+        Pdmg = prob_dmg[hps - 1, -idLen + 5]
+        Pdmg_rev = prob_dmg[hps - 1, idLen + 5]
+        Pdmg_bot = Pdmg
+        Pdmg_rev_bot = Pdmg_rev
+    # Original code applied a 6-line floor ("x[x == 0] = 1e-9") to all six
+    # outputs, but every line after the first re-tested Pamp==0 (not each
+    # variable's own zero-ness), which is never true once the first line has
+    # run. Only Pamp is actually floored; this preserves that exact behavior.
+    if Pamp == 0:
+        Pamp = 1e-9
+    return Pamp, Pamp_rev, Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot
+
+
 def genotypeDSIndel(
-    seqs, reference_start, reference_end, reference_int, antimask, hp_int, params
+    seqs,
+    reference_start,
+    reference_end,
+    reference_int,
+    antimask,
+    hp_raw,
+    str_raw,
+    params,
 ):
     prob_amp = params["ampmat_indel"]
     prob_amp_rev = params["ampmat_indel_rev"]
     prob_dmg = params["dmgmat_indel"]
     prob_dmg_rev = params["dmgmat_indel_rev"]
-    rc = [1, 0, 3, 2]
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
     F1R2 = []
     F2R1 = []
@@ -360,9 +457,13 @@ def genotypeDSIndel(
     indels = set()
     ### Geonotype indel for all found indels
     for seq in F1R2:
-        indels.update(findIndels(seq))
+        indels.update(
+            left_align_indel(i, reference_int, reference_start) for i in findIndels(seq)
+        )
     for seq in F2R1:
-        indels.update(findIndels(seq))
+        indels.update(
+            left_align_indel(i, reference_int, reference_start) for i in findIndels(seq)
+        )
     # start = seqs[0].reference_start
     indels = list(indels)
     indels_masked = list()
@@ -438,27 +539,29 @@ def genotypeDSIndel(
     Pdmg_bot = np.zeros(pos_masked.size)
     Pdmg_rev_bot = np.zeros(pos_masked.size)
     for nn in range(pos_masked.size):
-        # hp_int rows: 0 = repeat unit length, 1 = start-of-repeat bool,
-        # 2 = repeat count downstream
+        # hps is always the self-derived homopolymer run length (hp_raw
+        # row0), taken as the max over the indel's reference span so an
+        # anchor landing just outside the repeat still picks up the run
+        # it abuts — matches main's `hps[nn] = np.max(hp_int[0, ...])`.
+        # strs is a separate, independent lookup against the BED-derived
+        # STR annotation (str_raw), not a fallback gated by unit_len — an
+        # embedded homopolymer inside an STR unit (e.g. the "AA" in a
+        # (AAT)n repeat) still gets its true run length here, and is
+        # never mutually exclusive with the STR classification.
         anchor = pos_masked[nn] - start + offset[nn] + 1
-        unit_len = hp_int[0, anchor]
-        if unit_len <= 1:
-            # Homopolymer (or no repeat, unit length 0/1): hps is the
-            # homopolymer run length in bases
-            hps[nn] = np.max(
-                hp_int[
-                    2,
-                    max(0, pos_masked[nn] - start) : pos_masked[nn]
-                    + offset[nn]
-                    - start
-                    + 2,
-                ]
-            )
-            strs[nn] = 0
-        else:
-            # STR: bin the total repeat length (unit length * count downstream)
-            hps[nn] = 1
-            total_len = unit_len * hp_int[2, anchor]
+        hps[nn] = np.max(
+            hp_raw[
+                0,
+                max(0, pos_masked[nn] - start) : pos_masked[nn]
+                + offset[nn]
+                - start
+                + 2,
+            ]
+        )
+        unit_len_here = int(str_raw[0, anchor])
+        repeat_count_here = int(str_raw[1, anchor])
+        if unit_len_here >= 2:
+            total_len = unit_len_here * repeat_count_here
             if total_len >= 40:
                 strs[nn] = 3
             elif total_len >= 25:
@@ -467,64 +570,36 @@ def genotypeDSIndel(
                 strs[nn] = 1
             else:
                 strs[nn] = 0
+        else:
+            strs[nn] = 0
         idLen = indelLen_masked[nn]
         pos = pos_masked[nn]
         if hps[nn] > 20:
             hps[nn] = 20
-        if strs[nn] > 0 and (idLen >= 2 or idLen <= -2):
-            Pamp[nn] = prob_amp[19 + strs[nn], -indelLen_masked[nn] + 5]
-            Pamp_rev[nn] = prob_amp[19 + strs[nn], indelLen_masked[nn] + 5]
-            Pdmg[nn] = prob_dmg[19 + strs[nn], -indelLen_masked[nn] + 5]
-            Pdmg_rev[nn] = prob_dmg[19 + strs[nn], indelLen_masked[nn] + 5]
-            Pdmg_bot[nn] = Pdmg[nn]
-            Pdmg_rev_bot[nn] = Pdmg_rev[nn]
-        elif idLen == 1:
+        # Only evaluated lazily for +-1bp indels, matching the original
+        # inline code, so this never indexes reference_int out of bounds for
+        # longer indels near the edge of the window.
+        if idLen == 1 or idLen == -1:
             ref_allele = reference_int[pos - start + 1]
-            ref_allele_rc = rc[ref_allele]
-            if hps[nn] < 20:
-                Pamp[nn] = prob_amp[hps[nn], 12 + ref_allele * 3 - 1]
-                Pdmg[nn] = prob_dmg[hps[nn], 12 + ref_allele * 3 - 1]
-                Pdmg_bot[nn] = prob_dmg[hps[nn], 12 + ref_allele_rc * 3 - 1]
-                Pamp_rev[nn] = prob_amp[hps[nn] - 1, 12 + ref_allele * 3 + 1]
-                Pdmg_rev[nn] = prob_dmg[hps[nn] - 1, 12 + ref_allele * 3 + 1]
-                Pdmg_rev_bot[nn] = prob_dmg[hps[nn] - 1, 12 + ref_allele_rc * 3 + 1]
-            else:
-                Pamp[nn] = prob_amp[19, 12 + ref_allele * 3 - 1]
-                Pdmg[nn] = prob_dmg[19, 12 + ref_allele * 3 - 1]
-                Pdmg_bot[nn] = prob_dmg[19, 12 + ref_allele_rc * 3 - 1]
-                Pamp_rev[nn] = prob_amp[19, 12 + ref_allele * 3 + 1]
-                Pdmg_rev[nn] = prob_dmg[19, 12 + ref_allele * 3 + 1]
-                Pdmg_rev_bot[nn] = prob_dmg[19, 12 + ref_allele_rc * 3 + 1]
-        elif idLen == -1:
-            ref_allele = reference_int[pos - start + 1]
-            ref_allele_rc = rc[ref_allele]
-            if hps[nn] == 1:
-                Pamp[nn] = prob_amp[0, 12 + ref_allele * 3 + 1]
-                Pdmg[nn] = prob_dmg[0, 12 + ref_allele * 3 + 1]
-                Pdmg_bot[nn] = prob_dmg[0, 12 + ref_allele_rc * 3 + 1]
-                Pamp_rev[nn] = prob_amp[0, 12 + ref_allele * 3 - 1]
-                Pdmg_rev[nn] = prob_dmg[0, 12 + ref_allele * 3 - 1]
-                Pdmg_rev_bot[nn] = prob_dmg[0, 12 + ref_allele_rc * 3 - 1]
-            else:
-                Pamp[nn] = prob_amp[hps[nn] - 2, 12 + ref_allele * 3 + 1]
-                Pdmg[nn] = prob_dmg[hps[nn] - 2, 12 + ref_allele * 3 + 1]
-                Pdmg_bot[nn] = prob_dmg[hps[nn] - 2, 12 + ref_allele_rc * 3 + 1]
-                Pamp_rev[nn] = prob_amp[hps[nn] - 1, 12 + ref_allele * 3 - 1]
-                Pdmg_rev[nn] = prob_dmg[hps[nn] - 1, 12 + ref_allele * 3 - 1]
-                Pdmg_rev_bot[nn] = prob_dmg[hps[nn] - 1, 12 + ref_allele_rc * 3 - 1]
         else:
-            Pamp[nn] = prob_amp[hps[nn] - 1, -indelLen_masked[nn] + 5]
-            Pamp_rev[nn] = prob_amp[hps[nn] - 1, indelLen_masked[nn] + 5]
-            Pdmg[nn] = prob_dmg[hps[nn] - 1, -indelLen_masked[nn] + 5]
-            Pdmg_rev[nn] = prob_dmg[hps[nn] - 1, indelLen_masked[nn] + 5]
-            Pdmg_bot[nn] = Pdmg[nn]
-            Pdmg_rev_bot[nn] = Pdmg_rev[nn]
-    Pamp[Pamp == 0] = 1e-9
-    Pamp_rev[Pamp == 0] = 1e-9
-    Pdmg[Pamp == 0] = 1e-9
-    Pdmg_rev[Pamp == 0] = 1e-9
-    Pdmg_bot[Pamp == 0] = 1e-9
-    Pdmg_rev_bot[Pamp == 0] = 1e-9
+            ref_allele = 0
+        (
+            Pamp[nn],
+            Pamp_rev[nn],
+            Pdmg[nn],
+            Pdmg_rev[nn],
+            Pdmg_bot[nn],
+            Pdmg_rev_bot[nn],
+        ) = indelErrorProbs(
+            hps[nn],
+            strs[nn],
+            idLen,
+            ref_allele,
+            prob_amp,
+            prob_amp_rev,
+            prob_dmg,
+            prob_dmg_rev,
+        )
     ln10 = np.log(10)
     F1R2_alt_prob, F1R2_ref_prob = calculateSSPosterior(
         Pamp,

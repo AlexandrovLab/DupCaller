@@ -5,7 +5,6 @@ from DupCaller_sub.Trim import do_trim
 from DupCaller_sub.Summarize import do_summarize
 from DupCaller_sub.Learn import do_learn
 from DupCaller_sub.AggregateProfile import do_aggregate
-from DupCaller_sub.Estimate import do_estimate
 from DupCaller_sub.Index import do_index
 
 # from Estimate import do_estimate
@@ -500,16 +499,10 @@ if __name__ == "__main__":
         help="Fasta file of reference. Either -f or -ft should be set",
     )
     index_parser.add_argument(
-        "-s",
-        "--strbed",
+        "-rt",
+        "--repeatTsv",
         type=str,
-        help="Tabix-indexed BED file of repeats longer than 12bp. Column 4 is repeat unit length, column 5 is repeat length",
-    )
-    index_parser.add_argument(
-        "-rb",
-        "--repeatBed",
-        type=str,
-        help="Tabix-indexed BED file of repeats 12bp or shorter (including homopolymers). Column 4 is repeat unit length, column 5 is repeat length",
+        help="PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference, e.g. produced by `PERF.core -m 1 -M <N> -u 2 -i reference.fa`. Repeat unit length and repeat count are read directly from the motif and num_units columns. Entries with unit length 1 (homopolymers) are ignored -- those are self-derived from the reference sequence instead.",
     )
     args = master_parser.parse_args()
     """
@@ -523,6 +516,11 @@ if __name__ == "__main__":
     elif args.command == "summarize":
         do_summarize(args)
     elif args.command == "estimate":
+        # Deferred import: Estimate.py pulls in matplotlib + sigProfilerPlotting,
+        # which every other subcommand (call, index, etc.) would otherwise pay
+        # the import cost for on every invocation despite never using them.
+        from DupCaller_sub.Estimate import do_estimate
+
         do_estimate(args)
     elif args.command == "aggregate":
         do_aggregate(args)

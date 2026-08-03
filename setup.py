@@ -18,5 +18,6 @@ setup(
         "scipy==1.16.2",
         "pandas==2.3.3",
         "h5py==3.15.0",
+        "sigProfilerPlotting==1.4.3",
     ],
 )

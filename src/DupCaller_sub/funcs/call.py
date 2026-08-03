@@ -18,20 +18,34 @@ import copy
 
 from .depth import (
     extractDepthRegion,
-    extractDepthSnv,
-    extractDepthIndel,
+    extractDepthBatchSnv,
+    extractDepthBatchIndel,
+    extractDepthBatchDbs,
     prepareAlignMask,
     detectOverlapDiscord,
 )
 from .prob import (
     genotypeDSSnv,
     genotypeDSIndel,
+    indelErrorProbs,
     calculateSSPosterior,
     calculateDSPosterior,
 )
 from .learn import profileTriNucMismatches
 from .misc import getAlignmentObject as BAM
+from .misc import build_trinuc64_order
+from .misc import load_repeat_context
+from .misc import log_progress
+from .misc import build_dbs_raw144_labels, build_dbs_raw144_index_grid
 from .indels import findIndels
+
+# [4,4,4,4] (ref1_num, ref2_num, alt1_num, alt2_num) -> row index into the
+# 144-raw-class DBS opportunity space, all in the same "ATCG" 0-3 encoding
+# ref_int/alt_int already use below (base2num/num2base) -- built once at
+# import time (cheap: 144 valid entries out of 256) rather than per-call,
+# and reused by every duplex-group DBS-opportunity accumulation below.
+_DBS_RAW144_IDX_GRID = build_dbs_raw144_index_grid()
+_, DBS_RAW144_LABELS = build_dbs_raw144_labels()
 
 # from .prob_old import genotypeDSSnv,genotypeDSIndel# as oldDSSnv
 
@@ -262,12 +276,147 @@ def bamIterateMultipleRegion(bam, regions, ref):  # , regionFile):
 
 
 def regularizeErrorMat(mat, minerr):
-    if (np.logical_or(mat != 0, ~np.isnan(mat))).any():
-        mat_min = np.min(np.ma.masked_where(mat == 0, mat))
-        mat[mat == 0] = mat_min
-    else:
-        mat[:, :] = minerr
+    """Replace invalid cells — exact zero, or NaN from a 0/0 row-sum
+    division upstream (a trinuc/indel context with zero observed counts)
+    — with the smallest valid value found elsewhere in the matrix, so one
+    unobserved context can't leave a zero or NaN in the error model.
+    Falls back to `minerr` only if the matrix has no valid cells at all."""
+    invalid = (mat == 0) | np.isnan(mat)
+    valid = mat[~invalid]
+    mat_min = valid.min() if valid.size > 0 else minerr
+    mat[invalid] = mat_min
     return mat
+
+
+def _detect_dbs_pairs(
+    mut_chrom,
+    mut_positions,
+    muts_ind,
+    ref_int,
+    alt_int,
+    pass_bool,
+    LR_pass_bool,
+    flt_rs,
+    F1R2,
+    F2R1,
+    setBc,
+    currentStart,
+    template_length,
+    num2base,
+):
+    """Detect DBS (dinucleotide substitution) events within one duplex
+    read group's SNV candidate list: two positions changing
+    SIMULTANEOUSLY in the SAME physical molecule, not two independent
+    SNVs that happen to sit next to each other in the genome. Because
+    mut_positions/muts_ind/ref_int/alt_int all come from THIS one read
+    group's own consensus calling, a genomically-adjacent pair found here
+    is, by construction, supported by the same underlying reads — unlike
+    scanning the already-written SNV VCF after the fact, which has no way
+    to tell same-molecule adjacency from coincidence.
+
+    Only pairs where BOTH constituent SNVs individually reach full PASS
+    status are called as a DBS (recomputed here from pass_bool/
+    LR_pass_bool/flt_rs — the same three inputs the existing per-position
+    loop above already uses to decide flt — rather than threading a new
+    list through that loop, so this can be added without touching any of
+    its existing lines). Weaker DBS-specific filter tiers (mirroring
+    "masked"/"underpowered" for SNVs) aren't attempted in this first cut.
+
+    Returns a list of DBS mut dicts (ref/alt are 2-character
+    dinucleotides), in the same shape as the SNV mut dict built above,
+    minus the SNV-only INFO fields (CS/LR/LM/TC/BC/TN/HP/STR) that don't
+    apply to a 2-base event.
+    """
+
+    def _flt(i):
+        if pass_bool[i] and LR_pass_bool[i]:
+            return flt_rs
+        if pass_bool[i]:
+            return "underpowered"
+        return "masked"
+
+    dbs_muts = []
+    for k in range(len(mut_positions) - 1):
+        if mut_positions[k + 1] != mut_positions[k] + 1:
+            continue
+        i0, i1 = muts_ind[k], muts_ind[k + 1]
+        if _flt(i0) != "PASS" or _flt(i1) != "PASS":
+            continue
+        ref_dinuc = num2base[ref_int[i0]] + num2base[ref_int[i1]]
+        alt_dinuc = num2base[alt_int[i0]] + num2base[alt_int[i1]]
+        dbs_muts.append(
+            {
+                "chrom": mut_chrom,
+                "pos": mut_positions[k],
+                "ref": ref_dinuc,
+                "alt": alt_dinuc,
+                "filter": "PASS",
+                "infos": {
+                    "F1R2": F1R2,
+                    "F2R1": F2R1,
+                    "TAG1": setBc[0],
+                    "TAG2": setBc[1],
+                    "SP": currentStart,
+                    "TL": template_length,
+                },
+                "formats": ["AC", "RC", "DP"],
+                # No independent raw-BAM depth re-verification for DBS
+                # yet (mirroring extractDepthSnv/extractDepthBatchSnv for
+                # SNVs) — both constituent bases already passed full
+                # duplex-consensus CS/LR calling, which is a strong
+                # signal on its own, but there's currently no equivalent
+                # of the SNV/indel maxAF / normal-VAF post-processing
+                # check for DBS. Placeholder AC=1/RC=0/DP=1 (tumor),
+                # 0/0/0 (normal) so downstream VCF writing has values to
+                # write; a real depth-extraction pass would replace this.
+                "samples": [[1, 0, 1], [0, 0, 0]],
+            }
+        )
+    return dbs_muts
+
+
+def _compute_dbs_opportunity(cov_mat, ref_int, pass_bool):
+    """Per-duplex-group DBS opportunity contribution from one family's
+    window: for every pair of directly ADJACENT in-window positions
+    (i, i+1) that both individually pass calling (pass_bool[i] and
+    pass_bool[i+1]) and have a valid A/T/C/G reference base at both,
+    opportunity is coverage(alt1 at i) * coverage(alt2 at i+1) summed over
+    all 9 non-ref (alt1, alt2) combinations -- the same product-of-
+    coverages approximation Estimate.py's calculate_dbs_opportunity uses
+    genome-wide from the coverage bed, just computed here per-family (so
+    it can be attributed to that family's own duplex_no) from the same
+    cov_mat/ref_int/pass_bool the trinuc accumulator right after this
+    function's call site already uses -- window-local arrays, aligned the
+    same way.
+
+    cov_mat  : (window_len, 4) L-weighted per-alt-base coverage.
+    ref_int  : (window_len,) reference base, 0-3=A/T/C/G, 4=N/invalid.
+    pass_bool: (window_len,) bool, calling-eligible positions.
+    Returns a (144,) raw-DBS-class contribution vector (funcs/misc.py's
+    build_dbs_raw144_labels order), zero wherever no adjacent pass_bool
+    pair with valid reference bases exists.
+    """
+    contribution = np.zeros(144)
+    if cov_mat.shape[0] < 2:
+        return contribution
+    pair_ok = pass_bool[:-1] & pass_bool[1:]
+    if not np.any(pair_ok):
+        return contribution
+    r1 = ref_int[:-1]
+    r2 = ref_int[1:]
+    valid = pair_ok & (r1 <= 3) & (r2 <= 3)
+    if not np.any(valid):
+        return contribution
+    c1 = cov_mat[:-1][valid]  # (k, 4)
+    c2 = cov_mat[1:][valid]  # (k, 4)
+    pair_contrib = c1[:, :, None] * c2[:, None, :]  # (k, 4, 4)
+    raw_idx = _DBS_RAW144_IDX_GRID[r1[valid], r2[valid]]  # (k, 4, 4)
+    flat_idx = raw_idx.reshape(-1)
+    keep = flat_idx >= 0
+    contribution += np.bincount(
+        flat_idx[keep], weights=pair_contrib.reshape(-1)[keep], minlength=144
+    )
+    return contribution
 
 
 def callBam(params, processNo):
@@ -364,8 +513,11 @@ def callBam(params, processNo):
     muts = []
     muts_dict = dict()
     muts_indels = []
+    muts_dbs = []
     duplex_read_num_dict = dict()
     duplex_read_num_dict_trinuc = dict()
+    duplex_read_num_dict_indel = dict()
+    duplex_read_num_dict_dbs = dict()
     # unmasked_duplex_read_num_dict_trinuc = dict()
     unique_read_num = 0
     pass_read_num = 0
@@ -376,23 +528,7 @@ def callBam(params, processNo):
     indelerr_mat = np.zeros([23, 23])
     mismatch_dmg_mat = np.zeros([64, 4])
     indel_dmg_mat = np.zeros([23, 23])
-    trinuc2num = dict()
-    num2trinuc = list()
-    trinuc_order = 0
-    for minus_base in ["A", "T", "C", "G"]:
-        for ref_base in ["C", "T"]:
-            for plus_base in ["A", "T", "C", "G"]:
-                trinuc = minus_base + ref_base + plus_base
-                trinuc2num[trinuc] = trinuc_order
-                num2trinuc.append(trinuc)
-                trinuc_order += 1
-    for plus_base in ["T", "A", "G", "C"]:
-        for ref_base in ["G", "A"]:
-            for minus_base in ["T", "A", "G", "C"]:
-                trinuc = minus_base + ref_base + plus_base
-                trinuc2num[trinuc] = trinuc_order
-                num2trinuc.append(trinuc)
-                trinuc_order += 1
+    trinuc2num, num2trinuc = build_trinuc64_order()
 
     trinuc_convert_np = np.zeros([64, 4], dtype=np.uint8)
     for trinuc in trinuc2num.keys():
@@ -416,7 +552,17 @@ def callBam(params, processNo):
             .astype(float)
         )
     # ampmat += 0.5
-    ampmat = ampmat / ampmat.sum(axis=1, keepdims=True)
+    # A trinuc context with zero observed counts across all 4 alt bases
+    # has row sum 0; dividing those rows would produce NaN (0/0) instead
+    # of leaving them as exact zero, which regularizeErrorMat below can
+    # then correctly patch with the matrix's smallest valid value.
+    ampmat_row_sum = ampmat.sum(axis=1, keepdims=True)
+    ampmat_row_nonzero = (ampmat_row_sum != 0).flatten()
+    ampmat_normalized = np.zeros_like(ampmat)
+    ampmat_normalized[ampmat_row_nonzero, :] = (
+        ampmat[ampmat_row_nonzero, :] / ampmat_row_sum[ampmat_row_nonzero, :]
+    )
+    ampmat = ampmat_normalized
     # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
     ampmat_min_error = ampmat.min(axis=1, keepdims=True)
     ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)
@@ -490,7 +636,16 @@ def callBam(params, processNo):
         # dmgmat += 1
 
     # dmgmat += 0.5
-    dmgmat = dmgmat / dmgmat.sum(axis=1, keepdims=True)
+    # Same zero-row guard as ampmat above: a trinuc context with zero
+    # observed counts must stay exact zero here, not become NaN via 0/0,
+    # so regularizeErrorMat below can patch it correctly.
+    dmgmat_row_sum = dmgmat.sum(axis=1, keepdims=True)
+    dmgmat_row_nonzero = (dmgmat_row_sum != 0).flatten()
+    dmgmat_normalized = np.zeros_like(dmgmat)
+    dmgmat_normalized[dmgmat_row_nonzero, :] = (
+        dmgmat[dmgmat_row_nonzero, :] / dmgmat_row_sum[dmgmat_row_nonzero, :]
+    )
+    dmgmat = dmgmat_normalized
     # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
     dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
@@ -566,9 +721,9 @@ def callBam(params, processNo):
     # Initialize
 
     total_coverage = np.zeros(4)
-    total_coverage_indel = 0
+    total_coverage_indel_cat = np.zeros(14)
     total_unmasked_coverage = np.zeros(4)
-    total_unmasked_coverage_indel = 0
+    total_unmasked_coverage_indel_cat = np.zeros(14)
     starttime = time.time()
     tumorBam = BAM(bam, "rb", params.get("reference"))
     if nbams:
@@ -670,6 +825,11 @@ def callBam(params, processNo):
     for t in range(64):
         ref_base_idx_L = base2num[num2trinuc[t][1]]
         for b in range(4):
+            if b == ref_base_idx_L:
+                # A base "changing" to itself isn't a mutation opportunity;
+                # leave L[:, :, t, ref_base_idx_L] at its zero-initialized
+                # value instead of simulating a self-to-self detection power.
+                continue
             tc = int(trinuc_conv_np_L[t, b])
             P_arr = np.full(N_SIM, prob_amp_mat_L[tc, ref_base_idx_L])
             P_rev_arr = np.full(N_SIM, prob_amp_mat_rev_L[tc, ref_base_idx_L])
@@ -716,6 +876,197 @@ def callBam(params, processNo):
                         F2R1_b2,
                     )
                     L[i, j, t, b] = ((LL_B1 - LL_B2) >= pcut).mean()
+
+    # Build indel detection-power tables, analogous to L above but for indel
+    # calling. genotypeDSIndel classifies each candidate indel by repeat
+    # context (hps: homopolymer run length 0-20, strs: STR length bin 0-3)
+    # and indel length (idLen), then selects Pamp/Pdmg via indelErrorProbs.
+    # These tables simulate that same selection across every (top count,
+    # bottom count) combination and precompute the fraction of simulations
+    # that would clear indel calling's tiered pcutoffi threshold, so
+    # per-position indel coverage can be looked up by depth+context instead
+    # of re-simulated. Only built outside learn mode: ampmat_indel/
+    # dmgmat_indel (and pcutoffi-driven calling) aren't used in learn mode.
+    if not isLearn:
+        prob_amp_indel_L = params["ampmat_indel"]
+        prob_amp_indel_rev_L = params["ampmat_indel_rev"]
+        prob_dmg_indel_L = params["dmgmat_indel"]
+        prob_dmg_indel_rev_L = params["dmgmat_indel_rev"]
+        pcutoffi_L = params["pcutoffi"]
+
+        def indelTierThreshold(hps_c, strs_c):
+            # Mirrors the OR'd tiering used to build LR_pass_bool for real
+            # indel calls: hps<=5 -> tier0, 5<hps<=10 -> tier1, hps>10 ->
+            # tier2, and strs>0 additionally ORs in tier2. OR'ing two
+            # `LR >= x` comparisons on the same LR is equivalent to
+            # comparing against the smaller threshold.
+            if hps_c <= 5:
+                threshold = pcutoffi_L[0]
+            elif hps_c <= 10:
+                threshold = pcutoffi_L[1]
+            else:
+                threshold = pcutoffi_L[2]
+            if strs_c > 0:
+                threshold = min(threshold, pcutoffi_L[2])
+            return threshold
+
+        def simulateIndelPowerGrid(
+            Pamp_c,
+            Pamp_rev_c,
+            Pdmg_c,
+            Pdmg_rev_c,
+            Pdmg_bot_c,
+            Pdmg_rev_bot_c,
+            threshold,
+        ):
+            grid = np.zeros([10, 10])
+            P_arr = np.full(N_SIM, Pamp_c)
+            P_rev_arr = np.full(N_SIM, Pamp_rev_c)
+            Pt_arr = np.full(N_SIM, Pdmg_c)
+            Prev_t_arr = np.full(N_SIM, Pdmg_rev_c)
+            Pb_arr = np.full(N_SIM, Pdmg_bot_c)
+            Prev_b_arr = np.full(N_SIM, Pdmg_rev_bot_c)
+            for i in range(10):
+                for j in range(10):
+                    if i == 0 and j == 0:
+                        continue
+                    if i > 0:
+                        q_top = rng_L.choice(all_quals, size=(i, N_SIM), replace=True)
+                        F1R2_Pseq = -q_top / 10 * ln10_L
+                        F1R2_bin = np.ones([i, N_SIM], dtype=bool)
+                    else:
+                        F1R2_Pseq = np.zeros([0, N_SIM])
+                        F1R2_bin = np.zeros([0, N_SIM], dtype=bool)
+                    if j > 0:
+                        q_bot = rng_L.choice(all_quals, size=(j, N_SIM), replace=True)
+                        F2R1_Pseq = -q_bot / 10 * ln10_L
+                        F2R1_bin = np.ones([j, N_SIM], dtype=bool)
+                    else:
+                        F2R1_Pseq = np.zeros([0, N_SIM])
+                        F2R1_bin = np.zeros([0, N_SIM], dtype=bool)
+                    F1R2_b1, F1R2_b2 = calculateSSPosterior(
+                        P_arr, P_rev_arr, F1R2_bin, F1R2_Pseq
+                    )
+                    F2R1_b1, F2R1_b2 = calculateSSPosterior(
+                        P_arr, P_rev_arr, F2R1_bin, F2R1_Pseq
+                    )
+                    LL_B1, LL_B2 = calculateDSPosterior(
+                        Pt_arr,
+                        Prev_t_arr,
+                        Pb_arr,
+                        Prev_b_arr,
+                        F1R2_b1,
+                        F2R1_b1,
+                        F1R2_b2,
+                        F2R1_b2,
+                    )
+                    grid[i, j] = ((LL_B1 - LL_B2) >= threshold).mean()
+            return grid
+
+        # 1bp indels (deletion/insertion of a homopolymer's repeat unit):
+        # axes are top count, bottom count, hps (0-20), ref_allele (0-3),
+        # sign (0=deletion idLen=-1, 1=insertion idLen=+1).
+        L_indel_1bp = np.zeros([10, 10, 21, 4, 2])
+        for hps_c in range(21):
+            threshold = indelTierThreshold(hps_c, 0)
+            for ref_allele_c in range(4):
+                for sign_idx, idLen_c in enumerate((-1, 1)):
+                    (
+                        Pamp_c,
+                        Pamp_rev_c,
+                        Pdmg_c,
+                        Pdmg_rev_c,
+                        Pdmg_bot_c,
+                        Pdmg_rev_bot_c,
+                    ) = indelErrorProbs(
+                        hps_c,
+                        0,
+                        idLen_c,
+                        ref_allele_c,
+                        prob_amp_indel_L,
+                        prob_amp_indel_rev_L,
+                        prob_dmg_indel_L,
+                        prob_dmg_indel_rev_L,
+                    )
+                    L_indel_1bp[
+                        :, :, hps_c, ref_allele_c, sign_idx
+                    ] = simulateIndelPowerGrid(
+                        Pamp_c,
+                        Pamp_rev_c,
+                        Pdmg_c,
+                        Pdmg_rev_c,
+                        Pdmg_bot_c,
+                        Pdmg_rev_bot_c,
+                        threshold,
+                    )
+
+        # Length-bin indels (raw length 2/3/4/5+, either direction): axes are
+        # top count, bottom count, row (0-22, same hps-1/19+strs convention
+        # as ampmat_indel), idLen+5 (0-10, only 8 of 11 slots populated).
+        # Rows 0-19 are HP-context (hps 1-20); rows 20-22 are STR-context
+        # (strs 1-3, hps forced to 1, matching genotypeDSIndel/indelErrorProbs).
+        L_indel_len = np.zeros([10, 10, 23, 11])
+        len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
+        for hps_c in range(1, 21):
+            row = hps_c - 1
+            threshold = indelTierThreshold(hps_c, 0)
+            for idLen_c in len_idLens:
+                (
+                    Pamp_c,
+                    Pamp_rev_c,
+                    Pdmg_c,
+                    Pdmg_rev_c,
+                    Pdmg_bot_c,
+                    Pdmg_rev_bot_c,
+                ) = indelErrorProbs(
+                    hps_c,
+                    0,
+                    idLen_c,
+                    0,
+                    prob_amp_indel_L,
+                    prob_amp_indel_rev_L,
+                    prob_dmg_indel_L,
+                    prob_dmg_indel_rev_L,
+                )
+                L_indel_len[:, :, row, idLen_c + 5] = simulateIndelPowerGrid(
+                    Pamp_c,
+                    Pamp_rev_c,
+                    Pdmg_c,
+                    Pdmg_rev_c,
+                    Pdmg_bot_c,
+                    Pdmg_rev_bot_c,
+                    threshold,
+                )
+        for strs_c in range(1, 4):
+            row = 19 + strs_c
+            threshold = indelTierThreshold(1, strs_c)
+            for idLen_c in len_idLens:
+                (
+                    Pamp_c,
+                    Pamp_rev_c,
+                    Pdmg_c,
+                    Pdmg_rev_c,
+                    Pdmg_bot_c,
+                    Pdmg_rev_bot_c,
+                ) = indelErrorProbs(
+                    1,
+                    strs_c,
+                    idLen_c,
+                    0,
+                    prob_amp_indel_L,
+                    prob_amp_indel_rev_L,
+                    prob_dmg_indel_L,
+                    prob_dmg_indel_rev_L,
+                )
+                L_indel_len[:, :, row, idLen_c + 5] = simulateIndelPowerGrid(
+                    Pamp_c,
+                    Pamp_rev_c,
+                    Pdmg_c,
+                    Pdmg_rev_c,
+                    Pdmg_bot_c,
+                    Pdmg_rev_bot_c,
+                    threshold,
+                )
 
     retain_base = 5
     currentReadDictList = [
@@ -842,7 +1193,9 @@ def callBam(params, processNo):
                 duplex_no = f"{F1R2}+{F2R1}"
                 if duplex_read_num_dict.get(duplex_no) is None:
                     duplex_read_num_dict[duplex_no] = [0, 0, 0]
-                    duplex_read_num_dict_trinuc[duplex_no] = np.zeros((96, 4))
+                    duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
+                    duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
+                    duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
                     # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
                 duplex_read_num_dict[duplex_no][2] += 1
                 unique_read_num += 1
@@ -889,21 +1242,19 @@ def callBam(params, processNo):
                                 coverage[
                                     0 : coverage_leftover.shape[0]
                                 ] += coverage_leftover
-                                coverage_indel[
+                                coverage_indel_cat[
                                     0 : coverage_leftover.shape[0]
-                                ] += coverage_indel_leftover
+                                ] += coverage_indel_cat_leftover
                                 unmasked_coverage[
                                     0 : coverage_leftover.shape[0]
                                 ] += unmasked_coverage_leftover
-                                unmasked_coverage_indel[
+                                unmasked_coverage_indel_cat[
                                     0 : coverage_leftover.shape[0]
-                                ] += unmasked_coverage_indel_leftover
+                                ] += unmasked_coverage_indel_cat_leftover
                                 unmasked_coverage_leftover = np.zeros((1, 4))
-                                unmasked_coverage_indel_leftover = np.zeros(
-                                    1, dtype=int
-                                )
+                                unmasked_coverage_indel_cat_leftover = np.zeros((1, 14))
                                 coverage_leftover = np.zeros((1, 4))
-                                coverage_indel_leftover = np.zeros(1, dtype=int)
+                                coverage_indel_cat_leftover = np.zeros((1, 14))
                             if chromNow == reference_mat_chrom:
                                 coverage_leftover = copy.deepcopy(
                                     coverage[
@@ -912,8 +1263,8 @@ def callBam(params, processNo):
                                         )
                                     ]
                                 )
-                                coverage_indel_leftover = copy.deepcopy(
-                                    coverage_indel[
+                                coverage_indel_cat_leftover = copy.deepcopy(
+                                    coverage_indel_cat[
                                         (rs_reference_start - reference_mat_start) : (
                                             reference_mat_end - reference_mat_start
                                         )
@@ -926,8 +1277,8 @@ def callBam(params, processNo):
                                         )
                                     ]
                                 )
-                                unmasked_coverage_indel_leftover = copy.deepcopy(
-                                    unmasked_coverage_indel[
+                                unmasked_coverage_indel_cat_leftover = copy.deepcopy(
+                                    unmasked_coverage_indel_cat[
                                         (rs_reference_start - reference_mat_start) : (
                                             reference_mat_end - reference_mat_start
                                         )
@@ -937,13 +1288,14 @@ def callBam(params, processNo):
                                     coverage[
                                         0 : (rs_reference_start - reference_mat_start)
                                     ].sum(axis=1)
-                                    + coverage_indel[
+                                    + coverage_indel_cat[
                                         0 : (rs_reference_start - reference_mat_start)
-                                    ]
+                                    ].sum(axis=1)
                                 )
                             else:
                                 non_zero_positions = np.nonzero(
-                                    coverage.sum(axis=1) + coverage_indel
+                                    coverage.sum(axis=1)
+                                    + coverage_indel_cat.sum(axis=1)
                                 )
                             for pos in non_zero_positions[0].tolist():
                                 current_pos = pos + reference_mat_start
@@ -965,16 +1317,18 @@ def callBam(params, processNo):
                                             str(current_pos),
                                             str(current_pos + 1),
                                             "\t".join(str(v) for v in coverage[pos]),
-                                            str(coverage_indel[pos]),
+                                            "\t".join(
+                                                str(v) for v in coverage_indel_cat[pos]
+                                            ),
                                         ]
                                     )
                                     + "\n"
                                 )
                                 total_coverage += coverage[pos]
-                                total_coverage_indel += coverage_indel[pos]
+                                total_coverage_indel_cat += coverage_indel_cat[pos]
                                 total_unmasked_coverage += unmasked_coverage[pos]
-                                total_unmasked_coverage_indel += (
-                                    unmasked_coverage_indel[pos]
+                                total_unmasked_coverage_indel_cat += (
+                                    unmasked_coverage_indel_cat[pos]
                                 )
                         # if chromNow != reference_mat_chrom:
                         reference_mat_chrom = chromNow
@@ -996,13 +1350,34 @@ def callBam(params, processNo):
                         ref_h5 = h5py.File(params["reference"] + ".ref.h5", "r")
                         tn_h5 = h5py.File(params["reference"] + ".tn.h5", "r")
                         hp_h5 = h5py.File(params["reference"] + ".hp.h5", "r")
+                        str_h5 = h5py.File(params["reference"] + ".str.h5", "r")
                         ref_np = ref_h5[reference_mat_chrom][
                             reference_mat_start:reference_mat_end
                         ]
                         trinuc_np = tn_h5[reference_mat_chrom][
                             reference_mat_start:reference_mat_end
                         ]
-                        hp_np = hp_h5[reference_mat_chrom][
+                        # (3, window) — unit_len, cut (start-of-run), and
+                        # repeat_count, merged from the self-derived
+                        # homopolymer index and the BED-derived STR index
+                        # (see funcs/misc.py's load_repeat_context).
+                        hp_np = load_repeat_context(
+                            hp_h5[reference_mat_chrom],
+                            str_h5[reference_mat_chrom],
+                            reference_mat_start,
+                            reference_mat_end,
+                        )
+                        # Raw, unmerged slices for the learn-phase error-rate
+                        # estimation (profileTriNucMismatches), which needs
+                        # the self-derived homopolymer run and the BED-derived
+                        # STR annotation as independent sources rather than
+                        # load_repeat_context's STR-priority merge (that merge
+                        # is for indel *calling*'s classification, where a
+                        # position can only be one category at a time).
+                        hp_raw_np = hp_h5[reference_mat_chrom][
+                            :, reference_mat_start:reference_mat_end
+                        ]
+                        str_raw_np = str_h5[reference_mat_chrom][
                             :, reference_mat_start:reference_mat_end
                         ]
                         (
@@ -1032,9 +1407,9 @@ def callBam(params, processNo):
                         )
                         # print(ref_np,reference_mat_start)
                         coverage = np.zeros((1000000, 4))
-                        coverage_indel = np.zeros(1000000, dtype=int)
+                        coverage_indel_cat = np.zeros((1000000, 14))
                         unmasked_coverage = np.zeros((1000000, 4))
-                        unmasked_coverage_indel = np.zeros(1000000, dtype=int)
+                        unmasked_coverage_indel_cat = np.zeros((1000000, 14))
                     ### Record read names to check if mate has been processed
                     processed_flag = 0
                     for seq in readSet:
@@ -1128,8 +1503,8 @@ def callBam(params, processNo):
                             rs_reference_end,
                             ref_np[start_ind:end_ind],
                             unmasked_antimask_indel,
-                            # hp_np[0, start_ind:end_ind],
-                            hp_np[:, start_ind:end_ind],
+                            hp_raw_np[:, start_ind:end_ind],
+                            str_raw_np[:, start_ind:end_ind],
                             params,
                         )
                         # print(LR_max)
@@ -1169,11 +1544,6 @@ def callBam(params, processNo):
                                 )
                             ] = True
                         indels_pass = [indels[_] for _ in pass_inds]
-                        if flt_rs == "PASS":
-                            coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
-                            unmasked_coverage_indel[start_ind:end_ind_max][
-                                unmasked_antimask_indel
-                            ] += 1
                         for nn in range(len(indels_pass)):
                             indel = indels_pass[nn]
                             indel_chrom = chromNow
@@ -1321,8 +1691,8 @@ def callBam(params, processNo):
                                 rs_reference_start,
                                 ref_np[start_ind:end_ind],
                                 trinuc_np[start_ind:end_ind],
-                                # hp_np[0, start_ind:end_ind],
-                                hp_np[:, start_ind:end_ind],
+                                hp_raw_np[:, start_ind:end_ind],
+                                str_raw_np[:, start_ind:end_ind],
                                 np.copy(learn_antimask),
                                 params,
                             )
@@ -1352,6 +1722,432 @@ def callBam(params, processNo):
                             params,
                             L,
                         )
+                        # Per-position indel category coverage (del_unit,
+                        # del_2, del_3, del_4, del_5plus, ins_unit, ins_2,
+                        # ins_3, ins_4, ins_5plus): look up
+                        # detection power from the L_indel_1bp/L_indel_len
+                        # tables built above, using this window's repeat
+                        # context (hp_np) and the same per-base read-family
+                        # counts (F1R2_count/F2R1_count) SBS coverage uses
+                        # as its depth proxy.
+                        if not isLearn:
+                            unit_len_arr = hp_np[0, start_ind:end_ind].astype(int)
+                            repeat_count_arr = hp_np[2, start_ind:end_ind].astype(int)
+                            ref_allele_arr = ref_np[start_ind:end_ind]
+                            ref_allele_safe = np.where(
+                                ref_allele_arr > 3, 0, ref_allele_arr
+                            )
+                            is_hp = unit_len_arr <= 1
+                            hps_for_row = np.where(
+                                is_hp, np.minimum(repeat_count_arr, 20), 1
+                            )
+                            total_len_arr = unit_len_arr * repeat_count_arr
+                            strs_for_row = np.zeros_like(total_len_arr)
+                            strs_for_row[
+                                np.logical_and(~is_hp, total_len_arr >= 10)
+                            ] = 1
+                            strs_for_row[
+                                np.logical_and(~is_hp, total_len_arr >= 25)
+                            ] = 2
+                            strs_for_row[
+                                np.logical_and(~is_hp, total_len_arr >= 40)
+                            ] = 3
+                            row_len = np.where(
+                                strs_for_row > 0, 19 + strs_for_row, hps_for_row - 1
+                            )
+                            unit_len_clamped = np.clip(unit_len_arr, 2, 5)
+                            n_top_indel = np.minimum(F1R2_count.sum(axis=0), 9).astype(
+                                int
+                            )
+                            n_bot_indel = np.minimum(F2R1_count.sum(axis=0), 9).astype(
+                                int
+                            )
+                            # "Last cut"/"first cut" mask: repeat-based
+                            # classes (ins_unit/del_unit here, and the
+                            # homopolymer/STR raw classes below) can't
+                            # reliably confirm a run's true length once this
+                            # read family no longer extends past that run's
+                            # start (hp_np row-1 "cut", from
+                            # load_repeat_context), so everything from the
+                            # last cut within this family's span onward is
+                            # excluded — and symmetrically, the entire run
+                            # touching the family's own LEFT edge is
+                            # excluded too: whether an indel occurred within
+                            # a run right at the start of what this family's
+                            # reads cover is exactly as undecidable as one
+                            # at the end, since the family has no visible
+                            # flanking context on that side either way. This
+                            # is the whole run containing window position 0
+                            # — not just its first base — so if the window
+                            # itself starts exactly on a cut (that run's
+                            # start is confirmed), the excluded span still
+                            # runs to the *next* cut, not just past the
+                            # first one. Does not apply to del_2..del_5plus
+                            # / microhomology, which use a fixed context
+                            # regardless of any actual run.
+                            cut_arr = hp_np[1, start_ind:end_ind]
+                            last_cut_valid = np.ones(end_ind - start_ind, dtype=bool)
+                            cut_positions = np.nonzero(cut_arr)[0]
+                            if cut_positions.size > 0:
+                                last_cut_valid[cut_positions[-1] :] = False
+                                if cut_positions[0] == 0:
+                                    first_run_end = (
+                                        cut_positions[1]
+                                        if cut_positions.size > 1
+                                        else end_ind - start_ind
+                                    )
+                                else:
+                                    first_run_end = cut_positions[0]
+                                last_cut_valid[:first_run_end] = False
+                            # Reference base immediately following each
+                            # position, needed for the "Insertion A/T/C/G"
+                            # columns below and the matching fine-grained
+                            # 1bpins{base} columns (96-99): rep0 for
+                            # inserting base N requires only that this next
+                            # base differs from N — nothing to do with the
+                            # position's own reference base.
+                            window_len = end_ind - start_ind
+                            next_ref_arr = np.full(window_len, -1, dtype=int)
+                            avail = min(end_ind + 1, ref_np.shape[0]) - (start_ind + 1)
+                            if avail > 0:
+                                next_ref_arr[:avail] = ref_np[
+                                    start_ind + 1 : start_ind + 1 + avail
+                                ]
+                            next_ref_valid = (next_ref_arr >= 0) & (next_ref_arr <= 3)
+
+                            cov_mat_indel = np.zeros([window_len, 14])
+                            cov_mat_indel[:, 0] = (
+                                np.where(
+                                    is_hp,
+                                    L_indel_1bp[
+                                        n_top_indel,
+                                        n_bot_indel,
+                                        hps_for_row,
+                                        ref_allele_safe,
+                                        0,
+                                    ],
+                                    L_indel_len[
+                                        n_top_indel,
+                                        n_bot_indel,
+                                        row_len,
+                                        -unit_len_clamped + 5,
+                                    ],
+                                )
+                                * last_cut_valid
+                            )
+                            # Insertion of Repeat Unit: same shape as column
+                            # 0 (deletion of repeat unit) but the insertion
+                            # direction (last L_indel_1bp index 1, and
+                            # +unit_len_clamped+5 instead of
+                            # -unit_len_clamped+5 into L_indel_len).
+                            cov_mat_indel[:, 1] = (
+                                np.where(
+                                    is_hp,
+                                    L_indel_1bp[
+                                        n_top_indel,
+                                        n_bot_indel,
+                                        hps_for_row,
+                                        ref_allele_safe,
+                                        1,
+                                    ],
+                                    L_indel_len[
+                                        n_top_indel,
+                                        n_bot_indel,
+                                        row_len,
+                                        unit_len_clamped + 5,
+                                    ],
+                                )
+                                * last_cut_valid
+                            )
+                            # del_2..del_5plus: fixed homopolymer-length-1
+                            # context (microhomology-style, row 0 = hps=1),
+                            # not the position's actual repeat context.
+                            cov_mat_indel[:, 2] = L_indel_len[
+                                n_top_indel, n_bot_indel, 0, 3
+                            ]
+                            cov_mat_indel[:, 3] = L_indel_len[
+                                n_top_indel, n_bot_indel, 0, 2
+                            ]
+                            cov_mat_indel[:, 4] = L_indel_len[
+                                n_top_indel, n_bot_indel, 0, 1
+                            ]
+                            cov_mat_indel[:, 5] = L_indel_len[
+                                n_top_indel, n_bot_indel, 0, 0
+                            ]
+                            # Insertion A/T/C/G: rep0 opportunity to insert
+                            # exactly that base — fixed hps=1 context, using
+                            # THAT base (not the position's own reference
+                            # base) as the L_indel_1bp ref_allele index —
+                            # zeroed wherever the next reference base already
+                            # equals it (that's a repeat extension, not a
+                            # novel insertion).
+                            for b in range(4):
+                                cov_mat_indel[:, 6 + b] = (
+                                    L_indel_1bp[n_top_indel, n_bot_indel, 1, b, 1]
+                                    * next_ref_valid
+                                    * (next_ref_arr != b)
+                                    * antimask_indel
+                                )
+                            # Insertion Length 2..5+: power to see a novel
+                            # U-bp unit inserted where no repeat exists yet
+                            # (rep0 in classify_indel_record's is_hp/indel_len
+                            # >=2 branch, misc.py) — fixed hps=1 context (row
+                            # 0), same as del_2..del_5plus, but only where a
+                            # "no repeat here yet" call is even possible
+                            # (is_hp) and the read family can still confirm
+                            # that (last_cut_valid). Without this, novel
+                            # multi-bp insertions that DO get classified and
+                            # counted in the fine-grained per-duplex-group
+                            # totals had no per-locus coverage anywhere.
+                            ins_len_valid = is_hp & last_cut_valid & antimask_indel
+                            cov_mat_indel[:, 10] = (
+                                L_indel_len[n_top_indel, n_bot_indel, 0, 7]
+                                * ins_len_valid
+                            )
+                            cov_mat_indel[:, 11] = (
+                                L_indel_len[n_top_indel, n_bot_indel, 0, 8]
+                                * ins_len_valid
+                            )
+                            cov_mat_indel[:, 12] = (
+                                L_indel_len[n_top_indel, n_bot_indel, 0, 9]
+                                * ins_len_valid
+                            )
+                            cov_mat_indel[:, 13] = (
+                                L_indel_len[n_top_indel, n_bot_indel, 0, 10]
+                                * ins_len_valid
+                            )
+                            # Fine-grained 100-class raw indel classification
+                            # (mirrors the SBS 192-class raw trinuc scheme):
+                            # base-specific homopolymer del (24) + ins (20,
+                            # no rep0 bin — see below), unit-size/repeat-
+                            # count-specific STR del/ins (24+24),
+                            # microhomology deletion length (4). See
+                            # funcs/misc.py's build_indel100_labels for
+                            # the exact column layout.
+                            indel100 = np.zeros(100)
+
+                            def _accumulate_indel100(col_idx, weight, valid):
+                                if np.any(valid):
+                                    indel100[:] += np.bincount(
+                                        col_idx[valid].astype(int),
+                                        weights=weight[valid],
+                                        minlength=100,
+                                    )
+
+                            to_cgta = np.array([3, 2, 0, 1])  # base2num->CGTA order
+                            base_cgta = to_cgta[ref_allele_safe]
+
+                            # HP and STR opportunity below are credited
+                            # INDEPENDENTLY, from the raw (unmerged)
+                            # hp.h5/str.h5 arrays (hp_raw_np/str_raw_np) —
+                            # not from is_hp/unit_len_arr/cut_arr above,
+                            # which come from load_repeat_context's
+                            # STR-priority merge and silently drop a
+                            # position's homopolymer opportunity wherever
+                            # it also sits inside an annotated STR tract
+                            # (e.g. the "AA" in a (AAT)n repeat). That merge
+                            # is correct for classifying an *observed*
+                            # mutation event (necessarily one category or
+                            # the other) but wrong here: such a position is
+                            # a real candidate for both a 1bp homopolymer
+                            # slip and a larger STR-unit slip. Mirrors
+                            # funcs/misc.py's
+                            # indel100_reference_bucket_indices, which
+                            # already double-counts these positions into
+                            # both buckets on the genome-composition side —
+                            # see [[feedback-hp-str-independence]].
+                            def _run_boundary_valid(cut_bool_arr):
+                                valid = np.ones(cut_bool_arr.shape[0], dtype=bool)
+                                cut_positions = np.nonzero(cut_bool_arr)[0]
+                                if cut_positions.size > 0:
+                                    valid[cut_positions[-1] :] = False
+                                    if cut_positions[0] == 0:
+                                        first_run_end = (
+                                            cut_positions[1]
+                                            if cut_positions.size > 1
+                                            else cut_bool_arr.shape[0]
+                                        )
+                                    else:
+                                        first_run_end = cut_positions[0]
+                                    valid[:first_run_end] = False
+                                return valid
+
+                            hp_run_arr = np.minimum(
+                                hp_raw_np[0, start_ind:end_ind].astype(int), 20
+                            )
+                            hp_cut_bool = hp_raw_np[1, start_ind:end_ind].astype(bool)
+                            hp_repeat_valid = (
+                                _run_boundary_valid(hp_cut_bool) & antimask_indel
+                            )
+
+                            str_unit_raw = str_raw_np[0, start_ind:end_ind].astype(int)
+                            str_repeat_raw = str_raw_np[1, start_ind:end_ind].astype(
+                                int
+                            )
+                            str_cut_bool = str_raw_np[2, start_ind:end_ind].astype(bool)
+                            is_real_str = str_unit_raw >= 2
+                            str_repeat_valid = (
+                                _run_boundary_valid(str_cut_bool) & antimask_indel
+                            )
+                            total_len_str = str_unit_raw * str_repeat_raw
+                            strs_for_row_str = np.zeros_like(total_len_str)
+                            strs_for_row_str[is_real_str & (total_len_str >= 10)] = 1
+                            strs_for_row_str[is_real_str & (total_len_str >= 25)] = 2
+                            strs_for_row_str[is_real_str & (total_len_str >= 40)] = 3
+                            row_len_str = np.where(
+                                strs_for_row_str > 0, 19 + strs_for_row_str, 0
+                            )
+                            unit_len_clamped_str = np.clip(str_unit_raw, 2, 5)
+                            unit_bucket = np.clip(str_unit_raw, 2, 5) - 2
+                            count_bucket_del = np.clip(str_repeat_raw, 1, 6) - 1
+
+                            # 1-4: homopolymer deletion (cols 0-23) — always
+                            # from the position's own raw hp run/cut,
+                            # regardless of any STR annotation there too.
+                            hp_del_power = L_indel_1bp[
+                                n_top_indel,
+                                n_bot_indel,
+                                hp_run_arr,
+                                ref_allele_safe,
+                                0,
+                            ]
+                            del_bucket = np.clip(hp_run_arr, 1, 6) - 1
+                            _accumulate_indel100(
+                                base_cgta * 6 + del_bucket,
+                                hp_del_power,
+                                hp_repeat_valid & hp_cut_bool,
+                            )
+
+                            # 5-8: homopolymer insertion (cols 24-43) —
+                            # length bins 1..5+ only; rep0 (hp_run_arr==0,
+                            # never actually occurs) is deliberately not
+                            # credited here, since that value is always
+                            # discarded and replaced by the exact
+                            # 1bpins{base} next-base computation below (see
+                            # Estimate.py's
+                            # override_inshp0_with_next_base_opportunity).
+                            hp_ins_power = L_indel_1bp[
+                                n_top_indel,
+                                n_bot_indel,
+                                hp_run_arr,
+                                ref_allele_safe,
+                                1,
+                            ]
+                            ins_bucket = np.clip(hp_run_arr, 1, 5) - 1
+                            _accumulate_indel100(
+                                24 + base_cgta * 5 + ins_bucket,
+                                hp_ins_power,
+                                (hp_run_arr >= 1) & hp_repeat_valid & hp_cut_bool,
+                            )
+
+                            # 9: STR deletion (cols 44-67) — real part, from
+                            # the position's own raw STR annotation,
+                            # independent of any homopolymer overlap.
+                            str_del_power = L_indel_len[
+                                n_top_indel,
+                                n_bot_indel,
+                                row_len_str,
+                                -unit_len_clamped_str + 5,
+                            ]
+                            _accumulate_indel100(
+                                44 + unit_bucket * 6 + count_bucket_del,
+                                str_del_power,
+                                is_real_str & str_repeat_valid & str_cut_bool,
+                            )
+                            # Flat rep1 opportunity at positions with no
+                            # real STR annotation (whether or not they're
+                            # also a homopolymer run — that's credited
+                            # separately above): every such position is a
+                            # candidate for an arbitrary, non-repeating
+                            # U-bp deletion — a fixed hps=1/strs=0 power
+                            # lookup (row 0), not an attempt to discover a
+                            # true higher count that might coincidentally
+                            # exist there (that would need rescanning the
+                            # reference; see funcs/misc.py's
+                            # indel100_reference_bucket_indices for the
+                            # matching scan-free credit on the genome-wide
+                            # side). Gated by hp_repeat_valid, not
+                            # str_repeat_valid: there's no real STR tract
+                            # here to have its own boundary, so this reuses
+                            # the run-visibility this position already has
+                            # under its own (possibly trivial, length-1)
+                            # homopolymer context.
+                            for u_idx, U in enumerate([2, 3, 4, 5]):
+                                hyp_del_power = L_indel_len[
+                                    n_top_indel, n_bot_indel, 0, -U + 5
+                                ]
+                                _accumulate_indel100(
+                                    np.full(end_ind - start_ind, 44 + u_idx * 6),
+                                    hyp_del_power,
+                                    (~is_real_str) & hp_repeat_valid,
+                                )
+
+                            # 10: STR insertion (cols 68-91) — real part
+                            str_ins_power = L_indel_len[
+                                n_top_indel,
+                                n_bot_indel,
+                                row_len_str,
+                                unit_len_clamped_str + 5,
+                            ]
+                            count_bucket_ins = np.clip(str_repeat_raw, 0, 5)
+                            _accumulate_indel100(
+                                68 + unit_bucket * 6 + count_bucket_ins,
+                                str_ins_power,
+                                is_real_str & str_repeat_valid & str_cut_bool,
+                            )
+                            is_rep1 = str_repeat_raw == 1
+                            _accumulate_indel100(
+                                68 + unit_bucket * 6 + 0,
+                                str_ins_power,
+                                is_real_str & is_rep1 & str_repeat_valid & str_cut_bool,
+                            )
+                            # Flat rep0/rep1 opportunity at positions with
+                            # no real STR annotation ("what if a U-bp unit
+                            # were inserted here"): fixed hps=1/strs=0
+                            # context (row 0), same value added to both the
+                            # "0" and "1" repeat-count buckets for every
+                            # unit size — scan-free, matching the deletion
+                            # case above, and gated the same way (see
+                            # comment there for why hp_repeat_valid, not
+                            # str_repeat_valid).
+                            for u_idx, U in enumerate([2, 3, 4, 5]):
+                                hyp_power = L_indel_len[
+                                    n_top_indel, n_bot_indel, 0, U + 5
+                                ]
+                                base_col = 68 + u_idx * 6
+                                _accumulate_indel100(
+                                    np.full(end_ind - start_ind, base_col),
+                                    hyp_power,
+                                    (~is_real_str) & hp_repeat_valid,
+                                )
+                                _accumulate_indel100(
+                                    np.full(end_ind - start_ind, base_col + 1),
+                                    hyp_power,
+                                    (~is_real_str) & hp_repeat_valid,
+                                )
+
+                            # 11: microhomology deletion (cols 92-95) —
+                            # fixed context, every position, no last-cut
+                            # restriction; reuse cov_mat_indel[:,2:6].
+                            for k in range(4):
+                                _accumulate_indel100(
+                                    np.full(end_ind - start_ind, 92 + k),
+                                    cov_mat_indel[:, 2 + k],
+                                    antimask_indel,
+                                )
+
+                            # 12: 1bpins{base} rep0 opportunity (cols
+                            # 96-99) — identical per-position values to
+                            # cov_mat_indel[:,6:10] (Insertion A/T/C/G), so
+                            # just reuse them rather than recomputing; the
+                            # antimask_indel/next-base gating is already
+                            # baked into those columns.
+                            for b in range(4):
+                                _accumulate_indel100(
+                                    np.full(window_len, 96 + b),
+                                    cov_mat_indel[:, 6 + b],
+                                    np.ones(window_len, dtype=bool),
+                                )
                         """
                         (
                             LR_old,
@@ -1496,6 +2292,24 @@ def callBam(params, processNo):
                                 "_".join([mut_chrom, str(mut_pos), mut_ref, mut_alt])
                             ] = 0
                             muts.append(mut)
+                        muts_dbs.extend(
+                            _detect_dbs_pairs(
+                                reference_mat_chrom,
+                                mut_positions,
+                                muts_ind,
+                                ref_int,
+                                alt_int,
+                                pass_bool,
+                                LR_pass_bool,
+                                flt_rs,
+                                F1R2,
+                                F2R1,
+                                setBc,
+                                currentStart,
+                                readSet[0].template_length,
+                                num2base,
+                            )
+                        )
                         """
                         if isLearn:
                             continue
@@ -1511,8 +2325,11 @@ def callBam(params, processNo):
                                 duplex_read_num_dict_trinuc[duplex_no][
                                     :, b
                                 ] += np.bincount(
-                                    trinuc_pass, weights=cov_pass[:, b], minlength=96
+                                    trinuc_pass, weights=cov_pass[:, b], minlength=64
                                 )
+                            duplex_read_num_dict_dbs[
+                                duplex_no
+                            ] += _compute_dbs_opportunity(cov_mat, ref_int, pass_bool)
 
                             # Update unmasked coverage and trinuc counts (includes all passing sites)
 
@@ -1522,6 +2339,14 @@ def callBam(params, processNo):
                             if pass_bool.any():
                                 duplex_read_num_dict[duplex_no][0] += 1
                                 duplex_count += 1
+                            if not isLearn:
+                                coverage_indel_cat[start_ind:end_ind][
+                                    antimask_indel
+                                ] += cov_mat_indel[antimask_indel]
+                                unmasked_coverage_indel_cat[start_ind:end_ind][
+                                    unmasked_antimask_indel
+                                ] += cov_mat_indel[unmasked_antimask_indel]
+                                duplex_read_num_dict_indel[duplex_no] += indel100
             """
             Calling block ends
             """
@@ -1611,7 +2436,9 @@ def callBam(params, processNo):
         duplex_no = f"{F1R2}+{F2R1}"
         if duplex_read_num_dict.get(duplex_no) is None:
             duplex_read_num_dict[duplex_no] = [0, 0, 0]
-            duplex_read_num_dict_trinuc[duplex_no] = np.zeros((96, 4))
+            duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
+            duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
+            duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
             # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
         duplex_read_num_dict[duplex_no][2] += 1
         unique_read_num += 1
@@ -1648,19 +2475,19 @@ def callBam(params, processNo):
                 if "coverage" in locals():
                     if "coverage_leftover" in locals():
                         coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
-                        coverage_indel[
+                        coverage_indel_cat[
                             0 : coverage_leftover.shape[0]
-                        ] += coverage_indel_leftover
+                        ] += coverage_indel_cat_leftover
                         unmasked_coverage[
                             0 : coverage_leftover.shape[0]
                         ] += unmasked_coverage_leftover
-                        unmasked_coverage_indel[
+                        unmasked_coverage_indel_cat[
                             0 : coverage_leftover.shape[0]
-                        ] += unmasked_coverage_indel_leftover
+                        ] += unmasked_coverage_indel_cat_leftover
                         unmasked_coverage_leftover = np.zeros((1, 4))
-                        unmasked_coverage_indel_leftover = np.zeros(1, dtype=int)
+                        unmasked_coverage_indel_cat_leftover = np.zeros((1, 14))
                         coverage_leftover = np.zeros((1, 4))
-                        coverage_indel_leftover = np.zeros(1, dtype=int)
+                        coverage_indel_cat_leftover = np.zeros((1, 14))
                     if chromNow == reference_mat_chrom:
                         coverage_leftover = copy.deepcopy(
                             coverage[
@@ -1669,8 +2496,8 @@ def callBam(params, processNo):
                                 )
                             ]
                         )
-                        coverage_indel_leftover = copy.deepcopy(
-                            coverage_indel[
+                        coverage_indel_cat_leftover = copy.deepcopy(
+                            coverage_indel_cat[
                                 (rs_reference_start - reference_mat_start) : (
                                     reference_mat_end - reference_mat_start
                                 )
@@ -1683,8 +2510,8 @@ def callBam(params, processNo):
                                 )
                             ]
                         )
-                        unmasked_coverage_indel_leftover = copy.deepcopy(
-                            unmasked_coverage_indel[
+                        unmasked_coverage_indel_cat_leftover = copy.deepcopy(
+                            unmasked_coverage_indel_cat[
                                 (rs_reference_start - reference_mat_start) : (
                                     reference_mat_end - reference_mat_start
                                 )
@@ -1694,13 +2521,13 @@ def callBam(params, processNo):
                             coverage[
                                 0 : (rs_reference_start - reference_mat_start)
                             ].sum(axis=1)
-                            + coverage_indel[
+                            + coverage_indel_cat[
                                 0 : (rs_reference_start - reference_mat_start)
-                            ]
+                            ].sum(axis=1)
                         )
                     else:
                         non_zero_positions = np.nonzero(
-                            coverage.sum(axis=1) + coverage_indel
+                            coverage.sum(axis=1) + coverage_indel_cat.sum(axis=1)
                         )
                     for pos in non_zero_positions[0].tolist():
                         current_pos = pos + reference_mat_start
@@ -1722,15 +2549,17 @@ def callBam(params, processNo):
                                     str(current_pos),
                                     str(current_pos + 1),
                                     "\t".join(str(v) for v in coverage[pos]),
-                                    str(coverage_indel[pos]),
+                                    "\t".join(str(v) for v in coverage_indel_cat[pos]),
                                 ]
                             )
                             + "\n"
                         )
                         total_coverage += coverage[pos]
-                        total_coverage_indel += coverage_indel[pos]
+                        total_coverage_indel_cat += coverage_indel_cat[pos]
                         total_unmasked_coverage += unmasked_coverage[pos]
-                        total_unmasked_coverage_indel += unmasked_coverage_indel[pos]
+                        total_unmasked_coverage_indel_cat += (
+                            unmasked_coverage_indel_cat[pos]
+                        )
                 # if chromNow != reference_mat_chrom:
                 reference_mat_chrom = chromNow
                 # current_reference = str(fasta[reference_mat_chrom].seq)
@@ -1749,13 +2578,34 @@ def callBam(params, processNo):
                 ref_h5 = h5py.File(params["reference"] + ".ref.h5", "r")
                 tn_h5 = h5py.File(params["reference"] + ".tn.h5", "r")
                 hp_h5 = h5py.File(params["reference"] + ".hp.h5", "r")
+                str_h5 = h5py.File(params["reference"] + ".str.h5", "r")
                 ref_np = ref_h5[reference_mat_chrom][
                     reference_mat_start:reference_mat_end
                 ]
                 trinuc_np = tn_h5[reference_mat_chrom][
                     reference_mat_start:reference_mat_end
                 ]
-                hp_np = hp_h5[reference_mat_chrom][
+                # (3, window) — unit_len, cut (start-of-run), and
+                # repeat_count, merged from the self-derived homopolymer
+                # index and the BED-derived STR index (see
+                # funcs/misc.py's load_repeat_context).
+                hp_np = load_repeat_context(
+                    hp_h5[reference_mat_chrom],
+                    str_h5[reference_mat_chrom],
+                    reference_mat_start,
+                    reference_mat_end,
+                )
+                # Raw, unmerged slices for the learn-phase error-rate
+                # estimation (profileTriNucMismatches), which needs the
+                # self-derived homopolymer run and the BED-derived STR
+                # annotation as independent sources rather than
+                # load_repeat_context's STR-priority merge (that merge is
+                # for indel *calling*'s classification, where a position
+                # can only be one category at a time).
+                hp_raw_np = hp_h5[reference_mat_chrom][
+                    :, reference_mat_start:reference_mat_end
+                ]
+                str_raw_np = str_h5[reference_mat_chrom][
                     :, reference_mat_start:reference_mat_end
                 ]
                 (
@@ -1785,9 +2635,9 @@ def callBam(params, processNo):
                 )
                 # print(ref_np,reference_mat_start)
                 coverage = np.zeros((1000000, 4))
-                coverage_indel = np.zeros(1000000, dtype=int)
+                coverage_indel_cat = np.zeros((1000000, 14))
                 unmasked_coverage = np.zeros((1000000, 4))
-                unmasked_coverage_indel = np.zeros(1000000, dtype=int)
+                unmasked_coverage_indel_cat = np.zeros((1000000, 14))
             ### Record read names to check if mate has been processed
             processed_flag = 0
             for seq in readSet:
@@ -1865,8 +2715,8 @@ def callBam(params, processNo):
                     rs_reference_end,
                     ref_np[start_ind:end_ind],
                     unmasked_antimask_indel,
-                    # hp_np[0, start_ind:end_ind],
-                    hp_np[:, start_ind:end_ind],
+                    hp_raw_np[:, start_ind:end_ind],
+                    str_raw_np[:, start_ind:end_ind],
                     params,
                 )
                 # print(LR_max)
@@ -1896,11 +2746,6 @@ def callBam(params, processNo):
                         np.logical_and(LR_raw >= params["pcutoffi"][2], strs > 0)
                     ] = True
                 indels_pass = [indels[_] for _ in pass_inds]
-                if flt_rs == "PASS":
-                    coverage_indel[start_ind:end_ind_max][antimask_indel] += 1
-                    unmasked_coverage_indel[start_ind:end_ind_max][
-                        unmasked_antimask_indel
-                    ] += 1
                 for nn in range(len(indels_pass)):
                     indel = indels_pass[nn]
                     indel_chrom = chromNow
@@ -2043,8 +2888,8 @@ def callBam(params, processNo):
                         rs_reference_start,
                         ref_np[start_ind:end_ind],
                         trinuc_np[start_ind:end_ind],
-                        # hp_np[0, start_ind:end_ind],
-                        hp_np[:, start_ind:end_ind],
+                        hp_raw_np[:, start_ind:end_ind],
+                        str_raw_np[:, start_ind:end_ind],
                         np.copy(learn_antimask),
                         params,
                     )
@@ -2074,6 +2919,365 @@ def callBam(params, processNo):
                     params,
                     L,
                 )
+                # Per-position indel category coverage (del_unit, del_2,
+                # del_3, del_4, del_5plus, ins_unit, ins_2, ins_3, ins_4,
+                # ins_5plus): look up detection power from the
+                # L_indel_1bp/L_indel_len tables built above, using this
+                # window's repeat context (hp_np) and the same per-base
+                # read-family counts (F1R2_count/F2R1_count) SBS coverage
+                # uses as its depth proxy.
+                if not isLearn:
+                    unit_len_arr = hp_np[0, start_ind:end_ind].astype(int)
+                    repeat_count_arr = hp_np[2, start_ind:end_ind].astype(int)
+                    ref_allele_arr = ref_np[start_ind:end_ind]
+                    ref_allele_safe = np.where(ref_allele_arr > 3, 0, ref_allele_arr)
+                    is_hp = unit_len_arr <= 1
+                    hps_for_row = np.where(is_hp, np.minimum(repeat_count_arr, 20), 1)
+                    total_len_arr = unit_len_arr * repeat_count_arr
+                    strs_for_row = np.zeros_like(total_len_arr)
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 10)] = 1
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 25)] = 2
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 40)] = 3
+                    row_len = np.where(
+                        strs_for_row > 0, 19 + strs_for_row, hps_for_row - 1
+                    )
+                    unit_len_clamped = np.clip(unit_len_arr, 2, 5)
+                    n_top_indel = np.minimum(F1R2_count.sum(axis=0), 9).astype(int)
+                    n_bot_indel = np.minimum(F2R1_count.sum(axis=0), 9).astype(int)
+                    # "Last cut"/"first cut" mask: repeat-based classes
+                    # (ins_unit/del_unit here, and the homopolymer/STR raw
+                    # classes below) can't reliably confirm a run's true
+                    # length once this read family no longer extends past
+                    # that run's start (hp_np row-1 "cut", from
+                    # load_repeat_context), so everything from the last cut
+                    # within this family's span onward is excluded — and
+                    # symmetrically, the entire run touching the family's
+                    # own LEFT edge is excluded too: whether an indel
+                    # occurred within a run right at the start of what this
+                    # family's reads cover is exactly as undecidable as one
+                    # at the end, since the family has no visible flanking
+                    # context on that side either way. This is the whole
+                    # run containing window position 0 — not just its first
+                    # base — so if the window itself starts exactly on a
+                    # cut (that run's start is confirmed), the excluded
+                    # span still runs to the *next* cut, not just past the
+                    # first one. Does not apply to del_2..del_5plus /
+                    # microhomology, which use a fixed context regardless
+                    # of any actual run.
+                    cut_arr = hp_np[1, start_ind:end_ind]
+                    last_cut_valid = np.ones(end_ind - start_ind, dtype=bool)
+                    cut_positions = np.nonzero(cut_arr)[0]
+                    if cut_positions.size > 0:
+                        last_cut_valid[cut_positions[-1] :] = False
+                        if cut_positions[0] == 0:
+                            first_run_end = (
+                                cut_positions[1]
+                                if cut_positions.size > 1
+                                else end_ind - start_ind
+                            )
+                        else:
+                            first_run_end = cut_positions[0]
+                        last_cut_valid[:first_run_end] = False
+                    # Reference base immediately following each position,
+                    # needed for the "Insertion A/T/C/G" columns below and
+                    # the matching fine-grained 1bpins{base} columns
+                    # (96-99): rep0 for inserting base N requires only
+                    # that this next base differs from N — nothing to do
+                    # with the position's own reference base.
+                    window_len = end_ind - start_ind
+                    next_ref_arr = np.full(window_len, -1, dtype=int)
+                    avail = min(end_ind + 1, ref_np.shape[0]) - (start_ind + 1)
+                    if avail > 0:
+                        next_ref_arr[:avail] = ref_np[
+                            start_ind + 1 : start_ind + 1 + avail
+                        ]
+                    next_ref_valid = (next_ref_arr >= 0) & (next_ref_arr <= 3)
+
+                    cov_mat_indel = np.zeros([window_len, 14])
+                    cov_mat_indel[:, 0] = (
+                        np.where(
+                            is_hp,
+                            L_indel_1bp[
+                                n_top_indel,
+                                n_bot_indel,
+                                hps_for_row,
+                                ref_allele_safe,
+                                0,
+                            ],
+                            L_indel_len[
+                                n_top_indel,
+                                n_bot_indel,
+                                row_len,
+                                -unit_len_clamped + 5,
+                            ],
+                        )
+                        * last_cut_valid
+                    )
+                    # Insertion of Repeat Unit: same shape as column 0
+                    # (deletion of repeat unit) but the insertion direction
+                    # (last L_indel_1bp index 1, and +unit_len_clamped+5
+                    # instead of -unit_len_clamped+5 into L_indel_len).
+                    cov_mat_indel[:, 1] = (
+                        np.where(
+                            is_hp,
+                            L_indel_1bp[
+                                n_top_indel,
+                                n_bot_indel,
+                                hps_for_row,
+                                ref_allele_safe,
+                                1,
+                            ],
+                            L_indel_len[
+                                n_top_indel,
+                                n_bot_indel,
+                                row_len,
+                                unit_len_clamped + 5,
+                            ],
+                        )
+                        * last_cut_valid
+                    )
+                    # del_2..del_5plus: fixed homopolymer-length-1 context
+                    # (microhomology-style, row 0 = hps=1), not the
+                    # position's actual repeat context.
+                    cov_mat_indel[:, 2] = L_indel_len[n_top_indel, n_bot_indel, 0, 3]
+                    cov_mat_indel[:, 3] = L_indel_len[n_top_indel, n_bot_indel, 0, 2]
+                    cov_mat_indel[:, 4] = L_indel_len[n_top_indel, n_bot_indel, 0, 1]
+                    cov_mat_indel[:, 5] = L_indel_len[n_top_indel, n_bot_indel, 0, 0]
+                    # Insertion A/T/C/G: rep0 opportunity to insert exactly
+                    # that base — fixed hps=1 context, using THAT base (not
+                    # the position's own reference base) as the
+                    # L_indel_1bp ref_allele index — zeroed wherever the
+                    # next reference base already equals it (that's a
+                    # repeat extension, not a novel insertion).
+                    for b in range(4):
+                        cov_mat_indel[:, 6 + b] = (
+                            L_indel_1bp[n_top_indel, n_bot_indel, 1, b, 1]
+                            * next_ref_valid
+                            * (next_ref_arr != b)
+                            * antimask_indel
+                        )
+                    # Insertion Length 2..5+: power to see a novel U-bp unit
+                    # inserted where no repeat exists yet (rep0 in
+                    # classify_indel_record's is_hp/indel_len>=2 branch,
+                    # misc.py) — fixed hps=1 context (row 0), same as
+                    # del_2..del_5plus, but only where a "no repeat here yet"
+                    # call is even possible (is_hp) and the read family can
+                    # still confirm that (last_cut_valid).
+                    ins_len_valid = is_hp & last_cut_valid & antimask_indel
+                    cov_mat_indel[:, 10] = (
+                        L_indel_len[n_top_indel, n_bot_indel, 0, 7] * ins_len_valid
+                    )
+                    cov_mat_indel[:, 11] = (
+                        L_indel_len[n_top_indel, n_bot_indel, 0, 8] * ins_len_valid
+                    )
+                    cov_mat_indel[:, 12] = (
+                        L_indel_len[n_top_indel, n_bot_indel, 0, 9] * ins_len_valid
+                    )
+                    cov_mat_indel[:, 13] = (
+                        L_indel_len[n_top_indel, n_bot_indel, 0, 10] * ins_len_valid
+                    )
+                    # Fine-grained 100-class raw indel classification
+                    # (mirrors the SBS 192-class raw trinuc scheme):
+                    # base-specific homopolymer del (24) + ins (20, no
+                    # rep0 bin — see below), unit-size/repeat-count-
+                    # specific STR del/ins (24+24), microhomology deletion
+                    # length (4). See funcs/misc.py's build_indel100_labels
+                    # for the exact column layout.
+                    indel100 = np.zeros(100)
+
+                    def _accumulate_indel100(col_idx, weight, valid):
+                        if np.any(valid):
+                            indel100[:] += np.bincount(
+                                col_idx[valid].astype(int),
+                                weights=weight[valid],
+                                minlength=100,
+                            )
+
+                    to_cgta = np.array([3, 2, 0, 1])  # base2num->CGTA order
+                    base_cgta = to_cgta[ref_allele_safe]
+
+                    # HP and STR opportunity below are credited
+                    # INDEPENDENTLY, from the raw (unmerged) hp.h5/str.h5
+                    # arrays (hp_raw_np/str_raw_np) — not from
+                    # is_hp/unit_len_arr/cut_arr above, which come from
+                    # load_repeat_context's STR-priority merge and
+                    # silently drop a position's homopolymer opportunity
+                    # wherever it also sits inside an annotated STR tract
+                    # (e.g. the "AA" in a (AAT)n repeat). That merge is
+                    # correct for classifying an *observed* mutation event
+                    # (necessarily one category or the other) but wrong
+                    # here: such a position is a real candidate for both a
+                    # 1bp homopolymer slip and a larger STR-unit slip.
+                    # Mirrors funcs/misc.py's
+                    # indel100_reference_bucket_indices, which already
+                    # double-counts these positions into both buckets on
+                    # the genome-composition side — see
+                    # [[feedback-hp-str-independence]].
+                    def _run_boundary_valid(cut_bool_arr):
+                        valid = np.ones(cut_bool_arr.shape[0], dtype=bool)
+                        cut_positions = np.nonzero(cut_bool_arr)[0]
+                        if cut_positions.size > 0:
+                            valid[cut_positions[-1] :] = False
+                            if cut_positions[0] == 0:
+                                first_run_end = (
+                                    cut_positions[1]
+                                    if cut_positions.size > 1
+                                    else cut_bool_arr.shape[0]
+                                )
+                            else:
+                                first_run_end = cut_positions[0]
+                            valid[:first_run_end] = False
+                        return valid
+
+                    hp_run_arr = np.minimum(
+                        hp_raw_np[0, start_ind:end_ind].astype(int), 20
+                    )
+                    hp_cut_bool = hp_raw_np[1, start_ind:end_ind].astype(bool)
+                    hp_repeat_valid = _run_boundary_valid(hp_cut_bool) & antimask_indel
+
+                    str_unit_raw = str_raw_np[0, start_ind:end_ind].astype(int)
+                    str_repeat_raw = str_raw_np[1, start_ind:end_ind].astype(int)
+                    str_cut_bool = str_raw_np[2, start_ind:end_ind].astype(bool)
+                    is_real_str = str_unit_raw >= 2
+                    str_repeat_valid = (
+                        _run_boundary_valid(str_cut_bool) & antimask_indel
+                    )
+                    total_len_str = str_unit_raw * str_repeat_raw
+                    strs_for_row_str = np.zeros_like(total_len_str)
+                    strs_for_row_str[is_real_str & (total_len_str >= 10)] = 1
+                    strs_for_row_str[is_real_str & (total_len_str >= 25)] = 2
+                    strs_for_row_str[is_real_str & (total_len_str >= 40)] = 3
+                    row_len_str = np.where(
+                        strs_for_row_str > 0, 19 + strs_for_row_str, 0
+                    )
+                    unit_len_clamped_str = np.clip(str_unit_raw, 2, 5)
+                    unit_bucket = np.clip(str_unit_raw, 2, 5) - 2
+                    count_bucket_del = np.clip(str_repeat_raw, 1, 6) - 1
+
+                    # 1-4: homopolymer deletion (cols 0-23) — always from
+                    # the position's own raw hp run/cut, regardless of any
+                    # STR annotation there too.
+                    hp_del_power = L_indel_1bp[
+                        n_top_indel, n_bot_indel, hp_run_arr, ref_allele_safe, 0
+                    ]
+                    del_bucket = np.clip(hp_run_arr, 1, 6) - 1
+                    _accumulate_indel100(
+                        base_cgta * 6 + del_bucket,
+                        hp_del_power,
+                        hp_repeat_valid & hp_cut_bool,
+                    )
+
+                    # 5-8: homopolymer insertion (cols 24-43) — length
+                    # bins 1..5+ only; rep0 (hp_run_arr==0, never actually
+                    # occurs) is deliberately not credited here, since that
+                    # value is always discarded and replaced by the exact
+                    # 1bpins{base} next-base computation below (see
+                    # Estimate.py's
+                    # override_inshp0_with_next_base_opportunity).
+                    hp_ins_power = L_indel_1bp[
+                        n_top_indel, n_bot_indel, hp_run_arr, ref_allele_safe, 1
+                    ]
+                    ins_bucket = np.clip(hp_run_arr, 1, 5) - 1
+                    _accumulate_indel100(
+                        24 + base_cgta * 5 + ins_bucket,
+                        hp_ins_power,
+                        (hp_run_arr >= 1) & hp_repeat_valid & hp_cut_bool,
+                    )
+
+                    # 9: STR deletion (cols 44-67) — real part, from the
+                    # position's own raw STR annotation, independent of
+                    # any homopolymer overlap.
+                    str_del_power = L_indel_len[
+                        n_top_indel, n_bot_indel, row_len_str, -unit_len_clamped_str + 5
+                    ]
+                    _accumulate_indel100(
+                        44 + unit_bucket * 6 + count_bucket_del,
+                        str_del_power,
+                        is_real_str & str_repeat_valid & str_cut_bool,
+                    )
+                    # Flat rep1 opportunity at positions with no real STR
+                    # annotation (whether or not they're also a
+                    # homopolymer run — that's credited separately above):
+                    # every such position is a candidate for an arbitrary,
+                    # non-repeating U-bp deletion — a fixed hps=1/strs=0
+                    # power lookup (row 0), not an attempt to discover a
+                    # true higher count that might coincidentally exist
+                    # there (that would need rescanning the reference; see
+                    # funcs/misc.py's indel100_reference_bucket_indices for
+                    # the matching scan-free credit on the genome-wide
+                    # side). Gated by hp_repeat_valid, not
+                    # str_repeat_valid: there's no real STR tract here to
+                    # have its own boundary, so this reuses the
+                    # run-visibility this position already has under its
+                    # own (possibly trivial, length-1) homopolymer context.
+                    for u_idx, U in enumerate([2, 3, 4, 5]):
+                        hyp_del_power = L_indel_len[n_top_indel, n_bot_indel, 0, -U + 5]
+                        _accumulate_indel100(
+                            np.full(end_ind - start_ind, 44 + u_idx * 6),
+                            hyp_del_power,
+                            (~is_real_str) & hp_repeat_valid,
+                        )
+
+                    # 10: STR insertion (cols 68-91) — real part
+                    str_ins_power = L_indel_len[
+                        n_top_indel, n_bot_indel, row_len_str, unit_len_clamped_str + 5
+                    ]
+                    count_bucket_ins = np.clip(str_repeat_raw, 0, 5)
+                    _accumulate_indel100(
+                        68 + unit_bucket * 6 + count_bucket_ins,
+                        str_ins_power,
+                        is_real_str & str_repeat_valid & str_cut_bool,
+                    )
+                    is_rep1 = str_repeat_raw == 1
+                    _accumulate_indel100(
+                        68 + unit_bucket * 6 + 0,
+                        str_ins_power,
+                        is_real_str & is_rep1 & str_repeat_valid & str_cut_bool,
+                    )
+                    # Flat rep0/rep1 opportunity at positions with no real
+                    # STR annotation ("what if a U-bp unit were inserted
+                    # here"): fixed hps=1/strs=0 context (row 0), same
+                    # value added to both the "0" and "1" repeat-count
+                    # buckets for every unit size — scan-free, matching the
+                    # deletion case above, and gated the same way (see
+                    # comment there for why hp_repeat_valid, not
+                    # str_repeat_valid).
+                    for u_idx, U in enumerate([2, 3, 4, 5]):
+                        hyp_power = L_indel_len[n_top_indel, n_bot_indel, 0, U + 5]
+                        base_col = 68 + u_idx * 6
+                        _accumulate_indel100(
+                            np.full(end_ind - start_ind, base_col),
+                            hyp_power,
+                            (~is_real_str) & hp_repeat_valid,
+                        )
+                        _accumulate_indel100(
+                            np.full(end_ind - start_ind, base_col + 1),
+                            hyp_power,
+                            (~is_real_str) & hp_repeat_valid,
+                        )
+
+                    # 11: microhomology deletion (cols 92-95) — fixed
+                    # context, every position, no last-cut restriction;
+                    # reuse cov_mat_indel[:,2:6].
+                    for k in range(4):
+                        _accumulate_indel100(
+                            np.full(end_ind - start_ind, 92 + k),
+                            cov_mat_indel[:, 2 + k],
+                            antimask_indel,
+                        )
+
+                    # 12: 1bpins{base} rep0 opportunity (cols 96-99) —
+                    # identical per-position values to
+                    # cov_mat_indel[:,6:10] (Insertion A/T/C/G), so just
+                    # reuse them rather than recomputing; the
+                    # antimask_indel/next-base gating is already baked
+                    # into those columns.
+                    for b in range(4):
+                        _accumulate_indel100(
+                            np.full(window_len, 96 + b),
+                            cov_mat_indel[:, 6 + b],
+                            np.ones(window_len, dtype=bool),
+                        )
                 """
                 (
                     LR_old,
@@ -2201,6 +3405,24 @@ def callBam(params, processNo):
                     }
                     muts_dict["_".join([mut_chrom, str(mut_pos), mut_ref, mut_alt])] = 0
                     muts.append(mut)
+                muts_dbs.extend(
+                    _detect_dbs_pairs(
+                        reference_mat_chrom,
+                        mut_positions,
+                        muts_ind,
+                        ref_int,
+                        alt_int,
+                        pass_bool,
+                        LR_pass_bool,
+                        flt_rs,
+                        F1R2,
+                        F2R1,
+                        setBc,
+                        currentStart,
+                        readSet[0].template_length,
+                        num2base,
+                    )
+                )
                 """
                 if isLearn:
                     continue
@@ -2212,8 +3434,11 @@ def callBam(params, processNo):
                     cov_pass = cov_mat[pass_bool]
                     for b in range(4):
                         duplex_read_num_dict_trinuc[duplex_no][:, b] += np.bincount(
-                            trinuc_pass, weights=cov_pass[:, b], minlength=96
+                            trinuc_pass, weights=cov_pass[:, b], minlength=64
                         )
+                    duplex_read_num_dict_dbs[duplex_no] += _compute_dbs_opportunity(
+                        cov_mat, ref_int, pass_bool
+                    )
 
                     # Update unmasked coverage and trinuc counts (includes all passing sites)
 
@@ -2223,36 +3448,56 @@ def callBam(params, processNo):
                     if pass_bool.any():
                         duplex_read_num_dict[duplex_no][0] += 1
                         duplex_count += 1
+                    if not isLearn:
+                        coverage_indel_cat[start_ind:end_ind][
+                            antimask_indel
+                        ] += cov_mat_indel[antimask_indel]
+                        unmasked_coverage_indel_cat[start_ind:end_ind][
+                            unmasked_antimask_indel
+                        ] += cov_mat_indel[unmasked_antimask_indel]
+                        duplex_read_num_dict_indel[duplex_no] += indel100
     """
     Calling block ends
     """
     if isLearn:
         return mismatch_mat, indelerr_mat, mismatch_dmg_mat, indel_dmg_mat
+
+    ### SNV depth extraction, batched: gather every unique PASS/masked/
+    ### underpowered candidate first, then resolve the tumor BAM and each
+    ### normal BAM with a handful of sequential pileup() scans
+    ### (extractDepthBatchSnv) instead of one random-access pileup() call
+    ### per candidate.
     mut_dict = dict()
-    mut_pass_filter = []
+    snv_candidate_keys = []
     for mut in muts:
-        chrom = mut["chrom"]
-        pos = mut["pos"]
-        ref = mut["ref"]
-        alt = mut["alt"]
-        bc1 = mut["infos"]["TAG1"]
-        bc2 = mut["infos"]["TAG2"]
-        readStartCoord = mut["infos"]["SP"]
-        flt = mut["filter"]
-        if not mut_dict.get(":".join([chrom, str(pos), ref, alt])) and (
-            flt == "PASS" or flt == "masked" or flt == "underpowered"
-        ):
-            ta, tr, ti, tdp = extractDepthSnv(
-                tumorBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
-            )
+        if mut["filter"] not in ("PASS", "masked", "underpowered"):
+            continue
+        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if key not in mut_dict:
+            mut_dict[key] = None
+            snv_candidate_keys.append(key)
+
+    if snv_candidate_keys:
+        tumor_snv_depths = extractDepthBatchSnv(
+            tumorBam, snv_candidate_keys, params, minbq=params["minBq"]
+        )
+        normal_snv_depths = (
+            [
+                extractDepthBatchSnv(
+                    normalBam, snv_candidate_keys, params, minbq=params["minBq"]
+                )
+                for normalBam in normalBams
+            ]
+            if normalBams
+            else []
+        )
+        for key in snv_candidate_keys:
+            ta, tr, ti, tdp = tumor_snv_depths.get(key, (0, 0, 0, 0))
             if normalBams:
-                na = 0
-                nr = 0
-                ni = 0
-                ndp = 0
-                for normalBam in normalBams:
-                    na_now, nr_now, ni_now, ndp_now = extractDepthSnv(
-                        normalBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
+                na = nr = ni = ndp = 0
+                for normal_depths in normal_snv_depths:
+                    na_now, nr_now, ni_now, ndp_now = normal_depths.get(
+                        key, (0, 0, 0, 0)
                     )
                     na += na_now
                     nr += nr_now
@@ -2260,20 +3505,26 @@ def callBam(params, processNo):
                     ndp += ndp_now
             else:
                 na, nr, ni, ndp = (0, 0, 0, 0)
-            mut_dict[":".join([chrom, str(pos), ref, alt])] = (
-                ta,
-                tr,
-                ti,
-                tdp,
-                na,
-                nr,
-                ni,
-                ndp,
-            )
-        elif flt == "PASS" or flt == "masked" or flt == "underpowered":
-            ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[
-                ":".join([chrom, str(pos), ref, alt])
-            ]
+            mut_dict[key] = (ta, tr, ti, tdp, na, nr, ni, ndp)
+
+    mut_pass_filter = []
+    n_muts = len(muts)
+    snv_filter_progress = {"start": time.time(), "last": time.time()}
+    for i, mut in enumerate(muts):
+        chrom = mut["chrom"]
+        pos = mut["pos"]
+        ref = mut["ref"]
+        alt = mut["alt"]
+        flt = mut["filter"]
+        log_progress(
+            snv_filter_progress,
+            f"Process {processNo} filtering SNV mutations",
+            i,
+            n_muts,
+            extra=f"{chrom}:{pos}",
+        )
+        if flt == "PASS" or flt == "masked" or flt == "underpowered":
+            ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[(chrom, pos, ref, alt)]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         # if window_filter:
@@ -2294,47 +3545,72 @@ def callBam(params, processNo):
                     continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         mut_pass_filter.append(mut)
-    muts_indels_dict = dict()
-    muts_indels_pass_filter = []
-    for mut in muts_indels:
-        chrom = mut["chrom"]
-        pos = mut["pos"]
-        ref = mut["ref"]
-        alt = mut["alt"]
-        flt = mut["filter"]
 
-        if not muts_indels_dict.get(":".join([chrom, str(pos), ref, alt])) and (
-            flt == "PASS" or flt == "masked" or flt == "underpowered"
-        ):
-            ta, tr, ti, tdp = extractDepthIndel(tumorBam, chrom, pos, ref, alt, params)
+    ### Indel depth extraction, batched the same way.
+    muts_indels_dict = dict()
+    indel_candidate_keys = []
+    for mut in muts_indels:
+        if mut["filter"] not in ("PASS", "masked", "underpowered"):
+            continue
+        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if key not in muts_indels_dict:
+            muts_indels_dict[key] = None
+            indel_candidate_keys.append(key)
+
+    if indel_candidate_keys:
+        tumor_indel_depths = extractDepthBatchIndel(
+            tumorBam, indel_candidate_keys, params, minbq=params["minBq"]
+        )
+        normal_indel_depths = (
+            [
+                extractDepthBatchIndel(
+                    normalBam, indel_candidate_keys, params, minbq=params["minBq"]
+                )
+                for normalBam in normalBams
+            ]
+            if normalBams
+            else []
+        )
+        for key in indel_candidate_keys:
+            ta, tr, ti, tdp = tumor_indel_depths.get(key, (0, 0, 0, 0))
             if normalBams:
-                na = 0
-                nr = 0
-                ni = 0
-                ndp = 0
-                for normalBam in normalBams:
-                    na_now, nr_now, ni_now, ndp_now = extractDepthIndel(
-                        normalBam, chrom, pos, ref, alt, params, minbq=params["minBq"]
+                na = nr = ni = ndp = 0
+                for normal_depths in normal_indel_depths:
+                    na_now, nr_now, ni_now, ndp_now = normal_depths.get(
+                        key, (0, 0, 0, 0)
                     )
                     na += na_now
                     nr += nr_now
                     ni += ni_now
                     ndp += ndp_now
             else:
-                na, nr, ndp = (0, 0, 0)
-            muts_indels_dict[":".join([chrom, str(pos), ref, alt])] = (
-                ta,
-                tr,
-                tdp,
-                na,
-                nr,
-                ndp,
-                # window_filter,
-            )
-        elif flt == "PASS" or flt == "masked" or flt == "underpowered":
-            ta, tr, tdp, na, nr, ndp = muts_indels_dict[
-                ":".join([chrom, str(pos), ref, alt])
-            ]
+                na, nr, ni, ndp = (0, 0, 0, 0)
+            # na/nr/ndp match the pre-batching dict layout; ni (summed
+            # normal-BAM otherIndelCount) is additionally kept so the
+            # "if ni > 0" filter below always sees the real value instead
+            # of a stale ni left over from whatever mutation the
+            # single-pass loop happened to process previously (see
+            # commit message for details).
+            muts_indels_dict[key] = (ta, tr, tdp, na, nr, ndp, ni)
+
+    muts_indels_pass_filter = []
+    n_muts_indels = len(muts_indels)
+    indel_filter_progress = {"start": time.time(), "last": time.time()}
+    for i, mut in enumerate(muts_indels):
+        chrom = mut["chrom"]
+        pos = mut["pos"]
+        ref = mut["ref"]
+        alt = mut["alt"]
+        flt = mut["filter"]
+        log_progress(
+            indel_filter_progress,
+            f"Process {processNo} filtering indel mutations",
+            i,
+            n_muts_indels,
+            extra=f"{chrom}:{pos}",
+        )
+        if flt == "PASS" or flt == "masked" or flt == "underpowered":
+            ta, tr, tdp, na, nr, ndp, ni = muts_indels_dict[(chrom, pos, ref, alt)]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         if flt == "PASS" or flt == "masked" or flt == "underpowered":
@@ -2354,17 +3630,85 @@ def callBam(params, processNo):
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         muts_indels_pass_filter.append(mut)
 
+    ### DBS depth extraction, batched the same way, and filtered under the
+    ### same maxAF/minNdepth/normalVAF strategy as SNVs/indels above.
+    ### _detect_dbs_pairs only ever emits filter=="PASS" candidates (both
+    ### constituent bases already independently passed full duplex-consensus
+    ### calling), so — unlike the SNV/indel loops — there's no
+    ### masked/underpowered filter state to preserve here: a candidate either
+    ### clears this gate and is kept, or it's dropped.
+    muts_dbs_dict = dict()
+    dbs_candidate_keys = []
+    for mut in muts_dbs:
+        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if key not in muts_dbs_dict:
+            muts_dbs_dict[key] = None
+            dbs_candidate_keys.append(key)
+
+    if dbs_candidate_keys:
+        tumor_dbs_depths = extractDepthBatchDbs(
+            tumorBam, dbs_candidate_keys, params, minbq=params["minBq"]
+        )
+        normal_dbs_depths = (
+            [
+                extractDepthBatchDbs(
+                    normalBam, dbs_candidate_keys, params, minbq=params["minBq"]
+                )
+                for normalBam in normalBams
+            ]
+            if normalBams
+            else []
+        )
+        for key in dbs_candidate_keys:
+            ta, tr, ti, tdp = tumor_dbs_depths.get(key, (0, 0, 0, 0))
+            if normalBams:
+                na = nr = ni = ndp = 0
+                for normal_depths in normal_dbs_depths:
+                    na_now, nr_now, ni_now, ndp_now = normal_depths.get(
+                        key, (0, 0, 0, 0)
+                    )
+                    na += na_now
+                    nr += nr_now
+                    ni += ni_now
+                    ndp += ndp_now
+            else:
+                na, nr, ni, ndp = (0, 0, 0, 0)
+            muts_dbs_dict[key] = (ta, tr, ti, tdp, na, nr, ni, ndp)
+
+    muts_dbs_pass_filter = []
+    for mut in muts_dbs:
+        chrom = mut["chrom"]
+        pos = mut["pos"]
+        ref = mut["ref"]
+        alt = mut["alt"]
+        ta, tr, ti, tdp, na, nr, ni, ndp = muts_dbs_dict[(chrom, pos, ref, alt)]
+        if ta == 0:
+            continue
+        if ta / tdp > params["maxAF"]:
+            continue
+        if normalBams:
+            if ndp < params["minNdepth"]:
+                continue
+            if na / ndp > params["normalVAF"]:
+                continue
+        mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
+        muts_dbs_pass_filter.append(mut)
+
     if "coverage" in locals():
         if "coverage_leftover" in locals():
             coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
-            coverage_indel[0 : coverage_leftover.shape[0]] += coverage_indel_leftover
+            coverage_indel_cat[
+                0 : coverage_leftover.shape[0]
+            ] += coverage_indel_cat_leftover
             unmasked_coverage[
                 0 : coverage_leftover.shape[0]
             ] += unmasked_coverage_leftover
-            unmasked_coverage_indel[
+            unmasked_coverage_indel_cat[
                 0 : coverage_leftover.shape[0]
-            ] += unmasked_coverage_indel_leftover
-        non_zero_positions = np.nonzero(coverage.sum(axis=1) + coverage_indel)
+            ] += unmasked_coverage_indel_cat_leftover
+        non_zero_positions = np.nonzero(
+            coverage.sum(axis=1) + coverage_indel_cat.sum(axis=1)
+        )
         for pos in non_zero_positions[0].tolist():
             current_pos = pos + reference_mat_start
             bed_file = get_bed_file_for_position(
@@ -2385,15 +3729,15 @@ def callBam(params, processNo):
                         str(current_pos),
                         str(current_pos + 1),
                         "\t".join(str(v) for v in coverage[pos]),
-                        str(coverage_indel[pos]),
+                        "\t".join(str(v) for v in coverage_indel_cat[pos]),
                     ]
                 )
                 + "\n"
             )
             total_coverage += coverage[pos]
-            total_coverage_indel += coverage_indel[pos]
+            total_coverage_indel_cat += coverage_indel_cat[pos]
             total_unmasked_coverage += unmasked_coverage[pos]
-            total_unmasked_coverage_indel += unmasked_coverage_indel[pos]
+            total_unmasked_coverage_indel_cat += unmasked_coverage_indel_cat[pos]
 
     # Close the bed files
     locus_bed.close()
@@ -2404,11 +3748,10 @@ def callBam(params, processNo):
         f"Process {processNo} finished in {(time.time()-starttime)/60: .2f} minutes and processed {recCount} reads"
     )
 
-    for duplex_no in duplex_read_num_dict_trinuc.keys():
-        duplex_read_num_dict_trinuc[duplex_no] = (
-            duplex_read_num_dict_trinuc[duplex_no][:32, :]
-            + duplex_read_num_dict_trinuc[duplex_no][32:64][:, [1, 0, 3, 2]]
-        )
+    # duplex_read_num_dict_trinuc[duplex_no] stays a raw (64, 4) matrix here
+    # (64 trinuc contexts, un-folded by reverse complement); Caller.py's
+    # writer selects the 192 non-self (context, alt) cells for output, and
+    # reverse-complement pairs are only combined at estimation time.
 
     return (
         mut_pass_filter,
@@ -2418,11 +3761,14 @@ def callBam(params, processNo):
         duplex_read_num_dict,
         duplex_read_num_dict_trinuc,
         muts_indels_pass_filter,
-        total_coverage_indel,
         unique_read_num,
         pass_read_num,
         FPs,
         RPs,
         total_unmasked_coverage.sum(),
-        total_unmasked_coverage_indel,
+        total_coverage_indel_cat,
+        total_unmasked_coverage_indel_cat,
+        duplex_read_num_dict_indel,
+        muts_dbs_pass_filter,
+        duplex_read_num_dict_dbs,
     )

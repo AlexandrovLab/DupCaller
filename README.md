@@ -92,7 +92,7 @@ DupCaller.py index -f reference.fa -rb repeat_regions.bed.gz -s str_regions.bed.
 
 The command will generate three h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5` and `{reference}.hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and repeat (homopolymer/STR) annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
 
-Both BED files must be tabix-indexed (`.bed.gz` with a `.tbi` index) and have at least 5 columns: chrom, start, end, repeat unit length, and repeat length. Every repeat in the genome (including single-base homopolymers) should be covered by one of the two files, split by whether its total repeat length is <=12bp (`--repeatBed`) or >12bp (`--strbed`).
+Both BED files must be tabix-indexed (`.bed.gz` with a `.tbi` index) and have at least 4 columns: chrom, start, end, and repeat unit. Column 4 may be either a UCSC `rmsk`/simple-repeat style motif (e.g. `(CA)n`, `(CAAAA)n`) or a pre-computed integer repeat unit length; the repeat unit number is derived automatically as interval length (end - start) divided by repeat unit length. Every repeat in the genome (including single-base homopolymers) should be covered by one of the two files, split by whether its total repeat length is <=12bp (`--repeatBed`) or >12bp (`--strbed`).
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
@@ -119,7 +119,7 @@ For other reference genomes, a BED file of simple repeats is needed to build the
 4. Add filter: "repClass Does match Simple_repeat".
 5. For **Output format**, select "BED - browser extensible data".
 6. Input desired filename (e.g. `mm39_str.bed`) and download the output BED file.
-7. Add repeat unit length and repeat length as columns 4 and 5 (the UCSC `rmsk`/simple-repeat table reports the repeat unit and its period; derive these two columns from it), then split the records into two files by total repeat length: <=12bp goes into the file passed to `--repeatBed`, and >12bp goes into the file passed to `--strbed`.
+7. Split the records into two files by total repeat length (end - start): <=12bp goes into the file passed to `--repeatBed`, and >12bp goes into the file passed to `--strbed`. Column 4 (the repeat motif, e.g. `(CA)n`) can be passed through as-is; `DupCaller.py index` derives repeat unit length and repeat unit number from it automatically.
 8. Sort each bed file with your reference genome (Use bedtools or similar) and compress and index with bgzip:
 ```bash
 sortBed -i str.bed -faidx reference.fa.fai > str_sorted.bed

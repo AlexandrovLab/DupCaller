@@ -1,6 +1,305 @@
+from collections import defaultdict
+
 import numpy as np
 import pysam
 from .misc import getAlignmentObject as BAM
+
+# Candidates on the same chromosome farther apart than this start a new
+# pileup() scan in extractDepthBatchSnv/extractDepthBatchIndel, rather than
+# being folded into one scan that would otherwise burn time walking through
+# a mostly-empty span. htslib's pileup engine has to parse every read
+# overlapping ANY column in a merged span, wanted or not, so merging two
+# distant candidates can force parsing of reads that are irrelevant to
+# either one. Benchmarked under adversarial uniform 20x coverage (i.e. the
+# merged span is never actually empty): batching is still a ~1.7x win at
+# this gap, break-even lands around ~2800bp, and it becomes a ~3x
+# regression by 10000bp. 500bp keeps solid margin below that cliff and is
+# close to typical short-read length — candidates within about one read
+# length of each other already share most of the same overlapping reads
+# regardless of whether they're queried together, so merging them is
+# nearly free; farther apart than that, the shared-read assumption breaks
+# down and the merge starts paying for reads that don't matter to either
+# candidate.
+_DEPTH_BATCH_MAX_GAP = 500
+
+
+def _cluster_positions(positions, max_gap):
+    """Sort positions and split into runs where consecutive positions are
+    no more than max_gap bases apart."""
+    positions = sorted(positions)
+    clusters = []
+    current = [positions[0]]
+    for pos in positions[1:]:
+        if pos - current[-1] > max_gap:
+            clusters.append(current)
+            current = []
+        current.append(pos)
+    clusters.append(current)
+    return clusters
+
+
+def extractDepthBatchSnv(
+    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+):
+    """Batched equivalent of extractDepthSnv: resolves many (chrom, pos,
+    ref, alt) candidates with one sequential pileup() scan per cluster of
+    nearby positions (see _cluster_positions), instead of one
+    random-access pileup() call per candidate. Per-read filtering and
+    per-candidate accounting exactly mirror extractDepthSnv, just shared
+    across every candidate a given pileup column covers.
+
+    candidates: iterable of (chrom, pos, ref, alt) — 1-based pos, matching
+    extractDepthSnv's convention.
+    Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
+    Candidates with zero pileup coverage are simply absent from the
+    result — same information as extractDepthSnv returning all zeros.
+    """
+    results = {}
+    by_chrom = defaultdict(lambda: defaultdict(list))
+    for chrom, pos, ref, alt in candidates:
+        by_chrom[chrom][pos].append((ref, alt))
+
+    for chrom, pos_to_specs in by_chrom.items():
+        for cluster in _cluster_positions(list(pos_to_specs.keys()), max_gap):
+            wanted = set(cluster)
+            for pileupcolumn in bam.pileup(
+                chrom,
+                cluster[0] - 1,
+                cluster[-1],
+                min_base_quality=minbq,
+                truncated=True,
+                max_depth=params["maxDepth"],
+            ):
+                pos = pileupcolumn.pos + 1
+                if pos not in wanted:
+                    continue
+                specs = pos_to_specs[pos]
+                n = len(specs)
+                alt_counts = [0] * n
+                ref_counts = [0] * n
+                other_counts = [0] * n
+                indel_counts = [0] * n
+                processed_read_names = {}
+                for pileupread in pileupcolumn.pileups:
+                    aln = pileupread.alignment
+                    if (
+                        pileupread.is_refskip
+                        or aln.is_secondary
+                        or aln.is_supplementary
+                        or processed_read_names.get(aln.query_name)
+                        or aln.has_tag("DT")
+                        or aln.mapping_quality <= params["mapq"]
+                    ):
+                        continue
+                    processed_read_names[aln.query_name] = 1
+                    if aln.is_duplicate:
+                        continue
+                    is_indel = pileupread.is_del or pileupread.indel != 0
+                    base = (
+                        None
+                        if is_indel
+                        else aln.query_sequence[pileupread.query_position]
+                    )
+                    for i, (ref, alt) in enumerate(specs):
+                        if is_indel:
+                            indel_counts[i] += 1
+                            other_counts[i] += 1
+                        elif base == alt:
+                            alt_counts[i] += 1
+                        elif base == ref:
+                            ref_counts[i] += 1
+                        else:
+                            other_counts[i] += 1
+                for i, (ref, alt) in enumerate(specs):
+                    depth = ref_counts[i] + alt_counts[i] + other_counts[i]
+                    results[(chrom, pos, ref, alt)] = (
+                        alt_counts[i],
+                        ref_counts[i],
+                        indel_counts[i],
+                        depth,
+                    )
+                wanted.discard(pos)
+                if not wanted:
+                    break
+    return results
+
+
+def extractDepthBatchIndel(
+    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+):
+    """Batched equivalent of extractDepthIndel — see extractDepthBatchSnv.
+
+    candidates: iterable of (chrom, pos, ref, alt).
+    Returns: {(chrom, pos, ref, alt): (altCount, refCount, otherIndelCount, depth)}
+    """
+    results = {}
+    by_chrom = defaultdict(lambda: defaultdict(list))
+    for chrom, pos, ref, alt in candidates:
+        by_chrom[chrom][pos].append((ref, alt, len(alt) - len(ref)))
+
+    for chrom, pos_to_specs in by_chrom.items():
+        for cluster in _cluster_positions(list(pos_to_specs.keys()), max_gap):
+            wanted = set(cluster)
+            for pileupcolumn in bam.pileup(
+                chrom,
+                cluster[0] - 1,
+                cluster[-1],
+                min_base_quality=minbq,
+                truncate=True,
+                max_depth=params["maxDepth"],
+            ):
+                pos = pileupcolumn.pos + 1
+                if pos not in wanted:
+                    continue
+                specs = pos_to_specs[pos]
+                n = len(specs)
+                alt_counts = [0] * n
+                ref_counts = [0] * n
+                other_counts = [0] * n
+                other_indel_counts = [0] * n
+                processed_read_names = {}
+                for pileupread in pileupcolumn.pileups:
+                    aln = pileupread.alignment
+                    if (
+                        pileupread.is_del
+                        or pileupread.is_refskip
+                        or aln.is_secondary
+                        or aln.is_supplementary
+                        or processed_read_names.get(aln.query_name)
+                        or aln.has_tag("DT")
+                        or aln.mapping_quality <= params["mapq"]
+                    ):
+                        continue
+                    processed_read_names[aln.query_name] = 1
+                    if aln.is_duplicate:
+                        continue
+                    for i, (ref, alt, indel_size) in enumerate(specs):
+                        if pileupread.indel == indel_size:
+                            alt_counts[i] += 1
+                        elif pileupread.indel == 0:
+                            ref_counts[i] += 1
+                        else:
+                            other_counts[i] += 1
+                            if pileupread.indel != 0:
+                                other_indel_counts[i] += 1
+                for i, (ref, alt, indel_size) in enumerate(specs):
+                    depth = ref_counts[i] + alt_counts[i] + other_counts[i]
+                    results[(chrom, pos, ref, alt)] = (
+                        alt_counts[i],
+                        ref_counts[i],
+                        other_indel_counts[i],
+                        depth,
+                    )
+                wanted.discard(pos)
+                if not wanted:
+                    break
+    return results
+
+
+def extractDepthBatchDbs(
+    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+):
+    """Batched DBS depth extraction: for each (chrom, pos, ref, alt)
+    candidate (pos = 1-based position of the dinucleotide's FIRST base;
+    ref/alt are 2-character dinucleotide strings, matching
+    _detect_dbs_pairs' convention), counts reads by what they show at
+    BOTH positions TOGETHER on the SAME read — not two independently
+    tallied single-base pileups. A DBS is defined as both bases changing
+    simultaneously on one physical molecule, so a read only counts toward
+    alt if it carries alt[0] at pos AND alt[1] at pos+1 on that same read;
+    similarly for ref. Anything else observed at both positions (neither
+    the exact ref nor exact alt dinucleotide, or an indel at either
+    position) counts as "other" and contributes to depth but not
+    alt/ref — indelCount is the subset of "other" specifically caused by
+    an indel at either position.
+
+    Unlike extractDepthBatchSnv/Indel (one pileup column per candidate),
+    this needs both of a candidate's adjacent columns correlated by read
+    name, since the two single-column tallies alone can't tell whether
+    the SAME read carried both alt bases together.
+
+    Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
+    Candidates with zero reads spanning both positions are simply absent
+    from the result.
+    """
+    results = {}
+    by_chrom = defaultdict(lambda: defaultdict(list))
+    for chrom, pos, ref, alt in candidates:
+        by_chrom[chrom][pos].append((ref, alt))
+
+    for chrom, pos_to_specs in by_chrom.items():
+        for cluster in _cluster_positions(list(pos_to_specs.keys()), max_gap):
+            # Every candidate needs its own pair of adjacent columns
+            # (pos, pos+1), so the wanted set spans one past the usual
+            # cluster range too.
+            wanted_cols = set()
+            for p in cluster:
+                wanted_cols.add(p)
+                wanted_cols.add(p + 1)
+            col_bases = {}  # 1-based pos -> {read_name: base or None (indel)}
+            for pileupcolumn in bam.pileup(
+                chrom,
+                cluster[0] - 1,
+                cluster[-1] + 1,
+                min_base_quality=minbq,
+                truncated=True,
+                max_depth=params["maxDepth"],
+            ):
+                pos = pileupcolumn.pos + 1
+                if pos not in wanted_cols:
+                    continue
+                processed_read_names = {}
+                reads = {}
+                for pileupread in pileupcolumn.pileups:
+                    aln = pileupread.alignment
+                    if (
+                        pileupread.is_refskip
+                        or aln.is_secondary
+                        or aln.is_supplementary
+                        or processed_read_names.get(aln.query_name)
+                        or aln.has_tag("DT")
+                        or aln.mapping_quality <= params["mapq"]
+                    ):
+                        continue
+                    processed_read_names[aln.query_name] = 1
+                    if aln.is_duplicate:
+                        continue
+                    is_indel = pileupread.is_del or pileupread.indel != 0
+                    reads[aln.query_name] = (
+                        None
+                        if is_indel
+                        else aln.query_sequence[pileupread.query_position]
+                    )
+                col_bases[pos] = reads
+                wanted_cols.discard(pos)
+                if not wanted_cols:
+                    break
+            for p in cluster:
+                bases0 = col_bases.get(p, {})
+                bases1 = col_bases.get(p + 1, {})
+                shared_reads = bases0.keys() & bases1.keys()
+                for ref, alt in pos_to_specs[p]:
+                    alt_count = ref_count = other_count = indel_count = 0
+                    for rn in shared_reads:
+                        b0 = bases0[rn]
+                        b1 = bases1[rn]
+                        if b0 is None or b1 is None:
+                            other_count += 1
+                            indel_count += 1
+                        elif b0 == alt[0] and b1 == alt[1]:
+                            alt_count += 1
+                        elif b0 == ref[0] and b1 == ref[1]:
+                            ref_count += 1
+                        else:
+                            other_count += 1
+                    depth = alt_count + ref_count + other_count
+                    results[(chrom, p, ref, alt)] = (
+                        alt_count,
+                        ref_count,
+                        indel_count,
+                        depth,
+                    )
+    return results
 
 
 def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):

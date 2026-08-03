@@ -3,6 +3,8 @@
 import pandas as pd
 import os
 
+from .funcs.misc import parse_stats_file, INDEL_COVERAGE_CATEGORY_LABELS
+
 
 def do_summarize(args):
     samples = args.input
@@ -17,9 +19,9 @@ def do_summarize(args):
             sample = sample.strip("/")
             sample_name = os.path.basename(sample)
             stats_file = f"{sample}/{sample_name}_stats.txt"
-            snv_burden_file = f"{sample}/{sample_name}_sbs_burden.txt"
-            indel_burden_file = f"{sample}/{sample_name}_indel_burden.txt"
-            sbs96_file = f"{sample}/{sample_name}_sbs_96_corrected.txt"
+            snv_burden_file = f"{sample}/SBS/{sample_name}_sbs_burden.txt"
+            indel_burden_file = f"{sample}/INDEL/{sample_name}_indel_burden.txt"
+            sbs96_file = f"{sample}/SBS/{sample_name}_sbs_96_corrected.txt"
 
             if not os.path.exists(stats_file):
                 raise FileNotFoundError(f"Stats file not found: {stats_file}")
@@ -32,26 +34,22 @@ def do_summarize(args):
             if not os.path.exists(sbs96_file):
                 raise FileNotFoundError(f"SBS96 corrected file not found: {sbs96_file}")
 
-            # _stats.txt line layout:
-            # 0: Number of Read Families
-            # 1: Number of Pass-filter Reads
-            # 2: Number of Effective Read Families
-            # 3: Effective Coverage
-            # 4: Unmasked Coverage
-            # 5: Effective Indel Coverage
-            # 6: Unmasked Indel Coverage
-            # 7: Per Read Family Coverage
-            # 8: Pass-filter Duplication Rate
-            # 9: Efficiency
-            with open(stats_file) as stats:
-                lines = stats.readlines()
-                uniq_reads = int(lines[0].strip("\n").split("\t")[1])
-                pf_reads = int(lines[1].strip("\n").split("\t")[1])
-                pf_read_family = int(lines[2].strip("\n").split("\t")[1])
-                eff_cov = int(float(lines[3].strip("\n").split("\t")[1]))
-                indel_eff_cov = int(float(lines[5].strip("\n").split("\t")[1]))
-                dup_rate = float(lines[8].strip("\n").split("\t")[1])
-                read_efficiency = float(lines[9].strip("\n").split("\t")[1])
+            stats = parse_stats_file(stats_file)
+            uniq_reads = int(stats["Number of Read Families"])
+            pf_reads = int(stats["Number of Pass-filter Reads"])
+            pf_read_family = int(stats["Number of Effective Read Families"])
+            eff_cov = int(float(stats["Effective Coverage"]))
+            # There's no single flat indel coverage figure anymore; total
+            # indel coverage is the sum of the power-weighted category
+            # columns (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py).
+            indel_eff_cov = int(
+                sum(
+                    float(stats[f"Effective Indel Coverage ({label})"])
+                    for label in INDEL_COVERAGE_CATEGORY_LABELS
+                )
+            )
+            dup_rate = float(stats["Pass-filter Duplication Rate"])
+            read_efficiency = float(stats["Efficiency"])
 
             # _sbs_burden.txt line layout:
             # 0: Uncorrected burden

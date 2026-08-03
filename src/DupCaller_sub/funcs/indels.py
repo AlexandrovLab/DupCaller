@@ -1,5 +1,77 @@
 import numpy as np
 
+_BASE2NUM = {"A": 0, "T": 1, "C": 2, "G": 3}
+_NUM2BASE = "ATCG"
+
+
+def left_align_indel(indel, reference_int, reference_start):
+    """Shift a raw CIGAR-derived indel string (findIndels output) to its
+    canonical leftmost representation, the same normalization bcftools
+    norm/vt normalize apply as a post-alignment step -- BWA (like most
+    aligners) does not left-align indels itself, so within a repeat run,
+    different reads covering the identical true event can report it at
+    different raw CIGAR positions. Left-aligning here, before any indel
+    ever enters a set()-based consensus (genotypeDSIndel, funcs/prob.py;
+    profileTriNucMismatches, funcs/learn.py), makes reads of the same
+    physical event converge onto one canonical string instead of being
+    treated as distinct indels, and guarantees the "before" side of any
+    downstream repeat-count scan (Estimate.py's classify_indel_record/
+    classify_indel_channel) is always empty.
+
+    Standard single-base-at-a-time shift: for a deletion, shifting the
+    del_len-base deleted window one position left produces an identical
+    resulting sequence exactly when the base newly excluded from the
+    window (the old last deleted base) equals the base newly included
+    (one before the old anchor) -- ref[anchor] == ref[anchor+del_len].
+    For an insertion, the analogous condition is ref[anchor] == S[-1]
+    (the last inserted base), with the inserted sequence rotating by one
+    base each shift (S -> S[-1]+S[:-1]) to keep representing the same net
+    change.
+
+    indel: raw indel string from findIndels -- "{pos}:{len}:{seq}" for an
+        insertion or "{pos}:-{len}" for a deletion. pos is the 0-based
+        genomic anchor (last matched base before the event, VCF POS
+        convention).
+    reference_int: base2num-encoded reference array (A=0,T=1,C=2,G=3;
+        anything else treated as non-matching/ambiguous) for the window
+        containing this indel, starting at reference_start.
+    reference_start: genomic position reference_int[0] corresponds to.
+
+    Shifting simply stops early if it would run past the left edge of
+    reference_int -- identical in spirit to how repeat-context
+    computations elsewhere in this codebase (e.g. call.py's
+    last_cut_valid) already accept degraded results right at a
+    processing-window boundary, since real repeat runs are far shorter
+    than a window.
+    """
+    parts = indel.split(":")
+    pos = int(parts[0])
+    length = int(parts[1])
+    if length < 0:
+        del_len = -length
+        anchor = pos - reference_start
+        while (
+            anchor >= 0
+            and 0 <= reference_int[anchor] <= 3
+            and 0 <= reference_int[anchor + del_len] <= 3
+            and reference_int[anchor] == reference_int[anchor + del_len]
+        ):
+            anchor -= 1
+        return f"{anchor + reference_start}:{length}"
+    else:
+        seq_nums = [_BASE2NUM.get(b, -1) for b in parts[2]]
+        anchor = pos - reference_start
+        while (
+            anchor >= 0
+            and seq_nums[-1] != -1
+            and 0 <= reference_int[anchor] <= 3
+            and reference_int[anchor] == seq_nums[-1]
+        ):
+            seq_nums = [seq_nums[-1]] + seq_nums[:-1]
+            anchor -= 1
+        new_seq = "".join(_NUM2BASE[n] if 0 <= n <= 3 else "N" for n in seq_nums)
+        return f"{anchor + reference_start}:{length}:{new_seq}"
+
 
 def findIndels(seq):
     refPos = seq.reference_start
