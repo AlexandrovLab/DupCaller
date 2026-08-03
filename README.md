@@ -35,6 +35,7 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 - BWA version 0.7.17 (https://bio-bwa.sourceforge.net)
 - GATK version 4.2.6 (https://github.com/broadinstitute/gatk/releases)
 - Tabix for indexing compressed genomic files (recommended installation: `conda install bioconda::tabix`)
+- [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder) — only needed if you are building your own reference index (`DupCaller.py index`) rather than using one of the [pre-built indexes](#pre-built-indexes)
 
 ---
 
@@ -84,15 +85,24 @@ singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your com
 
 ### Step 1: Index Reference Genome
 
-DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching and trinucleotide context indexing. Indexing requires two tabix-indexed BED files of repeat regions (including homopolymers and short tandem repeats, STRs), split by total repeat length: repeats 12bp or shorter (`-rb`/`--repeatBed`) and repeats longer than 12bp (`-s`/`--strbed`). Both files annotate repeat loci for improved indel calling near repetitive regions. To index the reference genome, run:
+DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching, trinucleotide context lookup, and repeat (homopolymer/short tandem repeat, STR) annotation used to improve indel calling near repetitive regions.
+
+Repeat annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder), a tandem-repeat scanner — DupCaller reads PERF's own output format directly, no BED conversion needed. First, run PERF against the reference FASTA:
 
 ```bash
-DupCaller.py index -f reference.fa -rb repeat_regions.bed.gz -s str_regions.bed.gz
+python3 -m PERF.core -m 1 -M 10 -u 2 -i reference.fa -o repeats.tsv
 ```
 
-The command will generate three h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5` and `{reference}.hp.h5`, which are numpyrized reference sequences, trinucleotide contexts, and repeat (homopolymer/STR) annotations, respectively. Make sure that when running other DupCaller utilities, the three files are within the same folder as the reference genome.
+- `-m`/`-M` — min/max repeat unit (motif) size to search for. `-M 10` covers homopolymers through 10bp-unit STRs; going much higher increases PERF's runtime and memory non-trivially.
+- `-u 2` (`--min-units`) — minimum number of repeat copies to report. **Always pass this explicitly** — if neither `-u` nor `-l`/`--min-length` is given, PERF silently defaults to a 12bp minimum length, which under-represents shorter/lower-copy repeats of larger units.
 
-Both BED files must be tabix-indexed (`.bed.gz` with a `.tbi` index) and have at least 4 columns: chrom, start, end, and repeat unit. Column 4 may be either a UCSC `rmsk`/simple-repeat style motif (e.g. `(CA)n`, `(CAAAA)n`) or a pre-computed integer repeat unit length; the repeat unit number is derived automatically as interval length (end - start) divided by repeat unit length. Every repeat in the genome (including single-base homopolymers) should be covered by one of the two files, split by whether its total repeat length is <=12bp (`--repeatBed`) or >12bp (`--strbed`).
+Then index the reference, passing PERF's tsv directly:
+
+```bash
+DupCaller.py index -f reference.fa -rt repeats.tsv
+```
+
+The command will generate four h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5`, `{reference}.hp.h5`, and `{reference}.str.h5` — numpyrized reference sequences, trinucleotide contexts, homopolymer annotations, and STR (unit length >=2) annotations, respectively. Homopolymers (unit length 1) are self-derived directly from the reference sequence rather than taken from the PERF tsv, so PERF's `-m` can start at 1 or 2 with no effect on `hp.h5`. Make sure that when running other DupCaller utilities, all four files are within the same folder as the reference genome.
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
@@ -101,31 +111,12 @@ For human reference genome hg38 and mouse reference genome mm39, we provided pre
 | Short | Long | Description |
 | --- | --- | --- |
 | -f | --reference | Reference genome fasta file (required) |
-| -rb | --repeatBed | Tabix-indexed BED file of repeats 12bp or shorter, incl. homopolymers (required) |
-| -s | --strbed | Tabix-indexed BED file of repeats longer than 12bp (required) |
+| -rt | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns. |
 
 #### Pre-built Indexes
 
 We have built indexes for human reference genome GRCh38/hg38 and mouse reference genome GRCm39/mm39, and can be downloaded at:
 
-#### Short Tandem Repeat File
-
-For other reference genomes, a BED file of simple repeats is needed to build the index. The file can be obtained from the UCSC Table Browser (https://genome.ucsc.edu/cgi-bin/hgTables) with the following steps:
-
-1. For **Genome**, select the reference genome.
-2. For **Group**, select "Repeats","Variation and Repeats".
-3. For **Table**, select "repeat masker" or similar table.
-(Tips: the actual path to repeat masker may be different for different reference genome. Look for a table named "rmsk")
-4. Add filter: "repClass Does match Simple_repeat".
-5. For **Output format**, select "BED - browser extensible data".
-6. Input desired filename (e.g. `mm39_str.bed`) and download the output BED file.
-7. Split the records into two files by total repeat length (end - start): <=12bp goes into the file passed to `--repeatBed`, and >12bp goes into the file passed to `--strbed`. Column 4 (the repeat motif, e.g. `(CA)n`) can be passed through as-is; `DupCaller.py index` derives repeat unit length and repeat unit number from it automatically.
-8. Sort each bed file with your reference genome (Use bedtools or similar) and compress and index with bgzip:
-```bash
-sortBed -i str.bed -faidx reference.fa.fai > str_sorted.bed
-bgzip str_sorted.bed
-tabix str_sorted.bed.gz
-```
 ---
 
 ### Step 2: Trim Barcodes
@@ -334,7 +325,7 @@ After running `estimate` on all samples, use `DupCaller.py summarize` to collate
 DupCaller.py summarize -i sample1 sample2 sample3 -o cohort_summary.txt
 ```
 
-This reads `{sample}_stats.txt`, `{sample}_sbs_burden.txt`, `{sample}_indel_burden.txt`, and `{sample}_sbs_96_corrected.txt` from each sample folder and writes four output files:
+This reads `{sample}_stats.txt`, `{sample}/SBS/{sample}_sbs_burden.txt`, `{sample}/INDEL/{sample}_indel_burden.txt`, and `{sample}/SBS/{sample}_sbs_96_corrected.txt` from each sample folder and writes four output files:
 
 | File | Description |
 | --- | --- |
@@ -359,15 +350,20 @@ For detailed column-by-column and field-by-field descriptions of every output fi
 - [`docs/call_outputs.md`](docs/call_outputs.md) — all files from `DupCaller.py call`
 - [`docs/estimate_outputs.md`](docs/estimate_outputs.md) — all files from `DupCaller.py estimate`
 
+Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific outputs (VCFs, corrected-context tables, burden files, and signature plots) are written into per-type `SBS/`, `INDEL/`, and `DBS/` subfolders under the sample's output directory, rather than at the sample's top level.
+
 ### Core Output Files
 
 | File | Description |
 | --- | --- |
-| `{sample}_snv.vcf` | VCF of detected SNVs and MNVs |
-| `{sample}_indel.vcf` | VCF of detected short indel mutations |
+| `SBS/{sample}_sbs.vcf` | VCF of detected SNVs and MNVs |
+| `INDEL/{sample}_indel.vcf` | VCF of detected short indel mutations |
+| `DBS/{sample}_dbs.vcf` | VCF of detected dinucleotide substitution (DBS) mutations |
 | `{sample}_coverage.bed.gz` | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
 | `{sample}_coverage.bed.gz.tbi` | Tabix index for the coverage BED file |
-| `{sample}_trinuc_by_duplex_group.txt` | Trinucleotide context counts grouped by duplex read number, used for burden estimation |
+| `{sample}_trinuc_by_duplex_group.txt` | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation |
+| `{sample}_indel_by_duplex_group.txt` | Indel context counts grouped by duplex read number, used for indel burden estimation |
+| `{sample}_dbs_by_duplex_group.txt` | 144-class dinucleotide context counts grouped by duplex read number, used for DBS burden estimation |
 | `{sample}_duplex_family_strand_composition.txt` | Strand composition statistics for duplex read families |
 | `{sample}_duplex_family_strand_composition_heatmap.pdf` | Heatmap visualization of duplex family strand composition |
 | `{sample}_call_params.log` | Full record of all resolved parameters used for the `call` run |
@@ -386,26 +382,37 @@ For detailed column-by-column and field-by-field descriptions of every output fi
 
 | File | Description |
 | --- | --- |
-| `{sample}_sbs_burden.txt` | SBS burden with uncorrected and corrected estimates and 95% confidence intervals |
-| `{sample}_indel_burden.txt` | Indel burden with 95% confidence intervals, including masked and unmasked calculations |
-| `{sample}_sbs_96_corrected.txt` | Corrected SBS counts across 96 trinucleotide contexts for signature analysis |
-| `{sample}_sbs_burden_by_min_read_group_size.txt` | Burden estimates stratified by minimum read group size |
+| `SBS/{sample}_sbs_burden.txt` | SBS burden with uncorrected and corrected estimates and 95% confidence intervals |
+| `INDEL/{sample}_indel_burden.txt` | Indel burden with 95% confidence intervals, including masked and unmasked calculations |
+| `DBS/{sample}_dbs_burden.txt` | DBS burden with uncorrected and corrected estimates and 95% confidence intervals |
+| `SBS/{sample}_sbs_96_corrected.txt` | Corrected SBS counts across 96 trinucleotide contexts for signature analysis, including a `mutations_per_opportunity` column |
+| `INDEL/{sample}_indel_83_corrected.txt` | Corrected indel counts across the 83 ID contexts, including a `mutations_per_opportunity` column |
+| `DBS/{sample}_dbs_78_corrected.txt` | Corrected DBS counts across the 78 DBS contexts, including a `mutations_per_opportunity` column |
+| `SBS/{sample}_sbs_burden_by_group_size.txt` | SBS burden stratified by duplex group size, both cumulative ("min group size >= N") and exact ("group size == N"), corrected and uncorrected, with 95% CI |
+| `INDEL/{sample}_indel_burden_by_group_size.txt` | Same stratification as above, for indels |
+| `DBS/{sample}_dbs_burden_by_group_size.txt` | Same stratification as above, for DBS |
 | `{sample}_duplex_allele_counts.txt` | Duplex depths and allele counts for each unique mutation |
 
 ### Visualization Files
 
 | File | Description |
 | --- | --- |
-| `{sample}_sbs_96.pdf` | 96-context mutational signature plots (3 pages: uncorrected counts, corrected counts, estimated mutations per genome) |
-| `{sample}_sbs_burden_by_min_read_group_size.png` | Burden estimates across minimum read group sizes |
+| `SBS/SBS_96_plots_{sample}.pdf` | 96-context SBS mutational signature plots (uncorrected and corrected counts) |
+| `INDEL/ID_83_plots_{sample}.pdf` | 83-context indel (ID83) mutational signature plots |
+| `DBS/DBS_78_plots_{sample}.pdf` | 78-context DBS mutational signature plots |
+| `SBS/{sample}_sbs_burden_by_group_size.pdf` | SBS burden across cumulative and exact duplex group sizes |
+| `INDEL/{sample}_indel_burden_by_group_size.pdf` | Same, for indels |
+| `DBS/{sample}_dbs_burden_by_group_size.pdf` | Same, for DBS |
 
 ### Optional / Conditional Files
 
 | File | Condition | Description |
 | --- | --- | --- |
 | `{sample}_gene_coverage.txt` | `-gb` option | Mean duplex coverage per gene for dNdScv correction |
-| `{sample}_sbs_burden_re_estimate.txt` | `-rb` option | Re-estimated burden for specific regions |
-| `{sample}_sbs_96_corrected_re_estimate.pdf` | `-rb` option | Signature plots for re-estimated regions |
+| `SBS/{sample}_sbs_burden_re_estimate.txt` | `-rb` option | Re-estimated SBS burden for specific regions |
+| `INDEL/{sample}_indel_burden_re_estimate.txt` | `-rb` option | Re-estimated indel burden for specific regions |
+| `SBS/{sample}_sbs_96_corrected_re_estimate.txt` | `-rb` option | Re-estimated 96-context SBS counts for specific regions |
+| `SBS/SBS_96_plots_{sample}_re_estimate.pdf` | `-rb` option | Signature plots for re-estimated regions |
 
 ---
 
