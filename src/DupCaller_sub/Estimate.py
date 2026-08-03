@@ -1428,7 +1428,7 @@ def do_estimate(args):
                 print(f"  - {msg}")
             print(
                 "\nPlease re-index the reference genome with the current version of DupCaller:\n"
-                f"  DupCaller.py index -f {args.reference} -s <str_regions.bed.gz>"
+                f"  DupCaller.py index -f {args.reference} -rt <repeats.tsv>"
             )
             sys.exit(1)
 
@@ -1933,24 +1933,48 @@ def do_estimate(args):
             sample,
             "83",
         )
+        # Every burden below must be reported per surveyed (duplex-covered)
+        # reference base, matching the SBS/DBS convention -- there, dividing
+        # the raw coverage total by its known fixed per-locus multiplier (3
+        # alt bases for SBS, 9 alt-pair combos for DBS, baked into
+        # estimate_96/estimate_dbs78(_by_group)'s own `cov`) already yields a
+        # literal per-locus count, so mutations/cov there IS mutations-per-
+        # base. Indel coverage has no such fixed multiplier:
+        # INDEL_COVERAGE_CATEGORY_LABELS sums coverage across overlapping,
+        # locus-varying opportunity columns (one locus can count toward
+        # several ID83 channels at once), so estimate_indel83's own burden/
+        # cov arrays -- unlike estimate_96/estimate_dbs78_by_group's -- are
+        # mutations/coverage per opportunity-COLUMN, not per locus.
+        # genome_indel_cov/reference_base_number is that same column-per-
+        # locus multiplicity computed from the reference genome itself (a
+        # pure sequence-composition ratio, independent of sequencing depth)
+        # -- assuming covered loci have the same average multiplicity as the
+        # region overall, multiplying by it converts the opportunity-column
+        # rate into the same per-covered-base rate SBS/DBS already report
+        # directly. Computed here (rather than only at the _indel_burden.txt
+        # write below) so it can also rescale the group-size arrays going
+        # into write_burden_by_group_size -- those come straight from
+        # estimate_indel83 and would otherwise carry the same un-rescaled
+        # per-opportunity-column units into _indel_burden_by_group_size.txt.
+        indel_locus_multiplier = genome_indel_cov / reference_base_number
         write_burden_by_group_size(
             indel_dir,
             sample,
             "indel",
-            indel_burden_uncorrected,
-            indel_burden_uncorrected_lb,
-            indel_burden_uncorrected_ub,
-            indel_burden_corrected,
-            indel_burden_corrected_lb,
-            indel_burden_corrected_ub,
-            indel_cov_by_minread,
-            indel_burden_uncorrected_exact,
-            indel_burden_uncorrected_exact_lb,
-            indel_burden_uncorrected_exact_ub,
-            indel_burden_corrected_exact,
-            indel_burden_corrected_exact_lb,
-            indel_burden_corrected_exact_ub,
-            indel_cov_by_exact_group,
+            indel_burden_uncorrected * indel_locus_multiplier,
+            indel_burden_uncorrected_lb * indel_locus_multiplier,
+            indel_burden_uncorrected_ub * indel_locus_multiplier,
+            indel_burden_corrected * indel_locus_multiplier,
+            indel_burden_corrected_lb * indel_locus_multiplier,
+            indel_burden_corrected_ub * indel_locus_multiplier,
+            indel_cov_by_minread / indel_locus_multiplier,
+            indel_burden_uncorrected_exact * indel_locus_multiplier,
+            indel_burden_uncorrected_exact_lb * indel_locus_multiplier,
+            indel_burden_uncorrected_exact_ub * indel_locus_multiplier,
+            indel_burden_corrected_exact * indel_locus_multiplier,
+            indel_burden_corrected_exact_lb * indel_locus_multiplier,
+            indel_burden_corrected_exact_ub * indel_locus_multiplier,
+            indel_cov_by_exact_group / indel_locus_multiplier,
         )
         # Field order/naming mirrors _sbs_burden.txt exactly (uncorrected
         # block, corrected block, per-genome number, opportunity/coverage,
@@ -1958,26 +1982,6 @@ def do_estimate(args):
         # fixed line number, and (as under the old ordering) still
         # correspond to the uncorrected burden/mutation count, so no
         # Summarize.py index changes are needed.
-        #
-        # Every burden below is reported per surveyed (duplex-covered)
-        # reference base, matching the SBS/DBS convention -- there,
-        # dividing the raw coverage total by its known fixed per-locus
-        # multiplier (3 alt bases for SBS, 9 alt-pair combos for DBS,
-        # baked into estimate_96/estimate_dbs78's own `cov`) already
-        # yields a literal per-locus count, so mutations/cov there IS
-        # mutations-per-base. Indel coverage has no such fixed multiplier:
-        # INDEL_COVERAGE_CATEGORY_LABELS sums coverage across overlapping,
-        # locus-varying opportunity columns (one locus can count toward
-        # several ID83 channels at once), so indel_count/indel_cov is
-        # mutations per opportunity-COLUMN, not per locus.
-        # genome_indel_cov/reference_base_number is that same
-        # column-per-locus multiplicity computed from the reference genome
-        # itself (a pure sequence-composition ratio, independent of
-        # sequencing depth) -- assuming covered loci have the same average
-        # multiplicity as the region overall, multiplying by it converts
-        # the opportunity-column rate into the same per-covered-base rate
-        # SBS/DBS already report directly.
-        indel_locus_multiplier = genome_indel_cov / reference_base_number
         with open(indel_dir + "/" + sample + "_indel_burden.txt", "w") as f:
             f.write(f"Uncorrected burden\t{indel_burden * indel_locus_multiplier}\n")
             f.write(
@@ -2372,14 +2376,34 @@ def do_estimate(args):
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
             f.write(f"mutation number per genome\t{mut_per_genome}\n")
             f.write(f"genome coverage\t{genome_cov}\n")
+        # indel_cov_total sums the same 14 overlapping opportunity columns
+        # (parts[7:21] above) as INDEL_COVERAGE_CATEGORY_LABELS elsewhere in
+        # this file -- mutations/indel_cov_total is therefore per
+        # opportunity-COLUMN, not per locus, exactly the same units mismatch
+        # _indel_burden.txt's indel_locus_multiplier corrects for. This
+        # branch has no access to that multiplier (it's computed in the
+        # `if not args.reestimatebed` branch above, using ref_indel83 from
+        # the main indel83 pipeline, neither of which runs here), so
+        # recompute the reference-genome side of it directly from the index
+        # files the same way the main branch does.
+        label2num_100_re, _ = build_indel100_labels()
+        ref_indel100_re = calculate_ref_indel100(args)
+        ref_indel76_re = combine_indel100_to_indel76(ref_indel100_re, label2num_100_re)
+        ref_indel83_re = expand_indel76_to_indel83(ref_indel76_re)
+        ref_indel83_re = override_inshp0_with_next_base_opportunity(
+            ref_indel83_re, ref_indel100_re
+        )
+        indel_locus_multiplier_re = ref_indel83_re.sum() / ref_trinuc.sum()
         indel_burden_re = (
-            indel_count / float(indel_cov_total)
+            indel_count / float(indel_cov_total) * indel_locus_multiplier_re
             if indel_cov_total > 0
             else float("nan")
         )
         indel_burden_re_lb, indel_burden_re_ub = poisson_confint(
             indel_count, indel_cov_total
         )
+        indel_burden_re_lb *= indel_locus_multiplier_re
+        indel_burden_re_ub *= indel_locus_multiplier_re
         with open(indel_dir + "/" + sample + "_indel_burden_re_estimate.txt", "w") as f:
             f.write(f"Indel burden\t{indel_burden_re}\n")
             f.write(f"Indel burden 95% lower\t{indel_burden_re_lb}\n")
