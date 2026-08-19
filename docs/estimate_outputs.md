@@ -19,10 +19,11 @@ Tab-separated key–value file with SNV mutational burden estimates for the samp
 | `Corrected burden 95% upper` | Poisson 95% CI upper bound on corrected burden |
 | `Corrected mutation number` | Sum of correction-ratio-weighted per-context mutation counts |
 | `Mutation number per genome` | Estimated number of mutations per haploid genome: sum over all 96 SBS contexts of (per-context mutation rate × reference genome trinucleotide count) |
-| `Genome coverage` | Total trinucleotide count of the reference genome (used to compute per-genome mutation number) |
+| `Genome coverage` | Effective SNV coverage at minimum duplex group size 1 (the most inclusive, all-groups-combined figure — same value as `_sbs_burden_by_group_size.txt`'s `min_group_size==1` row) |
 | `Unmasked burden` | SNV burden including masked positions (before noise mask is applied) |
 | `Unmasked burden 95% lower` | Poisson 95% CI lower bound on unmasked burden |
 | `Unmasked burden 95% upper` | Poisson 95% CI upper bound on unmasked burden |
+| `Reference base number` | Total trinucleotide count of the reference genome (used to compute per-genome mutation number; this is what `Genome coverage` reported before it was changed to the effective-coverage figure above) |
 
 ### Trinucleotide correction method
 

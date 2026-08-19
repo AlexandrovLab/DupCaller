@@ -106,9 +106,23 @@ def genotypeDSSnv(
     trinuc_int,
     prior_mat,
     antimask,
+    mut_antimask_scope,
     params,
     L=None,
 ):
+    """antimask and mut_antimask_scope both start as boolean masks over
+    the same window, refined identically by the structural/quality checks
+    below (trinuc validity, zero-qual fraction, 3+-allele ambiguity) --
+    but antimask is the narrow one (still respects n_cov_mask/nm_mask/
+    trim, whatever the caller passed in) used only to gate cov_mat, while
+    mut_antimask_scope is the wide one (only include_mask ever blocks it)
+    used to gate mut_antimask/candidate detection. They're deliberately
+    decoupled so a --rescue-eligible candidate blocked only by a
+    rescuable mask (n_cov/nm/trim/indel_mask) can still get a real LR
+    score without also making low-reliability positions contribute to
+    cov_mat's coverage/opportunity accounting -- see call.py's rescue
+    branch for how the resulting LR gets used.
+    """
     prob_amp_mat = params["ampmat"]
     prob_amp_mat_rev = params["ampmat_rev"]
     prob_dmg_mat_top = params["dmgmat_top"]
@@ -117,6 +131,7 @@ def genotypeDSSnv(
     prob_dmg_mat_rev_bot = params["dmgmat_rev_bot"]
     trinuc_convert_np = params["trinuc_convert"]
     antimask[trinuc_int >= 64] = False
+    mut_antimask_scope[trinuc_int >= 64] = False
     F1R2 = []
     F2R1 = []
     for seq in seqs:
@@ -225,11 +240,14 @@ def genotypeDSSnv(
             np.logical_and(F2R1_seq_mat == nn, F2R1_qual_mat != 0)
         ).sum(axis=0)
     total_count_mat = F1R2_count_mat + F2R1_count_mat
-    antimask[
-        ((F1R2_qual_mat_0_count + F2R1_qual_mat_0_count) / (m_F1R2 + m_F2R1))
-        >= params["maxZeroQualFrac"]
-    ] = False
-    antimask[(total_count_mat >= 1).sum(axis=0) > 2] = False
+    zero_qual_frac_fail = (
+        (F1R2_qual_mat_0_count + F2R1_qual_mat_0_count) / (m_F1R2 + m_F2R1)
+    ) >= params["maxZeroQualFrac"]
+    ambiguous_allele_fail = (total_count_mat >= 1).sum(axis=0) > 2
+    antimask[zero_qual_frac_fail] = False
+    antimask[ambiguous_allele_fail] = False
+    mut_antimask_scope[zero_qual_frac_fail] = False
+    mut_antimask_scope[ambiguous_allele_fail] = False
     base1_int = np.argmax(total_count_mat, axis=0)
     total_count_without_base1 = total_count_mat.copy()
     total_count_without_base1[base1_int, np.ogrid[:n]] = -1
@@ -246,11 +264,10 @@ def genotypeDSSnv(
                 n_top_L[valid_idx_L], n_bot_L[valid_idx_L], trinuc_int[valid_idx_L]
             ]
 
-    mut_antimask = np.logical_and(antimask, base1_int != reference_int)
+    mut_antimask = np.logical_and(mut_antimask_scope, base1_int != reference_int)
     if not mut_antimask.any():
         return (
             cov_mat,
-            np.zeros(0),
             np.zeros(0),
             np.zeros(0),
             mut_antimask,
@@ -339,13 +356,17 @@ def genotypeDSSnv(
     LR_max = (
         log10(1 - Pdmg_t) + log10(1 - Pdmg_b) - log10(Pdmg_rev_t) - log10(Pdmg_rev_b)
     )
-    LR_diff = LR_max - LR_masked
-    LR_diff[LR_diff <= 0] = np.finfo(float).eps
-    LR_score = -log10(LR_diff / LR_max)
-    LR_score[LR_masked <= 0] = 0
+    # A negative LR_masked means the evidence actually favors base2 over
+    # the majority-vote base1 -- not a real mutation candidate, just noise
+    # in the vote. genotypeDSIndel has always excluded these via its own
+    # `take = LR_masked >= 0` gate, independent of CS; mirror that here so
+    # SNVs get the same non-CS-based sanity filter.
+    keep = LR_masked >= 0
+    mut_antimask[mut_antimask] = keep
+    LR_masked = LR_masked[keep]
+    LR_max = LR_max[keep]
     return (
         cov_mat,
-        LR_score,
         LR_masked,
         LR_max,
         mut_antimask,
@@ -357,76 +378,114 @@ def genotypeDSSnv(
 
 
 def indelErrorProbs(
-    hps, strs, idLen, ref_allele, prob_amp, prob_amp_rev, prob_dmg, prob_dmg_rev
+    hps,
+    strs,
+    idLen,
+    ref_allele,
+    inserted_base,
+    prob_amp_hp,
+    prob_dmg_hp,
+    prob_amp_str,
+    prob_dmg_str,
 ):
-    """Select Pamp/Pdmg values for a candidate indel from the loaded 23x23
-    error matrices, given its repeat context (hps/strs) and length (idLen).
-    Verbatim port of the per-candidate branch previously inlined in
-    genotypeDSIndel's loop; also reused to build the indel coverage-power
-    tables in call.py, so both use identical math.
+    """Select Pamp/Pdmg values for a candidate indel from the new split
+    error matrices: prob_*_hp is (10, 12) -- rows hp run length 1-10+
+    (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1} (the
+    idLen=0 column is the reference/opportunity count); prob_*_str is
+    (5, 11) -- rows STR-length bin 0="0-1" (i.e. not a real repeat) / 1=
+    "2-9" / 2="10-24" / 3="25-39" / 4="40+", columns idLen+5 for idLen in
+    -5..5 (idLen=0 again the opportunity column). See Index.py-style
+    write-out in Caller.py/Learn.py and funcs/learn.py's accumulation for
+    how these are built.
 
-    Note: when hps==0 (no repeat nearby, the common case since repeatBed/
-    strbed only annotate actual repeats), the STR-less branches below index
-    prob_amp/prob_dmg with a negative row (hps-1 or hps-2), which via numpy
-    wraparound silently reads an STR row (22 or 21) instead of a "no repeat"
-    rate. This is a pre-existing behavior of the real caller, preserved here
-    intentionally rather than fixed, so this function's output matches what
-    genotypeDSIndel actually does.
+    Routing rule for +-1bp indels: a deletion always removes a base that
+    was actually there, so it trivially belongs to that base's own
+    homopolymer (hp matrix) regardless of hp length (even hp_len==1, an
+    "isolated" base, counts). An insertion only belongs to the hp matrix
+    if `inserted_base` (the base actually being inserted -- for real
+    candidates, read off the event itself; for context/coverage
+    enumeration where every base is by construction the position's own,
+    pass inserted_base == ref_allele) matches `ref_allele` (the reference
+    base immediately after the insertion point, i.e. the base whose run
+    would be extended); otherwise it isn't a real homopolymer-slippage
+    event and falls to str.txt's row 0 ("not a repeat") at the +-1
+    column. Indels of length >=2 are always STR-context (no hp.txt
+    column exists for them), keyed directly by `strs` (the STR-length
+    bin already computed by the caller) regardless of any hp annotation
+    -- a length>=2 indel not inside an annotated STR has no hp-length
+    fallback here; it still routes through str.txt (row 0, "not a
+    repeat").
+
+    No separate "_rev" matrices, unlike the SBS side: Pamp_rev/Pdmg_rev
+    are the same hp/str matrix as Pamp/Pdmg, just indexed at the column
+    for -idLen instead of idLen (the opposite-direction column).
     """
-    rc = [1, 0, 3, 2]
-    if strs > 0 and (idLen >= 2 or idLen <= -2):
-        Pamp = prob_amp[19 + strs, -idLen + 5]
-        Pamp_rev = prob_amp[19 + strs, idLen + 5]
-        Pdmg = prob_dmg[19 + strs, -idLen + 5]
-        Pdmg_rev = prob_dmg[19 + strs, idLen + 5]
+    if idLen == 0:
+        raise ValueError("idLen must be nonzero")
+    if abs(idLen) >= 2:
+        row = strs
+        col = -idLen + 5
+        col_rev = idLen + 5
+        Pamp = prob_amp_str[row, col]
+        Pamp_rev = prob_amp_str[row, col_rev]
+        Pdmg = prob_dmg_str[row, col]
+        Pdmg_rev = prob_dmg_str[row, col_rev]
         Pdmg_bot = Pdmg
         Pdmg_rev_bot = Pdmg_rev
-    elif idLen == 1:
-        ref_allele_rc = rc[ref_allele]
-        if hps < 20:
-            Pamp = prob_amp[hps, 12 + ref_allele * 3 - 1]
-            Pdmg = prob_dmg[hps, 12 + ref_allele * 3 - 1]
-            Pdmg_bot = prob_dmg[hps, 12 + ref_allele_rc * 3 - 1]
-            Pamp_rev = prob_amp[hps - 1, 12 + ref_allele * 3 + 1]
-            Pdmg_rev = prob_dmg[hps - 1, 12 + ref_allele * 3 + 1]
-            Pdmg_rev_bot = prob_dmg[hps - 1, 12 + ref_allele_rc * 3 + 1]
-        else:
-            Pamp = prob_amp[19, 12 + ref_allele * 3 - 1]
-            Pdmg = prob_dmg[19, 12 + ref_allele * 3 - 1]
-            Pdmg_bot = prob_dmg[19, 12 + ref_allele_rc * 3 - 1]
-            Pamp_rev = prob_amp[19, 12 + ref_allele * 3 + 1]
-            Pdmg_rev = prob_dmg[19, 12 + ref_allele * 3 + 1]
-            Pdmg_rev_bot = prob_dmg[19, 12 + ref_allele_rc * 3 + 1]
     elif idLen == -1:
+        # Deletion: always matches its own homopolymer.
+        rc = [1, 0, 3, 2]
         ref_allele_rc = rc[ref_allele]
-        if hps == 1:
-            Pamp = prob_amp[0, 12 + ref_allele * 3 + 1]
-            Pdmg = prob_dmg[0, 12 + ref_allele * 3 + 1]
-            Pdmg_bot = prob_dmg[0, 12 + ref_allele_rc * 3 + 1]
-            Pamp_rev = prob_amp[0, 12 + ref_allele * 3 - 1]
-            Pdmg_rev = prob_dmg[0, 12 + ref_allele * 3 - 1]
-            Pdmg_rev_bot = prob_dmg[0, 12 + ref_allele_rc * 3 - 1]
+        row = min(hps, 10) - 1
+        col = ref_allele * 3 + 0
+        col_rev = ref_allele * 3 + 2
+        col_bot = ref_allele_rc * 3 + 0
+        col_rev_bot = ref_allele_rc * 3 + 2
+        Pamp = prob_amp_hp[row, col]
+        Pamp_rev = prob_amp_hp[row, col_rev]
+        Pdmg = prob_dmg_hp[row, col]
+        Pdmg_rev = prob_dmg_hp[row, col_rev]
+        Pdmg_bot = prob_dmg_hp[row, col_bot]
+        Pdmg_rev_bot = prob_dmg_hp[row, col_rev_bot]
+    else:  # idLen == 1
+        if inserted_base == ref_allele:
+            rc = [1, 0, 3, 2]
+            ref_allele_rc = rc[ref_allele]
+            row = min(hps, 10) - 1
+            col = ref_allele * 3 + 2
+            col_rev = ref_allele * 3 + 0
+            col_bot = ref_allele_rc * 3 + 2
+            col_rev_bot = ref_allele_rc * 3 + 0
+            Pamp = prob_amp_hp[row, col]
+            Pamp_rev = prob_amp_hp[row, col_rev]
+            Pdmg = prob_dmg_hp[row, col]
+            Pdmg_rev = prob_dmg_hp[row, col_rev]
+            Pdmg_bot = prob_dmg_hp[row, col_bot]
+            Pdmg_rev_bot = prob_dmg_hp[row, col_rev_bot]
         else:
-            Pamp = prob_amp[hps - 2, 12 + ref_allele * 3 + 1]
-            Pdmg = prob_dmg[hps - 2, 12 + ref_allele * 3 + 1]
-            Pdmg_bot = prob_dmg[hps - 2, 12 + ref_allele_rc * 3 + 1]
-            Pamp_rev = prob_amp[hps - 1, 12 + ref_allele * 3 - 1]
-            Pdmg_rev = prob_dmg[hps - 1, 12 + ref_allele * 3 - 1]
-            Pdmg_rev_bot = prob_dmg[hps - 1, 12 + ref_allele_rc * 3 - 1]
-    else:
-        Pamp = prob_amp[hps - 1, -idLen + 5]
-        Pamp_rev = prob_amp[hps - 1, idLen + 5]
-        Pdmg = prob_dmg[hps - 1, -idLen + 5]
-        Pdmg_rev = prob_dmg[hps - 1, idLen + 5]
-        Pdmg_bot = Pdmg
-        Pdmg_rev_bot = Pdmg_rev
-    # Original code applied a 6-line floor ("x[x == 0] = 1e-9") to all six
-    # outputs, but every line after the first re-tested Pamp==0 (not each
-    # variable's own zero-ness), which is never true once the first line has
-    # run. Only Pamp is actually floored; this preserves that exact behavior.
+            row = 0
+            col = 1 + 5
+            col_rev = -1 + 5
+            Pamp = prob_amp_str[row, col]
+            Pamp_rev = prob_amp_str[row, col_rev]
+            Pdmg = prob_dmg_str[row, col]
+            Pdmg_rev = prob_dmg_str[row, col_rev]
+            Pdmg_bot = Pdmg
+            Pdmg_rev_bot = Pdmg_rev
     if Pamp == 0:
         Pamp = 1e-9
     return Pamp, Pamp_rev, Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot
+
+
+def indelMaxLR(Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot):
+    """Theoretical ceiling of masked LR for an indel context: log10(1-Pdmg)
+    + log10(1-Pdmg_bot) - log10(Pdmg_rev) - log10(Pdmg_rev_bot). Same shape
+    as genotypeDSSnv's LR_max/"LM" field; depends only on context (hps/
+    strs/idLen/ref_allele via indelErrorProbs), never on read depth, so it
+    doubles as the per-context calling-threshold ceiling in call.py/
+    Caller.py.
+    """
+    return log10(1 - Pdmg) + log10(1 - Pdmg_bot) - log10(Pdmg_rev) - log10(Pdmg_rev_bot)
 
 
 def genotypeDSIndel(
@@ -439,10 +498,10 @@ def genotypeDSIndel(
     str_raw,
     params,
 ):
-    prob_amp = params["ampmat_indel"]
-    prob_amp_rev = params["ampmat_indel_rev"]
-    prob_dmg = params["dmgmat_indel"]
-    prob_dmg_rev = params["dmgmat_indel_rev"]
+    prob_amp_hp = params["ampmat_hp"]
+    prob_dmg_hp = params["dmgmat_hp"]
+    prob_amp_str = params["ampmat_str"]
+    prob_dmg_str = params["dmgmat_str"]
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
     F1R2 = []
     F2R1 = []
@@ -538,6 +597,14 @@ def genotypeDSIndel(
     Pdmg_rev = np.zeros(pos_masked.size)
     Pdmg_bot = np.zeros(pos_masked.size)
     Pdmg_rev_bot = np.zeros(pos_masked.size)
+    # True for every deletion (always matches its own homopolymer) and
+    # for a homopolymer-matching insertion; False only for an insertion
+    # that indelErrorProbs routed to str.txt row 0. Saved per-candidate
+    # (unlike Pamp/Pdmg, which only need the aggregate probability) so
+    # Caller.py's channel/rate-table classification can route a real
+    # PASS call the same way indelErrorProbs itself did, instead of
+    # approximating every +-1bp call as HP-matched.
+    hp_match_arr = np.ones(pos_masked.size, dtype=bool)
     for nn in range(pos_masked.size):
         # hps is always the self-derived homopolymer run length (hp_raw
         # row0), taken as the max over the indel's reference span so an
@@ -560,29 +627,50 @@ def genotypeDSIndel(
         )
         unit_len_here = int(str_raw[0, anchor])
         repeat_count_here = int(str_raw[1, anchor])
+        # 5 STR-length bins now (0="0-1"/not a real repeat, 1="2-9",
+        # 2="10-24", 3="25-39", 4="40+"), matching str.txt's 5 rows --
+        # was 4 bins (0-3, with 0 meaning "<10" rather than "not a real
+        # repeat") before this rewrite.
         if unit_len_here >= 2:
             total_len = unit_len_here * repeat_count_here
             if total_len >= 40:
-                strs[nn] = 3
+                strs[nn] = 4
             elif total_len >= 25:
-                strs[nn] = 2
+                strs[nn] = 3
             elif total_len >= 10:
-                strs[nn] = 1
+                strs[nn] = 2
             else:
-                strs[nn] = 0
+                strs[nn] = 1
         else:
             strs[nn] = 0
         idLen = indelLen_masked[nn]
         pos = pos_masked[nn]
-        if hps[nn] > 20:
-            hps[nn] = 20
+        if hps[nn] > 10:
+            hps[nn] = 10
         # Only evaluated lazily for +-1bp indels, matching the original
         # inline code, so this never indexes reference_int out of bounds for
-        # longer indels near the edge of the window.
+        # longer indels near the edge of the window. ref_allele is the
+        # reference base immediately after the insertion point / the
+        # deleted base itself -- same anchor (pos-start+1) for both
+        # directions, matching funcs/learn.py's accumulation exactly (the
+        # old learn-time code used a different, inconsistent anchor for
+        # deletions; this rewrite aligns the two).
         if idLen == 1 or idLen == -1:
-            ref_allele = reference_int[pos - start + 1]
+            ref_allele = int(reference_int[pos - start + 1])
         else:
             ref_allele = 0
+        # inserted_base: the actual base being inserted, read off the
+        # event's own sequence (indels_masked entries are "pos:len:seq"
+        # for insertions) -- only meaningful/used when idLen==1, where
+        # indelErrorProbs compares it against ref_allele to decide
+        # whether this is a real homopolymer-extending insertion (hp.txt)
+        # or an unrelated single-base insertion (str.txt row 0).
+        if idLen == 1:
+            inserted_seq = indels_masked[nn].split(":")[2]
+            inserted_base = base2num.get(inserted_seq[0], -1) if inserted_seq else -1
+            hp_match_arr[nn] = inserted_base == ref_allele
+        else:
+            inserted_base = ref_allele
         (
             Pamp[nn],
             Pamp_rev[nn],
@@ -595,10 +683,11 @@ def genotypeDSIndel(
             strs[nn],
             idLen,
             ref_allele,
-            prob_amp,
-            prob_amp_rev,
-            prob_dmg,
-            prob_dmg_rev,
+            inserted_base,
+            prob_amp_hp,
+            prob_dmg_hp,
+            prob_amp_str,
+            prob_dmg_str,
         )
     ln10 = np.log(10)
     F1R2_alt_prob, F1R2_ref_prob = calculateSSPosterior(
@@ -629,16 +718,10 @@ def genotypeDSIndel(
         F2R1_ref_prob,
     )
     LR_masked = LL_B1 - LL_B2
-    LR_max = (
-        log10(1 - Pdmg) + log10(1 - Pdmg_bot) - log10(Pdmg_rev) - log10(Pdmg_rev_bot)
-    )
-    LR_diff = LR_max - LR_masked
-    LR_score = -log10(LR_diff / LR_max)
+    LR_max = indelMaxLR(Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot)
     take = LR_masked >= 0
     take[mask_multiallele == 0] = 0
     return (
-        # LR_diff[take],
-        LR_score[take],
         LR_masked[take],
         LR_max[take],
         [indels_masked[nn] for nn in range(len(take)) if take[nn]],
@@ -648,4 +731,5 @@ def genotypeDSIndel(
         f1r2_alt_count[take].astype("int"),
         f2r1_ref_count[take].astype("int"),
         f2r1_alt_count[take].astype("int"),
+        hp_match_arr[take],
     )

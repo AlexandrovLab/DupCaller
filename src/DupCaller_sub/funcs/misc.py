@@ -4,6 +4,7 @@ import time
 from multiprocessing import Pool
 import numpy as np
 import h5py
+import pysam
 from pysam import AlignmentFile as BAM
 from pysam import TabixFile as BED
 
@@ -12,12 +13,14 @@ def _ensure_type_subdirs(prefix):
     """Per-mutation-type output subfolders under a sample's prefix
     directory — SBS/, INDEL/, DBS/ — created (if missing). Every
     SBS/indel/DBS-specific output (VCFs, corrected tables, burden files,
-    plots, by-read-group breakdowns) lives under the matching subfolder;
-    shared/whole-sample files (_stats.txt, _coverage.bed.gz,
-    _duplex_allele_counts.txt, _*_by_duplex_group.txt, etc.) stay at the
-    top level of prefix. Shared by Caller.py (writer of the VCFs) and
-    Estimate.py (writer of everything else, and reader of the VCFs) so
-    both agree on the exact same subfolder layout.
+    plots, by-read-group breakdowns, and each type's own
+    _*_by_duplex_group.txt coverage file) lives under the matching
+    subfolder; only genuinely whole-sample, type-agnostic files
+    (_stats.txt, _coverage.bed.gz, _duplex_allele_counts.txt, learned
+    error matrices under ERROR/, etc.) stay at the top level of prefix.
+    Shared by Caller.py (writer of the VCFs) and Estimate.py (writer of
+    everything else, and reader of the VCFs) so both agree on the exact
+    same subfolder layout.
 
     Returns (sbs_dir, indel_dir, dbs_dir).
     """
@@ -144,6 +147,66 @@ def build_trinuc192_labels(num2trinuc):
             label2num[label] = len(labels)
             labels.append(label)
     return label2num, labels
+
+
+_REVCOMP = {"A": "T", "T": "A", "C": "G", "G": "C"}
+
+
+def _build_sbs96_labels():
+    """96 canonical (C/T-ref, pyrimidine-convention) SBS mutation-class
+    labels, bracket notation "{minus}[{ref}>{alt}]{plus}"."""
+    label2num = {}
+    labels = []
+    for minus_base in ["A", "T", "C", "G"]:
+        for ref_base in ["C", "T"]:
+            for plus_base in ["A", "T", "C", "G"]:
+                alts = ["A", "T", "C", "G"]
+                alts.remove(ref_base)
+                for alt_base in alts:
+                    label = f"{minus_base}[{ref_base}>{alt_base}]{plus_base}"
+                    label2num[label] = len(labels)
+                    labels.append(label)
+    return label2num, labels
+
+
+TRINUCSBS2NUM_96, NUM2TRINUCSBS_96 = _build_sbs96_labels()
+
+
+def combine_raw192_to_sbs96(values_192, label2num_192):
+    """Combine the 192 raw (un-folded) (trinuc, alt) mutation classes into
+    the 96 canonical pyrimidine-convention SBS96 classes, by summing each
+    canonical class with its reverse-complement partner from the other half
+    of the 64-context space. This is the single point where reverse-
+    complement pairs get folded together, deferred to estimation time
+    rather than done at raw accumulation time.
+
+    values_192   : array shaped (192,) or (192, n_groups).
+    label2num_192: {"{trinuc}>{alt}": row_index} for values_192's rows.
+    Returns an array shaped (96,) or (96, n_groups).
+    """
+    out_shape = (96,) if values_192.ndim == 1 else (96, values_192.shape[1])
+    combined = np.zeros(out_shape)
+    for k, label in enumerate(NUM2TRINUCSBS_96):
+        trinuc = label[0] + label[2] + label[6]
+        alt = label[4]
+        rc_trinuc = _REVCOMP[trinuc[2]] + _REVCOMP[trinuc[1]] + _REVCOMP[trinuc[0]]
+        rc_alt = _REVCOMP[alt]
+        combined[k] = (
+            values_192[label2num_192[f"{trinuc}>{alt}"]]
+            + values_192[label2num_192[f"{rc_trinuc}>{rc_alt}"]]
+        )
+    return combined
+
+
+def _safe_rate(mut, cov):
+    """np.where(cov > 0, mut / cov, 0), without the RuntimeWarning:
+    np.where evaluates BOTH branches in full before selecting, so
+    `mut / cov` still runs — and warns — at every position where cov==0,
+    even though the result there is thrown away in favor of the literal
+    0. The final values are identical either way; this just silences the
+    warning for a divide-by-zero that was always going to be discarded."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(cov > 0, mut / cov, 0)
 
 
 def _num_dinuc(n):
@@ -385,19 +448,15 @@ def indel100_reference_bucket_indices(
     0-based terms). Keep bucket boundaries here in sync with both if
     build_indel100_labels ever changes.
 
-    Returns the (100,) accumulated opportunity-count array directly.
-    (Previously returned (col_idx, weight) arrays for the caller to run
-    through np.bincount(..., minlength=100) — but every contribution here
-    has weight exactly 1, and up to ~20 separate whole-chromosome-length
-    index/weight array pairs had to stay alive simultaneously (one per
-    call below) until one final concatenate at the end. For a real
-    chromosome that pattern was the dominant memory cost of computing
-    reference-genome indel composition — see calculate_ref_indel100. Each
-    contribution is now folded straight into the running (100,) total
-    instead: a scalar increment for columns shared by every masked
+    Returns the (100,) accumulated opportunity-count array directly: each
+    contribution is folded straight into the running (100,) total as it's
+    computed -- a scalar increment for columns shared by every masked
     position, or a small per-call np.bincount for columns that vary
-    per-position — numerically identical since every weight was always 1,
-    just without the concatenated-array detour.)
+    per-position. Every contribution has weight exactly 1, so this avoids
+    keeping up to ~20 separate whole-chromosome-length index/weight array
+    pairs alive simultaneously for one final concatenate, which for a real
+    chromosome would be the dominant memory cost of computing
+    reference-genome indel composition (see calculate_ref_indel100).
     """
     n = hp_run_arr.shape[0]
     ref_base_safe = np.where((ref_base_arr < 0) | (ref_base_arr > 3), 0, ref_base_arr)
@@ -515,10 +574,9 @@ def load_repeat_context(hp_dataset, str_dataset, start=None, end=None):
 
     Wherever a position falls inside an annotated STR interval (str
     unit_len >= 2), the STR annotation wins; everywhere else this falls
-    back to the self-derived homopolymer run (unit_len implicitly 1) —
-    mirrors the old apply_repeat_bed's last-write-wins priority, where
-    --strbed/--repeatBed entries always described actual annotated repeats
-    and there was no separate "background" source to conflict with.
+    back to the self-derived homopolymer run (unit_len implicitly 1) --
+    safe because an annotated STR interval always describes an actual
+    repeat, with no separate "background" source to conflict with.
 
     hp_dataset, str_dataset: h5py Datasets for one chromosome from hp.h5
         and str.h5 respectively (e.g. hp_h5[chrom], str_h5[chrom]).
@@ -528,12 +586,11 @@ def load_repeat_context(hp_dataset, str_dataset, start=None, end=None):
     Values never exceed 127 (Index.py clips them before writing), so int16
     is already generous — it's only used instead of int8/uint8 to leave
     headroom for downstream arithmetic (e.g. subtracting a small constant)
-    without any risk of silent unsigned wraparound. This used to be a
-    plain `int` (numpy int64) via `.astype(int)` on every row, an 8x
-    widening of the on-disk uint8 data for no reason — for a whole
+    without any risk of silent unsigned wraparound, while avoiding the 8x
+    widening a plain `int` (numpy int64) would cost on the on-disk uint8
+    data -- several GB of unnecessary temporary allocation for a whole
     chromosome (the common case for Estimate.py's genome-composition
-    calls, as opposed to call.py's windowed calls) that was several GB of
-    unnecessary temporary allocation per call.
+    calls, as opposed to call.py's windowed calls).
     """
     sl = slice(start, end)
     hp_run = hp_dataset[0, sl]
@@ -728,6 +785,40 @@ def classify_indel_channel(indel_seq, ref_after, indel_len, anno=None):
     return f"{del_group}delMH{mh_label}"
 
 
+def indel_coverage_category_index(indel_seq, ref_after, indel_len):
+    """Map a single observed indel event to its one matching column index
+    (0-13) into coverage.bed.gz's 14 power-weighted indel opportunity
+    columns, i.e. INDEL_COVERAGE_CATEGORY_LABELS above -- the exact
+    channel this specific mutation's own detection power was screened/
+    thresholded against (call.py's cov_mat_indel columns, same order),
+    not an average across all 14 unrelated categories.
+
+    Reuses classify_indel_record's repeat-vs-mismatch determination for
+    the 1bp cases (the only place this coarser 14-category scheme
+    distinguishes repeat-unit from novel/mismatched events -- deletions
+    and insertions of length >=2 are bucketed by length alone here,
+    regardless of true-STR vs microhomology, since that finer distinction
+    only exists in the 83-channel scheme classify_indel_channel builds on
+    top of this).
+
+    indel_seq/ref_after/indel_len: same arguments as classify_indel_record.
+    """
+    if indel_len < 0:
+        del_len = -indel_len
+        if del_len == 1:
+            return 0  # Deletion of Repeat Unit
+        return min(del_len, 5)  # Deletion Length 2/3/4/5+ -> cols 2-5
+
+    ins_len = indel_len
+    if ins_len == 1:
+        matches_after = len(ref_after) >= 1 and ref_after[:1] == indel_seq
+        if matches_after:
+            return 1  # Insertion of Repeat Unit
+        base2idx = {"A": 0, "T": 1, "C": 2, "G": 3}
+        return 6 + base2idx[indel_seq[0].upper()]  # Insertion A/T/C/G
+    return 8 + min(ins_len, 5)  # Insertion Length 2/3/4/5+ -> cols 10-13
+
+
 def parse_stats_file(path):
     """Parse a DupCaller _stats.txt file into a {label: value_string} dict,
     keyed by the text before the first tab on each line. Label-based lookup
@@ -845,23 +936,50 @@ def createVcfStrings(chromDict, infoDict, formatDict, filterDict, recs):
     return "\n".join(lines) + "\n"
 
 
-def bamReadCount(bam, chrom, start, end, ref):  # , regionFile):
-    # if not regionFile:
-    count = getAlignmentObject(bam, "rb", ref).count(chrom, start, end)
-    """
+def bamReadCount(bam, chrom, start, end, ref, regionFile=None):
+    if not regionFile:
+        count = getAlignmentObject(bam, "rb", ref).count(chrom, start, end)
     else:
-        regionFile = BED(regionFile,parser = pysam.asBed())
+        # -R restricts calling to the bed file's regions, so windows with
+        # no overlap contribute nothing and can skip the bam.count() call
+        # entirely -- otherwise splitBamRegions ends up counting reads
+        # across the whole genome even when -R covers only a small
+        # fraction of it.
+        regionBed = BED(regionFile)
         count = 0
-        if chrom in regionFile.contigs:
-            for interval in regionFile.fetch(chrom,start,end):
-                count += getAlignmentObject(bam, "rb", ref).count(interval.contig, interval.start, interval.end)
-        else:
-            count += 0
-    """
+        if chrom in regionBed.contigs:
+            bamObject = getAlignmentObject(bam, "rb", ref)
+            for interval in regionBed.fetch(chrom, start, end, parser=pysam.asBed()):
+                interval_start = max(interval.start, start)
+                interval_end = min(interval.end, end)
+                if interval_start < interval_end:
+                    count += bamObject.count(chrom, interval_start, interval_end)
     return count
 
 
-def splitBamRegions(bams, num, contigs, step, ref):  # , regionFile):
+def drop_empty_regions(regionSequence, bamObject):
+    """Filter out any region tuple spanning zero real bases: a
+    (contig, start, end) tuple with start>=end, or the open-ended
+    (contig, start) "rest of this contig" tail once start already sits
+    at (or past) that contig's actual length. Both can arise from
+    splitBamRegions's cut sites landing exactly at a contig boundary
+    (see its own comments) -- a benign edge case at high thread counts
+    or on small/sparse inputs, but an empty region reaching callBam would
+    otherwise, for the 3-tuple case, write a zero-width coverage.bed.gz
+    interval that breaks tabix's sort-order requirement, and for the
+    2-tuple case fetch an inverted/out-of-range range.
+    """
+    filtered = []
+    for region in regionSequence:
+        if len(region) == 3 and region[1] >= region[2]:
+            continue
+        if len(region) == 2 and region[1] >= bamObject.get_reference_length(region[0]):
+            continue
+        filtered.append(region)
+    return filtered
+
+
+def splitBamRegions(bams, num, contigs, step, ref=None, regionFile=None):
     bamObject = getAlignmentObject(bams[0], "rb", ref)
     contigs_set = set(contigs)
     contigs_sorted = [_ for _ in bamObject.references if _ in contigs]
@@ -901,7 +1019,7 @@ def splitBamRegions(bams, num, contigs, step, ref):  # , regionFile):
                         k * step,
                         k * step + step,
                         ref,
-                        # regionFile,
+                        regionFile,
                     )
                     for k in range(contig_windows)
                 ]
@@ -921,8 +1039,39 @@ def splitBamRegions(bams, num, contigs, step, ref):  # , regionFile):
     cut_pos = (
         cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]
     ) * step
+    # window_nums's last window per contig is a partial window whenever
+    # contig_len isn't an exact multiple of step, so window_index * step
+    # can overshoot that contig's real length. That only actually happens
+    # when cut_inds saturates at window_nums_cumulative[-1] (i.e. a
+    # requested thread count -p asks for more chunks than there's read
+    # data to fill -- the trailing np.arange(1, num) * chunkSize targets
+    # exceed the total read count and searchsorted pins them at the very
+    # last window index). Left unclamped this produces a cut site past
+    # the chromosome end, which downstream becomes a region with
+    # start > end (or start beyond the contig) and crashes when that
+    # range is fetched. Clamping to the contig's real length instead
+    # collapses those trailing, over-saturated cut sites onto the
+    # legitimate end-of-contig boundary, where the dedup below then
+    # merges them into one.
+    cut_pos = np.minimum(cut_pos, contig_lens[cut_contigs])
     for nn in range(cut_inds.size):
-        cutSite.append((cut_contigs[nn], cut_pos[nn]))
+        candidate = (int(cut_contigs[nn]), int(cut_pos[nn]))
+        # At high thread counts (small chunkSize) a single window whose
+        # read count exceeds chunkSize can have more than one of the
+        # np.arange(1, num) * chunkSize thresholds land inside it, so
+        # searchsorted returns the same index for consecutive nn --
+        # duplicating the previous cut site here. cutSite entries become
+        # (contig, start, end) region boundaries downstream (see the
+        # cutSites[1:] consuming loops in Caller.py/Learn.py), so a
+        # duplicate produces a zero-width start==end region, which in
+        # turn writes a zero-width coverage.bed.gz interval and breaks
+        # its sort order for tabix. Skipping the duplicate just means
+        # this run ends up with one fewer real parallel chunk than -p
+        # requested for this contig boundary; callers already tolerate
+        # fewer chunks than threads.
+        if candidate == cutSite[-1]:
+            continue
+        cutSite.append(candidate)
     return cutSite, chunkSize, contigs_sorted
 
 
@@ -940,3 +1089,21 @@ def getAlignmentObject(bam, mode, refpath=None):
     else:
         raise NameError(f"{bam} should have .bam or .cram as file extension")
     return bamObject
+
+
+def get_duplex_barcode(rec, nanoseq_bam=False):
+    """Return the "bc1-bc2" duplex barcode string for an aligned read.
+
+    Normally this is just the DB tag written by DupCaller trim. With
+    nanoseq_bam, the bam instead carries NanoSeq-style per-mate RB/MB tags
+    (own-read barcode / mate barcode); the DB-equivalent string is
+    reconstructed as {MB}-{RB} for read 1 and {RB}-{MB} for read 2, so it
+    can be split the same way DB is everywhere else.
+    """
+    if not nanoseq_bam:
+        return rec.get_tag("DB")
+    mb_tag = rec.get_tag("MB")
+    rb_tag = rec.get_tag("RB")
+    if rec.is_read2:
+        return f"{rb_tag}-{mb_tag}"
+    return f"{mb_tag}-{rb_tag}"

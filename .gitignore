@@ -47,3 +47,6 @@ nextflow/test_pipeline.sh
 
 .pre-commit-config.yaml
 .prettierignore
+
+# Reference mask data (large BED files)
+masks/

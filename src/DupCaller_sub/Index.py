@@ -23,8 +23,8 @@ def _iter_repeat_tsv_by_chrom(path):
     chromosome as "no STR annotation here" rather than erroring.
 
     unit_len is read directly from len(motif) and repeat_count directly
-    from the num_units column — no span/unit_len division involved, unlike
-    the old BED-derived path, since PERF already reports the exact count.
+    from the num_units column — no span/unit_len division involved, since
+    PERF already reports the exact count.
     Entries with unit_len==1 (homopolymers) are skipped entirely: those are
     self-derived from the reference sequence instead (see
     homopolymer_run_and_cut below), never taken from this tsv.
@@ -52,6 +52,56 @@ def _iter_repeat_tsv_by_chrom(path):
             yield current_chrom, current_rows
     finally:
         handle.close()
+
+
+def _dinuc_int_for_chrom(reference_int, sentinel=16):
+    """Per-position raw dinucleotide class (0-15 = 4*base_at_i +
+    base_at_i+1, over the same A/T/C/G->0-3 encoding ref.h5 uses),
+    pairing every position with its successor — mirrors
+    Estimate.py's calculate_ref_dbs exactly (same `4*base1+base2`,
+    same "either base >3 (N/ambiguous) is invalid" rule), just
+    materialized per-position instead of summed into an aggregate
+    count. The last position in a chromosome has no successor and gets
+    `sentinel` (16, one past the valid 0-15 range), matching how
+    Index.py's trinuc index uses a boundary "N" at contig edges.
+    """
+    n = reference_int.shape[0]
+    dinuc_int = np.full(n, sentinel, dtype=np.uint8)
+    if n >= 2:
+        base1 = reference_int[:-1]
+        base2 = reference_int[1:]
+        valid = (base1 <= 3) & (base2 <= 3)
+        dinuc_int[:-1][valid] = (4 * base1[valid] + base2[valid]).astype(np.uint8)
+    return dinuc_int
+
+
+def do_index_dbs(args):
+    """Add a .dbs.h5 (per-position raw-16 reference dinucleotide class)
+    to an already-indexed reference, derived read-only from its existing
+    .ref.h5 — does not open .ref.h5/.tn.h5/.hp.h5/.str.h5 for writing and
+    never touches them. Safe to run against a reference other `call`/
+    `estimate` jobs currently have open, unlike re-running the full
+    `index` command (which rewrites all four files and would race any
+    live reader — see Caller.py's do_call comments on this exact hazard).
+    Same per-position encoding do_index's main loop below also now
+    produces for any *new* full index build (`_dinuc_int_for_chrom`).
+    """
+    ref_h5_path = args.reference + ".ref.h5"
+    if not os.path.exists(ref_h5_path):
+        raise FileNotFoundError(
+            f"{ref_h5_path} not found -- run `DupCaller.py index` first"
+        )
+    ref_h5 = h5py.File(ref_h5_path, "r")
+    dbs_h5 = h5py.File(args.reference + ".dbs.h5", "w")
+    dbs_h5.attrs["index_schema_version"] = INDEX_SCHEMA_VERSION
+    chroms = list(ref_h5.keys())
+    for i, chrom in enumerate(chroms):
+        print(f"[{i + 1}/{len(chroms)}] Creating dinucleotide (DBS) index: {chrom}")
+        dinuc_int = _dinuc_int_for_chrom(ref_h5[chrom][:])
+        dbs_h5.create_dataset(chrom, data=dinuc_int)
+    ref_h5.close()
+    dbs_h5.close()
+    print(f"DBS index written to {args.reference}.dbs.h5")
 
 
 def _iter_fasta_records(path):
@@ -114,14 +164,13 @@ def do_index(args):
             trinuc_order += 1
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3, "a": 0, "t": 1, "c": 2, "g": 3}
 
-    # Whole-genome lookup tables, built once: turn per-base/per-trinuc
-    # encoding into O(1) numpy fancy-indexing instead of a Python-level
-    # per-base string list (previously the single largest memory consumer —
-    # a new 3-character str object allocated for every base in the
-    # chromosome) and a np.vectorize call (a disguised per-base Python
+    # Whole-genome lookup tables, built once: O(1) numpy fancy-indexing for
+    # per-base/per-trinuc encoding, avoiding a per-base Python string list
+    # (a new 3-character str object allocated for every base in the
+    # chromosome) or a np.vectorize call (a disguised per-base Python
     # loop). Any byte combination not explicitly set below keeps the
-    # table's default, reproducing the old dict.get(key, default) fallback
-    # exactly — including for ambiguity codes other than "N".
+    # table's default, matching dict.get(key, default) fallback semantics
+    # — including for ambiguity codes other than "N".
     base2num_lut = np.full(256, 4, dtype=np.uint8)
     for base, code in base2num.items():
         base2num_lut[ord(base)] = code
@@ -136,7 +185,8 @@ def do_index(args):
     tn_h5 = h5py.File(args.reference + ".tn.h5", "w")
     hp_h5 = h5py.File(args.reference + ".hp.h5", "w")
     str_h5 = h5py.File(args.reference + ".str.h5", "w")
-    for h5_file in (ref_h5, tn_h5, hp_h5, str_h5):
+    dbs_h5 = h5py.File(args.reference + ".dbs.h5", "w")
+    for h5_file in (ref_h5, tn_h5, hp_h5, str_h5, dbs_h5):
         h5_file.attrs["index_schema_version"] = INDEX_SCHEMA_VERSION
     repeat_tsv_iter = _iter_repeat_tsv_by_chrom(args.repeatTsv)
 
@@ -191,6 +241,9 @@ def do_index(args):
         trinuc_int = trinuc_lut[minus_bytes, seq_bytes, plus_bytes]
         del minus_bytes, plus_bytes
 
+        print(f"Creating dinucleotide (DBS) index")
+        dinuc_int = _dinuc_int_for_chrom(reference_int)
+
         print(f"Creating homopolymer index")
         hp_run, hp_cut = homopolymer_run_and_cut(reference_int)
         # hp_lens rows: 0 = homopolymer run length (same value at every
@@ -231,7 +284,9 @@ def do_index(args):
         tn = tn_h5.create_dataset(chrom, data=trinuc_int)
         hp = hp_h5.create_dataset(chrom, data=hp_lens)
         st = str_h5.create_dataset(chrom, data=str_lens)
+        db = dbs_h5.create_dataset(chrom, data=dinuc_int)
     ref_h5.close()
     tn_h5.close()
     hp_h5.close()
     str_h5.close()
+    dbs_h5.close()

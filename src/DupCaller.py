@@ -5,7 +5,7 @@ from DupCaller_sub.Trim import do_trim
 from DupCaller_sub.Summarize import do_summarize
 from DupCaller_sub.Learn import do_learn
 from DupCaller_sub.AggregateProfile import do_aggregate
-from DupCaller_sub.Index import do_index
+from DupCaller_sub.Index import do_index, do_index_dbs
 
 # from Estimate import do_estimate
 if __name__ == "__main__":
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "-gaf",
         "--germlineAfCutoff",
-        type=str,
+        type=float,
         help="minimum population af to exclude a germline mutation",
         default=0.001,
     )
@@ -87,36 +87,12 @@ if __name__ == "__main__":
     )
     ### Learning file locations
     call_parser.add_argument(
-        "-e",
+        "-E",
         "--errprefix",
         type=str,
-        help="prefix for all four error files ({prefix}.amp.tn.txt, {prefix}.amp.id.txt, "
-        "{prefix}.dmg.tn.txt, {prefix}.dmg.id.txt); overrides the default (output prefix); "
-        "individual -AS/-AI/-DS/-DI arguments take priority over this prefix",
-    )
-    call_parser.add_argument(
-        "-AS",
-        "--amperrfile",
-        type=str,
-        help="amplification SBS error matrix (overrides -e)",
-    )
-    call_parser.add_argument(
-        "-AI",
-        "--amperrfileindel",
-        type=str,
-        help="amplification indel error matrix (overrides -e)",
-    )
-    call_parser.add_argument(
-        "-DS",
-        "--dmgerrfile",
-        type=str,
-        help="damage SBS error matrix (overrides -e)",
-    )
-    call_parser.add_argument(
-        "-DI",
-        "--dmgerrfileindel",
-        type=str,
-        help="damage indel error matrix (overrides -e)",
+        help="prefix for all six error files ({prefix}.amp.tn.txt, {prefix}.amp.hp.txt, "
+        "{prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, "
+        "{prefix}.dmg.str.txt); overrides the default (output prefix)",
     )
     call_parser.add_argument(
         "-mr",
@@ -126,33 +102,29 @@ if __name__ == "__main__":
         default=3e-10,
     )
     call_parser.add_argument(
-        "-ts",
-        "--thresholdSnv",
+        "-fdr",
+        "--fdrThreshold",
         type=float,
-        help="log likelihood ratio threshold of making a mutation call",
-        default=8.5,
+        help="target per-channel FDR (max of 1/(1+LR*mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised and mutation rate re-estimated iteratively",
+        default=0.05,
     )
     call_parser.add_argument(
-        "-ti",
-        "--thresholdIndel",
-        nargs=3,
+        "-a",
+        "--pseudocount",
         type=float,
-        help="log likelihood ratio threshold of making a mutation call, given 1-5 homopolymer, 6-10 homopolymer, and 11+ homopolymer",
-        default=[10.3, 8.5, 7],
+        help="regularization pseudocount added to each channel's per-channel mixture-weight MLE solve (mu), guaranteeing a root strictly between 0 and 1 without needing a channel-exclusion fallback",
+        default=0.5,
     )
     call_parser.add_argument(
-        "-cs",
-        "--scoreSnv",
-        type=float,
-        help="log likelihood ratio threshold of making a mutation call",
-        default=0.3,
-    )
-    call_parser.add_argument(
-        "-ci",
-        "--scoreIndel",
-        type=float,
-        help="log likelihood ratio threshold of making a mutation call",
-        default=0.3,
+        "-sc",
+        "--skipCoveragePass",
+        action="store_true",
+        help="skip round 2 (the coverage-only pass): no duplex depth / per-locus coverage.bed.gz, "
+        "no duplex-family composition or by-duplex-group output files, and masked candidates "
+        "that only clear the final FDR-refined threshold get no real depth. Only round 1 calling "
+        "and FDR-threshold determination run; VCFs and a trimmed _stats.txt are still written. "
+        "Roughly halves total runtime.",
+        default=False,
     )
     call_parser.add_argument(
         "-mq",
@@ -260,9 +232,21 @@ if __name__ == "__main__":
         default=0.01,
     )
     call_parser.add_argument(
+        "--minGroupAmp",
+        type=int,
+        help="minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to amplification-error learning",
+        default=3,
+    )
+    call_parser.add_argument(
+        "--minGroupDmg",
+        type=int,
+        help="minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to damage-error learning",
+        default=3,
+    )
+    call_parser.add_argument(
         "--rescue",
         "-res",
-        type=bool,
+        action="store_true",
         help="output discarded variants with reason in the filter field",
         default=False,
     )
@@ -280,6 +264,23 @@ if __name__ == "__main__":
         help="Maximum depth for samtools mpileup",
         default=1000000,
     )
+    call_parser.add_argument(
+        "--NanoSeqBam",
+        "-nb",
+        action="store_true",
+        help="bam uses NanoSeq-style per-mate RB/MB tags instead of a DB tag: the duplex "
+        "barcode is read as {MB}-{RB} for read 1 and {RB}-{MB} for read 2",
+        default=False,
+    )
+    call_parser.add_argument(
+        "--seed",
+        type=int,
+        help="RNG seed for the Monte Carlo detection-power simulation used by mutation-burden "
+        "calling, so results are reproducible across repeated runs and across different -p "
+        "thread counts. If not set, a random seed is generated and recorded in the run's "
+        "_call_params.log for later reuse",
+        default=None,
+    )
     ###########
     """
     Learn Arguments
@@ -296,7 +297,7 @@ if __name__ == "__main__":
     learn_parser.add_argument(
         "-gaf",
         "--germlineAfCutoff",
-        type=str,
+        type=float,
         help="minimum population af to exclude a germline mutation",
         default=0.001,
     )
@@ -504,6 +505,20 @@ if __name__ == "__main__":
         type=str,
         help="PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference, e.g. produced by `PERF.core -m 1 -M <N> -u 2 -i reference.fa`. Repeat unit length and repeat count are read directly from the motif and num_units columns. Entries with unit length 1 (homopolymers) are ignored -- those are self-derived from the reference sequence instead.",
     )
+
+    index_dbs_parser = subparsers.add_parser(
+        "index-dbs",
+        help="Add a DBS (dinucleotide) index to an already-indexed reference. "
+        "Derived read-only from the existing .ref.h5 -- does not touch "
+        "ref/tn/hp/str.h5, so it's safe to run against a reference other "
+        "call/estimate jobs currently have open.",
+    )
+    index_dbs_parser.add_argument(
+        "-f",
+        "--reference",
+        type=str,
+        help="Fasta file of reference (must already have a .ref.h5 from `DupCaller.py index`)",
+    )
     args = master_parser.parse_args()
     """
     Store Parameters
@@ -526,5 +541,7 @@ if __name__ == "__main__":
         do_aggregate(args)
     elif args.command == "index":
         do_index(args)
+    elif args.command == "index-dbs":
+        do_index_dbs(args)
     else:
         do_learn(args)

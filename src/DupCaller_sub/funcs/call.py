@@ -15,6 +15,7 @@ import re
 import h5py
 import errno
 import copy
+from scipy.optimize import brentq
 
 from .depth import (
     extractDepthRegion,
@@ -28,6 +29,7 @@ from .prob import (
     genotypeDSSnv,
     genotypeDSIndel,
     indelErrorProbs,
+    indelMaxLR,
     calculateSSPosterior,
     calculateDSPosterior,
 )
@@ -37,6 +39,7 @@ from .misc import build_trinuc64_order
 from .misc import load_repeat_context
 from .misc import log_progress
 from .misc import build_dbs_raw144_labels, build_dbs_raw144_index_grid
+from .misc import get_duplex_barcode
 from .indels import findIndels
 
 # [4,4,4,4] (ref1_num, ref2_num, alt1_num, alt2_num) -> row index into the
@@ -251,28 +254,125 @@ def get_bed_file_for_position(
         return locus_bed
 
 
-def bamIterateMultipleRegion(bam, regions, ref):  # , regionFile):
-    bamObject = BAM(bam, "rb", ref)
-    # if not regionFile:
-    for region in regions:
-        for rec in bamObject.fetch(*region):
-            if len(region) >= 2:
-                if rec.reference_start < region[1]:
-                    continue
-            yield rec, region
+def _rescue_reason_label(
+    ncov_flag, nm_flag, trim_flag, extra_flag=None, extra_label=None
+):
+    """Pick a single, specific rescue-reason filter label for a
+    --rescue-eligible candidate that reached the masked-rescue fallback
+    (snp_mask/noise_mask no longer block calling at all -- see the
+    unmasked_pass_bool/unmasked_antimask switch below -- and include_mask
+    is never rescuable, so by construction whatever's left blocking this
+    candidate is one or more of: n_cov_mask, nm_mask, trim, and -- indel
+    side only -- indel_mask). Args are booleans or boolean arrays covering
+    the candidate's own position(s); a plain scalar bool works too since
+    np.any() accepts one. extra_flag/extra_label covers indel_mask, which
+    has no SNV analogue. Checked in a fixed priority order so a position
+    blocked by more than one mask still gets exactly one label rather than
+    silently picking whichever happened to be checked last.
     """
+    if extra_flag is not None and np.any(extra_flag):
+        return extra_label
+    if np.any(ncov_flag):
+        return "ncov_rescued"
+    if np.any(nm_flag):
+        return "nm_rescued"
+    if np.any(trim_flag):
+        return "trim_rescued"
+    return "masked_rescued"
+
+
+def bamIterateMultipleRegion(bam, regions, ref, regionFile=None):
+    bamObject = BAM(bam, "rb", ref)
+    if not regionFile:
+        for region in regions:
+            for rec in bamObject.fetch(*region):
+                if len(region) >= 2:
+                    if rec.reference_start < region[1]:
+                        continue
+                yield rec, region
     else:
+        # -R restricts calling to the bed file's regions, so only fetch
+        # reads inside the bed intervals that overlap this worker's chunk
+        # region, instead of every read across the whole chunk. A read can
+        # overlap more than one bed interval within the same chunk (e.g.
+        # adjacent/nearby targets), so dedup on (query_name, is_read1,
+        # reference_start) within the chunk; cross-chunk dedup still relies
+        # on the same reference_start >= region[1] rule used above, which
+        # is unaffected by which bed interval a read was fetched through.
+        regionBed = BED(regionFile)
         for region in regions:
             chrom = region[0]
-            if chrom in regionFile.contigs:
-                for interval in regionFile.fetch(*region):
-                    for rec in bamObject.fetch(interval.contig, interval.start, interval.end):
-                        if len(region) >= 2:
-                            if rec.reference_start < region[1]:
-                                continue
+            if chrom not in regionBed.contigs:
+                continue
+            seen = set()
+            for interval in regionBed.fetch(*region, parser=pysam.asBed()):
+                interval_start = interval.start
+                interval_end = interval.end
+                if len(region) >= 2:
+                    interval_start = max(interval_start, region[1])
+                if len(region) == 3:
+                    interval_end = min(interval_end, region[2])
+                if interval_start >= interval_end:
+                    continue
+                for rec in bamObject.fetch(chrom, interval_start, interval_end):
+                    if len(region) >= 2 and rec.reference_start < region[1]:
+                        continue
+                    key = (rec.query_name, rec.is_read1, rec.reference_start)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     yield rec, region
-            else: continue
+
+
+def _normalize_indel_hp_mat(mat):
+    """Normalize a raw (10, 12) hp.txt count matrix (rows hp run length
+    1-10+, columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}) into
+    per-context probabilities: within each base's own 3-column group
+    (ref/del/ins counts for that base), each row is divided by its own
+    sum so the three probabilities for a given (hp_len, base) add to 1.
+    Then enforce monotonic non-decrease across increasing hp_len within
+    each group (row n >= row n-1 elementwise) --
+    a regularization against noisy per-row estimates at the sparser,
+    longer-homopolymer rows, done independently per base group since
+    they're otherwise unrelated contexts.
     """
+    mat_new = np.zeros_like(mat, dtype=float)
+    for g in range(4):
+        block = mat[:, g * 3 : g * 3 + 3]
+        row_sum = block.sum(axis=1, keepdims=True)
+        row_nonzero = (row_sum != 0).flatten()
+        block_new = np.zeros_like(block, dtype=float)
+        block_new[row_nonzero, :] = block[row_nonzero, :] / row_sum[row_nonzero, :]
+        for nn in range(1, block_new.shape[0]):
+            current_row = block_new[nn, :]
+            smaller_entries = current_row <= block_new[nn - 1, :]
+            current_row[smaller_entries] = block_new[nn - 1, :][smaller_entries]
+            block_new[nn, :] = current_row
+        mat_new[:, g * 3 : g * 3 + 3] = block_new
+    return mat_new
+
+
+def _normalize_indel_str_mat(mat):
+    """Normalize a raw (5, 11) str.txt count matrix (rows STR-length bin
+    0="0-1"/not a real repeat through 4="40+", columns idLen+5 for idLen
+    in -5..5) into per-context probabilities: each row divided by its own
+    sum across all 11 columns. Real-STR rows (1-4) that end up entirely
+    zero (no observations at that length bin) fall back to the pooled
+    distribution across whichever real-STR rows do have data. Row 0 is a
+    different population (not a real repeat at all) and is never pooled
+    into or from.
+    """
+    row_sum = mat.sum(axis=1, keepdims=True)
+    row_nonzero = (row_sum != 0).flatten()
+    mat_new = np.zeros_like(mat, dtype=float)
+    mat_new[row_nonzero, :] = mat[row_nonzero, :] / row_sum[row_nonzero, :]
+    str_rows_total = mat[1:5, :].sum(axis=0)
+    if str_rows_total.sum() > 0:
+        pooled = str_rows_total / str_rows_total.sum()
+        for r in range(1, 5):
+            if row_sum[r, 0] == 0:
+                mat_new[r, :] = pooled
+    return mat_new
 
 
 def regularizeErrorMat(mat, minerr):
@@ -319,20 +419,17 @@ def _detect_dbs_pairs(
     LR_pass_bool/flt_rs — the same three inputs the existing per-position
     loop above already uses to decide flt — rather than threading a new
     list through that loop, so this can be added without touching any of
-    its existing lines). Weaker DBS-specific filter tiers (mirroring
-    "masked"/"underpowered" for SNVs) aren't attempted in this first cut.
+    its existing lines).
 
     Returns a list of DBS mut dicts (ref/alt are 2-character
     dinucleotides), in the same shape as the SNV mut dict built above,
-    minus the SNV-only INFO fields (CS/LR/LM/TC/BC/TN/HP/STR) that don't
+    minus the SNV-only INFO fields (LR/LM/TC/BC/TN/HP/STR) that don't
     apply to a 2-base event.
     """
 
     def _flt(i):
         if pass_bool[i] and LR_pass_bool[i]:
             return flt_rs
-        if pass_bool[i]:
-            return "underpowered"
         return "masked"
 
     dbs_muts = []
@@ -363,7 +460,7 @@ def _detect_dbs_pairs(
                 # No independent raw-BAM depth re-verification for DBS
                 # yet (mirroring extractDepthSnv/extractDepthBatchSnv for
                 # SNVs) — both constituent bases already passed full
-                # duplex-consensus CS/LR calling, which is a strong
+                # duplex-consensus LR calling, which is a strong
                 # signal on its own, but there's currently no equivalent
                 # of the SNV/indel maxAF / normal-VAF post-processing
                 # check for DBS. Placeholder AC=1/RC=0/DP=1 (tumor),
@@ -417,6 +514,620 @@ def _compute_dbs_opportunity(cov_mat, ref_int, pass_bool):
         flat_idx[keep], weights=pair_contrib.reshape(-1)[keep], minlength=144
     )
     return contribution
+
+
+def _accumulate_depth_matrix(depth_mat, n_top, n_bot, category, valid, n_cat):
+    """
+    Add one count per valid position to depth_mat[n_top, n_bot, category],
+    via a single bincount instead of a Python loop.
+
+    depth_mat: (10, 10, n_cat) running total, updated in place.
+    n_top, n_bot: (window_len,) read-family top/bottom-strand counts,
+        already capped at 9 (matching the L-table convention used
+        elsewhere in this module).
+    category: (window_len,) context bucket index in [0, n_cat) -- e.g.
+        trinuc (0-63), merged hp/str bucket (0-22), or dinuc (0-15).
+        Entries outside [0, n_cat) are fine as long as they're excluded
+        by `valid` (this function never reads them).
+    valid: (window_len,) bool mask of positions to actually count.
+
+    This only ever touches the small, fixed-size aggregate total -- no
+    per-locus record is kept, so there is nothing to carry across window
+    boundaries and nothing to merge across worker processes' regions.
+    """
+    if not np.any(valid):
+        return
+    idx = (
+        n_top[valid].astype(np.int64) * 10 * n_cat
+        + n_bot[valid].astype(np.int64) * n_cat
+        + category[valid].astype(np.int64)
+    )
+    depth_mat += np.bincount(idx, minlength=10 * 10 * n_cat).reshape(10, 10, n_cat)
+
+
+def threshold_rng(base_seed, threshold):
+    """Deterministic, order-independent RNG for one simulate_power_grid
+    Monte Carlo draw at a specific LR `threshold`.
+
+    Deriving a fresh seed from (base_seed, threshold) means the same
+    threshold always gets the same seed -- and thus the same simulated
+    grid -- no matter which process/thread computes it or in what order.
+    Results are therefore reproducible across both repeated runs (given
+    the same base_seed) and different -p values: a shared per-worker RNG
+    would instead make results depend on which worker happens to process
+    which threshold, which itself depends on how many -p workers exist.
+
+    Seeded from base_seed plus the threshold's first 5 significant digits
+    (threshold values here are LR thresholds, typically single- to
+    low-double-digit floats) -- np.random.default_rng mixes a sequence of
+    ints via SeedSequence, so combining the two this way (rather than
+    concatenating/adding them by hand) avoids accidental seed collisions
+    between different (base_seed, threshold) pairs.
+    """
+    threshold_digits = int(round(abs(threshold) * 10000)) % 100000
+    return np.random.default_rng((int(base_seed), threshold_digits))
+
+
+def simulate_power_grid(
+    Pamp_c,
+    Pamp_rev_c,
+    Pdmg_c,
+    Pdmg_rev_c,
+    Pdmg_bot_c,
+    Pdmg_rev_bot_c,
+    threshold,
+    all_quals,
+    rng=None,
+    N_SIM=100,
+):
+    """Monte Carlo (10, 10) detection-power grid: for every (top-strand,
+    bottom-strand) read-family count composition, the fraction of N_SIM
+    simulated quality draws where calculateDSPosterior's log-likelihood
+    ratio (LL_B1 - LL_B2) clears `threshold`, given this single context's
+    fixed amplification/damage probabilities.
+
+    Shared by callBam's L (SBS) and L_indel_1bp/L_indel_len (indel)
+    power-table construction below, and reused as-is by Caller.py to
+    re-simulate one channel's grid at a new, FDR-controlled threshold
+    without rescanning the bam -- both need bit-identical math, just at a
+    different threshold.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    ln10 = np.log(10)
+    grid = np.zeros([10, 10])
+    P_arr = np.full(N_SIM, Pamp_c)
+    P_rev_arr = np.full(N_SIM, Pamp_rev_c)
+    Pt_arr = np.full(N_SIM, Pdmg_c)
+    Prev_t_arr = np.full(N_SIM, Pdmg_rev_c)
+    Pb_arr = np.full(N_SIM, Pdmg_bot_c)
+    Prev_b_arr = np.full(N_SIM, Pdmg_rev_bot_c)
+    for i in range(10):
+        for j in range(10):
+            if i == 0 and j == 0:
+                continue
+            if i > 0:
+                q_top = rng.choice(all_quals, size=(i, N_SIM), replace=True)
+                F1R2_Pseq = -q_top / 10 * ln10
+                F1R2_bin = np.ones([i, N_SIM], dtype=bool)
+            else:
+                F1R2_Pseq = np.zeros([0, N_SIM])
+                F1R2_bin = np.zeros([0, N_SIM], dtype=bool)
+            if j > 0:
+                q_bot = rng.choice(all_quals, size=(j, N_SIM), replace=True)
+                F2R1_Pseq = -q_bot / 10 * ln10
+                F2R1_bin = np.ones([j, N_SIM], dtype=bool)
+            else:
+                F2R1_Pseq = np.zeros([0, N_SIM])
+                F2R1_bin = np.zeros([0, N_SIM], dtype=bool)
+            F1R2_b1, F1R2_b2 = calculateSSPosterior(
+                P_arr, P_rev_arr, F1R2_bin, F1R2_Pseq
+            )
+            F2R1_b1, F2R1_b2 = calculateSSPosterior(
+                P_arr, P_rev_arr, F2R1_bin, F2R1_Pseq
+            )
+            LL_B1, LL_B2 = calculateDSPosterior(
+                Pt_arr,
+                Prev_t_arr,
+                Pb_arr,
+                Prev_b_arr,
+                F1R2_b1,
+                F2R1_b1,
+                F1R2_b2,
+                F2R1_b2,
+            )
+            grid[i, j] = ((LL_B1 - LL_B2) >= threshold).mean()
+    return grid
+
+
+_REFINE_WORKER_CTX = {}
+
+
+def init_refine_worker(
+    depth_by_trinuc,
+    depth_by_hpstr,
+    all_quals,
+    ampmat,
+    ampmat_rev,
+    dmgmat_top,
+    dmgmat_rev_top,
+    dmgmat_bot,
+    dmgmat_rev_bot,
+    trinuc_convert,
+    ampmat_hp,
+    dmgmat_hp,
+    ampmat_str,
+    dmgmat_str,
+    seed,
+):
+    """Pool initializer for the per-channel FDR-threshold refinement pool
+    (refine_channel_task below): stashes the read-only context every
+    channel's Eeff simulation needs as worker-global state once per
+    process, instead of re-pickling it into each of the ~200 per-channel
+    tasks Caller.py's do_call dispatches. trinuc2num/num2trinuc are
+    rebuilt locally (build_trinuc64_order takes no args and is
+    deterministic) rather than also being passed through initargs.
+
+    `seed` is the run's base Monte Carlo seed (params["seed"], resolved
+    once in Caller.py's do_call), stashed here rather than a live RNG
+    instance -- _channel_eeff_at_threshold derives a fresh, threshold-
+    specific RNG per call (see threshold_rng) instead of mutating one
+    shared generator, so results don't depend on which worker or how many
+    -p workers end up evaluating which threshold.
+    """
+    global _REFINE_WORKER_CTX
+    trinuc2num, num2trinuc = build_trinuc64_order()
+    _REFINE_WORKER_CTX = dict(
+        depth_by_trinuc=depth_by_trinuc,
+        depth_by_hpstr=depth_by_hpstr,
+        all_quals=all_quals,
+        ampmat=ampmat,
+        ampmat_rev=ampmat_rev,
+        dmgmat_top=dmgmat_top,
+        dmgmat_rev_top=dmgmat_rev_top,
+        dmgmat_bot=dmgmat_bot,
+        dmgmat_rev_bot=dmgmat_rev_bot,
+        trinuc_convert=trinuc_convert,
+        ampmat_hp=ampmat_hp,
+        dmgmat_hp=dmgmat_hp,
+        ampmat_str=ampmat_str,
+        dmgmat_str=dmgmat_str,
+        trinuc2num=trinuc2num,
+        num2trinuc=num2trinuc,
+        base2num={"A": 0, "T": 1, "C": 2, "G": 3},
+        seed=seed,
+        n1_mask=np.minimum(*np.indices((10, 10))) >= 1,
+    )
+
+
+def _channel_eeff_at_threshold(kind, ctx_key, threshold):
+    """Detection-power-weighted opportunity (Eeff) for one channel at one
+    LR threshold. Picklable top-level dispatch on channel kind, so one
+    per-channel worker task (refine_channel_task) can call this instead of
+    needing a different closure per kind -- closures aren't picklable
+    across a Pool.
+
+    rng is derived fresh from (base seed, threshold) on every call via
+    threshold_rng rather than reused from worker state, so the same
+    threshold always simulates the same grid regardless of which worker
+    or how many -p workers are running.
+    """
+    c = _REFINE_WORKER_CTX
+    rng = threshold_rng(c["seed"], threshold)
+    if kind == "sbs96":
+        t_fwd, b_fwd, t_rc = ctx_key
+        ref_base_idx = c["base2num"][c["num2trinuc"][t_fwd][1]]
+        tc = int(c["trinuc_convert"][t_fwd, b_fwd])
+        probs = (
+            c["ampmat"][tc, ref_base_idx],
+            c["ampmat_rev"][tc, ref_base_idx],
+            c["dmgmat_top"][tc, ref_base_idx],
+            c["dmgmat_rev_top"][tc, ref_base_idx],
+            c["dmgmat_bot"][tc, ref_base_idx],
+            c["dmgmat_rev_bot"][tc, ref_base_idx],
+        )
+        grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
+        n1_mask = c["n1_mask"]
+        eeff = float(np.sum(c["depth_by_trinuc"][:, :, t_fwd] * grid * n1_mask))
+        eeff += float(np.sum(c["depth_by_trinuc"][:, :, t_rc] * grid * n1_mask))
+        return eeff
+    if kind == "hp":
+        # HP channels only ever exist for id_len in {-1, 1} now -- there's
+        # no hp.txt column for multi-bp lengths any more (those are always
+        # STR-context, see indelErrorProbs). inserted_base is passed equal
+        # to `base` (the position's own reference base) since this is
+        # enumerating "the true opportunity for a real same-base
+        # homopolymer-extending event at a position with this base" --
+        # exactly what depth_by_hpstr's base axis already represents, not
+        # an arbitrary hypothetical mismatched insertion (that background
+        # rate has its own str.txt row-0 context, not tied to hp_len/base
+        # at all). Restricted to just this channel's own pool's 2 bases
+        # (base2num order A,T,C,G -- "T" pool is A/T, "C" pool is C/G,
+        # matching classify_indel_channel's own base pooling and
+        # Caller.py's raw_lr_hp accumulation) rather than all 4, now that
+        # each pool is its own channel with its own threshold.
+        hp_len, id_len, pool = ctx_key
+        total = 0.0
+        for base in (0, 1) if pool == "T" else (2, 3):
+            probs = indelErrorProbs(
+                hp_len,
+                0,
+                id_len,
+                base,
+                base,
+                c["ampmat_hp"],
+                c["dmgmat_hp"],
+                c["ampmat_str"],
+                c["dmgmat_str"],
+            )
+            grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
+            total += float(
+                np.sum(c["depth_by_hpstr"][:, :, base * 10 + hp_len - 1] * grid)
+            )
+        return total
+    if kind == "str":
+        # str_bin in {1,2,3,4} for real STR-length contexts (>=2bp
+        # events): ref_allele/inserted_base are irrelevant there (no base
+        # identity in that branch of indelErrorProbs). str_bin==0 with
+        # id_len==1 is the mismatched-insertion background channel (the
+        # only way to reach str.txt row 0 for a +-1bp event) -- forced by
+        # passing two different dummy base values (0 != 1) so
+        # indelErrorProbs takes the mismatch branch regardless; harmless
+        # for the multi-bp case since that branch ignores both args.
+        str_bin, id_len = ctx_key
+        probs = indelErrorProbs(
+            1,
+            str_bin,
+            id_len,
+            0,
+            1,
+            c["ampmat_hp"],
+            c["dmgmat_hp"],
+            c["ampmat_str"],
+            c["dmgmat_str"],
+        )
+        grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
+        if str_bin == 0:
+            # No per-context depth bucket exists for "not a real repeat"
+            # (depth_by_hpstr's 39+strs_for_row buckets only ever populate
+            # for strs_for_row>=1 -- 39+0 would collide with the last real
+            # HP bucket, base G/hp_len=10, not a dedicated background
+            # slot). A mismatched-insertion opportunity isn't tied to any
+            # hp/str context anyway (row 0's Pamp/Pdmg have no context
+            # dependence), so the correct denominator is genuinely
+            # "covered at this (n_top, n_bot) depth, anywhere" --
+            # depth_by_trinuc summed across all 64 contexts is exactly
+            # that count, already computed for the SBS side.
+            depth = c["depth_by_trinuc"].sum(axis=2)
+        else:
+            depth = c["depth_by_hpstr"][:, :, 39 + str_bin]
+        return float(np.sum(depth * grid))
+    raise ValueError(f"unknown channel kind {kind!r}")
+
+
+def _refine_channel(mu0, threshold0, fdr_thr):
+    """Non-iterative FDR-controlled threshold for one channel.
+
+    mu0 (this channel's round-1 MLE mixture weight, from the direct
+    brentq solve in refine_channel_task) is taken as the channel's
+    mutation rate outright -- no re-simulation/re-MLE step-up loop. The LR
+    threshold whose local fdr 1/(1+LR*mu0) equals fdr_thr is solved for
+    directly (LR = (1-fdr_thr)/(fdr_thr*mu0)); mu0 itself is also what
+    every PASS call's own local FDR is computed against downstream
+    (Caller.py's per-call FDR stamping).
+
+    Clamped to never go below threshold0: round 1's bam scan only ever
+    records a candidate whose LR clears threshold0 in the first place
+    (funcs/call.py's LR_pass_bool gate, evaluated long before any
+    per-channel refinement exists) -- a candidate below threshold0 isn't
+    filtered out, it's never written into mutsAll/indelsAll at all, so
+    round 2's post-hoc re-filter (no bam rescan) could never recover it
+    even if mu0 alone would justify a looser threshold here.
+
+    mu0 == 0 (this channel had zero effective coverage in round 1 -- see
+    refine_channel_task's Eeff0 == 0 short-circuit) makes the local-fdr
+    formula's implied LR threshold a division by zero (mu0/(1-mu0) == 0).
+    There is no mutation-rate evidence for this channel at all, so instead
+    of solving for a finite cutoff, report nothing as PASS in round 2 for
+    it: a threshold of +inf fails every finite LR in Caller.py's
+    LR < threshold re-filter.
+    """
+    if mu0 == 0:
+        return float("inf")
+    lr_threshold = (1.0 - fdr_thr) / (fdr_thr * mu0 / (1 - mu0))
+    return max(threshold0, float(np.log10(lr_threshold)))
+
+
+def refine_channel_task(job):
+    """One independent unit of work for the FDR-threshold pool: computes
+    this channel's Eeff at its default threshold, then solves directly for
+    this channel's MLE mixture weight (mu0) and the LR threshold at which
+    its local fdr (using mu0) equals fdr_thr, clamped to never go below
+    threshold0 -- see _refine_channel. Channels (each SBS96 class / each
+    HP-length x indel-length / STR-bin x indel-length combo, ~200 total)
+    are fully independent -- own raw_lr list, own Eeff formula -- so
+    do_call dispatches these across a Pool (one task per channel) instead
+    of running them one at a time in the main process.
+
+    mu0 solves g(mu) = sum(raw_lr/(1-mu+mu*raw_lr)) - Eeff0 + pseudocount/mu
+    == 0 directly via brentq. The pseudocount/mu term sends g(0) to
+    literally +inf (np.divide(pseudocount, 0.0) rather than plain float
+    division, which would raise ZeroDivisionError instead), so g is
+    guaranteed to cross zero somewhere in (0, 1) for any Eeff0 > 0 -- no
+    exclusion fallback needed for channels with weak evidence (without
+    this term, g has a trivial root sitting at mu=0 itself).
+
+    Eeff0 == 0 (zero effective coverage for this channel in round 1) is
+    the one case brentq can't solve: every term of g is non-negative
+    then, so g never crosses zero anywhere in (0, 1) and brentq raises
+    for failing to bracket a root. Short-circuit to mu0 = 0 directly --
+    there's no coverage to estimate a mutation rate from anyway.
+    """
+    name, kind, ctx_key, raw_lr_list, threshold0, fdr_thr, pseudocount = job
+    Eeff0 = _channel_eeff_at_threshold(kind, ctx_key, threshold0)
+    raw_lr = np.asarray(raw_lr_list, dtype=float)
+
+    if Eeff0 == 0:
+        mu0 = 0.0
+    else:
+
+        def g(mu):
+            with np.errstate(divide="ignore"):
+                return (
+                    np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
+                    - Eeff0
+                    + np.divide(pseudocount, mu)
+                )
+
+        mu0 = brentq(g, 0.0, 1.0)
+    new_threshold = _refine_channel(mu0, threshold0, fdr_thr)
+    return name, kind, ctx_key, Eeff0, mu0, new_threshold
+
+
+def load_error_matrices(params):
+    """Load and regularize the SBS (amperr/dmgerr) and indel
+    (amperri/dmgerri) error-rate matrices from the files named in params,
+    populating params in place with ampmat/ampmat_rev/dmgmat_top/
+    dmgmat_rev_top/dmgmat_bot/dmgmat_rev_bot/ampmat_hp/dmgmat_hp/
+    ampmat_str/dmgmat_str/trinuc_convert/
+    trinuc2num_dict/num2trinuc_list -- exactly the fields callBam needs to
+    build its L/L_indel_1bp/L_indel_len power tables. Factored out (rather
+    than left inlined in callBam) so Caller.py's post-hoc per-channel FDR
+    threshold refinement -- re-simulating a single context's detection
+    power at a new, stricter LR threshold -- can load the identical
+    matrices without re-running callBam/rescanning the bam.
+
+    isLearn is read from params (defaulting False); in learn mode the amp/
+    dmg matrices are left as zeros (they're not used for calling there).
+    """
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    isLearn = params.get("isLearn", False)
+
+    trinuc2num, num2trinuc = build_trinuc64_order()
+
+    trinuc_convert_np = np.zeros([64, 4], dtype=np.uint8)
+    for trinuc in trinuc2num.keys():
+        row = np.zeros(4)
+        row_num = trinuc2num[trinuc]
+        row[0] = trinuc2num[trinuc[0] + "A" + trinuc[2]]
+        row[1] = trinuc2num[trinuc[0] + "T" + trinuc[2]]
+        row[2] = trinuc2num[trinuc[0] + "C" + trinuc[2]]
+        row[3] = trinuc2num[trinuc[0] + "G" + trinuc[2]]
+        trinuc_convert_np[row_num, :] = row
+    params["trinuc_convert"] = trinuc_convert_np
+    params["trinuc2num_dict"] = trinuc2num
+    params["num2trinuc_list"] = num2trinuc
+    ### Load amp error matrix
+    if isLearn:
+        ampmat = np.zeros([64, 4])
+    else:
+        ampmat = (
+            pd.read_csv(params["amperr_file"], sep="\t", index_col=0)
+            .to_numpy()
+            .astype(float)
+        )
+    # ampmat += 0.5
+    # A trinuc context with zero observed counts across all 4 alt bases
+    # has row sum 0; dividing those rows would produce NaN (0/0) instead
+    # of leaving them as exact zero, which regularizeErrorMat below can
+    # then correctly patch with the matrix's smallest valid value.
+    ampmat_row_sum = ampmat.sum(axis=1, keepdims=True)
+    ampmat_row_nonzero = (ampmat_row_sum != 0).flatten()
+    ampmat_normalized = np.zeros_like(ampmat)
+    ampmat_normalized[ampmat_row_nonzero, :] = (
+        ampmat[ampmat_row_nonzero, :] / ampmat_row_sum[ampmat_row_nonzero, :]
+    )
+    ampmat = ampmat_normalized
+    # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
+    ampmat_min_error = ampmat.min(axis=1, keepdims=True)
+    ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)
+    ampmat = regularizeErrorMat(ampmat, 1e-6)
+    params["ampmat"] = ampmat
+
+    ampmat_rev = np.zeros([64, 4])
+    for trinuc in trinuc2num.keys():
+        refbase = trinuc[1]
+        for nn, altbase in enumerate(["A", "T", "C", "G"]):
+            ampmat_rev[trinuc2num[trinuc], nn] = ampmat[
+                trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
+            ]
+    # ampmat_rev_avg_error = (1 - ampmat_rev.max(axis=1,keepdims=True))/3
+    ampmat_rev_min_error = ampmat_rev.min(axis=1, keepdims=True)
+    ampmat_rev = np.concatenate([ampmat_rev, ampmat_rev_min_error], axis=1)
+    params["ampmat_rev"] = ampmat_rev
+
+    if isLearn:
+        params["ampmat_hp"] = np.zeros([10, 12])
+        params["ampmat_str"] = np.zeros([5, 11])
+    else:
+        # amperri_file's prefix, split into the two files funcs/learn.py
+        # writes (see Caller.py/Learn.py's write-out).
+        amperri_hp_file = params["amperri_file"].replace(".amp.id.txt", ".amp.hp.txt")
+        amperri_str_file = params["amperri_file"].replace(".amp.id.txt", ".amp.str.txt")
+        ampmat_hp = pd.read_csv(amperri_hp_file, sep="\t", index_col=0).to_numpy(
+            dtype=float
+        )
+        ampmat_str = pd.read_csv(amperri_str_file, sep="\t", index_col=0).to_numpy(
+            dtype=float
+        )
+        ampmat_hp = _normalize_indel_hp_mat(ampmat_hp)
+        ampmat_hp = regularizeErrorMat(ampmat_hp, 1e-6)
+        params["ampmat_hp"] = ampmat_hp
+
+        ampmat_str = _normalize_indel_str_mat(ampmat_str)
+        ampmat_str = regularizeErrorMat(ampmat_str, 1e-6)
+        params["ampmat_str"] = ampmat_str
+
+    # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
+    # params["ampmat_indel_rev_mean"] = np.mean(ampmat_indel_rev,axis=1)
+
+    ### Load damage matrix
+    if isLearn:
+        dmgmat = np.zeros([64, 4])
+    else:
+        dmgmat = (
+            pd.read_csv(params["dmgerr_file"], sep="\t", index_col=0)
+            .to_numpy()
+            .astype(float)
+        )
+        # dmgmat += 1
+
+    # dmgmat += 0.5
+    # Same zero-row guard as ampmat above: a trinuc context with zero
+    # observed counts must stay exact zero here, not become NaN via 0/0,
+    # so regularizeErrorMat below can patch it correctly.
+    dmgmat_row_sum = dmgmat.sum(axis=1, keepdims=True)
+    dmgmat_row_nonzero = (dmgmat_row_sum != 0).flatten()
+    dmgmat_normalized = np.zeros_like(dmgmat)
+    dmgmat_normalized[dmgmat_row_nonzero, :] = (
+        dmgmat[dmgmat_row_nonzero, :] / dmgmat_row_sum[dmgmat_row_nonzero, :]
+    )
+    dmgmat = dmgmat_normalized
+    # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
+    dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
+    dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
+    dmgmat = regularizeErrorMat(dmgmat, 1e-8)
+
+    params["dmgmat_top"] = dmgmat
+    params["trinuc2num_dict"] = trinuc2num
+
+    dmgmat_rev = np.zeros([64, 4])
+    dmgmat_rev_ref_error = np.zeros(64)
+    for trinuc in trinuc2num.keys():
+        refbase = trinuc[1]
+        for nn, altbase in enumerate(["A", "T", "C", "G"]):
+            dmgmat_rev[trinuc2num[trinuc], nn] = dmgmat[
+                trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
+            ]
+    # dmgmat_rev_ref_error = 1 -  dmgmat_rev.max(axis=1, keepdims=True)
+    dmgmat_rev_ref_error = dmgmat_rev.min(axis=1, keepdims=True)
+    dmgmat_rev = np.concatenate([dmgmat_rev, dmgmat_rev_ref_error], axis=1)
+    params["dmgmat_rev_top"] = dmgmat_rev
+
+    dmgmat_b = np.vstack((dmgmat[32:64, [1, 0, 3, 2]], dmgmat[:32, [1, 0, 3, 2]]))
+    # dmgmat_b_ref_error = 1 - dmgmat_b.max(axis=1, keepdims=True)
+    dmgmat_b_ref_error = dmgmat_b.min(axis=1, keepdims=True)
+    dmgmat_rev_b = np.vstack(
+        (dmgmat_rev[32:64, [1, 0, 3, 2]], dmgmat_rev[:32, [1, 0, 3, 2]])
+    )
+    dmgmat_rev_b_ref_error = dmgmat_rev_b.min(axis=1, keepdims=True)
+    dmgmat_b = np.concatenate([dmgmat_b, dmgmat_b_ref_error], axis=1)
+    dmgmat_rev_b = np.concatenate([dmgmat_rev_b, dmgmat_rev_b_ref_error], axis=1)
+    params["dmgmat_bot"] = dmgmat_b
+    params["dmgmat_rev_bot"] = dmgmat_rev_b
+
+    if isLearn:
+        params["dmgmat_hp"] = np.zeros([10, 12])
+        params["dmgmat_str"] = np.zeros([5, 11])
+    else:
+        dmgerri_hp_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.hp.txt")
+        dmgerri_str_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.str.txt")
+        dmgmat_hp = pd.read_csv(dmgerri_hp_file, sep="\t", index_col=0).to_numpy(
+            dtype=float
+        )
+        dmgmat_str = pd.read_csv(dmgerri_str_file, sep="\t", index_col=0).to_numpy(
+            dtype=float
+        )
+        dmgmat_hp = _normalize_indel_hp_mat(dmgmat_hp)
+        dmgmat_hp = regularizeErrorMat(dmgmat_hp, 1e-8)
+        params["dmgmat_hp"] = dmgmat_hp
+
+        dmgmat_str = _normalize_indel_str_mat(dmgmat_str)
+        dmgmat_str = regularizeErrorMat(dmgmat_str, 1e-8)
+        params["dmgmat_str"] = dmgmat_str
+
+
+def _compute_read_label(rec, params):
+    """Duplex-family label for rec: barcode pair plus signed template_length."""
+    bc1, bc2 = get_duplex_barcode(rec, params.get("nanoSeqBam")).split("-")
+    if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
+        return bc1 + "+" + bc2 + "+" + str(rec.template_length)
+    else:
+        return bc2 + "+" + bc1 + "+" + str(rec.template_length)
+
+
+def _place_read_in_dict(rec, label, currentReadDict):
+    """Add rec to currentReadDict under label, merging into an existing
+    family entry if one is already open."""
+    if label in currentReadDict:
+        currentReadDict[label]["seqs"].append(rec)
+        currentReadDict[label]["names"][rec.query_name] = (
+            len(currentReadDict[label]["seqs"]) - 1
+        )
+    else:
+        currentReadDict[label] = {
+            "seqs": [rec],
+            "F1R2": 0,
+            "F2R1": 0,
+            "names": {rec.query_name: 0},
+        }
+    if (rec.is_forward and rec.is_read1) or (rec.is_reverse and rec.is_read2):
+        currentReadDict[label]["F1R2"] += 1
+    else:
+        currentReadDict[label]["F2R1"] += 1
+
+
+def _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool):
+    """For each upstream-anchor family (template_length > 0) whose members
+    disagree on next_reference_start, point every minority read's mate at
+    the majority (largest) mate position via rugged_reads_index, and
+    pre-open its rugged_reads_pool bucket.
+
+    Pool/index keys are (chrom, position), not bare position: a redirect
+    queued here isn't guaranteed to ever be drained (e.g. the downstream
+    mate never turns up in this process's region -- filtered upstream, or
+    mapped outside the assigned span). An orphaned bare-position key would
+    silently collide with an unrelated position on a *later* chromosome
+    (every chromosome restarts its own coordinate numbering near 0),
+    merging a stale read from one chromosome into another chromosome's
+    batch -- which corrupts reference_mat_chrom for that flush and writes
+    a non-contiguous chromosome block into the coverage bed file (fatal
+    for tabix indexing). Qualifying by chromosome makes a stale entry
+    inert instead of a silent cross-chromosome misattribution.
+    """
+    for group in currentReadDict.values():
+        group_seqs = group["seqs"]
+        if group_seqs[0].template_length <= 0:
+            continue
+        chrom = group_seqs[0].reference_name
+        mate_starts = [r.next_reference_start for r in group_seqs]
+        largest_mate_start = max(mate_starts)
+        if any(ms != largest_mate_start for ms in mate_starts):
+            pool_key = (chrom, largest_mate_start)
+            rugged_reads_pool.setdefault(pool_key, [])
+            for r, ms in zip(group_seqs, mate_starts):
+                if ms != largest_mate_start:
+                    rugged_reads_index[r.query_name] = pool_key
+
+
+def _drain_rugged_pool(chrom, position, rugged_reads_pool, params, currentReadDict):
+    """Merge any reads pooled for (chrom, position) into currentReadDict."""
+    pooled = rugged_reads_pool.pop((chrom, position), None)
+    if pooled:
+        for pooled_rec in pooled:
+            _place_read_in_dict(
+                pooled_rec, _compute_read_label(pooled_rec, params), currentReadDict
+            )
 
 
 def callBam(params, processNo):
@@ -525,205 +1236,37 @@ def callBam(params, processNo):
     RPs = []
     indel_dict = dict()
     mismatch_mat = np.zeros([64, 4])
-    indelerr_mat = np.zeros([23, 23])
+    hp_alt_mat = np.zeros([10, 12])
+    str_alt_mat = np.zeros([5, 11])
     mismatch_dmg_mat = np.zeros([64, 4])
-    indel_dmg_mat = np.zeros([23, 23])
-    trinuc2num, num2trinuc = build_trinuc64_order()
-
-    trinuc_convert_np = np.zeros([64, 4], dtype=np.uint8)
-    for trinuc in trinuc2num.keys():
-        row = np.zeros(4)
-        row_num = trinuc2num[trinuc]
-        row[0] = trinuc2num[trinuc[0] + "A" + trinuc[2]]
-        row[1] = trinuc2num[trinuc[0] + "T" + trinuc[2]]
-        row[2] = trinuc2num[trinuc[0] + "C" + trinuc[2]]
-        row[3] = trinuc2num[trinuc[0] + "G" + trinuc[2]]
-        trinuc_convert_np[row_num, :] = row
-    params["trinuc_convert"] = trinuc_convert_np
-    params["trinuc2num_dict"] = trinuc2num
-    params["num2trinuc_list"] = num2trinuc
-    ### Load amp error matrix
-    if isLearn:
-        ampmat = np.zeros([64, 4])
-    else:
-        ampmat = (
-            pd.read_csv(params["amperr_file"], sep="\t", index_col=0)
-            .to_numpy()
-            .astype(float)
-        )
-    # ampmat += 0.5
-    # A trinuc context with zero observed counts across all 4 alt bases
-    # has row sum 0; dividing those rows would produce NaN (0/0) instead
-    # of leaving them as exact zero, which regularizeErrorMat below can
-    # then correctly patch with the matrix's smallest valid value.
-    ampmat_row_sum = ampmat.sum(axis=1, keepdims=True)
-    ampmat_row_nonzero = (ampmat_row_sum != 0).flatten()
-    ampmat_normalized = np.zeros_like(ampmat)
-    ampmat_normalized[ampmat_row_nonzero, :] = (
-        ampmat[ampmat_row_nonzero, :] / ampmat_row_sum[ampmat_row_nonzero, :]
-    )
-    ampmat = ampmat_normalized
-    # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
-    ampmat_min_error = ampmat.min(axis=1, keepdims=True)
-    ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)
-    ampmat = regularizeErrorMat(ampmat, 1e-6)
-    params["ampmat"] = ampmat
-
-    ampmat_rev = np.zeros([64, 4])
-    for trinuc in trinuc2num.keys():
-        refbase = trinuc[1]
-        for nn, altbase in enumerate(["A", "T", "C", "G"]):
-            ampmat_rev[trinuc2num[trinuc], nn] = ampmat[
-                trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
-            ]
-    # ampmat_rev_avg_error = (1 - ampmat_rev.max(axis=1,keepdims=True))/3
-    ampmat_rev_min_error = ampmat_rev.min(axis=1, keepdims=True)
-    ampmat_rev = np.concatenate([ampmat_rev, ampmat_rev_min_error], axis=1)
-    params["ampmat_rev"] = ampmat_rev
-
-    if isLearn:
-        ampmat_indel = np.zeros([23, 23])
-    else:
-        ampmat_indel = np.loadtxt(params["amperri_file"], delimiter="\t", dtype=float)
-        # ampmat_indel += 0.5
-        ampmats = list()
-        ampmats.append(ampmat_indel[:, 0:11])
-        ampmats.append(ampmat_indel[:, 11:14])
-        ampmats.append(ampmat_indel[:, 14:17])
-        ampmats.append(ampmat_indel[:, 17:20])
-        ampmats.append(ampmat_indel[:, 20:23])
-        ampmats_new = list()
-        ampmats_new_rev = list()
-        for mm, mat in enumerate(ampmats):
-            row_non_zero = np.sum(mat, axis=1, keepdims=False) != 0
-            mat_new = np.zeros(mat.shape)
-            mat_new[row_non_zero, :] = mat[row_non_zero, :] / np.sum(
-                mat[row_non_zero, :], axis=1, keepdims=True
-            )
-            for nn in range(1, 20):
-                current_row = mat_new[nn, :]
-                smaller_entries = current_row <= mat_new[nn - 1, :]
-                current_row[smaller_entries] = mat_new[nn - 1, :][smaller_entries]
-                mat_new[nn, :] = current_row
-            if mm == 0:
-                str_mat = mat[20:23, 0:11]
-                str_mat_total = np.vstack(
-                    [str_mat.sum(axis=0) / str_mat.sum(axis=0).sum()] * 3
-                )
-                mat_new[20:23, 0:11][str_mat == 0] = str_mat_total[str_mat == 0]
-            ampmats_new.append(mat_new.copy())
-            ampmats_new_rev.append(np.fliplr(mat_new.copy()))
-        ampmat_indel = np.hstack(ampmats_new)
-        ampmat_indel = regularizeErrorMat(ampmat_indel, 1e-6)
-        params["ampmat_indel"] = ampmat_indel
-
-        ampmat_indel_rev = np.hstack(ampmats_new_rev)
-        ampmat_indel_rev = regularizeErrorMat(ampmat_indel_rev, 1e-6)
-        params["ampmat_indel_rev"] = ampmat_indel_rev
-
-    # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
-    # params["ampmat_indel_rev_mean"] = np.mean(ampmat_indel_rev,axis=1)
-
-    ### Load damage matrix
-    if isLearn:
-        dmgmat = np.zeros([64, 4])
-    else:
-        dmgmat = (
-            pd.read_csv(params["dmgerr_file"], sep="\t", index_col=0)
-            .to_numpy()
-            .astype(float)
-        )
-        # dmgmat += 1
-
-    # dmgmat += 0.5
-    # Same zero-row guard as ampmat above: a trinuc context with zero
-    # observed counts must stay exact zero here, not become NaN via 0/0,
-    # so regularizeErrorMat below can patch it correctly.
-    dmgmat_row_sum = dmgmat.sum(axis=1, keepdims=True)
-    dmgmat_row_nonzero = (dmgmat_row_sum != 0).flatten()
-    dmgmat_normalized = np.zeros_like(dmgmat)
-    dmgmat_normalized[dmgmat_row_nonzero, :] = (
-        dmgmat[dmgmat_row_nonzero, :] / dmgmat_row_sum[dmgmat_row_nonzero, :]
-    )
-    dmgmat = dmgmat_normalized
-    # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
-    dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
-    dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
-    dmgmat = regularizeErrorMat(dmgmat, 1e-8)
-
-    params["dmgmat_top"] = dmgmat
-    params["trinuc2num_dict"] = trinuc2num
-
-    dmgmat_rev = np.zeros([64, 4])
-    dmgmat_rev_ref_error = np.zeros(64)
-    for trinuc in trinuc2num.keys():
-        refbase = trinuc[1]
-        for nn, altbase in enumerate(["A", "T", "C", "G"]):
-            dmgmat_rev[trinuc2num[trinuc], nn] = dmgmat[
-                trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
-            ]
-    # dmgmat_rev_ref_error = 1 -  dmgmat_rev.max(axis=1, keepdims=True)
-    dmgmat_rev_ref_error = dmgmat_rev.min(axis=1, keepdims=True)
-    dmgmat_rev = np.concatenate([dmgmat_rev, dmgmat_rev_ref_error], axis=1)
-    params["dmgmat_rev_top"] = dmgmat_rev
-
-    dmgmat_b = np.vstack((dmgmat[32:64, [1, 0, 3, 2]], dmgmat[:32, [1, 0, 3, 2]]))
-    # dmgmat_b_ref_error = 1 - dmgmat_b.max(axis=1, keepdims=True)
-    dmgmat_b_ref_error = dmgmat_b.min(axis=1, keepdims=True)
-    dmgmat_rev_b = np.vstack(
-        (dmgmat_rev[32:64, [1, 0, 3, 2]], dmgmat_rev[:32, [1, 0, 3, 2]])
-    )
-    dmgmat_rev_b_ref_error = dmgmat_rev_b.min(axis=1, keepdims=True)
-    dmgmat_b = np.concatenate([dmgmat_b, dmgmat_b_ref_error], axis=1)
-    dmgmat_rev_b = np.concatenate([dmgmat_rev_b, dmgmat_rev_b_ref_error], axis=1)
-    params["dmgmat_bot"] = dmgmat_b
-    params["dmgmat_rev_bot"] = dmgmat_rev_b
-
-    if isLearn:
-        dmgmat_indel = np.zeros([21, 23])
-    else:
-        # dmgmat_indel = np.loadtxt(params["dmgerri_file"], delimiter="\t")
-        dmgmat_indel = np.loadtxt(params["dmgerri_file"], delimiter="\t", dtype=float)
-        # dmgmat_indel+= 0.5
-        dmgmats = list()
-        dmgmats.append(dmgmat_indel[:, 0:11])
-        dmgmats.append(dmgmat_indel[:, 11:14])
-        dmgmats.append(dmgmat_indel[:, 14:17])
-        dmgmats.append(dmgmat_indel[:, 17:20])
-        dmgmats.append(dmgmat_indel[:, 20:23])
-        dmgmats_new = list()
-        dmgmats_new_rev = list()
-        for mm, mat in enumerate(dmgmats):
-            row_non_zero = np.sum(mat, axis=1, keepdims=False) != 0
-            mat_new = np.zeros(mat.shape)
-            mat_new[row_non_zero, :] = mat[row_non_zero, :] / np.sum(
-                mat[row_non_zero, :], axis=1, keepdims=True
-            )
-            for nn in range(1, 20):
-                current_row = mat_new[nn, :]
-                smaller_entries = current_row <= mat_new[nn - 1, :]
-                current_row[smaller_entries] = mat_new[nn - 1, :][smaller_entries]
-                mat_new[nn, :] = current_row
-            if mm == 0:
-                str_mat = mat[20:23, 0:11]
-                str_mat_total = np.vstack(
-                    [str_mat.sum(axis=0) / str_mat.sum(axis=0).sum()] * 3
-                )
-                mat_new[20:23, 0:11][str_mat == 0] = str_mat_total[str_mat == 0]
-            dmgmats_new.append(mat_new.copy())
-            dmgmats_new_rev.append(np.fliplr(mat_new.copy()))
-        dmgmat_indel = np.hstack(dmgmats_new)
-        dmgmat_indel = regularizeErrorMat(dmgmat_indel, 1e-8)
-        params["dmgmat_indel"] = dmgmat_indel
-        dmgmat_indel_rev = np.hstack(dmgmats_new_rev)
-        dmgmat_indel_rev = regularizeErrorMat(dmgmat_indel_rev, 1e-8)
-        params["dmgmat_indel_rev"] = dmgmat_indel_rev
+    hp_dmg_mat = np.zeros([10, 12])
+    str_dmg_mat = np.zeros([5, 11])
+    # Loads/regularizes ampmat/ampmat_rev/dmgmat_top/rev_top/bot/rev_bot/
+    # ampmat_indel/ampmat_indel_rev/dmgmat_indel/dmgmat_indel_rev and sets
+    # trinuc_convert/trinuc2num_dict/num2trinuc_list on params -- see
+    # load_error_matrices's docstring for why this is a standalone,
+    # importable function rather than inlined here.
+    load_error_matrices(params)
+    trinuc2num = params["trinuc2num_dict"]
+    num2trinuc = params["num2trinuc_list"]
     # Initialize
 
     total_coverage = np.zeros(4)
     total_coverage_indel_cat = np.zeros(14)
     total_unmasked_coverage = np.zeros(4)
     total_unmasked_coverage_indel_cat = np.zeros(14)
+    # Read-family depth-composition totals: depth_mat[top_count, bot_count,
+    # category] = number of passing loci with that exact (F1R2, F2R1) count
+    # composition (each capped at 9) in that context bucket. Unlike the old
+    # per-locus dict keyed by (chrom, pos), these are pure aggregate counts
+    # -- no locus identity is kept, so there is nothing to carry across
+    # window boundaries and no cross-process boundary merging to do; see
+    # _accumulate_depth_matrix.
+    depth_by_trinuc = np.zeros((10, 10, 64), dtype=np.int64)  # 64 trinuc contexts
+    depth_by_hpstr = np.zeros(
+        (10, 10, 44), dtype=np.int64
+    )  # 40 hp (A/T/C/G x len 1-10, capped) + 4 str buckets
+    depth_by_dinuc = np.zeros((10, 10, 16), dtype=np.int64)  # 16 dinuc contexts
     starttime = time.time()
     tumorBam = BAM(bam, "rb", params.get("reference"))
     if nbams:
@@ -740,6 +1283,15 @@ def callBam(params, processNo):
     duplex_count = 0
     reference_mat_chrom = "anyChrom"
     reference_mat_start = 0
+    # Highest position already written to locus_bed for reference_mat_chrom
+    # (reset on chromosome change, below). A backward window re-init (see
+    # the rs_reference_start < reference_mat_start branch further down)
+    # can revisit positions whose coverage was already flushed under the
+    # window active before the re-init -- writing them again would corrupt
+    # the bed file's required sort order and double-count their coverage,
+    # so any flush only ever emits strictly-increasing positions and
+    # silently drops the (already-accounted-for) rest.
+    max_flushed_pos = -1
     locus_bed = bgzf.open(output + "_coverage.bed.gz", "wt")
     locus_bed_prev = bgzf.open(output + "_coverage_prev_region.tmp.bed.gz", "wt")
     locus_bed_next = bgzf.open(output + "_coverage_next_region.tmp.bed.gz", "wt")
@@ -762,7 +1314,7 @@ def callBam(params, processNo):
         read_blacklist = set()
         rec_num = 0
         for rec, region in bamIterateMultipleRegion(
-            bam, regions, params.get("reference")
+            bam, regions, params.get("reference"), params.get("region_file")
         ):
             rec_num += 1
             if rec.query_name in read_blacklist or rec.is_unmapped:
@@ -790,23 +1342,31 @@ def callBam(params, processNo):
     # Axis 1: bottom strand (F2R1) read count 0-9
     # Axis 2: trinuc context index 0-63
     # Axis 3: converted (alt) base index 0-3 (A/T/C/G)
+    # Only ever populated (via simulate_power_grid, below) in coverage_only
+    # mode -- round-1/genotyping mode leaves this all-zero, which is fine
+    # since genotypeDSSnv treats it exactly like L=None (cov_mat stays 0,
+    # see prob.py) and round 1 doesn't write coverage.bed at all.
+    coverage_only = params.get("coverage_only", False)
     L = np.zeros([10, 10, 64, 4])
 
-    # Sample base quality distribution from the BAM regions
+    # Sample base quality distribution from the BAM regions -- only needed
+    # to feed simulate_power_grid below, so skip entirely outside
+    # coverage_only mode.
     all_quals = []
-    reads_sampled = 0
-    max_qual_reads = 1000
-    for region in regions:
-        for read in tumorBam.fetch(*region):
-            if not read.is_unmapped and read.query_alignment_qualities is not None:
-                quals = np.array(read.query_alignment_qualities, dtype=float)
-                valid_quals = quals[quals > params["minBq"]]
-                all_quals.extend(valid_quals.tolist())
-                reads_sampled += 1
-                if reads_sampled >= max_qual_reads:
-                    break
-        if reads_sampled >= max_qual_reads:
-            break
+    if coverage_only:
+        reads_sampled = 0
+        max_qual_reads = 1000
+        for region in regions:
+            for read in tumorBam.fetch(*region):
+                if not read.is_unmapped and read.query_alignment_qualities is not None:
+                    quals = np.array(read.query_alignment_qualities, dtype=float)
+                    valid_quals = quals[quals > params["minBq"]]
+                    all_quals.extend(valid_quals.tolist())
+                    reads_sampled += 1
+                    if reads_sampled >= max_qual_reads:
+                        break
+            if reads_sampled >= max_qual_reads:
+                break
     if not all_quals:
         all_quals = [30]
     all_quals = np.array(all_quals, dtype=float)
@@ -818,97 +1378,121 @@ def callBam(params, processNo):
     prob_dmg_b_L = params["dmgmat_bot"]
     prob_dmg_rev_b_L = params["dmgmat_rev_bot"]
     trinuc_conv_np_L = params["trinuc_convert"]
-    ln10_L = np.log(10)
     N_SIM = 100
-    rng_L = np.random.default_rng()
+    # Each simulate_power_grid call below derives its own RNG fresh from
+    # (params["seed"], threshold) via threshold_rng instead of sharing one
+    # live generator across every context/threshold this call processes --
+    # see threshold_rng's docstring for why a shared, order-dependent RNG
+    # broke reproducibility across different -p thread counts.
+    base_seed_L = params["seed"]
 
-    for t in range(64):
-        ref_base_idx_L = base2num[num2trinuc[t][1]]
-        for b in range(4):
-            if b == ref_base_idx_L:
-                # A base "changing" to itself isn't a mutation opportunity;
-                # leave L[:, :, t, ref_base_idx_L] at its zero-initialized
-                # value instead of simulating a self-to-self detection power.
+    # Per-(trinuc context, alt base) SBS calling threshold: max(pcutoff,
+    # maxLR), where maxLR = log10(1-Pdmg_t) + log10(1-Pdmg_b)
+    # - log10(Pdmg_rev_t) - log10(Pdmg_rev_b) is the theoretical ceiling of
+    # LR_masked for that SBS type (same formula as genotypeDSSnv's
+    # LR_max/"LM" INFO field, here evaluated once per context instead of
+    # once per called family, since Pdmg_t/Pdmg_rev_t/Pdmg_b/Pdmg_rev_b
+    # only depend on context, never on read depth). Contexts t and
+    # (t+32)%64 with alt bases b and b^1 are always exact reverse
+    # complements (see build_trinuc64_order), and dmgmat_bot/
+    # dmgmat_rev_bot are themselves built from dmgmat_top/dmgmat_rev_top
+    # via that same reverse-complement mapping, so maxLR at an RC pair is
+    # always identical -- only the canonical (t<32) half needs computing;
+    # the other half is filled in by mirroring.
+    pcutoff_sbs = np.full((64, 4), pcut, dtype=float)
+    for t_ctx in range(32):
+        ref_base_idx_ctx = base2num[num2trinuc[t_ctx][1]]
+        for b_ctx in range(4):
+            if b_ctx == ref_base_idx_ctx:
                 continue
-            tc = int(trinuc_conv_np_L[t, b])
-            P_arr = np.full(N_SIM, prob_amp_mat_L[tc, ref_base_idx_L])
-            P_rev_arr = np.full(N_SIM, prob_amp_mat_rev_L[tc, ref_base_idx_L])
-            Pt_arr = np.full(N_SIM, prob_dmg_t_L[tc, ref_base_idx_L])
-            Prev_t_arr = np.full(N_SIM, prob_dmg_rev_t_L[tc, ref_base_idx_L])
-            Pb_arr = np.full(N_SIM, prob_dmg_b_L[tc, ref_base_idx_L])
-            Prev_b_arr = np.full(N_SIM, prob_dmg_rev_b_L[tc, ref_base_idx_L])
+            tc_ctx = int(trinuc_conv_np_L[t_ctx, b_ctx])
+            Pdmg_t_ctx = prob_dmg_t_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_rev_t_ctx = prob_dmg_rev_t_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_b_ctx = prob_dmg_b_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_rev_b_ctx = prob_dmg_rev_b_L[tc_ctx, ref_base_idx_ctx]
+            if Pdmg_t_ctx == 0:
+                Pdmg_t_ctx = 1e-9
+            if Pdmg_rev_t_ctx == 0:
+                Pdmg_rev_t_ctx = 1e-9
+            if Pdmg_b_ctx == 0:
+                Pdmg_b_ctx = 1e-9
+            if Pdmg_rev_b_ctx == 0:
+                Pdmg_rev_b_ctx = 1e-9
+            maxLR_ctx = (
+                np.log10(1 - Pdmg_t_ctx)
+                + np.log10(1 - Pdmg_b_ctx)
+                - np.log10(Pdmg_rev_t_ctx)
+                - np.log10(Pdmg_rev_b_ctx)
+            )
+            chosen_threshold = min(pcut, maxLR_ctx)
+            pcutoff_sbs[t_ctx, b_ctx] = chosen_threshold
+            pcutoff_sbs[t_ctx + 32, b_ctx ^ 1] = chosen_threshold
+    # Per-channel FDR-driven threshold overrides (Caller.py's post-hoc
+    # per-channel refinement), keyed by raw (trinuc, alt) index pairs --
+    # applied after the maxLR ceiling above so a rerun restricted to a
+    # handful of adjusted channels only touches L at those (t, b) cells,
+    # leaving every other cell's power table exactly as the full run built
+    # it. Absent (the normal, non-rerun path) for every other caller.
+    for (t_ov, b_ov), new_threshold in params.get("pcutoff_sbs_override", {}).items():
+        pcutoff_sbs[t_ov, b_ov] = new_threshold
+    params["pcutoff_sbs"] = pcutoff_sbs
 
-            for i in range(10):
-                for j in range(10):
-                    if i == 0 and j == 0:
-                        continue
-
-                    if i > 0:
-                        q_top = rng_L.choice(all_quals, size=(i, N_SIM), replace=True)
-                        F1R2_Pseq = -q_top / 10 * ln10_L
-                        F1R2_bin = np.ones([i, N_SIM], dtype=bool)
-                    else:
-                        F1R2_Pseq = np.zeros([0, N_SIM])
-                        F1R2_bin = np.zeros([0, N_SIM], dtype=bool)
-
-                    if j > 0:
-                        q_bot = rng_L.choice(all_quals, size=(j, N_SIM), replace=True)
-                        F2R1_Pseq = -q_bot / 10 * ln10_L
-                        F2R1_bin = np.ones([j, N_SIM], dtype=bool)
-                    else:
-                        F2R1_Pseq = np.zeros([0, N_SIM])
-                        F2R1_bin = np.zeros([0, N_SIM], dtype=bool)
-
-                    F1R2_b1, F1R2_b2 = calculateSSPosterior(
-                        P_arr, P_rev_arr, F1R2_bin, F1R2_Pseq
-                    )
-                    F2R1_b1, F2R1_b2 = calculateSSPosterior(
-                        P_arr, P_rev_arr, F2R1_bin, F2R1_Pseq
-                    )
-                    LL_B1, LL_B2 = calculateDSPosterior(
-                        Pt_arr,
-                        Prev_t_arr,
-                        Pb_arr,
-                        Prev_b_arr,
-                        F1R2_b1,
-                        F2R1_b1,
-                        F1R2_b2,
-                        F2R1_b2,
-                    )
-                    L[i, j, t, b] = ((LL_B1 - LL_B2) >= pcut).mean()
+    if coverage_only:
+        for t in range(64):
+            ref_base_idx_L = base2num[num2trinuc[t][1]]
+            for b in range(4):
+                if b == ref_base_idx_L:
+                    # A base "changing" to itself isn't a mutation
+                    # opportunity; leave L[:, :, t, ref_base_idx_L] at its
+                    # zero-initialized value instead of simulating a
+                    # self-to-self detection power.
+                    continue
+                tc = int(trinuc_conv_np_L[t, b])
+                L[:, :, t, b] = simulate_power_grid(
+                    prob_amp_mat_L[tc, ref_base_idx_L],
+                    prob_amp_mat_rev_L[tc, ref_base_idx_L],
+                    prob_dmg_t_L[tc, ref_base_idx_L],
+                    prob_dmg_rev_t_L[tc, ref_base_idx_L],
+                    prob_dmg_b_L[tc, ref_base_idx_L],
+                    prob_dmg_rev_b_L[tc, ref_base_idx_L],
+                    pcutoff_sbs[t, b],
+                    all_quals,
+                    threshold_rng(base_seed_L, pcutoff_sbs[t, b]),
+                    N_SIM,
+                )
 
     # Build indel detection-power tables, analogous to L above but for indel
     # calling. genotypeDSIndel classifies each candidate indel by repeat
-    # context (hps: homopolymer run length 0-20, strs: STR length bin 0-3)
+    # context (hps: homopolymer run length 0-10, capped; strs: STR length
+    # bin 0-3)
     # and indel length (idLen), then selects Pamp/Pdmg via indelErrorProbs.
     # These tables simulate that same selection across every (top count,
     # bottom count) combination and precompute the fraction of simulations
-    # that would clear indel calling's tiered pcutoffi threshold, so
+    # that would clear indel calling's per-context pcutoffi threshold, so
     # per-position indel coverage can be looked up by depth+context instead
     # of re-simulated. Only built outside learn mode: ampmat_indel/
     # dmgmat_indel (and pcutoffi-driven calling) aren't used in learn mode.
+    # Defaults for isLearn mode, where neither table is built below --
+    # kept as None (rather than omitted) so callBam's return signature is
+    # identical in both modes.
+    L_indel_1bp = None
+    L_indel_len = None
     if not isLearn:
-        prob_amp_indel_L = params["ampmat_indel"]
-        prob_amp_indel_rev_L = params["ampmat_indel_rev"]
-        prob_dmg_indel_L = params["dmgmat_indel"]
-        prob_dmg_indel_rev_L = params["dmgmat_indel_rev"]
+        prob_amp_hp_L = params["ampmat_hp"]
+        prob_dmg_hp_L = params["dmgmat_hp"]
+        prob_amp_str_L = params["ampmat_str"]
+        prob_dmg_str_L = params["dmgmat_str"]
         pcutoffi_L = params["pcutoffi"]
 
-        def indelTierThreshold(hps_c, strs_c):
-            # Mirrors the OR'd tiering used to build LR_pass_bool for real
-            # indel calls: hps<=5 -> tier0, 5<hps<=10 -> tier1, hps>10 ->
-            # tier2, and strs>0 additionally ORs in tier2. OR'ing two
-            # `LR >= x` comparisons on the same LR is equivalent to
-            # comparing against the smaller threshold.
-            if hps_c <= 5:
-                threshold = pcutoffi_L[0]
-            elif hps_c <= 10:
-                threshold = pcutoffi_L[1]
-            else:
-                threshold = pcutoffi_L[2]
-            if strs_c > 0:
-                threshold = min(threshold, pcutoffi_L[2])
-            return threshold
+        def indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c):
+            # Uniform default cutoff, capped per-context by the theoretical
+            # ceiling of masked LR for that context (same formula as
+            # genotypeDSSnv's LR_max/"LM" field -- see indelMaxLR), mirroring
+            # pcutoff_sbs's min(pcut, maxLR_ctx) treatment above.
+            return min(
+                pcutoffi_L,
+                float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c)),
+            )
 
         def simulateIndelPowerGrid(
             Pamp_c,
@@ -919,58 +1503,92 @@ def callBam(params, processNo):
             Pdmg_rev_bot_c,
             threshold,
         ):
-            grid = np.zeros([10, 10])
-            P_arr = np.full(N_SIM, Pamp_c)
-            P_rev_arr = np.full(N_SIM, Pamp_rev_c)
-            Pt_arr = np.full(N_SIM, Pdmg_c)
-            Prev_t_arr = np.full(N_SIM, Pdmg_rev_c)
-            Pb_arr = np.full(N_SIM, Pdmg_bot_c)
-            Prev_b_arr = np.full(N_SIM, Pdmg_rev_bot_c)
-            for i in range(10):
-                for j in range(10):
-                    if i == 0 and j == 0:
-                        continue
-                    if i > 0:
-                        q_top = rng_L.choice(all_quals, size=(i, N_SIM), replace=True)
-                        F1R2_Pseq = -q_top / 10 * ln10_L
-                        F1R2_bin = np.ones([i, N_SIM], dtype=bool)
-                    else:
-                        F1R2_Pseq = np.zeros([0, N_SIM])
-                        F1R2_bin = np.zeros([0, N_SIM], dtype=bool)
-                    if j > 0:
-                        q_bot = rng_L.choice(all_quals, size=(j, N_SIM), replace=True)
-                        F2R1_Pseq = -q_bot / 10 * ln10_L
-                        F2R1_bin = np.ones([j, N_SIM], dtype=bool)
-                    else:
-                        F2R1_Pseq = np.zeros([0, N_SIM])
-                        F2R1_bin = np.zeros([0, N_SIM], dtype=bool)
-                    F1R2_b1, F1R2_b2 = calculateSSPosterior(
-                        P_arr, P_rev_arr, F1R2_bin, F1R2_Pseq
-                    )
-                    F2R1_b1, F2R1_b2 = calculateSSPosterior(
-                        P_arr, P_rev_arr, F2R1_bin, F2R1_Pseq
-                    )
-                    LL_B1, LL_B2 = calculateDSPosterior(
-                        Pt_arr,
-                        Prev_t_arr,
-                        Pb_arr,
-                        Prev_b_arr,
-                        F1R2_b1,
-                        F2R1_b1,
-                        F1R2_b2,
-                        F2R1_b2,
-                    )
-                    grid[i, j] = ((LL_B1 - LL_B2) >= threshold).mean()
-            return grid
+            return simulate_power_grid(
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+                threshold,
+                all_quals,
+                threshold_rng(base_seed_L, threshold),
+                N_SIM,
+            )
 
         # 1bp indels (deletion/insertion of a homopolymer's repeat unit):
-        # axes are top count, bottom count, hps (0-20), ref_allele (0-3),
-        # sign (0=deletion idLen=-1, 1=insertion idLen=+1).
-        L_indel_1bp = np.zeros([10, 10, 21, 4, 2])
-        for hps_c in range(21):
-            threshold = indelTierThreshold(hps_c, 0)
-            for ref_allele_c in range(4):
-                for sign_idx, idLen_c in enumerate((-1, 1)):
+        # axes are top count, bottom count, hps (0-10, capped), ref_allele
+        # (0-3), sign (0=deletion idLen=-1, 1=insertion idLen=+1).
+        # inserted_base is passed equal to ref_allele_c throughout -- this
+        # grid represents the true same-base homopolymer-extension
+        # opportunity at a position with this (hps, ref_allele) context
+        # (what genotypeDSIndel/depth_by_hpstr's base axis actually means),
+        # not an arbitrary mismatched-base scenario. A mismatched 1bp
+        # insertion (str.txt row 0) has no per-(hps, base) coverage grid of
+        # its own -- known gap, see funcs/call.py's indelErrorProbs
+        # docstring and Caller.py's channel job-building for the same
+        # scoping note; such candidates still get scored correctly by
+        # genotypeDSIndel, they just don't get an FDR-refined threshold.
+        L_indel_1bp = np.zeros([10, 10, 11, 4, 2])
+        indel_1bp_threshold_override = params.get("indel_1bp_threshold_override", {})
+        if coverage_only:
+            for hps_c in range(11):
+                for ref_allele_c in range(4):
+                    for sign_idx, idLen_c in enumerate((-1, 1)):
+                        (
+                            Pamp_c,
+                            Pamp_rev_c,
+                            Pdmg_c,
+                            Pdmg_rev_c,
+                            Pdmg_bot_c,
+                            Pdmg_rev_bot_c,
+                        ) = indelErrorProbs(
+                            hps_c,
+                            0,
+                            idLen_c,
+                            ref_allele_c,
+                            ref_allele_c,
+                            prob_amp_hp_L,
+                            prob_dmg_hp_L,
+                            prob_amp_str_L,
+                            prob_dmg_str_L,
+                        )
+                        # Per-(hp length, sign, base pool) FDR-driven
+                        # override, same idea as pcutoff_sbs_override
+                        # above; falls back to the per-context threshold
+                        # when absent. Pool ("C"=C/G, "T"=A/T) matches
+                        # Caller.py's raw_lr_hp accumulation -- base2num
+                        # order A,T,C,G, so ref_allele_c in (2,3) is "C".
+                        pool_c = "C" if ref_allele_c in (2, 3) else "T"
+                        threshold = indel_1bp_threshold_override.get(
+                            (hps_c, sign_idx, pool_c),
+                            indelContextThreshold(
+                                Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
+                            ),
+                        )
+                        L_indel_1bp[
+                            :, :, hps_c, ref_allele_c, sign_idx
+                        ] = simulateIndelPowerGrid(
+                            Pamp_c,
+                            Pamp_rev_c,
+                            Pdmg_c,
+                            Pdmg_rev_c,
+                            Pdmg_bot_c,
+                            Pdmg_rev_bot_c,
+                            threshold,
+                        )
+
+        # Length-bin indels (raw length 2/3/4/5+, either direction): axes
+        # are top count, bottom count, STR-length-bin row (0="0-1"/not a
+        # real repeat through 4="40+"), idLen+5. Always STR-context -- a
+        # length>=2 indel outside an annotated repeat is row 0, so this is
+        # a single loop over all 5 str.txt rows.
+        L_indel_len = np.zeros([10, 10, 5, 11])
+        len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
+        indel_len_threshold_override = params.get("indel_len_threshold_override", {})
+        if coverage_only:
+            for strs_c in range(5):
+                for idLen_c in len_idLens:
                     (
                         Pamp_c,
                         Pamp_rev_c,
@@ -979,18 +1597,23 @@ def callBam(params, processNo):
                         Pdmg_bot_c,
                         Pdmg_rev_bot_c,
                     ) = indelErrorProbs(
-                        hps_c,
-                        0,
+                        1,
+                        strs_c,
                         idLen_c,
-                        ref_allele_c,
-                        prob_amp_indel_L,
-                        prob_amp_indel_rev_L,
-                        prob_dmg_indel_L,
-                        prob_dmg_indel_rev_L,
+                        0,
+                        0,
+                        prob_amp_hp_L,
+                        prob_dmg_hp_L,
+                        prob_amp_str_L,
+                        prob_dmg_str_L,
                     )
-                    L_indel_1bp[
-                        :, :, hps_c, ref_allele_c, sign_idx
-                    ] = simulateIndelPowerGrid(
+                    threshold = indel_len_threshold_override.get(
+                        (strs_c, idLen_c),
+                        indelContextThreshold(
+                            Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
+                        ),
+                    )
+                    L_indel_len[:, :, strs_c, idLen_c + 5] = simulateIndelPowerGrid(
                         Pamp_c,
                         Pamp_rev_c,
                         Pdmg_c,
@@ -999,80 +1622,62 @@ def callBam(params, processNo):
                         Pdmg_rev_bot_c,
                         threshold,
                     )
+            # Row 0 ("not a real repeat") at idLen=+1 specifically: the
+            # mismatched-insertion background scenario (str.txt row 0's
+            # only real column), needed below for the "Insertion A/T/C/G"
+            # coverage columns -- a *novel* insertion (next reference base
+            # != the inserted base, i.e. not a repeat extension; see that
+            # code's own comment), which is exactly the row-0/mismatch
+            # context, not the hp.txt/matching one L_indel_1bp represents.
+            # Not part of len_idLens above since every other +-1bp
+            # scenario is HP-context, handled by L_indel_1bp instead.
+            (
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+            ) = indelErrorProbs(
+                1,
+                0,
+                1,
+                0,
+                1,
+                prob_amp_hp_L,
+                prob_dmg_hp_L,
+                prob_amp_str_L,
+                prob_dmg_str_L,
+            )
+            threshold = indel_len_threshold_override.get(
+                (0, 1),
+                indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c),
+            )
+            L_indel_len[:, :, 0, 6] = simulateIndelPowerGrid(
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+                threshold,
+            )
 
-        # Length-bin indels (raw length 2/3/4/5+, either direction): axes are
-        # top count, bottom count, row (0-22, same hps-1/19+strs convention
-        # as ampmat_indel), idLen+5 (0-10, only 8 of 11 slots populated).
-        # Rows 0-19 are HP-context (hps 1-20); rows 20-22 are STR-context
-        # (strs 1-3, hps forced to 1, matching genotypeDSIndel/indelErrorProbs).
-        L_indel_len = np.zeros([10, 10, 23, 11])
-        len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
-        for hps_c in range(1, 21):
-            row = hps_c - 1
-            threshold = indelTierThreshold(hps_c, 0)
-            for idLen_c in len_idLens:
-                (
-                    Pamp_c,
-                    Pamp_rev_c,
-                    Pdmg_c,
-                    Pdmg_rev_c,
-                    Pdmg_bot_c,
-                    Pdmg_rev_bot_c,
-                ) = indelErrorProbs(
-                    hps_c,
-                    0,
-                    idLen_c,
-                    0,
-                    prob_amp_indel_L,
-                    prob_amp_indel_rev_L,
-                    prob_dmg_indel_L,
-                    prob_dmg_indel_rev_L,
-                )
-                L_indel_len[:, :, row, idLen_c + 5] = simulateIndelPowerGrid(
-                    Pamp_c,
-                    Pamp_rev_c,
-                    Pdmg_c,
-                    Pdmg_rev_c,
-                    Pdmg_bot_c,
-                    Pdmg_rev_bot_c,
-                    threshold,
-                )
-        for strs_c in range(1, 4):
-            row = 19 + strs_c
-            threshold = indelTierThreshold(1, strs_c)
-            for idLen_c in len_idLens:
-                (
-                    Pamp_c,
-                    Pamp_rev_c,
-                    Pdmg_c,
-                    Pdmg_rev_c,
-                    Pdmg_bot_c,
-                    Pdmg_rev_bot_c,
-                ) = indelErrorProbs(
-                    1,
-                    strs_c,
-                    idLen_c,
-                    0,
-                    prob_amp_indel_L,
-                    prob_amp_indel_rev_L,
-                    prob_dmg_indel_L,
-                    prob_dmg_indel_rev_L,
-                )
-                L_indel_len[:, :, row, idLen_c + 5] = simulateIndelPowerGrid(
-                    Pamp_c,
-                    Pamp_rev_c,
-                    Pdmg_c,
-                    Pdmg_rev_c,
-                    Pdmg_bot_c,
-                    Pdmg_rev_bot_c,
-                    threshold,
-                )
-
-    retain_base = 5
-    currentReadDictList = [
-        dict() for _ in range(retain_base)
-    ]  # Adjustable parameter pending
-    for rec, region in bamIterateMultipleRegion(bam, regions, params.get("reference")):
+    # Families are keyed by label and require an exact reference_start match.
+    currentReadDict = {}
+    # rugged_reads_index/rugged_reads_pool: reroute a downstream mate whose
+    # own alignment start disagrees with the rest of its anchor family's
+    # next_reference_start into that family's majority-position group.
+    rugged_reads_index = {}
+    rugged_reads_pool = {}
+    # Chromosome of the entries currently held in rugged_reads_index/
+    # rugged_reads_pool, so they can be dropped in bulk once we move past
+    # it (see the purge below) instead of leaking for the rest of the
+    # process's lifetime.
+    rugged_pool_chrom = None
+    for rec, region in bamIterateMultipleRegion(
+        bam, regions, params.get("reference"), params.get("region_file")
+    ):
         recCount += 1
         if recCount == currentCheckPoint:
             currentTime = (time.time() - starttime) / 60
@@ -1102,64 +1707,51 @@ def callBam(params, processNo):
         ):
             continue
         pass_read_num += 1
+        if rec.template_length < 0 and rec.query_name in rugged_reads_index:
+            rugged_reads_pool[rugged_reads_index.pop(rec.query_name)].append(rec)
+            continue
         start = rec.reference_start
-        bc = rec.query_name.split("_")[-1]
-        bcsplit = bc.split("+")
-        bc1 = bcsplit[0]
-        bc2 = bcsplit[1]
-        if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
-            label = bc1 + "+" + bc2 + "+" + str(rec.template_length)
-        else:
-            label = bc2 + "+" + bc1 + "+" + str(rec.template_length)
+        label = _compute_read_label(rec, params)
         chrom = tumorBam.get_reference_name(rec.reference_id)
+        if chrom != rugged_pool_chrom:
+            # BAM is coordinate-sorted, so once we've moved past a
+            # chromosome any redirect still sitting in rugged_reads_pool/
+            # rugged_reads_index for it (its downstream mate was filtered
+            # out or never turned up in this process's region) can never
+            # be matched -- drop it now rather than hold onto it, and
+            # every prior chromosome's leftovers, for the rest of the
+            # process.
+            rugged_reads_pool.clear()
+            rugged_reads_index.clear()
+            rugged_pool_chrom = chrom
         if currentStart == -1:
             currentStart = start
+            _drain_rugged_pool(
+                chrom, currentStart, rugged_reads_pool, params, currentReadDict
+            )
         if start == currentStart:
-            has_same_label_flag = False
-            for rb in range(retain_base):
-                if currentReadDictList[rb].get(label):
-                    currentReadDictList[rb][label]["seqs"].append(rec)
-                    currentReadDictList[rb][label]["names"][rec.query_name] = (
-                        len(currentReadDictList[rb][label]["seqs"]) - 1
-                    )
-                    if (rec.is_forward and rec.is_read1) or (
-                        rec.is_reverse and rec.is_read2
-                    ):
-                        currentReadDictList[rb][label]["F1R2"] += 1
-                    else:
-                        currentReadDictList[rb][label]["F2R1"] += 1
-                    has_same_label_flag = True
-                    break
-
-            if not has_same_label_flag:
-                # else:
-                currentReadDictList[-1].update(
-                    {
-                        label: {
-                            "seqs": [rec],
-                            "F1R2": 0,
-                            "F2R1": 0,
-                            "names": {rec.query_name: 0},
-                        }
-                    }
-                )
-                if (rec.is_forward and rec.is_read1) or (
-                    rec.is_reverse and rec.is_read2
-                ):
-                    currentReadDictList[retain_base - 1][label]["F1R2"] += 1
-                else:
-                    currentReadDictList[retain_base - 1][label]["F2R1"] += 1
+            _place_read_in_dict(rec, label, currentReadDict)
             # print(currentStart,start)
         else:
-            # print(currentReadDictList)
             """
             Calling block starts
             """
-            # print(currentReadDictList):
-            currentReadDict = dict()
-            for _ in range(min(start - currentStart, retain_base)):
-                currentReadDict |= currentReadDictList.pop(0)
-                currentReadDictList.append(dict())
+            _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool)
+            # _drain_rugged_pool (above, at the previous batch transition) can
+            # merge a read into a family at this batch's currentStart even
+            # though the read's own true reference_start is a few bp earlier
+            # (that's the whole point -- reconciling a minority mate whose
+            # alignment disagrees slightly with the rest of its family). So
+            # the first key that ends up establishing/extending the
+            # reference window below isn't guaranteed to have the earliest
+            # start of any key still to come in this same batch, and a
+            # later key's start_ind can go negative. Floor the window at the
+            # batch's true minimum read start to rule that out up front.
+            batch_min_start = min(
+                r.reference_start
+                for entry in currentReadDict.values()
+                for r in entry["seqs"]
+            )
             for key in currentReadDict.keys():
                 flt_rs = "PASS"
                 readSet = currentReadDict[key]["seqs"]
@@ -1232,11 +1824,28 @@ def callBam(params, processNo):
                     rs_reference_start = min([r.reference_start for r in readSet])
 
                     chromNow = readSet[0].reference_name
+                    contig_len_now = tumorBam.get_reference_length(chromNow)
+                    if rs_reference_start >= contig_len_now:
+                        # A read set can't be placed in any window bounded by
+                        # its own chromosome's length -- skip it rather than
+                        # building a zero/negative-length reference window
+                        # that crashes the downstream mask slicing.
+                        print(
+                            f"WARNING: skipping read set at {chromNow}:"
+                            f"{rs_reference_start}-{rs_reference_end}, which "
+                            f"starts at or beyond the contig length "
+                            f"({contig_len_now})"
+                        )
+                        continue
                     if (
                         chromNow != reference_mat_chrom
                         or rs_reference_end > reference_mat_end
+                        or rs_reference_start < reference_mat_start
                     ):
                         ### Output coverage
+                        # Original per-locus multi-column coverage write-out
+                        # (per-subprocess only -- Caller.py does not merge
+                        # these across process boundaries yet).
                         if "coverage" in locals():
                             if "coverage_leftover" in locals():
                                 coverage[
@@ -1255,7 +1864,22 @@ def callBam(params, processNo):
                                 unmasked_coverage_indel_cat_leftover = np.zeros((1, 14))
                                 coverage_leftover = np.zeros((1, 4))
                                 coverage_indel_cat_leftover = np.zeros((1, 14))
-                            if chromNow == reference_mat_chrom:
+                            if (
+                                chromNow == reference_mat_chrom
+                                and rs_reference_start >= reference_mat_start
+                            ):
+                                # Forward progress within the same
+                                # chromosome: the new window starts inside
+                                # the old window's range, so the old
+                                # window's tail is still relevant and gets
+                                # carried forward as "leftover" rather than
+                                # flushed immediately. A *backward* trigger
+                                # (rs_reference_start < reference_mat_start)
+                                # can't reuse this -- the new window's
+                                # positions aren't a re-based slice of the
+                                # old coverage array -- so it falls through
+                                # to the full-flush branch below instead,
+                                # same as a chromosome change.
                                 coverage_leftover = copy.deepcopy(
                                     coverage[
                                         (rs_reference_start - reference_mat_start) : (
@@ -1299,6 +1923,14 @@ def callBam(params, processNo):
                                 )
                             for pos in non_zero_positions[0].tolist():
                                 current_pos = pos + reference_mat_start
+                                if current_pos <= max_flushed_pos:
+                                    # Already flushed under the window
+                                    # active before a backward re-init (see
+                                    # the max_flushed_pos comment above) --
+                                    # skip to avoid an out-of-order bed
+                                    # line and double-counting.
+                                    continue
+                                max_flushed_pos = current_pos
                                 bed_file = get_bed_file_for_position(
                                     current_pos,
                                     reference_mat_chrom,
@@ -1331,16 +1963,34 @@ def callBam(params, processNo):
                                     unmasked_coverage_indel_cat[pos]
                                 )
                         # if chromNow != reference_mat_chrom:
+                        if chromNow != reference_mat_chrom:
+                            max_flushed_pos = -1
                         reference_mat_chrom = chromNow
                         # current_reference = str(fasta[reference_mat_chrom].seq)
-                        reference_mat_start = rs_reference_start
+                        # batch_min_start <= rs_reference_start always (it's
+                        # the min over every key in this batch, of which
+                        # this key's readSet is one) -- use it so a later
+                        # key in this same batch can never start before the
+                        # window.
+                        reference_mat_start = batch_min_start
                         try:
                             region_end = region[2]
                         except:
                             region_end = 10e10
-                        contig_end = tumorBam.get_reference_length(chromNow)
+                        contig_end = contig_len_now
+                        # The +1000000 cap must be measured from
+                        # reference_mat_start (batch_min_start), not from
+                        # this key's own rs_reference_start -- coverage/
+                        # coverage_indel_cat/etc. below are fixed at
+                        # 1,000,000 rows, so basing the cap on the
+                        # unfloored rs_reference_start could let the
+                        # window (reference_mat_end - reference_mat_start)
+                        # exceed 1,000,000 whenever batch_min_start pulled
+                        # the start back, silently truncating those
+                        # arrays relative to ref_np/trinuc_np/masks (which
+                        # aren't capped at 1,000,000).
                         reference_mat_end = min(
-                            rs_reference_start + 1000000,
+                            reference_mat_start + 1000000,
                             max(
                                 region_end, max([seq.reference_end for seq in readSet])
                             ),
@@ -1459,6 +2109,19 @@ def callBam(params, processNo):
                     unmasked_antimask = np.all(~masks[2:, :], axis=0)
                     unmasked_antimask[trinuc_np[start_ind:end_ind] > 64] = False
                     unmasked_antimask[ref_np[start_ind:end_ind] == 4] = False
+                    # Rescue eligibility: clear of include_mask only (row 3
+                    # -- the one mask that's never rescuable, full stop).
+                    # snp_mask/noise_mask (rows 0,1) are handled upstream by
+                    # unmasked_pass_bool/unmasked_antimask, which already
+                    # let a position blocked *only* by snp/noise through as
+                    # a genuine PASS (see the flt assignment below), so this
+                    # fallback is only ever reached when something else
+                    # (n_cov_mask/nm_mask/trim) is also blocking it. Used
+                    # only to pick a rescue-reason flt_rs label below when
+                    # params["rescue"] is set; never feeds pass_bool/coverage.
+                    rescue_antimask = ~masks[3, :]
+                    rescue_antimask[trinuc_np[start_ind:end_ind] > 64] = False
+                    rescue_antimask[ref_np[start_ind:end_ind] == 4] = False
                     learn_antimask = np.all(~masks[3:, :], axis=0)
                     learn_antimask[trinuc_np[start_ind:end_ind] > 64] = False
                     learn_antimask[ref_np[start_ind:end_ind] == 4] = False
@@ -1485,9 +2148,28 @@ def callBam(params, processNo):
                         masks_indel[4, :] = include_mask[start_ind:end_ind_max]
                         masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
                         antimask_indel = np.all(~masks_indel, axis=0)
-                        unmasked_antimask_indel = np.all(~masks_indel[2:, :], axis=0)
+                        # Ignores noise_mask only (row 1) -- indel_mask
+                        # stays a real block here (unlike the SNV side's
+                        # snp_mask, indel_mask is --rescue-gated, not
+                        # unconditional; see the clarified mask split
+                        # below). Used both for the true-PASS decision in
+                        # the flt assignment further down and for
+                        # unmasked-coverage tracking, so the numerator
+                        # (mutations let through here) and denominator
+                        # (opportunity counted as unmasked) stay
+                        # consistent with each other.
+                        unmasked_antimask_indel = np.all(
+                            ~masks_indel[[0, 2, 3, 4, 5], :], axis=0
+                        )
+                        # Same rescue-eligibility split as the SNV side:
+                        # never-rescuable is include_mask only (row 4).
+                        # noise_mask (row 1) is handled upstream by
+                        # unmasked_antimask_indel (see the flt assignment
+                        # below); indel_mask (row 0) is part of the
+                        # rescuable set along with n_cov_mask/trim/nm_mask
+                        # (rows 2,3,5).
+                        rescue_antimask_indel = ~masks_indel[4, :]
                         (
-                            CS,
                             LR_raw,
                             LR_max,
                             indels,
@@ -1497,52 +2179,39 @@ def callBam(params, processNo):
                             F1R2_alt_count,
                             F2R1_ref_count,
                             F2R1_alt_count,
+                            hp_match,
                         ) = genotypeDSIndel(
                             readSet,
                             rs_reference_start,
                             rs_reference_end,
                             ref_np[start_ind:end_ind],
-                            unmasked_antimask_indel,
+                            # Wide (rescue) scope, not unmasked_antimask_indel
+                            # -- candidate detection only ever needs
+                            # include_mask clear now; n_cov/nm/trim/
+                            # indel_mask no longer block detection, only
+                            # PASS-vs-rescue-label reporting downstream.
+                            # cov_mat_indel (coverage/opportunity) is
+                            # computed independently below via
+                            # unmasked_antimask_indel, unaffected by this.
+                            rescue_antimask_indel,
                             hp_raw_np[:, start_ind:end_ind],
                             str_raw_np[:, start_ind:end_ind],
                             params,
                         )
                         # print(LR_max)
-                        # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
-
-                        # pass_inds = np.nonzero(LR_raw >= params["pcutoffi"])[0].tolist()
-                        # pass_inds = np.nonzero(LR_raw >= params["pcutoffi"])[0].tolist()
-                        pass_inds = np.nonzero(CS >= params["cscutoffi"])[0].tolist()
-                        # LR_pass_bool = (LR_raw >= params["pcutoffi"])
+                        # No CS-based prefilter -- every genotyped candidate
+                        # indel is emitted, tagged "masked" or "PASS" by the
+                        # antimask/LR_pass_bool checks below.
+                        pass_inds = list(range(len(indels)))
                         if len(LR_raw) > 0:
-                            LR_pass_bool = np.zeros(len(LR_raw), dtype=bool)
-                            LR_pass_bool[
-                                np.logical_and(
-                                    LR_raw >= params["pcutoffi"][0], hps <= 5
-                                )
-                            ] = True
-                            LR_pass_bool[
-                                np.all(
-                                    np.vstack(
-                                        [
-                                            LR_raw >= params["pcutoffi"][1],
-                                            hps <= 10,
-                                            hps > 5,
-                                        ]
-                                    ),
-                                    axis=0,
-                                )
-                            ] = True
-                            LR_pass_bool[
-                                np.logical_and(
-                                    LR_raw >= params["pcutoffi"][2], hps > 10
-                                )
-                            ] = True
-                            LR_pass_bool[
-                                np.logical_and(
-                                    LR_raw >= params["pcutoffi"][2], strs > 0
-                                )
-                            ] = True
+                            # ts/ti removed: any candidate with a positive
+                            # LR is treated as a candidate mutation, capped
+                            # per-call by that call's own theoretical LR
+                            # ceiling (LR_max/"LM", already
+                            # context-specific -- see indelMaxLR).
+                            LR_pass_bool = LR_raw > np.minimum(
+                                params["pcutoffi"], LR_max
+                            )
                         indels_pass = [indels[_] for _ in pass_inds]
                         for nn in range(len(indels_pass)):
                             indel = indels_pass[nn]
@@ -1613,21 +2282,52 @@ def callBam(params, processNo):
                                 offset = 0
                             else:
                                 offset = -indel_size
-                            unmasked_flag = antimask_indel[
-                                indel_pos
-                                - reference_mat_start
-                                - start_ind : indel_pos
-                                - reference_mat_start
-                                - start_ind
-                                + offset
-                                + 1
-                            ].all()
-                            if unmasked_flag and LR_pass_bool[nn]:
+                            indel_slice_start = (
+                                indel_pos - reference_mat_start - start_ind
+                            )
+                            indel_slice = slice(
+                                indel_slice_start, indel_slice_start + offset + 1
+                            )
+                            if not LR_pass_bool[nn]:
+                                # Never above the round-1 candidate floor
+                                # (LR<=0): no evidence of a real
+                                # duplex-confirmed indel, so no record at
+                                # all, regardless of --rescue.
+                                continue
+                            if antimask_indel[indel_slice].all():
+                                # Fully unmasked (noise_mask included) and
+                                # clears threshold: genuine PASS.
                                 flt = flt_rs
-                            elif unmasked_flag:
-                                flt = "underpowered"
-                            else:
+                            elif unmasked_antimask_indel[indel_slice].all():
+                                # Blocked only by noise_mask -- still
+                                # fully evaluated (LR + depth extracted
+                                # below, always-on) so it feeds the
+                                # unmasked-burden numerator, but the label
+                                # stays "masked"; NOISEM INFO tag records
+                                # why.
                                 flt = "masked"
+                            elif (
+                                params["rescue"]
+                                and rescue_antimask_indel[indel_slice].all()
+                            ):
+                                # Fails only a rescuable mask (n_cov/nm/
+                                # trim/indel_mask, never include) --
+                                # reported, but no depth-extraction (see
+                                # the eligibility check further down this
+                                # function).
+                                flt = _rescue_reason_label(
+                                    masks_indel[2, indel_slice],
+                                    masks_indel[5, indel_slice],
+                                    masks_indel[3, indel_slice],
+                                    extra_flag=masks_indel[0, indel_slice],
+                                    extra_label="indelregion_rescued",
+                                )
+                            else:
+                                # Blocked by something other than noise,
+                                # and either --rescue is off or this is
+                                # include_mask (never rescuable): no
+                                # record at all.
+                                continue
 
                             indel_rec = {
                                 "chrom": chromNow,
@@ -1645,7 +2345,6 @@ def callBam(params, processNo):
                                         + F2R1_ref_count[pass_inds[nn]]
                                     ),
                                     # "LR": LR[pass_inds[0]],
-                                    "CS": CS[pass_inds[nn]],
                                     "LR": LR_raw[pass_inds[nn]],
                                     "LM": LR_max[pass_inds[nn]],
                                     # "BLR": F2R1_LR[pass_inds[0]],
@@ -1670,6 +2369,23 @@ def callBam(params, processNo):
                                     "HP": hps[pass_inds[nn]],
                                     "TL": readSet[0].template_length,
                                     "STR": strs[nn],
+                                    # 1 if this +-1bp indel matches its own
+                                    # flanking homopolymer (hp.txt) or is a
+                                    # deletion (always matches); 0 if it's
+                                    # a mismatched insertion (str.txt row
+                                    # 0). Meaningless/always 1 for length
+                                    # >=2 events, which don't have a
+                                    # match/mismatch distinction. Lets
+                                    # Caller.py's channel classification
+                                    # route a real PASS call the same way
+                                    # indelErrorProbs did, instead of
+                                    # approximating.
+                                    "HM": int(hp_match[pass_inds[nn]]),
+                                    # No snp_mask concept for indels --
+                                    # placeholder so infoDict (shared with
+                                    # SNV) always finds the key.
+                                    "SNPM": 0,
+                                    "NOISEM": int(np.any(masks_indel[1, indel_slice])),
                                 },
                                 "formats": ["AC", "RC", "DP"],
                                 # "samples": [[ta, tr, tdp], [na, nr, ndp]],
@@ -1683,9 +2399,11 @@ def callBam(params, processNo):
                         if isLearn and F1R2 > 2 and F2R1 > 2:
                             (
                                 mismatch_now,
-                                indelerr_now,
+                                hp_alt_now,
+                                str_alt_now,
                                 mismatch_dmg_now,
-                                indel_dmg_now,
+                                hp_dmg_now,
+                                str_dmg_now,
                             ) = profileTriNucMismatches(
                                 readSet,
                                 rs_reference_start,
@@ -1697,14 +2415,15 @@ def callBam(params, processNo):
                                 params,
                             )
                             mismatch_mat += mismatch_now
-                            indelerr_mat += indelerr_now
+                            hp_alt_mat += hp_alt_now
+                            str_alt_mat += str_alt_now
                             mismatch_dmg_mat += mismatch_dmg_now
-                            indel_dmg_mat += indel_dmg_now
+                            hp_dmg_mat += hp_dmg_now
+                            str_dmg_mat += str_dmg_now
                         if isLearn:
                             continue
                         (
                             cov_mat,
-                            CS_mut,
                             LR_raw_mut,
                             LR_max_mut,
                             mut_mask,
@@ -1719,6 +2438,13 @@ def callBam(params, processNo):
                             trinuc_np[start_ind:end_ind],
                             prior_mat[start_ind:end_ind, :],
                             np.copy(unmasked_antimask),
+                            # Wide (rescue) scope for candidate detection
+                            # only -- cov_mat above stays gated by the
+                            # narrow antimask (unmasked_antimask), so
+                            # n_cov/nm/trim-masked positions still don't
+                            # contribute to coverage/opportunity even
+                            # though they can now surface a real LR here.
+                            np.copy(rescue_antimask),
                             params,
                             L,
                         )
@@ -1739,21 +2465,43 @@ def callBam(params, processNo):
                             )
                             is_hp = unit_len_arr <= 1
                             hps_for_row = np.where(
-                                is_hp, np.minimum(repeat_count_arr, 20), 1
+                                is_hp, np.minimum(repeat_count_arr, 10), 1
                             )
                             total_len_arr = unit_len_arr * repeat_count_arr
-                            strs_for_row = np.zeros_like(total_len_arr)
+                            # STR-length bin for L_indel_len's row axis
+                            # (1="2-9" through 4="40+") -- always >=1
+                            # wherever ~is_hp (unit_len>=2 there implies a
+                            # real annotated repeat by construction, so
+                            # there's no more "not really a repeat"
+                            # fallback to an hp-length row; row 0 of
+                            # L_indel_len is reserved for genuinely
+                            # unannotated positions, which this branch
+                            # never represents since is_hp already covers
+                            # those via L_indel_1bp below).
+                            strs_for_row = np.where(~is_hp, 1, 0)
                             strs_for_row[
                                 np.logical_and(~is_hp, total_len_arr >= 10)
-                            ] = 1
-                            strs_for_row[
-                                np.logical_and(~is_hp, total_len_arr >= 25)
                             ] = 2
                             strs_for_row[
-                                np.logical_and(~is_hp, total_len_arr >= 40)
+                                np.logical_and(~is_hp, total_len_arr >= 25)
                             ] = 3
-                            row_len = np.where(
-                                strs_for_row > 0, 19 + strs_for_row, hps_for_row - 1
+                            strs_for_row[
+                                np.logical_and(~is_hp, total_len_arr >= 40)
+                            ] = 4
+                            row_len = strs_for_row
+                            # depth_by_hpstr bucketing only: base-specific hp
+                            # length (1-10, capped at 10) x A/T/C/G -- a
+                            # different (finer, base-split) encoding from
+                            # row_len above, which stays base-agnostic and
+                            # indexes L_indel_len's power-table rows. Both
+                            # happen to cap the hp axis at 10 now, but
+                            # row_len must keep its own base-agnostic
+                            # formula since L_indel_len has no base axis.
+                            hp_len_capped10 = np.minimum(repeat_count_arr, 10)
+                            hpstr_depth_row = np.where(
+                                strs_for_row > 0,
+                                39 + strs_for_row,
+                                ref_allele_safe * 10 + hp_len_capped10 - 1,
                             )
                             unit_len_clamped = np.clip(unit_len_arr, 2, 5)
                             n_top_indel = np.minimum(F1R2_count.sum(axis=0), 9).astype(
@@ -1875,31 +2623,36 @@ def callBam(params, processNo):
                                 n_top_indel, n_bot_indel, 0, 0
                             ]
                             # Insertion A/T/C/G: rep0 opportunity to insert
-                            # exactly that base — fixed hps=1 context, using
-                            # THAT base (not the position's own reference
-                            # base) as the L_indel_1bp ref_allele index —
-                            # zeroed wherever the next reference base already
-                            # equals it (that's a repeat extension, not a
-                            # novel insertion).
+                            # exactly that base where it's genuinely novel
+                            # (next reference base != that base -- a real
+                            # repeat extension is credited under hp.txt/
+                            # L_indel_1bp instead, not here) -- the row-0/
+                            # mismatch context, which has no base axis of
+                            # its own (str.txt row 0 doesn't distinguish
+                            # which base was inserted), hence the same
+                            # L_indel_len[...,0,6] value for all 4 columns,
+                            # just gated by whichever base's own next-ref
+                            # match excludes it.
                             for b in range(4):
                                 cov_mat_indel[:, 6 + b] = (
-                                    L_indel_1bp[n_top_indel, n_bot_indel, 1, b, 1]
+                                    L_indel_len[n_top_indel, n_bot_indel, 0, 6]
                                     * next_ref_valid
                                     * (next_ref_arr != b)
                                     * antimask_indel
                                 )
-                            # Insertion Length 2..5+: power to see a novel
-                            # U-bp unit inserted where no repeat exists yet
-                            # (rep0 in classify_indel_record's is_hp/indel_len
-                            # >=2 branch, misc.py) — fixed hps=1 context (row
-                            # 0), same as del_2..del_5plus, but only where a
-                            # "no repeat here yet" call is even possible
-                            # (is_hp) and the read family can still confirm
-                            # that (last_cut_valid). Without this, novel
-                            # multi-bp insertions that DO get classified and
-                            # counted in the fine-grained per-duplex-group
-                            # totals had no per-locus coverage anywhere.
-                            ins_len_valid = is_hp & last_cut_valid & antimask_indel
+                            # Insertion Length 2..5+: fixed hps=1 context
+                            # (row 0), same fallback deletion length 2..5+
+                            # uses unconditionally -- credited regardless of
+                            # whether this position's true context is HP or
+                            # STR (unit_len>=2), matching
+                            # indel_coverage_category_index's own documented
+                            # intent that these coarse length-bucketed
+                            # categories are "regardless of true-STR vs
+                            # microhomology". Requires last_cut_valid (the
+                            # read family must be able to confirm no repeat
+                            # already exists here) and antimask_indel (not
+                            # masked).
+                            ins_len_valid = last_cut_valid & antimask_indel
                             cov_mat_indel[:, 10] = (
                                 L_indel_len[n_top_indel, n_bot_indel, 0, 7]
                                 * ins_len_valid
@@ -1973,7 +2726,7 @@ def callBam(params, processNo):
                                 return valid
 
                             hp_run_arr = np.minimum(
-                                hp_raw_np[0, start_ind:end_ind].astype(int), 20
+                                hp_raw_np[0, start_ind:end_ind].astype(int), 10
                             )
                             hp_cut_bool = hp_raw_np[1, start_ind:end_ind].astype(bool)
                             hp_repeat_valid = (
@@ -1990,13 +2743,16 @@ def callBam(params, processNo):
                                 _run_boundary_valid(str_cut_bool) & antimask_indel
                             )
                             total_len_str = str_unit_raw * str_repeat_raw
-                            strs_for_row_str = np.zeros_like(total_len_str)
-                            strs_for_row_str[is_real_str & (total_len_str >= 10)] = 1
-                            strs_for_row_str[is_real_str & (total_len_str >= 25)] = 2
-                            strs_for_row_str[is_real_str & (total_len_str >= 40)] = 3
-                            row_len_str = np.where(
-                                strs_for_row_str > 0, 19 + strs_for_row_str, 0
-                            )
+                            # Row 0 = not a real repeat (also L_indel_len's
+                            # background/"hyp" row used below for the flat
+                            # non-STR opportunity), rows 1-4 = real STR-
+                            # length bins "2-9".."40+" -- matches
+                            # str.txt's 5 rows exactly.
+                            strs_for_row_str = np.where(is_real_str, 1, 0)
+                            strs_for_row_str[is_real_str & (total_len_str >= 10)] = 2
+                            strs_for_row_str[is_real_str & (total_len_str >= 25)] = 3
+                            strs_for_row_str[is_real_str & (total_len_str >= 40)] = 4
+                            row_len_str = strs_for_row_str
                             unit_len_clamped_str = np.clip(str_unit_raw, 2, 5)
                             unit_bucket = np.clip(str_unit_raw, 2, 5) - 2
                             count_bucket_del = np.clip(str_repeat_raw, 1, 6) - 1
@@ -2174,20 +2930,23 @@ def callBam(params, processNo):
 
                         ref_int = ref_np[start_ind:end_ind]
                         n_win = ref_int.size
+                        # No CS-based prefilter -- every genotyped candidate
+                        # mismatch is emitted, tagged "masked" or "PASS" by
+                        # the antimask/LR_pass_bool checks below.
                         mut_pos_in_win = np.nonzero(mut_mask)[0]
-                        if CS_mut.size > 0:
-                            muts_ind_compressed = np.nonzero(
-                                CS_mut >= params["cscutoff"]
-                            )[0]
-                            muts_ind = mut_pos_in_win[muts_ind_compressed].tolist()
-                        else:
-                            muts_ind_compressed = np.zeros(0, dtype=int)
-                            muts_ind = []
+                        muts_ind_compressed = np.arange(mut_pos_in_win.size)
+                        muts_ind = mut_pos_in_win.tolist()
                         refs_ind = np.nonzero(
                             np.logical_and(unmasked_antimask, b1_int == ref_int)
                         )[0].tolist()
                         LR_pass_bool = np.zeros(n_win, dtype=bool)
-                        LR_pass_bool[mut_mask] = LR_raw_mut >= params["pcutoff"]
+                        mut_thresholds = params["pcutoff_sbs"][
+                            trinuc_np[start_ind:end_ind][mut_mask],
+                            b1_int[mut_mask],
+                        ]
+                        # ts removed: any candidate with a positive LR is
+                        # treated as a candidate mutation.
+                        LR_pass_bool[mut_mask] = LR_raw_mut > mut_thresholds
                         alt_int = b1_int
                         unmasked_pass_bool = np.full(n_win, False, dtype=bool)
                         unmasked_pass_bool[refs_ind] = True
@@ -2239,12 +2998,44 @@ def callBam(params, processNo):
                                 continue
                             if F2R1_count[:, muts_ind[nn]].sum() == 0:
                                 continue
-                            if pass_bool[muts_ind[nn]] and LR_pass_bool[muts_ind[nn]]:
+                            if not LR_pass_bool[muts_ind[nn]]:
+                                # Never above the round-1 candidate floor
+                                # (LR<=0): no evidence of a real
+                                # duplex-confirmed mutation, so no record
+                                # at all, regardless of --rescue.
+                                continue
+                            if pass_bool[muts_ind[nn]]:
+                                # Fully unmasked and clears threshold:
+                                # genuine PASS.
                                 flt = flt_rs
-                            elif pass_bool[muts_ind[nn]]:
-                                flt = "underpowered"
-                            else:
+                            elif unmasked_pass_bool[muts_ind[nn]]:
+                                # Blocked only by snp_mask/noise_mask
+                                # (pass_bool false, unmasked_pass_bool
+                                # true). Still fully evaluated (LR +
+                                # depth extracted below, always-on -- not
+                                # gated by --rescue) so it feeds the
+                                # unmasked-burden numerator, but the label
+                                # stays "masked"; SNPM/NOISEM INFO tags
+                                # record why.
                                 flt = "masked"
+                            elif params["rescue"] and rescue_antimask[muts_ind[nn]]:
+                                # Reaching here already failed the
+                                # unmasked_pass_bool elif above, so this is
+                                # blocked by something other than snp/
+                                # noise (n_cov/nm/trim or a blacklisted
+                                # read) -- only reportable, and only
+                                # without depth, under --rescue.
+                                flt = _rescue_reason_label(
+                                    masks[2, muts_ind[nn]],
+                                    masks[4, muts_ind[nn]],
+                                    masks[5, muts_ind[nn]],
+                                )
+                            else:
+                                # Blocked by something other than snp/
+                                # noise, and either --rescue is off or
+                                # this is include_mask (never rescuable):
+                                # no record at all.
+                                continue
                             mut = {
                                 "chrom": mut_chrom,
                                 "pos": mut_pos,
@@ -2254,7 +3045,6 @@ def callBam(params, processNo):
                                 "infos": {
                                     "F1R2": F1R2,
                                     "F2R1": F2R1,
-                                    "CS": CS_mut[muts_ind_compressed[nn]],
                                     "LR": LR_raw_mut[muts_ind_compressed[nn]],
                                     "LM": LR_max_mut[muts_ind_compressed[nn]],
                                     # "BLR": F2R1_LR[muts_ind[nn]],
@@ -2284,6 +3074,19 @@ def callBam(params, processNo):
                                     "HP": "0",
                                     "TL": readSet[0].template_length,
                                     "STR": 0,
+                                    # Set unconditionally (0/1 regardless
+                                    # of filter) so downstream readers
+                                    # never need to special-case a missing
+                                    # tag. Always 0 on a PASS record now --
+                                    # a candidate blocked only by snp/
+                                    # noise stays filter="masked" (see the
+                                    # flt assignment above), so these tags
+                                    # are how a "masked" record is told
+                                    # apart from every other masked reason
+                                    # (and how Estimate.py finds the
+                                    # unmasked-burden set).
+                                    "SNPM": int(masks[0, muts_ind[nn]]),
+                                    "NOISEM": int(masks[1, muts_ind[nn]]),
                                 },
                                 "formats": ["AC", "RC", "DP"],
                                 # "samples": [[ta, tr, tdp], [na, nr, ndp]],
@@ -2347,61 +3150,74 @@ def callBam(params, processNo):
                                     unmasked_antimask_indel
                                 ] += cov_mat_indel[unmasked_antimask_indel]
                                 duplex_read_num_dict_indel[duplex_no] += indel100
+                                # Read-family depth-composition totals: one
+                                # increment per passing locus for this
+                                # family's (top_count, bot_count)
+                                # composition, bucketed by context.
+                                # unmasked_pass_bool (not pass_bool) is used
+                                # deliberately -- masking is meant to be
+                                # re-derived downstream from the mask beds
+                                # directly rather than baked in here.
+                                trinuc_ctx = trinuc_np[start_ind:end_ind]
+                                _accumulate_depth_matrix(
+                                    depth_by_trinuc,
+                                    n_top_indel,
+                                    n_bot_indel,
+                                    trinuc_ctx,
+                                    unmasked_pass_bool & (trinuc_ctx < 64),
+                                    64,
+                                )
+                                _accumulate_depth_matrix(
+                                    depth_by_hpstr,
+                                    n_top_indel,
+                                    n_bot_indel,
+                                    hpstr_depth_row,
+                                    unmasked_pass_bool,
+                                    44,
+                                )
+                                dinuc_ctx = ref_allele_safe * 4 + np.where(
+                                    next_ref_arr >= 0, next_ref_arr, 0
+                                )
+                                # A dinuc spans two positions, so a mask at
+                                # either one has to exclude it: the dinuc
+                                # "at" a masked position (it's the first
+                                # base) and the dinuc "before" it (it's the
+                                # second base) both need to be dropped, not
+                                # just the former.
+                                next_unmasked_pass_bool = np.zeros_like(
+                                    unmasked_pass_bool
+                                )
+                                next_unmasked_pass_bool[:-1] = unmasked_pass_bool[1:]
+                                _accumulate_depth_matrix(
+                                    depth_by_dinuc,
+                                    n_top_indel,
+                                    n_bot_indel,
+                                    dinuc_ctx,
+                                    unmasked_pass_bool
+                                    & next_unmasked_pass_bool
+                                    & (ref_allele_arr <= 3)
+                                    & next_ref_valid,
+                                    16,
+                                )
             """
             Calling block ends
             """
-            has_same_label_flag = False
-            for rb in range(retain_base):
-                if currentReadDictList[rb].get(label):
-                    """
-                    if currentReadDictList[rb][label]["names"].get(rec.query_name):
-                        if rec.is_read2:
-                            continue
-                        else:
-                            ind = currentReadDictList[rb][label]["names"].get(rec.query_name)
-                            currentReadDictList[rb][label]["seqs"][ind] = rec
-                    else:
-                    """
-                    currentReadDictList[rb][label]["seqs"].append(rec)
-                    currentReadDictList[rb][label]["names"][rec.query_name] = (
-                        len(currentReadDictList[rb][label]["seqs"]) - 1
-                    )
-                    if (rec.is_forward and rec.is_read1) or (
-                        rec.is_reverse and rec.is_read2
-                    ):
-                        currentReadDictList[rb][label]["F1R2"] += 1
-                    else:
-                        currentReadDictList[rb][label]["F2R1"] += 1
-                    has_same_label_flag = True
-                    break
-
-            if not has_same_label_flag:
-                # else:
-                currentReadDictList[retain_base - 1].update(
-                    {
-                        label: {
-                            "seqs": [rec],
-                            "F1R2": 0,
-                            "F2R1": 0,
-                            "names": {rec.query_name: 0},
-                        }
-                    }
-                )
-                if (rec.is_forward and rec.is_read1) or (
-                    rec.is_reverse and rec.is_read2
-                ):
-                    currentReadDictList[retain_base - 1][label]["F1R2"] += 1
-                else:
-                    currentReadDictList[retain_base - 1][label]["F2R1"] += 1
+            currentReadDict = {}
+            _place_read_in_dict(rec, label, currentReadDict)
             currentStart = start
+            _drain_rugged_pool(
+                chrom, currentStart, rugged_reads_pool, params, currentReadDict
+            )
     """
     Calling block starts
     """
-    # print(currentReadDictList):
-    currentReadDict = dict()
-    for _ in range(len(currentReadDictList)):
-        currentReadDict |= currentReadDictList.pop(0)
-        currentReadDictList.append(dict())
+    _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool)
+    # See the matching comment on the equivalent block earlier in this
+    # function: floor the window at this final batch's true minimum read
+    # start too, for the same reason.
+    batch_min_start = min(
+        r.reference_start for entry in currentReadDict.values() for r in entry["seqs"]
+    )
 
     for key in currentReadDict.keys():
         flt_rs = "PASS"
@@ -2470,8 +3286,27 @@ def callBam(params, processNo):
             rs_reference_start = min([r.reference_start for r in readSet])
 
             chromNow = readSet[0].reference_name
-            if chromNow != reference_mat_chrom or rs_reference_end > reference_mat_end:
+            contig_len_now = tumorBam.get_reference_length(chromNow)
+            if rs_reference_start >= contig_len_now:
+                # See the matching guard earlier in this function -- skip a
+                # read set that starts at or beyond its own chromosome's
+                # length instead of building a degenerate reference window.
+                print(
+                    f"WARNING: skipping read set at {chromNow}:"
+                    f"{rs_reference_start}-{rs_reference_end}, which "
+                    f"starts at or beyond the contig length "
+                    f"({contig_len_now})"
+                )
+                continue
+            if (
+                chromNow != reference_mat_chrom
+                or rs_reference_end > reference_mat_end
+                or rs_reference_start < reference_mat_start
+            ):
                 ### Output coverage
+                # Original per-locus multi-column coverage write-out
+                # (per-subprocess only -- see the matching block earlier in
+                # this function).
                 if "coverage" in locals():
                     if "coverage_leftover" in locals():
                         coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
@@ -2488,7 +3323,12 @@ def callBam(params, processNo):
                         unmasked_coverage_indel_cat_leftover = np.zeros((1, 14))
                         coverage_leftover = np.zeros((1, 4))
                         coverage_indel_cat_leftover = np.zeros((1, 14))
-                    if chromNow == reference_mat_chrom:
+                    if (
+                        chromNow == reference_mat_chrom
+                        and rs_reference_start >= reference_mat_start
+                    ):
+                        # See the matching comment on the equivalent block
+                        # earlier in this function.
                         coverage_leftover = copy.deepcopy(
                             coverage[
                                 (rs_reference_start - reference_mat_start) : (
@@ -2531,6 +3371,11 @@ def callBam(params, processNo):
                         )
                     for pos in non_zero_positions[0].tolist():
                         current_pos = pos + reference_mat_start
+                        if current_pos <= max_flushed_pos:
+                            # See the matching comment on the equivalent
+                            # block earlier in this function.
+                            continue
+                        max_flushed_pos = current_pos
                         bed_file = get_bed_file_for_position(
                             current_pos,
                             reference_mat_chrom,
@@ -2561,16 +3406,20 @@ def callBam(params, processNo):
                             unmasked_coverage_indel_cat[pos]
                         )
                 # if chromNow != reference_mat_chrom:
+                if chromNow != reference_mat_chrom:
+                    max_flushed_pos = -1
                 reference_mat_chrom = chromNow
                 # current_reference = str(fasta[reference_mat_chrom].seq)
-                reference_mat_start = rs_reference_start
+                reference_mat_start = batch_min_start
                 try:
                     region_end = region[2]
                 except:
                     region_end = 10e10
-                contig_end = tumorBam.get_reference_length(chromNow)
+                contig_end = contig_len_now
+                # See the matching comment on the equivalent block earlier
+                # in this function.
                 reference_mat_end = min(
-                    rs_reference_start + 1000000,
+                    reference_mat_start + 1000000,
                     max(region_end, max([seq.reference_end for seq in readSet])),
                     contig_end,
                 )
@@ -2674,6 +3523,11 @@ def callBam(params, processNo):
             unmasked_antimask = np.all(~masks[2:, :], axis=0)
             unmasked_antimask[trinuc_np[start_ind:end_ind] > 64] = False
             unmasked_antimask[ref_np[start_ind:end_ind] == 4] = False
+            # Rescue eligibility -- see the matching block earlier in this
+            # function for the full explanation.
+            rescue_antimask = ~masks[3, :]
+            rescue_antimask[trinuc_np[start_ind:end_ind] > 64] = False
+            rescue_antimask[ref_np[start_ind:end_ind] == 4] = False
             learn_antimask = np.all(~masks[3:, :], axis=0)
             learn_antimask[trinuc_np[start_ind:end_ind] > 64] = False
             learn_antimask[ref_np[start_ind:end_ind] == 4] = False
@@ -2697,9 +3551,14 @@ def callBam(params, processNo):
                 masks_indel[4, :] = include_mask[start_ind:end_ind_max]
                 masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
                 antimask_indel = np.all(~masks_indel, axis=0)
-                unmasked_antimask_indel = np.all(~masks_indel[2:, :], axis=0)
+                # Ignores noise_mask only -- see the matching block
+                # earlier in this function for the full explanation.
+                unmasked_antimask_indel = np.all(
+                    ~masks_indel[[0, 2, 3, 4, 5], :], axis=0
+                )
+                # Same rescue-eligibility split as the SNV side above.
+                rescue_antimask_indel = ~masks_indel[4, :]
                 (
-                    CS,
                     LR_raw,
                     LR_max,
                     indels,
@@ -2709,42 +3568,30 @@ def callBam(params, processNo):
                     F1R2_alt_count,
                     F2R1_ref_count,
                     F2R1_alt_count,
+                    hp_match,
                 ) = genotypeDSIndel(
                     readSet,
                     rs_reference_start,
                     rs_reference_end,
                     ref_np[start_ind:end_ind],
-                    unmasked_antimask_indel,
+                    # Wide (rescue) scope -- see the matching call site
+                    # earlier in this function for the full explanation.
+                    rescue_antimask_indel,
                     hp_raw_np[:, start_ind:end_ind],
                     str_raw_np[:, start_ind:end_ind],
                     params,
                 )
                 # print(LR_max)
-                # pass_inds = np.nonzero(LR <= params["pcutoffi"])[0].tolist()
-
-                # pass_inds = np.nonzero(LR_raw >= params["pcutoffi"])[0].tolist()
-                # pass_inds = np.nonzero(LR_raw >= params["pcutoffi"])[0].tolist()
-                pass_inds = np.nonzero(CS >= params["cscutoffi"])[0].tolist()
-                # LR_pass_bool = (LR_raw >= params["pcutoffi"])
+                # No CS-based prefilter -- every genotyped candidate indel
+                # is emitted, tagged "masked" or "PASS" by the
+                # antimask/LR_pass_bool checks below.
+                pass_inds = list(range(len(indels)))
                 if len(LR_raw) > 0:
-                    LR_pass_bool = np.zeros(len(LR_raw), dtype=bool)
-                    LR_pass_bool[
-                        np.logical_and(LR_raw >= params["pcutoffi"][0], hps <= 5)
-                    ] = True
-                    LR_pass_bool[
-                        np.all(
-                            np.vstack(
-                                [LR_raw >= params["pcutoffi"][1], hps <= 10, hps > 5]
-                            ),
-                            axis=0,
-                        )
-                    ] = True
-                    LR_pass_bool[
-                        np.logical_and(LR_raw >= params["pcutoffi"][2], hps > 10)
-                    ] = True
-                    LR_pass_bool[
-                        np.logical_and(LR_raw >= params["pcutoffi"][2], strs > 0)
-                    ] = True
+                    # ts/ti removed: any candidate with a positive LR is
+                    # treated as a candidate mutation, capped per-call by
+                    # that call's own theoretical LR ceiling (LR_max/"LM",
+                    # already context-specific -- see indelMaxLR).
+                    LR_pass_bool = LR_raw > np.minimum(params["pcutoffi"], LR_max)
                 indels_pass = [indels[_] for _ in pass_inds]
                 for nn in range(len(indels_pass)):
                     indel = indels_pass[nn]
@@ -2810,21 +3657,28 @@ def callBam(params, processNo):
                         offset = 0
                     else:
                         offset = -indel_size
-                    unmasked_flag = antimask_indel[
-                        indel_pos
-                        - reference_mat_start
-                        - start_ind : indel_pos
-                        - reference_mat_start
-                        - start_ind
-                        + offset
-                        + 1
-                    ].all()
-                    if unmasked_flag and LR_pass_bool[nn]:
+                    indel_slice_start = indel_pos - reference_mat_start - start_ind
+                    indel_slice = slice(
+                        indel_slice_start, indel_slice_start + offset + 1
+                    )
+                    # See the matching block earlier in this function for
+                    # the full explanation.
+                    if not LR_pass_bool[nn]:
+                        continue
+                    if antimask_indel[indel_slice].all():
                         flt = flt_rs
-                    elif unmasked_flag:
-                        flt = "underpowered"
-                    else:
+                    elif unmasked_antimask_indel[indel_slice].all():
                         flt = "masked"
+                    elif params["rescue"] and rescue_antimask_indel[indel_slice].all():
+                        flt = _rescue_reason_label(
+                            masks_indel[2, indel_slice],
+                            masks_indel[5, indel_slice],
+                            masks_indel[3, indel_slice],
+                            extra_flag=masks_indel[0, indel_slice],
+                            extra_label="indelregion_rescued",
+                        )
+                    else:
+                        continue
 
                     indel_rec = {
                         "chrom": chromNow,
@@ -2842,7 +3696,6 @@ def callBam(params, processNo):
                                 + F2R1_ref_count[pass_inds[nn]]
                             ),
                             # "LR": LR[pass_inds[0]],
-                            "CS": CS[pass_inds[nn]],
                             "LR": LR_raw[pass_inds[nn]],
                             "LM": LR_max[pass_inds[nn]],
                             # "BLR": F2R1_LR[pass_inds[0]],
@@ -2867,6 +3720,9 @@ def callBam(params, processNo):
                             "HP": hps[pass_inds[nn]],
                             "TL": readSet[0].template_length,
                             "STR": strs[nn],
+                            "HM": int(hp_match[pass_inds[nn]]),
+                            "SNPM": 0,
+                            "NOISEM": int(np.any(masks_indel[1, indel_slice])),
                         },
                         "formats": ["AC", "RC", "DP"],
                         # "samples": [[ta, tr, tdp], [na, nr, ndp]],
@@ -2880,9 +3736,11 @@ def callBam(params, processNo):
                 if isLearn and F1R2 > 2 and F2R1 > 2:
                     (
                         mismatch_now,
-                        indelerr_now,
+                        hp_alt_now,
+                        str_alt_now,
                         mismatch_dmg_now,
-                        indel_dmg_now,
+                        hp_dmg_now,
+                        str_dmg_now,
                     ) = profileTriNucMismatches(
                         readSet,
                         rs_reference_start,
@@ -2894,14 +3752,15 @@ def callBam(params, processNo):
                         params,
                     )
                     mismatch_mat += mismatch_now
-                    indelerr_mat += indelerr_now
+                    hp_alt_mat += hp_alt_now
+                    str_alt_mat += str_alt_now
                     mismatch_dmg_mat += mismatch_dmg_now
-                    indel_dmg_mat += indel_dmg_now
+                    hp_dmg_mat += hp_dmg_now
+                    str_dmg_mat += str_dmg_now
                 if isLearn:
                     continue
                 (
                     cov_mat,
-                    CS_mut,
                     LR_raw_mut,
                     LR_max_mut,
                     mut_mask,
@@ -2916,6 +3775,9 @@ def callBam(params, processNo):
                     trinuc_np[start_ind:end_ind],
                     prior_mat[start_ind:end_ind, :],
                     np.copy(unmasked_antimask),
+                    # Wide (rescue) scope -- see the matching call site
+                    # earlier in this function for the full explanation.
+                    np.copy(rescue_antimask),
                     params,
                     L,
                 )
@@ -2932,14 +3794,33 @@ def callBam(params, processNo):
                     ref_allele_arr = ref_np[start_ind:end_ind]
                     ref_allele_safe = np.where(ref_allele_arr > 3, 0, ref_allele_arr)
                     is_hp = unit_len_arr <= 1
-                    hps_for_row = np.where(is_hp, np.minimum(repeat_count_arr, 20), 1)
+                    hps_for_row = np.where(is_hp, np.minimum(repeat_count_arr, 10), 1)
                     total_len_arr = unit_len_arr * repeat_count_arr
-                    strs_for_row = np.zeros_like(total_len_arr)
-                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 10)] = 1
-                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 25)] = 2
-                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 40)] = 3
-                    row_len = np.where(
-                        strs_for_row > 0, 19 + strs_for_row, hps_for_row - 1
+                    # STR-length bin for L_indel_len's row axis (1="2-9"
+                    # through 4="40+") -- always >=1 wherever ~is_hp
+                    # (unit_len>=2 there implies a real annotated repeat by
+                    # construction, so there's no more "not really a
+                    # repeat" fallback to an hp-length row; row 0 of
+                    # L_indel_len is reserved for genuinely unannotated
+                    # positions, which this branch never represents since
+                    # is_hp already covers those via L_indel_1bp below).
+                    strs_for_row = np.where(~is_hp, 1, 0)
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 10)] = 2
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 25)] = 3
+                    strs_for_row[np.logical_and(~is_hp, total_len_arr >= 40)] = 4
+                    row_len = strs_for_row
+                    # depth_by_hpstr bucketing only: base-specific hp length
+                    # (1-10, capped at 10) x A/T/C/G -- a different (finer,
+                    # base-split) encoding from row_len above, which stays
+                    # base-agnostic and indexes L_indel_len's power-table
+                    # rows. Both happen to cap the hp axis at 10 now, but
+                    # row_len must keep its own base-agnostic formula since
+                    # L_indel_len has no base axis.
+                    hp_len_capped10 = np.minimum(repeat_count_arr, 10)
+                    hpstr_depth_row = np.where(
+                        strs_for_row > 0,
+                        39 + strs_for_row,
+                        ref_allele_safe * 10 + hp_len_capped10 - 1,
                     )
                     unit_len_clamped = np.clip(unit_len_arr, 2, 5)
                     n_top_indel = np.minimum(F1R2_count.sum(axis=0), 9).astype(int)
@@ -3044,26 +3925,28 @@ def callBam(params, processNo):
                     cov_mat_indel[:, 4] = L_indel_len[n_top_indel, n_bot_indel, 0, 1]
                     cov_mat_indel[:, 5] = L_indel_len[n_top_indel, n_bot_indel, 0, 0]
                     # Insertion A/T/C/G: rep0 opportunity to insert exactly
-                    # that base — fixed hps=1 context, using THAT base (not
-                    # the position's own reference base) as the
-                    # L_indel_1bp ref_allele index — zeroed wherever the
-                    # next reference base already equals it (that's a
-                    # repeat extension, not a novel insertion).
+                    # that base where it's genuinely novel (next reference
+                    # base != that base -- a real repeat extension is
+                    # credited under hp.txt/L_indel_1bp instead, not here)
+                    # -- the row-0/mismatch context, which has no base
+                    # axis of its own, hence the same L_indel_len[...,0,6]
+                    # value for all 4 columns, just gated by whichever
+                    # base's own next-ref match excludes it.
                     for b in range(4):
                         cov_mat_indel[:, 6 + b] = (
-                            L_indel_1bp[n_top_indel, n_bot_indel, 1, b, 1]
+                            L_indel_len[n_top_indel, n_bot_indel, 0, 6]
                             * next_ref_valid
                             * (next_ref_arr != b)
                             * antimask_indel
                         )
-                    # Insertion Length 2..5+: power to see a novel U-bp unit
-                    # inserted where no repeat exists yet (rep0 in
-                    # classify_indel_record's is_hp/indel_len>=2 branch,
-                    # misc.py) — fixed hps=1 context (row 0), same as
-                    # del_2..del_5plus, but only where a "no repeat here yet"
-                    # call is even possible (is_hp) and the read family can
-                    # still confirm that (last_cut_valid).
-                    ins_len_valid = is_hp & last_cut_valid & antimask_indel
+                    # Insertion Length 2..5+: fixed hps=1 context (row 0),
+                    # same fallback deletion length 2..5+ uses
+                    # unconditionally -- credited regardless of true HP vs
+                    # STR context (see the matching block earlier in this
+                    # function for the full explanation of why `is_hp` was
+                    # dropped from this gate). Still requires
+                    # last_cut_valid and antimask_indel.
+                    ins_len_valid = last_cut_valid & antimask_indel
                     cov_mat_indel[:, 10] = (
                         L_indel_len[n_top_indel, n_bot_indel, 0, 7] * ins_len_valid
                     )
@@ -3130,7 +4013,7 @@ def callBam(params, processNo):
                         return valid
 
                     hp_run_arr = np.minimum(
-                        hp_raw_np[0, start_ind:end_ind].astype(int), 20
+                        hp_raw_np[0, start_ind:end_ind].astype(int), 10
                     )
                     hp_cut_bool = hp_raw_np[1, start_ind:end_ind].astype(bool)
                     hp_repeat_valid = _run_boundary_valid(hp_cut_bool) & antimask_indel
@@ -3143,13 +4026,15 @@ def callBam(params, processNo):
                         _run_boundary_valid(str_cut_bool) & antimask_indel
                     )
                     total_len_str = str_unit_raw * str_repeat_raw
-                    strs_for_row_str = np.zeros_like(total_len_str)
-                    strs_for_row_str[is_real_str & (total_len_str >= 10)] = 1
-                    strs_for_row_str[is_real_str & (total_len_str >= 25)] = 2
-                    strs_for_row_str[is_real_str & (total_len_str >= 40)] = 3
-                    row_len_str = np.where(
-                        strs_for_row_str > 0, 19 + strs_for_row_str, 0
-                    )
+                    # Row 0 = not a real repeat (also L_indel_len's
+                    # background/"hyp" row used below for the flat non-STR
+                    # opportunity), rows 1-4 = real STR-length bins
+                    # "2-9".."40+" -- matches str.txt's 5 rows exactly.
+                    strs_for_row_str = np.where(is_real_str, 1, 0)
+                    strs_for_row_str[is_real_str & (total_len_str >= 10)] = 2
+                    strs_for_row_str[is_real_str & (total_len_str >= 25)] = 3
+                    strs_for_row_str[is_real_str & (total_len_str >= 40)] = 4
+                    row_len_str = strs_for_row_str
                     unit_len_clamped_str = np.clip(str_unit_raw, 2, 5)
                     unit_bucket = np.clip(str_unit_raw, 2, 5) - 2
                     count_bucket_del = np.clip(str_repeat_raw, 1, 6) - 1
@@ -3304,18 +4189,23 @@ def callBam(params, processNo):
 
                 ref_int = ref_np[start_ind:end_ind]
                 n_win = ref_int.size
+                # No CS-based prefilter -- every genotyped candidate
+                # mismatch is emitted, tagged "masked" or "PASS" by the
+                # antimask/LR_pass_bool checks below.
                 mut_pos_in_win = np.nonzero(mut_mask)[0]
-                if CS_mut.size > 0:
-                    muts_ind_compressed = np.nonzero(CS_mut >= params["cscutoff"])[0]
-                    muts_ind = mut_pos_in_win[muts_ind_compressed].tolist()
-                else:
-                    muts_ind_compressed = np.zeros(0, dtype=int)
-                    muts_ind = []
+                muts_ind_compressed = np.arange(mut_pos_in_win.size)
+                muts_ind = mut_pos_in_win.tolist()
                 refs_ind = np.nonzero(
                     np.logical_and(unmasked_antimask, b1_int == ref_int)
                 )[0].tolist()
                 LR_pass_bool = np.zeros(n_win, dtype=bool)
-                LR_pass_bool[mut_mask] = LR_raw_mut >= params["pcutoff"]
+                mut_thresholds = params["pcutoff_sbs"][
+                    trinuc_np[start_ind:end_ind][mut_mask],
+                    b1_int[mut_mask],
+                ]
+                # ts removed: any candidate with a positive LR is treated
+                # as a candidate mutation.
+                LR_pass_bool[mut_mask] = LR_raw_mut > mut_thresholds
                 alt_int = b1_int
                 unmasked_pass_bool = np.full(n_win, False, dtype=bool)
                 unmasked_pass_bool[refs_ind] = True
@@ -3364,12 +4254,22 @@ def callBam(params, processNo):
                         continue
                     if F2R1_count[:, muts_ind[nn]].sum() == 0:
                         continue
-                    if pass_bool[muts_ind[nn]] and LR_pass_bool[muts_ind[nn]]:
+                    # See the matching block earlier in this function for
+                    # the full explanation.
+                    if not LR_pass_bool[muts_ind[nn]]:
+                        continue
+                    if pass_bool[muts_ind[nn]]:
                         flt = flt_rs
-                    elif pass_bool[muts_ind[nn]]:
-                        flt = "underpowered"
-                    else:
+                    elif unmasked_pass_bool[muts_ind[nn]]:
                         flt = "masked"
+                    elif params["rescue"] and rescue_antimask[muts_ind[nn]]:
+                        flt = _rescue_reason_label(
+                            masks[2, muts_ind[nn]],
+                            masks[4, muts_ind[nn]],
+                            masks[5, muts_ind[nn]],
+                        )
+                    else:
+                        continue
                     mut = {
                         "chrom": mut_chrom,
                         "pos": mut_pos,
@@ -3379,7 +4279,6 @@ def callBam(params, processNo):
                         "infos": {
                             "F1R2": F1R2,
                             "F2R1": F2R1,
-                            "CS": CS_mut[muts_ind_compressed[nn]],
                             "LR": LR_raw_mut[muts_ind_compressed[nn]],
                             "LM": LR_max_mut[muts_ind_compressed[nn]],
                             # "BLR": F2R1_LR[muts_ind[nn]],
@@ -3399,6 +4298,8 @@ def callBam(params, processNo):
                             "HP": "0",
                             "TL": readSet[0].template_length,
                             "STR": 0,
+                            "SNPM": int(masks[0, muts_ind[nn]]),
+                            "NOISEM": int(masks[1, muts_ind[nn]]),
                         },
                         "formats": ["AC", "RC", "DP"],
                         # "samples": [[ta, tr, tdp], [na, nr, ndp]],
@@ -3456,28 +4357,90 @@ def callBam(params, processNo):
                             unmasked_antimask_indel
                         ] += cov_mat_indel[unmasked_antimask_indel]
                         duplex_read_num_dict_indel[duplex_no] += indel100
+                        # Read-family depth-composition totals (see the
+                        # matching block earlier in this function for the
+                        # full explanation).
+                        trinuc_ctx = trinuc_np[start_ind:end_ind]
+                        _accumulate_depth_matrix(
+                            depth_by_trinuc,
+                            n_top_indel,
+                            n_bot_indel,
+                            trinuc_ctx,
+                            unmasked_pass_bool & (trinuc_ctx < 64),
+                            64,
+                        )
+                        _accumulate_depth_matrix(
+                            depth_by_hpstr,
+                            n_top_indel,
+                            n_bot_indel,
+                            hpstr_depth_row,
+                            unmasked_pass_bool,
+                            44,
+                        )
+                        dinuc_ctx = ref_allele_safe * 4 + np.where(
+                            next_ref_arr >= 0, next_ref_arr, 0
+                        )
+                        # A dinuc spans two positions, so a mask at either
+                        # one has to exclude it: the dinuc "at" a masked
+                        # position (it's the first base) and the dinuc
+                        # "before" it (it's the second base) both need to
+                        # be dropped, not just the former.
+                        next_unmasked_pass_bool = np.zeros_like(unmasked_pass_bool)
+                        next_unmasked_pass_bool[:-1] = unmasked_pass_bool[1:]
+                        _accumulate_depth_matrix(
+                            depth_by_dinuc,
+                            n_top_indel,
+                            n_bot_indel,
+                            dinuc_ctx,
+                            unmasked_pass_bool
+                            & next_unmasked_pass_bool
+                            & (ref_allele_arr <= 3)
+                            & next_ref_valid,
+                            16,
+                        )
     """
     Calling block ends
     """
     if isLearn:
-        return mismatch_mat, indelerr_mat, mismatch_dmg_mat, indel_dmg_mat
+        return (
+            mismatch_mat,
+            hp_alt_mat,
+            str_alt_mat,
+            mismatch_dmg_mat,
+            hp_dmg_mat,
+            str_dmg_mat,
+        )
 
-    ### SNV depth extraction, batched: gather every unique PASS/masked/
-    ### underpowered candidate first, then resolve the tumor BAM and each
-    ### normal BAM with a handful of sequential pileup() scans
-    ### (extractDepthBatchSnv) instead of one random-access pileup() call
-    ### per candidate.
+    ### SNV depth extraction, batched: gather every eligible candidate
+    ### first, then resolve the tumor BAM and each normal BAM with a
+    ### handful of sequential pileup() scans (extractDepthBatchSnv) instead
+    ### of one random-access pileup() call per candidate.
+    ###
+    ### Eligibility differs by round: round 1 (not coverage_only) only
+    ### depth-extracts true PASS candidates -- masked ones (and any
+    ### rescue-reason label) get no depth-extraction here, matching this
+    ### round's default-threshold classification. Round 2 (coverage_only)
+    ### instead only depth-extracts the deferred set Caller.py identified in
+    ### its re-filter step: candidates masked in round 1 whose raw LR now
+    ### clears the channel's final refined threshold. PASS candidates from
+    ### round 1 (even ones later downgraded to "underpowered") already have
+    ### real depth from round 1 and are never re-extracted here.
+    deferred_depth_keys = params.get("deferred_depth_keys", frozenset())
     mut_dict = dict()
     snv_candidate_keys = []
     for mut in muts:
-        if mut["filter"] not in ("PASS", "masked", "underpowered"):
-            continue
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if coverage_only:
+            if key not in deferred_depth_keys:
+                continue
+        elif mut["filter"] != "PASS":
+            continue
         if key not in mut_dict:
             mut_dict[key] = None
             snv_candidate_keys.append(key)
 
     if snv_candidate_keys:
+        _snv_depth_t0 = time.time()
         tumor_snv_depths = extractDepthBatchSnv(
             tumorBam, snv_candidate_keys, params, minbq=params["minBq"]
         )
@@ -3490,6 +4453,11 @@ def callBam(params, processNo):
             ]
             if normalBams
             else []
+        )
+        print(
+            f"Process {processNo}: SNV depth extraction for "
+            f"{len(snv_candidate_keys)} candidates took "
+            f"{(time.time() - _snv_depth_t0) / 60:.2f} minutes"
         )
         for key in snv_candidate_keys:
             ta, tr, ti, tdp = tumor_snv_depths.get(key, (0, 0, 0, 0))
@@ -3523,41 +4491,60 @@ def callBam(params, processNo):
             n_muts,
             extra=f"{chrom}:{pos}",
         )
-        if flt == "PASS" or flt == "masked" or flt == "underpowered":
-            ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[(chrom, pos, ref, alt)]
+        key = (chrom, pos, ref, alt)
+        eligible = key in deferred_depth_keys if coverage_only else flt == "PASS"
+        if eligible:
+            ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[key]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         # if window_filter:
         # continue
         # if ta > params["maxAltCount"]:
         # continue
-        if flt == "PASS" or flt == "masked" or flt == "underpowered":
+        # Real depth was extracted (eligible), but it fails a post-hoc
+        # sanity check PASS candidates are also held to. Rather than
+        # vanishing silently here, this is always tagged with which check
+        # it failed and kept (with real AC/RC/DP) -- Caller.py prunes these
+        # reject-reason records out after round 2's merge, unless --rescue
+        # is on (same "junk mutations that may carry real biological
+        # signal" opt-in as every other rescue reason). Not dropped here
+        # directly: for round 2 (coverage_only) this record is a
+        # region-local copy that only feeds Caller.py's merge-by-position,
+        # never the final mutsAll/indelsAll directly, so a `continue` here
+        # would be invisible to the real keep/drop decision.
+        if eligible:
             if ta == 0:
-                continue
-            if ta / tdp > params["maxAF"]:
-                continue
+                mut["filter"] = "no_good_alt_read"
+            elif ta / tdp > params["maxAF"]:
+                mut["filter"] = "duplex_vaf"
             # if ti >= 1:
             # continue
-            if normalBams:
+            elif normalBams:
                 if ndp < params["minNdepth"]:
-                    continue
-                if na / ndp > params["normalVAF"]:
-                    continue
+                    mut["filter"] = "n_cov_mask"
+                elif na / ndp > params["normalVAF"]:
+                    mut["filter"] = "normal_vaf"
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         mut_pass_filter.append(mut)
 
-    ### Indel depth extraction, batched the same way.
+    ### Indel depth extraction, batched the same way, with the same
+    ### round-1-PASS-only / round-2-deferred-set eligibility split as SNVs
+    ### above.
     muts_indels_dict = dict()
     indel_candidate_keys = []
     for mut in muts_indels:
-        if mut["filter"] not in ("PASS", "masked", "underpowered"):
-            continue
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if coverage_only:
+            if key not in deferred_depth_keys:
+                continue
+        elif mut["filter"] != "PASS":
+            continue
         if key not in muts_indels_dict:
             muts_indels_dict[key] = None
             indel_candidate_keys.append(key)
 
     if indel_candidate_keys:
+        _indel_depth_t0 = time.time()
         tumor_indel_depths = extractDepthBatchIndel(
             tumorBam, indel_candidate_keys, params, minbq=params["minBq"]
         )
@@ -3570,6 +4557,11 @@ def callBam(params, processNo):
             ]
             if normalBams
             else []
+        )
+        print(
+            f"Process {processNo}: indel depth extraction for "
+            f"{len(indel_candidate_keys)} candidates took "
+            f"{(time.time() - _indel_depth_t0) / 60:.2f} minutes"
         )
         for key in indel_candidate_keys:
             ta, tr, ti, tdp = tumor_indel_depths.get(key, (0, 0, 0, 0))
@@ -3586,11 +4578,10 @@ def callBam(params, processNo):
             else:
                 na, nr, ni, ndp = (0, 0, 0, 0)
             # na/nr/ndp match the pre-batching dict layout; ni (summed
-            # normal-BAM otherIndelCount) is additionally kept so the
-            # "if ni > 0" filter below always sees the real value instead
-            # of a stale ni left over from whatever mutation the
-            # single-pass loop happened to process previously (see
-            # commit message for details).
+            # normal-BAM otherIndelCount) is additionally kept per key so
+            # the "if ni > 0" filter below always sees this mutation's own
+            # value, not a stale value from whichever mutation a
+            # single-pass loop last happened to process.
             muts_indels_dict[key] = (ta, tr, tdp, na, nr, ndp, ni)
 
     muts_indels_pass_filter = []
@@ -3609,23 +4600,30 @@ def callBam(params, processNo):
             n_muts_indels,
             extra=f"{chrom}:{pos}",
         )
-        if flt == "PASS" or flt == "masked" or flt == "underpowered":
-            ta, tr, tdp, na, nr, ndp, ni = muts_indels_dict[(chrom, pos, ref, alt)]
+        key = (chrom, pos, ref, alt)
+        eligible = key in deferred_depth_keys if coverage_only else flt == "PASS"
+        if eligible:
+            ta, tr, tdp, na, nr, ndp, ni = muts_indels_dict[key]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
-        if flt == "PASS" or flt == "masked" or flt == "underpowered":
+        # Same real-depth-but-rejected reporting as the SNV loop above --
+        # see its comment (tagged here, pruned centrally by Caller.py after
+        # round 2's merge). ni>0 (other-indel evidence in normal) is left
+        # as an unconditional drop, not one of the labeled reasons -- never
+        # reported regardless of --rescue.
+        if eligible:
             if ta == 0:
-                continue
+                mut["filter"] = "no_good_alt_read"
             # if ti > 0:
             # continue
-            if ta / tdp > params["maxAF"]:
-                continue
-            if normalBams:
+            elif ta / tdp > params["maxAF"]:
+                mut["filter"] = "duplex_vaf"
+            elif normalBams:
                 if ndp < params["minNdepth"]:
-                    continue
-                if na / ndp > params["normalVAF"]:
-                    continue
-                if ni > 0:
+                    mut["filter"] = "n_cov_mask"
+                elif na / ndp > params["normalVAF"]:
+                    mut["filter"] = "normal_vaf"
+                elif ni > 0:
                     continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         muts_indels_pass_filter.append(mut)
@@ -3634,66 +4632,78 @@ def callBam(params, processNo):
     ### same maxAF/minNdepth/normalVAF strategy as SNVs/indels above.
     ### _detect_dbs_pairs only ever emits filter=="PASS" candidates (both
     ### constituent bases already independently passed full duplex-consensus
-    ### calling), so — unlike the SNV/indel loops — there's no
-    ### masked/underpowered filter state to preserve here: a candidate either
-    ### clears this gate and is kept, or it's dropped.
-    muts_dbs_dict = dict()
-    dbs_candidate_keys = []
-    for mut in muts_dbs:
-        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
-        if key not in muts_dbs_dict:
-            muts_dbs_dict[key] = None
-            dbs_candidate_keys.append(key)
-
-    if dbs_candidate_keys:
-        tumor_dbs_depths = extractDepthBatchDbs(
-            tumorBam, dbs_candidate_keys, params, minbq=params["minBq"]
-        )
-        normal_dbs_depths = (
-            [
-                extractDepthBatchDbs(
-                    normalBam, dbs_candidate_keys, params, minbq=params["minBq"]
-                )
-                for normalBam in normalBams
-            ]
-            if normalBams
-            else []
-        )
-        for key in dbs_candidate_keys:
-            ta, tr, ti, tdp = tumor_dbs_depths.get(key, (0, 0, 0, 0))
-            if normalBams:
-                na = nr = ni = ndp = 0
-                for normal_depths in normal_dbs_depths:
-                    na_now, nr_now, ni_now, ndp_now = normal_depths.get(
-                        key, (0, 0, 0, 0)
-                    )
-                    na += na_now
-                    nr += nr_now
-                    ni += ni_now
-                    ndp += ndp_now
-            else:
-                na, nr, ni, ndp = (0, 0, 0, 0)
-            muts_dbs_dict[key] = (ta, tr, ti, tdp, na, nr, ni, ndp)
-
+    ### calling), so — unlike the SNV/indel loops — there's no masked filter
+    ### state to preserve here (a candidate either clears this gate and is
+    ### kept, or it's dropped) and therefore no round-2 deferred set either
+    ### -- DBS depth-extraction only runs in round 1.
     muts_dbs_pass_filter = []
-    for mut in muts_dbs:
-        chrom = mut["chrom"]
-        pos = mut["pos"]
-        ref = mut["ref"]
-        alt = mut["alt"]
-        ta, tr, ti, tdp, na, nr, ni, ndp = muts_dbs_dict[(chrom, pos, ref, alt)]
-        if ta == 0:
-            continue
-        if ta / tdp > params["maxAF"]:
-            continue
-        if normalBams:
-            if ndp < params["minNdepth"]:
-                continue
-            if na / ndp > params["normalVAF"]:
-                continue
-        mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
-        muts_dbs_pass_filter.append(mut)
+    if not coverage_only:
+        muts_dbs_dict = dict()
+        dbs_candidate_keys = []
+        for mut in muts_dbs:
+            key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+            if key not in muts_dbs_dict:
+                muts_dbs_dict[key] = None
+                dbs_candidate_keys.append(key)
 
+        if dbs_candidate_keys:
+            _dbs_depth_t0 = time.time()
+            tumor_dbs_depths = extractDepthBatchDbs(
+                tumorBam, dbs_candidate_keys, params, minbq=params["minBq"]
+            )
+            normal_dbs_depths = (
+                [
+                    extractDepthBatchDbs(
+                        normalBam, dbs_candidate_keys, params, minbq=params["minBq"]
+                    )
+                    for normalBam in normalBams
+                ]
+                if normalBams
+                else []
+            )
+            print(
+                f"Process {processNo}: DBS depth extraction for "
+                f"{len(dbs_candidate_keys)} candidates took "
+                f"{(time.time() - _dbs_depth_t0) / 60:.2f} minutes"
+            )
+            for key in dbs_candidate_keys:
+                ta, tr, ti, tdp = tumor_dbs_depths.get(key, (0, 0, 0, 0))
+                if normalBams:
+                    na = nr = ni = ndp = 0
+                    for normal_depths in normal_dbs_depths:
+                        na_now, nr_now, ni_now, ndp_now = normal_depths.get(
+                            key, (0, 0, 0, 0)
+                        )
+                        na += na_now
+                        nr += nr_now
+                        ni += ni_now
+                        ndp += ndp_now
+                else:
+                    na, nr, ni, ndp = (0, 0, 0, 0)
+                muts_dbs_dict[key] = (ta, tr, ti, tdp, na, nr, ni, ndp)
+
+        for mut in muts_dbs:
+            chrom = mut["chrom"]
+            pos = mut["pos"]
+            ref = mut["ref"]
+            alt = mut["alt"]
+            ta, tr, ti, tdp, na, nr, ni, ndp = muts_dbs_dict[(chrom, pos, ref, alt)]
+            if ta == 0:
+                continue
+            if ta / tdp > params["maxAF"]:
+                continue
+            if normalBams:
+                if ndp < params["minNdepth"]:
+                    continue
+                if na / ndp > params["normalVAF"]:
+                    continue
+            mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
+            muts_dbs_pass_filter.append(mut)
+
+    # Original per-locus multi-column coverage write-out: final,
+    # unconditional flush of whatever remains buffered (per-subprocess
+    # only -- see the matching blocks earlier in this function).
+    _final_flush_t0 = time.time()
     if "coverage" in locals():
         if "coverage_leftover" in locals():
             coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
@@ -3711,6 +4721,11 @@ def callBam(params, processNo):
         )
         for pos in non_zero_positions[0].tolist():
             current_pos = pos + reference_mat_start
+            if current_pos <= max_flushed_pos:
+                # See the matching comment on the equivalent blocks
+                # earlier in this function.
+                continue
+            max_flushed_pos = current_pos
             bed_file = get_bed_file_for_position(
                 current_pos,
                 reference_mat_chrom,
@@ -3745,6 +4760,10 @@ def callBam(params, processNo):
     locus_bed_next.close()
 
     print(
+        f"Process {processNo}: final coverage flush took "
+        f"{(time.time() - _final_flush_t0) / 60:.2f} minutes"
+    )
+    print(
         f"Process {processNo} finished in {(time.time()-starttime)/60: .2f} minutes and processed {recCount} reads"
     )
 
@@ -3771,4 +4790,20 @@ def callBam(params, processNo):
         duplex_read_num_dict_indel,
         muts_dbs_pass_filter,
         duplex_read_num_dict_dbs,
+        # Read-family depth-composition totals by trinuc/hp/str context
+        # (see _accumulate_depth_matrix above) and the detection-power
+        # lookup tables (L for SBS, L_indel_1bp/L_indel_len for indels;
+        # None in isLearn mode). Caller.py uses these two ways: (1) at the
+        # initial mutation-rate estimate, combined with PASS calls' raw
+        # (non-log) likelihood ratios; (2) for the per-channel FDR
+        # threshold refinement, re-simulating just that channel's (10,10)
+        # power grid at a new, stricter LR threshold (via
+        # load_error_matrices + simulate_power_grid) and recombining with
+        # these same depth counts for a new effective coverage, without
+        # rescanning the bam.
+        depth_by_trinuc,
+        depth_by_hpstr,
+        L,
+        L_indel_1bp,
+        L_indel_len,
     )

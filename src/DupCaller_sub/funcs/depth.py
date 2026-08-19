@@ -3,6 +3,7 @@ from collections import defaultdict
 import numpy as np
 import pysam
 from .misc import getAlignmentObject as BAM
+from .misc import get_duplex_barcode
 
 # Candidates on the same chromosome farther apart than this start a new
 # pileup() scan in extractDepthBatchSnv/extractDepthBatchIndel, rather than
@@ -395,23 +396,82 @@ def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=18):
     return altAlleleCount, refAlleleCount, otherIndelCount, depth
 
 
-def extractDepthRegion(bam, chrom, start, end, params):
+_MPILEUP_BASE_COL = {"A": 0, "T": 1, "C": 2, "G": 3}
+
+
+def _parse_mpileup_bases(ref_base, bases_str):
+    """Parse one samtools mpileup read-bases column (already quality/mapq
+    filtered by the -Q/-q flags the caller passed to pysam.mpileup, so
+    this is just accounting, no further filtering) into (a, t, c, g)
+    counts. `.`/`,` mean "matches ref_base" (forward/reverse), a bare
+    ACGTacgt is an explicit mismatch call, `^X` marks a read start (X is
+    a mapping-quality char to skip, not a base), `$` marks a read end,
+    and `+N<seq>`/`-N<seq>` is an insertion/deletion attached to the
+    current position's read (the N inserted/deleted bases themselves
+    aren't a call at this column, so both notation and bases are
+    skipped). `*` (mid-deletion placeholder) and N/n are counted in
+    neither ref nor alt."""
+    counts = [0, 0, 0, 0]
+    ref_col = _MPILEUP_BASE_COL.get(ref_base)
+    i = 0
+    n = len(bases_str)
+    while i < n:
+        c = bases_str[i]
+        if c == "^":
+            i += 2
+            continue
+        if c == "$":
+            i += 1
+            continue
+        if c == "+" or c == "-":
+            j = i + 1
+            while j < n and bases_str[j].isdigit():
+                j += 1
+            indel_len = int(bases_str[i + 1 : j])
+            i = j + indel_len
+            continue
+        if c == "." or c == ",":
+            if ref_col is not None:
+                counts[ref_col] += 1
+            i += 1
+            continue
+        col = _MPILEUP_BASE_COL.get(c.upper())
+        if col is not None:
+            counts[col] += 1
+        i += 1
+    return counts
+
+
+def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
+    """count_alleles=True additionally tallies, from the exact same
+    mpileup scan (no second pass), a per-position (end-start, 4) A/T/C/G
+    count matrix -- letting any later candidate's ref/alt count at a
+    position in this region be read directly out of the matrix instead
+    of needing its own separate extractDepthBatchSnv/Indel re-scan of
+    the same bam region. Only the caller that actually needs it pays for
+    the extra per-line parsing; existing callers (indelmask/coverage-
+    threshold-only, e.g. the tumor maxAF<1 branch) are unaffected."""
     depth = np.zeros(end - start)
     indelmask = np.zeros(end - start, dtype=bool)
     # processed_read_names = {}
     mapq = params["mapq"]
-    depth = np.zeros(end - start)
     max_depth = params["minNdepth"]
+    acgt = np.zeros((end - start, 4)) if count_alleles else None
     # for line in pysam.depth("-q","30","-Q",f"{mapq}","-J","-r",f"{chrom}:{start}-{end}",bam).split("\n"):
     for line in pysam.mpileup(
         "-Q", "30", "-q", f"{mapq}", "-r", f"{chrom}:{start}-{end}", bam
     ).split("\n"):
         if line:
             try:
-                pos = int(line.split("\t")[1]) - 1  # 0-based position
-                depth[pos - start] = int(line.split("\t")[3])
+                parts = line.split("\t")
+                pos = int(parts[1]) - 1  # 0-based position
+                depth[pos - start] = int(parts[3])
+                if count_alleles:
+                    acgt[pos - start] = _parse_mpileup_bases(parts[2].upper(), parts[4])
             except:
                 1
+    if count_alleles:
+        return depth, indelmask, acgt
     return depth, indelmask
 
 
@@ -674,9 +734,9 @@ def detectOverlapDiscord(
                     or pileupread.is_del
                 ):
                     continue
-                read_name = pileupread.alignment.query_name
-                read_bc1 = (read_name.split("_")[1].split("+"))[0]
-                read_bc2 = (read_name.split("_")[1].split("+"))[1]
+                read_bc1, read_bc2 = get_duplex_barcode(
+                    pileupread.alignment, params.get("nanoSeqBam")
+                ).split("-")
                 if (
                     (
                         (read_bc1 == bc1 and read_bc2 == bc2)

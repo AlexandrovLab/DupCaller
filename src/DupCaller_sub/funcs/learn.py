@@ -13,8 +13,18 @@ def profileTriNucMismatches(
     chrom = seqs[0].reference_name
     start = seqs[0].reference_start
     trinuc2num = params["trinuc2num_dict"]
-    hpindel_alt_count = np.zeros([23, 23])
-    hpindel_dmg_count = np.zeros([23, 23])
+    # hp_alt_count/hp_dmg_count: (10, 12) -- rows hp run length 1-10+
+    # (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}
+    # (idLen=0 is the reference/opportunity column). str_alt_count/
+    # str_dmg_count: (5, 11) -- rows STR-length bin 0="0-1" (not a real
+    # repeat) / 1="2-9" / 2="10-24" / 3="25-39" / 4="40+", columns
+    # idLen+5 for idLen in -5..5 (idLen=0 the opportunity column). See
+    # funcs/prob.py's indelErrorProbs for the matching call-time
+    # selection logic these are built to feed.
+    hp_alt_count = np.zeros([10, 12])
+    hp_dmg_count = np.zeros([10, 12])
+    str_alt_count = np.zeros([5, 11])
+    str_dmg_count = np.zeros([5, 11])
 
     F1R2 = []
     F2R1 = []
@@ -29,12 +39,28 @@ def profileTriNucMismatches(
     m_F1R2 = len(F1R2)
     m_F2R1 = len(F2R1)
 
-    if m_F1R2 <= 2 or m_F2R1 <= 2:
+    # Minimum reads-per-strand for a family to contribute to amp/damage
+    # learning, independently adjustable since damage (single-strand-
+    # specific errors) and amp (errors shared by both consensus reads)
+    # need different amounts of depth to reliably separate signal from
+    # noise. The family-level floor below (below which NOTHING can be
+    # learned from this family, amp or damage) is the smaller of the two --
+    # each learning track's own, possibly-stricter minimum is applied
+    # separately at its own antimask further down, so a family passing
+    # only the lower of the two still contributes to whichever track it
+    # actually qualifies for.
+    min_group_amp = params.get("minGroupAmp", 3)
+    min_group_dmg = params.get("minGroupDmg", 3)
+    if m_F1R2 < min(min_group_amp, min_group_dmg) or m_F2R1 < min(
+        min_group_amp, min_group_dmg
+    ):
         return (
             np.zeros([64, 4]),
-            np.zeros([23, 23]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
             np.zeros([64, 4]),
-            np.zeros([23, 23]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
         )
 
     ### Prepare sequence matrix and quality matrix for each strand
@@ -111,8 +137,13 @@ def profileTriNucMismatches(
 
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
+    if m_F1R2 < min_group_amp or m_F2R1 < min_group_amp:
+        F1R2_antimask[:] = False
+        F2R1_antimask[:] = False
 
     dmg_antimask = antimask.copy()
+    if m_F1R2 < min_group_dmg or m_F2R1 < min_group_dmg:
+        dmg_antimask[:] = False
 
     F1R2_qual_mat_merged = np.zeros([4, n])
     F1R2_count_mat = np.zeros([4, n], dtype=int)
@@ -202,24 +233,29 @@ def profileTriNucMismatches(
     # F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
 
     F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
+    F1R2_antimask_positions = np.nonzero(F1R2_antimask)[0]
     F1R2_trinuc_alt_count_mat = np.zeros([96, 4])
     F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
     for mm in range(F1R2_seq_mat.shape[0]):
-        if (F1R2_seq_mat[mm, F1R2_antimask] != reference_int[F1R2_antimask]).sum() > 1:
+        seq_masked = F1R2_seq_mat[mm, F1R2_antimask]
+        ref_masked = reference_int[F1R2_antimask]
+        mismatch_bool = seq_masked != ref_masked
+        n_mismatch = int(mismatch_bool.sum())
+        if n_mismatch == 0:
             continue
-        F1R2_trinuc_alt_1Dmap = (
-            F1R2_trinuc_masked + F1R2_seq_mat[mm, F1R2_antimask] * 96
-        )
-        # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
-        F1R2_trinuc_alt_count_mat += (
-            np.bincount(
-                F1R2_trinuc_alt_1Dmap,
-                weights=1 - 10 ** (-F1R2_qual_mat[mm, F1R2_antimask] / 10),
-                minlength=96 * 4,
-            )[0 : 4 * 96]
-            .reshape([4, 96])
-            .T
-        )
+        if n_mismatch == 1:
+            F1R2_trinuc_alt_1Dmap = F1R2_trinuc_masked + seq_masked * 96
+            # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
+            F1R2_trinuc_alt_count_mat += (
+                np.bincount(
+                    F1R2_trinuc_alt_1Dmap,
+                    weights=1 - 10 ** (-F1R2_qual_mat[mm, F1R2_antimask] / 10),
+                    minlength=96 * 4,
+                )[0 : 4 * 96]
+                .reshape([4, 96])
+                .T
+            )
+        # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[:32,:] + F1R2_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -230,23 +266,28 @@ def profileTriNucMismatches(
 
     F2R1_trinuc_alt_count_mat = np.zeros([96, 4])
     F2R1_trinuc_masked = trinuc_int[F2R1_antimask]
+    F2R1_antimask_positions = np.nonzero(F2R1_antimask)[0]
     # F1R2_alt_masked = F1R2_alt_int[F1R2_antimask]
     for mm in range(F2R1_seq_mat.shape[0]):
-        if (F2R1_seq_mat[mm, F2R1_antimask] != reference_int[F2R1_antimask]).sum() > 1:
+        seq_masked = F2R1_seq_mat[mm, F2R1_antimask]
+        ref_masked = reference_int[F2R1_antimask]
+        mismatch_bool = seq_masked != ref_masked
+        n_mismatch = int(mismatch_bool.sum())
+        if n_mismatch == 0:
             continue
-        F2R1_trinuc_alt_1Dmap = (
-            F2R1_trinuc_masked + F2R1_seq_mat[mm, F2R1_antimask] * 96
-        )
-        # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
-        F2R1_trinuc_alt_count_mat += (
-            np.bincount(
-                F2R1_trinuc_alt_1Dmap,
-                weights=1 - 10 ** (-F2R1_qual_mat[mm, F2R1_antimask] / 10),
-                minlength=96 * 4,
-            )[0 : 4 * 96]
-            .reshape([4, 96])
-            .T
-        )
+        if n_mismatch == 1:
+            F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
+            # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
+            F2R1_trinuc_alt_count_mat += (
+                np.bincount(
+                    F2R1_trinuc_alt_1Dmap,
+                    weights=1 - 10 ** (-F2R1_qual_mat[mm, F2R1_antimask] / 10),
+                    minlength=96 * 4,
+                )[0 : 4 * 96]
+                .reshape([4, 96])
+                .T
+            )
+        # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[:32,:] + F2R1_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -287,87 +328,137 @@ def profileTriNucMismatches(
     if m >= 2:
         return (
             F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
-            np.zeros([23, 23]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
             dmg_trinuc_alt_count_mat_norm,
-            np.zeros([23, 23]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
         )
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
+    if m_F1R2 < min_group_amp or m_F2R1 < min_group_amp:
+        F1R2_antimask[:] = False
+        F2R1_antimask[:] = False
     dmg_antimask = antimask.copy()
-    if m_F1R2 < 3 or m_F2R1 < 3:
+    if m_F1R2 < min_group_dmg or m_F2R1 < min_group_dmg:
         dmg_antimask[:] = False
 
     # hp_raw (hp.h5): row0 = self-derived homopolymer run length, row1 =
     # start-of-run bool. str_raw (str.h5): row0 = repeat unit length,
     # row1 = number of times the unit repeats, row2 = start-of-repeat
-    # bool. These are two independent sources, matching main's original
-    # single combined hp.h5 (rows 0-3: hp_lens_rev, hp_lens_cut,
-    # hp_lens_str, hp_lens_str_cut) — a position inside an annotated STR
-    # interval that also starts an embedded run of identical bases (e.g.
-    # the "AA" in a (AAT)n repeat) is credited to BOTH the homopolymer
-    # and the STR opportunity/error tables, never mutually exclusive.
+    # bool. These are two independent sources — a position inside an
+    # annotated STR interval that also starts an embedded run of
+    # identical bases (e.g. the "AA" in a (AAT)n repeat) is credited to
+    # BOTH the homopolymer and the STR opportunity/error tables, never
+    # mutually exclusive (unchanged from before this rewrite).
     hp_len_arr = hp_raw[0].astype(int)
     hp_mask = hp_raw[1] == 1
 
     unit_len = str_raw[0].astype(int)
     repeat_count = str_raw[1].astype(int)
     total_len = unit_len * repeat_count
+    is_str = unit_len >= 2
+    # 5 bins: 0 = not a real repeat (is_str False -- never populated by
+    # the opportunity pass below, only ever reached by an actual
+    # mismatched-insertion event; see the per-event loop), 1="2-9",
+    # 2="10-24", 3="25-39", 4="40+".
     str_bin_arr = np.zeros_like(total_len)
-    str_bin_arr[total_len >= 10] = 1
-    str_bin_arr[total_len >= 25] = 2
-    str_bin_arr[total_len >= 40] = 3
-    str_mask = (str_raw[2] == 1) & (str_bin_arr > 0)
+    str_bin_arr[is_str] = 1
+    str_bin_arr[is_str & (total_len >= 10)] = 2
+    str_bin_arr[is_str & (total_len >= 25)] = 3
+    str_bin_arr[is_str & (total_len >= 40)] = 4
+    str_mask = (str_raw[2] == 1) & is_str
 
-    hp_F1R2 = hp_len_arr[F1R2_antimask][hp_mask[F1R2_antimask]]
-    hp_F2R1 = hp_len_arr[F2R1_antimask][hp_mask[F2R1_antimask]]
-    hp_F1R2[hp_F1R2 > 20] = 20
-    hp_F2R1[hp_F2R1 > 20] = 20
+    hp_rc4 = [1, 0, 3, 2]  # base-complement permutation, 4-wide axis
 
-    ref_F1R2 = reference_int[F1R2_antimask][hp_mask[F1R2_antimask]]
-    F1R2_id_alt_1Dmap = hp_F1R2 - 1 + ref_F1R2 * 20
-    hpindel_alt_count[0:20, 5] += np.bincount(hp_F1R2 - 1, minlength=20) * m_F1R2
-    F1R2_hpindel_1bp = (
-        np.bincount(F1R2_id_alt_1Dmap, minlength=20 * 4).reshape(4, 20).T * m_F1R2
-    )
-    F1R2_hpindel_1bp += F1R2_hpindel_1bp[0:20, [1, 0, 3, 2]]
-    hpindel_alt_count[0:20, [12, 15, 18, 21]] += F1R2_hpindel_1bp
+    # HP amp opportunity: every start-of-run position (regardless of
+    # is_str) contributes its own (hp length, own reference base) as an
+    # idLen=0 (column base*3+1) observation, weighted by family size and
+    # self-RC-folded per strand -- same convention as the SBS/DBS amp
+    # matrices above (each strand's own tally symmetrized under base-
+    # complement, then the two strands summed), since amp errors have no
+    # strand-of-origin directionality. reference_int can be 4 (N/
+    # ambiguous) at a run-start position; those are excluded rather than
+    # risking an out-of-range column.
+    def _hp_amp_opportunity(strand_antimask, weight):
+        hp_here = hp_len_arr[strand_antimask][hp_mask[strand_antimask]]
+        ref_here = reference_int[strand_antimask][hp_mask[strand_antimask]]
+        valid = ref_here <= 3
+        hp_here = np.minimum(hp_here[valid], 10)
+        ref_here = ref_here[valid]
+        local = np.zeros([10, 4])
+        np.add.at(local, (hp_here - 1, ref_here), 1)
+        local *= weight
+        return local + local[:, hp_rc4]
 
-    ref_F2R1 = reference_int[F2R1_antimask][hp_mask[F2R1_antimask]]
-    F2R1_id_alt_1Dmap = hp_F2R1 - 1 + ref_F2R1 * 20
-    hpindel_alt_count[0:20, 5] += np.bincount(hp_F2R1 - 1, minlength=20) * m_F2R1
-    F2R1_hpindel_1bp = (
-        np.bincount(F2R1_id_alt_1Dmap, minlength=20 * 4).reshape(4, 20).T * m_F2R1
-    )
-    F2R1_hpindel_1bp += F2R1_hpindel_1bp[0:20, [1, 0, 3, 2]]
-    hpindel_alt_count[0:20, [12, 15, 18, 21]] += F2R1_hpindel_1bp
+    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(F1R2_antimask, m_F1R2)
+    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(F2R1_antimask, m_F2R1)
 
-    hp_dmg = hp_len_arr[dmg_antimask][hp_mask[dmg_antimask]]
-    hp_dmg[hp_dmg > 20] = 20
-    hpindel_dmg_count[0:20, 5] += np.bincount(hp_dmg - 1, minlength=20) * 2
+    # STR amp opportunity: only at annotated-repeat start positions,
+    # column 5 (idLen=0). No base identity/RC-fold involved (a repeat's
+    # unit length has no complement).
+    def _str_amp_opportunity(strand_antimask, weight):
+        bin_here = str_bin_arr[strand_antimask][str_mask[strand_antimask]]
+        return np.bincount(bin_here, minlength=5) * weight
 
-    ref_dmg = reference_int[dmg_antimask][hp_mask[dmg_antimask]]
-    F1R2_dmg_id_alt_1Dmap = hp_dmg - 1 + ref_dmg * 20
-    F1R2_dmg_hpindel_1bp = (
-        np.bincount(F1R2_dmg_id_alt_1Dmap, minlength=20 * 4).reshape(4, 20).T
-    )
-    F2R1_dmg_hpindel_1bp = F1R2_dmg_hpindel_1bp[:, [1, 0, 3, 2]]
-    hpindel_dmg_count[0:20, [12, 15, 18, 21]] += F1R2_dmg_hpindel_1bp
-    hpindel_dmg_count[0:20, [12, 15, 18, 21]] += F2R1_dmg_hpindel_1bp
+    str_alt_count[:, 5] += _str_amp_opportunity(F1R2_antimask, m_F1R2)
+    str_alt_count[:, 5] += _str_amp_opportunity(F2R1_antimask, m_F2R1)
 
-    str_dmg = str_bin_arr[dmg_antimask][str_mask[dmg_antimask]]
-    hpindel_dmg_count[20:23, 5] += np.bincount(str_dmg - 1, minlength=3) * 2
+    # STR amp opportunity for row 0 ("not a real repeat"): unlike rows
+    # 1-4 (one credit per real, cut-gated repeat tract via str_mask),
+    # row 0 has no tract to dedupe by -- str_mask structurally excludes
+    # every row-0 position (str_mask requires is_str), so without this,
+    # row 0's own column 5 stays permanently 0 and
+    # _normalize_indel_str_mat's row-sum normalization has no real
+    # opportunity denominator for row 0, silently normalizing its rare
+    # event counts against each other instead and producing wildly
+    # inflated "probabilities" (observed: up to 0.58, when a real
+    # damage/amp rate should be ~1e-5 or smaller). Every antimask-
+    # passing, non-STR-annotated position independently counts here
+    # (matches misc.py's indel100_reference_bucket_indices flat rep1/
+    # rep0 credit and call.py's L_indel_len[...,0,X] lookup, both of
+    # which already treat row 0 as one shared, position-count-weighted
+    # background population regardless of indel length).
+    def _str_amp_opportunity_row0(strand_antimask, weight):
+        return np.count_nonzero(strand_antimask & ~is_str) * weight
 
-    str_F1R2 = str_bin_arr[F1R2_antimask][str_mask[F1R2_antimask]]
-    hpindel_alt_count[20:23, 5] += np.bincount(str_F1R2 - 1, minlength=3) * m_F1R2
-    str_F2R1 = str_bin_arr[F1R2_antimask][str_mask[F1R2_antimask]]
-    hpindel_alt_count[20:23, 5] += np.bincount(str_F2R1 - 1, minlength=3) * m_F2R1
+    str_alt_count[0, 5] += _str_amp_opportunity_row0(F1R2_antimask, m_F1R2)
+    str_alt_count[0, 5] += _str_amp_opportunity_row0(F2R1_antimask, m_F2R1)
+
+    # HP dmg opportunity: a single combined pass (dmg_antimask doesn't
+    # distinguish which strand might show damage), credited to BOTH
+    # orientations from the same position data -- direct (F1R2 frame)
+    # and base-complemented (F2R1/bottom-strand frame) via the same
+    # self-fold operation as the amp case, mirroring how the per-event
+    # dmg branch below folds F2R1's contribution onto F1R2's frame
+    # instead of self-folding each independently.
+    hp_dmg_here = hp_len_arr[dmg_antimask][hp_mask[dmg_antimask]]
+    ref_dmg_here = reference_int[dmg_antimask][hp_mask[dmg_antimask]]
+    valid_dmg = ref_dmg_here <= 3
+    hp_dmg_here = np.minimum(hp_dmg_here[valid_dmg], 10)
+    ref_dmg_here = ref_dmg_here[valid_dmg]
+    hp_dmg_local = np.zeros([10, 4])
+    np.add.at(hp_dmg_local, (hp_dmg_here - 1, ref_dmg_here), 1)
+    hp_dmg_count[:, [1, 4, 7, 10]] += hp_dmg_local + hp_dmg_local[:, hp_rc4]
+
+    # STR dmg opportunity: same *2 (both orientations, no base identity
+    # to complement) as the two separate-weighted amp strand passes.
+    str_dmg_here = str_bin_arr[dmg_antimask][str_mask[dmg_antimask]]
+    str_dmg_count[:, 5] += np.bincount(str_dmg_here, minlength=5) * 2
+
+    # STR dmg opportunity for row 0 -- same reasoning as the amp case
+    # above, same *2 (both orientations, no base identity to
+    # complement) as the two separate-weighted amp strand passes.
+    str_dmg_count[0, 5] += np.count_nonzero(dmg_antimask & ~is_str) * 2
 
     if m == 0:
         return (
             F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
-            hpindel_alt_count,
+            hp_alt_count,
+            str_alt_count,
             dmg_trinuc_alt_count_mat_norm,
-            hpindel_dmg_count,
+            hp_dmg_count,
+            str_dmg_count,
         )
 
     F1R2_alt_qual = np.zeros(m)
@@ -427,108 +518,133 @@ def profileTriNucMismatches(
     F2R1_antimask[F2R1_ref_count + F2R1_alt_count < 3] = False
     F2R1_antimask[F2R1_alt_count > 1] = False
 
-    F1R2_hpindel_alt_count = np.zeros([20, 12])
-    F2R1_hpindel_alt_count = np.zeros([20, 12])
-    dmg_hpindel_alt_count = np.zeros([20, 12])
+    # m == 1 here (m>=2 and m==0 both returned above), so this loop runs
+    # exactly once -- kept as a loop (rather than indexing indels_masked[0]
+    # directly) only to mirror the surrounding code's style.
     for mm, indel in enumerate(indels_masked):
-        pos = int(indel.split(":")[0]) - start
-        indelLen = int(indel.split(":")[1])
-        offset = -indelLen
-        if offset < 0:
-            offset = 0
-        anchor = pos + 1 + offset
-        # hp is always the self-derived homopolymer run length at the
-        # anchor base (hp_raw row0), independent of whether that base
-        # also falls inside an annotated STR interval — matches main's
-        # `hp = int(hp_int[0, anchor])`. STR classification (str_bin_here)
-        # is a separate, independent lookup against the BED-derived STR
-        # annotation (str_raw), not a fallback gated by unit_len.
+        parts = indel.split(":")
+        pos = int(parts[0]) - start
+        indelLen = int(parts[1])
+        # anchor is the reference base immediately after the insertion
+        # point / the deleted base itself -- same position for both
+        # directions, matching funcs/prob.py's genotypeDSIndel exactly, so
+        # learn-time and call-time always agree.
+        anchor = pos + 1
         hp = int(hp_raw[0, anchor])
+        hp_capped = min(hp, 10)
         unit_len_here = int(str_raw[0, anchor])
         repeat_count_here = int(str_raw[1, anchor])
         if unit_len_here >= 2:
             total_len_here = unit_len_here * repeat_count_here
             if total_len_here >= 40:
-                str_bin_here = 3
+                str_bin_here = 4
             elif total_len_here >= 25:
-                str_bin_here = 2
+                str_bin_here = 3
             elif total_len_here >= 10:
-                str_bin_here = 1
+                str_bin_here = 2
             else:
-                str_bin_here = 0
+                str_bin_here = 1
         else:
             str_bin_here = 0
-        if hp > 20:
-            hp = 20
+
         if indelLen > 5:
             indelLen = 5
         if indelLen < -5:
             indelLen = -5
+
         if indelLen == 1 or indelLen == -1:
-            ref_allele = int(reference_int[pos + 1 + offset])
+            ref_allele = int(reference_int[anchor])
             ref_allele_rc = int(reverse_comp[ref_allele])
-            if F1R2_antimask[mm]:
-                F1R2_hpindel_alt_count[
-                    hp - 1, 1 + ref_allele * 3 + indelLen
-                ] += F1R2_alt_count[mm]
-                F1R2_hpindel_alt_count[hp - 1, 1 + ref_allele * 3] -= F1R2_alt_count[mm]
-            if F2R1_antimask[mm]:
-                F2R1_hpindel_alt_count[
-                    hp - 1, 1 + ref_allele_rc * 3 + indelLen
-                ] += F2R1_alt_count[mm]
-                F2R1_hpindel_alt_count[hp - 1, 1 + ref_allele_rc * 3] -= F2R1_alt_count[
-                    mm
-                ]
-            if F1R2_dmg_antimask[mm]:
-                dmg_hpindel_alt_count[hp - 1, 1 + ref_allele * 3 + indelLen] += 1
-                dmg_hpindel_alt_count[hp - 1, 1 + ref_allele * 3] -= 1
-            if F2R1_dmg_antimask[mm]:
-                # print(hpindel_dmg_count)
-                dmg_hpindel_alt_count[hp - 1, 1 + ref_allele_rc * 3 + indelLen] += 1
-                dmg_hpindel_alt_count[hp - 1, 1 + ref_allele_rc * 3] -= 1
-                # print([_.cigartuples for _ in seqs],hpindel_dmg_count)
-            F1R2_hpindel_alt_count[0:20, :] += F1R2_hpindel_alt_count[
-                0:20, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
-            ]
-            F2R1_hpindel_alt_count[0:20, :] += F2R1_hpindel_alt_count[
-                0:20, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
-            ]
-            hpindel_alt_count[0:20, 11:23] += (
-                F1R2_hpindel_alt_count + F2R1_hpindel_alt_count
-            )
-            hpindel_dmg_count[0:20, 11:23] += dmg_hpindel_alt_count
+            if indelLen == -1:
+                # Deletion: the deleted base is trivially the
+                # homopolymer's own base -- always a match.
+                hp_match = True
+            else:
+                inserted_seq = parts[2] if len(parts) > 2 else ""
+                inserted_base = (
+                    base2num.get(inserted_seq[0], -1) if inserted_seq else -1
+                )
+                hp_match = inserted_base == ref_allele
 
+            if hp_match:
+                row = hp_capped - 1
+                col = ref_allele * 3 + (indelLen + 1)
+                col_rc = ref_allele_rc * 3 + (indelLen + 1)
+                opp_col = ref_allele * 3 + 1
+                opp_col_rc = ref_allele_rc * 3 + 1
+
+                # Amp: reconcile against the opportunity credit already
+                # given to this exact (hp_len, base) cell above (this
+                # position was covered and its hp/base context counted
+                # there without knowing an indel would land here), then
+                # self-RC-fold each strand's own delta before summing --
+                # same convention as the opportunity pass.
+                F1R2_local = np.zeros(12)
+                F2R1_local = np.zeros(12)
+                if F1R2_antimask[mm]:
+                    F1R2_local[col] += F1R2_alt_count[mm]
+                    F1R2_local[opp_col] -= F1R2_alt_count[mm]
+                if F2R1_antimask[mm]:
+                    F2R1_local[col_rc] += F2R1_alt_count[mm]
+                    F2R1_local[opp_col_rc] -= F2R1_alt_count[mm]
+                F1R2_local = F1R2_local.reshape(4, 3)
+                F1R2_local = F1R2_local + F1R2_local[hp_rc4, :]
+                F2R1_local = F2R1_local.reshape(4, 3)
+                F2R1_local = F2R1_local + F2R1_local[hp_rc4, :]
+                hp_alt_count[row, :] += (F1R2_local + F2R1_local).reshape(12)
+
+                # Dmg: both strands fold directly into the same cell
+                # (F2R1 via the complemented base), same as the dmg
+                # opportunity pass and the SBS/DBS dmg convention.
+                if F1R2_dmg_antimask[mm]:
+                    hp_dmg_count[row, col] += 1
+                    hp_dmg_count[row, opp_col] -= 1
+                if F2R1_dmg_antimask[mm]:
+                    hp_dmg_count[row, col_rc] += 1
+                    hp_dmg_count[row, opp_col_rc] -= 1
+            else:
+                # Inserted base doesn't match the flanking homopolymer:
+                # not a real slippage event -- str.txt row 0, +-1
+                # column. Row 0 now does receive opportunity credit (see
+                # the row-0 opportunity pass above), so this position's
+                # own event needs the same reconciliation subtraction
+                # rows 1-4 get below -- otherwise it would be double-
+                # counted as both "no event" (col 5) and "this event"
+                # (col). No base identity to RC-fold either way.
+                col = indelLen + 5
+                if F1R2_antimask[mm]:
+                    str_alt_count[0, col] += F1R2_alt_count[mm]
+                    str_alt_count[0, 5] -= F1R2_alt_count[mm]
+                if F2R1_antimask[mm]:
+                    str_alt_count[0, col] += F2R1_alt_count[mm]
+                    str_alt_count[0, 5] -= F2R1_alt_count[mm]
+                if dmg_antimask[mm]:
+                    str_dmg_count[0, col] += 1
+                    str_dmg_count[0, 5] -= 1
         else:
+            # Length >=2: always STR-context, keyed by this position's
+            # real STR-length bin (0 if not actually annotated -- no
+            # hp-length fallback). Row 0 receives opportunity credit same
+            # as rows 1-4 (see the row-0 opportunity pass above), so the
+            # reconciliation subtraction applies uniformly regardless of
+            # row.
+            row = str_bin_here
+            col = indelLen + 5
             if F1R2_antimask[mm]:
-                if str_bin_here != 0:
-                    hpindel_alt_count[
-                        19 + str_bin_here, indelLen + 5
-                    ] += F1R2_alt_count[mm]
-                    hpindel_alt_count[19 + str_bin_here, 5] += F1R2_alt_count[mm]
-                else:
-                    hpindel_alt_count[hp - 1, indelLen + 5] += F1R2_alt_count[mm]
-                    hpindel_alt_count[hp - 1, 5] -= F1R2_alt_count[mm]
+                str_alt_count[row, col] += F1R2_alt_count[mm]
+                str_alt_count[row, 5] -= F1R2_alt_count[mm]
             if F2R1_antimask[mm]:
-                if str_bin_here != 0:
-                    hpindel_alt_count[
-                        19 + str_bin_here, indelLen + 5
-                    ] += F2R1_alt_count[mm]
-                    hpindel_alt_count[19 + str_bin_here, 5] -= F2R1_alt_count[mm]
-                else:
-                    hpindel_alt_count[hp - 1, indelLen + 5] += F2R1_alt_count[mm]
-                    hpindel_alt_count[hp - 1, 5] -= F2R1_alt_count[mm]
+                str_alt_count[row, col] += F2R1_alt_count[mm]
+                str_alt_count[row, 5] -= F2R1_alt_count[mm]
             if dmg_antimask[mm]:
-                if str_bin_here != 0:
-                    hpindel_dmg_count[19 + str_bin_here, indelLen + 5] += 1
-                    hpindel_dmg_count[19 + str_bin_here, 5] -= 1
-                else:
-                    hpindel_dmg_count[hp - 1, indelLen + 5] += 1
-                    hpindel_dmg_count[hp - 1, 5] -= 1
+                str_dmg_count[row, col] += 1
+                str_dmg_count[row, 5] -= 1
 
-        # print([_.cigartuples for _ in seqs],hpindel_alt_count,hpindel_dmg_count)
-        return (
-            F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
-            hpindel_alt_count,
-            dmg_trinuc_alt_count_mat_norm,
-            hpindel_dmg_count,
-        )
+    return (
+        F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
+        hp_alt_count,
+        str_alt_count,
+        dmg_trinuc_alt_count_mat_norm,
+        hp_dmg_count,
+        str_dmg_count,
+    )

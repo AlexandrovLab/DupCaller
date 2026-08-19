@@ -1,8 +1,8 @@
 # DupCaller
 
-[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://github.com/AlexandrovLab/DupCaller/blob/main/README.md) [![License](https://img.shields.io/badge/License-BSD%202--Clause-orange.svg)](https://opensource.org/licenses/BSD-2-Clause) [![Build Status](https://github.com/AlexandrovLab/DupCaller/actions/workflows/test.yml/badge.svg)](https://github.com/AlexandrovLab/DupCaller/actions)[![Uptime Robot status](https://img.shields.io/uptimerobot/status/m795312784-02766a79f207f67626cef289)](https://stats.uptimerobot.com/jjqW4Ulymx)
+[![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://github.com/AlexandrovLab/DupCaller/blob/main/README.md) [![License](<https://img.shields.io/badge/License-BSD%202--Clause-orange.svg>)](https://opensource.org/licenses/BSD-2-Clause) [![Build Status](https://github.com/AlexandrovLab/DupCaller/actions/workflows/test.yml/badge.svg)](https://github.com/AlexandrovLab/DupCaller/actions)[![Uptime Robot status](https://img.shields.io/uptimerobot/status/m795312784-02766a79f207f67626cef289)](https://stats.uptimerobot.com/jjqW4Ulymx)
 
-DupCaller is a universal tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS) data with matched normal (e.x. NanoSeq).
+DupCaller is a universal tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS) data with matched normal (e.x. NanoSeq, UDSeq).
 
 ---
 
@@ -65,16 +65,19 @@ A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.
 **Pull and run with Singularity:**
 
 Pull the image from Docker Hub (only needed once):
+
 ```bash
 singularity pull dupcaller-1.1.0.sif docker://yuhecheng62/dupcaller:1.1.0-amd64
 ```
 
 For quick verification:
+
 ```bash
 singularity exec dupcaller-1.1.0.sif DupCaller.py --help
 ```
 
 For installation-free execution of DupCaller commands, run all DupCaller.py commands with `singularity exec` and binding of current directories:
+
 ```bash
 singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your commands}
 ```
@@ -102,22 +105,17 @@ Then index the reference, passing PERF's tsv directly:
 DupCaller.py index -f reference.fa -rt repeats.tsv
 ```
 
-The command will generate four h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5`, `{reference}.hp.h5`, and `{reference}.str.h5` — numpyrized reference sequences, trinucleotide contexts, homopolymer annotations, and STR (unit length >=2) annotations, respectively. Homopolymers (unit length 1) are self-derived directly from the reference sequence rather than taken from the PERF tsv, so PERF's `-m` can start at 1 or 2 with no effect on `hp.h5`. Make sure that when running other DupCaller utilities, all four files are within the same folder as the reference genome.
+The command will generate five h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5`, `{reference}.hp.h5`, `{reference}.str.h5`, and `{reference}.dbs.h5` — numpyrized reference sequences, trinucleotide contexts, homopolymer annotations, STR (unit length >=2) annotations, and per-position dinucleotide (DBS) classes, respectively. Make sure that when running other DupCaller utilities, all five files are within the same folder as the reference genome.
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
 #### Parameters
 
-| Short | Long | Description |
-| --- | --- | --- |
-| -f | --reference | Reference genome fasta file (required) |
-| -rt | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns. |
+| Short | Long        | Description                                                                                                                                                                                                          |
+| ----- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| -f    | --reference | Reference genome fasta file (required)                                                                                                                                                                               |
+| -rt   | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns. |
 
-#### Pre-built Indexes
-
-We have built indexes for human reference genome GRCh38/hg38 and mouse reference genome GRCm39/mm39, and can be downloaded at:
-
----
 
 ### Step 2: Trim Barcodes
 
@@ -129,7 +127,7 @@ DupCaller.py trim -i read1.fq -i2 read2.fq -p barcode_pattern -o sample_name
 
 - `read1.fq` / `read2.fq` — FASTQ files from read 1 and read 2. Both unzipped and gzip-compressed files are supported.
 - `barcode_pattern` — pattern of barcodes starting from the 5-prime end, with `N` representing a barcode base and `X` representing a skipped base (similar notation to [UMI-tools](https://github.com/CGATOxford/UMI-tools)). For example, NanoSeq uses a 3-base barcode followed by 4 constant bases, so the pattern should be `NNNXXXX`.
-- `sample_name` — prefix of output paired FASTQs. After the run completes, `{sample_name}_1.fastq` and `{sample_name}_2.fastq` will be generated. Barcodes will be recorded in each read name as `{original_read_name}:{read1_barcode}+{read2_barcode}`.
+- `sample_name` — prefix of output paired FASTQs. After the run completes, `{sample_name}_1.fastq` and `{sample_name}_2.fastq` will be generated. Barcodes are appended to each read name (`{original_read_name}_{read1_barcode}+{read2_barcode}`, for optical-duplicate read-name matching only) and also written as a `DB:Z:{read1_barcode}-{read2_barcode}` FASTQ comment; the comment is promoted to a BAM tag by `bwa mem -C` (Step 3) and is what `DupCaller.py call` actually reads to assign duplex family membership — it never parses the read name for barcodes.
 
 If the matched normal is prepared in the same way as the sample, apply trimming with the same scheme to the matched normal FASTQs. For traditional bulk normal, trimming is not needed.
 
@@ -176,18 +174,22 @@ gatk MarkDuplicates \
 After preprocessing, run `DupCaller.py call` to call somatic mutations. Usage depends on your experimental design:
 
 **Whole genome / whole exome / reduced genome (e.g. NanoSeq) with a matched normal:**
+
 ```bash
 DupCaller.py call -b ${sample}.mkdped.bam -f reference.fa -o {output_prefix} \
     -p {threads} -n {normal.bam} -g germline.vcf.gz -m noise_mask.bed.gz
 ```
 
 **Mutagenesis panel without a matched normal:**
+
 ```bash
 DupCaller.py call -b ${sample}.mkdped.bam -f reference.fa -o {output_prefix} \
     -p {threads} -g germline.vcf.gz -m noise_mask.bed.gz -maf 0.1
 ```
 
 > Note: DupCaller partitions jobs by genomic region; multithreading is less effective for small targeted panels. In this case, use at most one thread per distinct targeted region.
+
+**NanoSeq-tagged BAMs:** BAMs produced by DupCaller's own `trim` (Step 2) carry a shared `DB:Z:{bc1}-{bc2}` tag per read pair. If instead you are calling directly from a BAM produced by the Sanger NanoSeq pipeline, which tags each read with its own `RB`/`MB` (read/mate barcode) tags rather than a single `DB` tag, pass `-nb`/`--NanoSeqBam` so `call` reconstructs the duplex barcode as `{MB}-{RB}` for read 1 and `{RB}-{MB}` for read 2 instead of reading `DB` directly.
 
 **Input validation:** DupCaller checks for the existence of all required files (BAM, reference, h5 index files, and optional files) before starting analysis, providing clear error messages for missing files.
 
@@ -199,61 +201,65 @@ See the [Results](#results) section for descriptions of all output files.
 
 ##### Required
 
-| Short | Long | Description |
-| --- | --- | --- |
-| -b | --bam | BAM file of ecNGS data |
-| -f | --reference | Reference genome FASTA file |
-| -o | --output | Prefix of the output files |
+| Short | Long        | Description                 |
+| ----- | ----------- | --------------------------- |
+| -b    | --bam       | BAM file of ecNGS data      |
+| -f    | --reference | Reference genome FASTA file |
+| -o    | --output    | Prefix of the output files  |
 
 ##### Recommended
 
 These options should be understood and customized accordingly.
 
-| Short | Long | Description | Default |
-| --- | --- | --- | --- |
-| -r | --regions | Contigs to consider for variant calling. For non-human species, set accordingly (e.g. for mouse: `-r chr{1..19} chrX`) | chr{1..22} chrX|
-| -g | --germline | Indexed germline VCF with AF field | None |
-| -p | --threads | Number of threads | 1 |
-| -n | --normalBams | BAM file(s) of matched normals. When unavailable, set `-maf` to an appropriate value (e.g. 0.1) | None |
-| -m | --noise | BED interval file(s) masking noisy positions | None |
-| -R | --regionfile | Inclusive BED file specifying target regions | None |
-| -maf | --maxAF | Maximum allele fraction to call a somatic mutation. Must be set when matched normal (`-n`) is unavailable | 1 |
-| -tt | --trimF | Ignore mutations less than n bp from template ends | 7 |
-| -tr | --trimR | Ignore mutations less than n bp from read ends | 7 |
+| Short | Long         | Description                                                                                                               | Default         |
+| ----- | ------------ | ------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| -r    | --regions    | Contigs to consider for variant calling. For non-human species, set accordingly (e.g. for mouse:`-r chr{1..19} chrX`)   | chr{1..22} chrX |
+| -g    | --germline   | Indexed germline VCF with AF field                                                                                        | None            |
+| -p    | --threads    | Number of threads                                                                                                         | 1               |
+| -n    | --normalBams | BAM file(s) of matched normals. When unavailable, set`-maf` to an appropriate value (e.g. 0.1)                          | None            |
+| -m    | --noise      | BED interval file(s) masking noisy positions                                                                              | None            |
+| -R    | --regionfile | Inclusive BED file specifying target regions                                                                              | None            |
+| -maf  | --maxAF      | Maximum allele fraction to call a somatic mutation. Must be set when matched normal (`-n`) is unavailable               | 1               |
+| -tt   | --trimF      | Ignore mutations less than n bp from template ends                                                                        | 7               |
+| -tr   | --trimR      | Ignore mutations less than n bp from read ends                                                                            | 7               |
+| -nb   | --NanoSeqBam | Read the duplex barcode from NanoSeq-style per-mate`RB`/`MB` BAM tags instead of a shared `DB` tag (see note above) | False           |
 
 ##### Optional
 
 The effect of changing these parameters should be evaluated before implementation.
 
-| Short | Long | Description | Default |
-| --- | --- | --- | --- |
-| --naf | | Maximum VAF in matched normal for a mutation to be called | 0.01 |
-| --rescue | | Output discarded variants with reason in the FILTER field | False |
-| -nm | --nmflt | Filter reads with edit distance larger than this value | 5 |
-| -ax | --minMeanASXS | Minimum mean AS-XS alignment score difference for a read group to be considered | 50 |
-| -gaf | --germlineAfCutoff | Skip positions with germline AF above this threshold | 0.001 |
-| -d | --minNdepth | Minimum coverage in normal for called variants | 10 |
+| Short    | Long               | Description                                                                                                                                                                                                                                                                                                                                                                               | Default |
+| -------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| --naf    |                    | Maximum VAF in matched normal for a mutation to be called                                                                                                                                                                                                                                                                                                                                 | 0.01    |
+| --rescue |                    | Output discarded variants with reason in the FILTER field                                                                                                                                                                                                                                                                                                                                 | False   |
+| -nm      | --nmflt            | Filter reads with edit distance larger than this value                                                                                                                                                                                                                                                                                                                                    | 5       |
+| -ax      | --minMeanASXS      | Minimum mean AS-XS alignment score difference for a read group to be considered                                                                                                                                                                                                                                                                                                           | 50      |
+| -gaf     | --germlineAfCutoff | Skip positions with germline AF above this threshold                                                                                                                                                                                                                                                                                                                                      | 0.001   |
+| -d       | --minNdepth        | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                                            | 10      |
+| -mr      | --mutRate          | Estimated somatic mutation rate per base, used as the prior for per-channel FDR refinement                                                                                                                                                                                                                                                                                                | 3e-10   |
+| -sc      | --skipCoveragePass | Skip round 2 (the coverage-only pass): no duplex depth / per-locus`coverage.bed.gz`, no duplex-family composition or by-duplex-group output files, and masked candidates that only clear the final FDR-refined threshold get no real depth. Only round 1 calling and FDR-threshold determination run; VCFs and a trimmed `_stats.txt` are still written. Roughly halves total runtime | False   |
 
 ##### Advanced
 
 These are variant calling model parameters; adjustment is unnecessary for general use.
 
-| Short | Long | Description | Default |
-| --- | --- | --- | --- |
-| -AS | --amperrfile | Pre-learned error profile for amplification SBS error | None |
-| -AI | --amperrfileindel | Pre-learned error profile for amplification indel error | None |
-| -DS | --dmgerrfile | Pre-learned error profile for SBS damage | None |
-| -DI | --dmgerrfileindel | Pre-learned error profile for indel damage | None |
-| -ts | --thresholdSnv | Log likelihood ratio threshold for SNV calls | 8.5 |
-| -ti | --thresholdIndel | Log likelihood ratio threshold for indel calls. Three values corresponds to the threshold for 1. homopolymer length less than 5; 2. homopolymer length 6 to 10; 3. homopolymer length more than 10 or are in STR regions.  | 10.3,8.5,7 |
-| -mq | --mapq | Minimum MAPQ for an alignment to be considered | 40 |
-| -w | --windowSize | Genomic window size for coverage calculation and BAM partitioning | 100000 |
-| -bq | --minBq | Bases with quality below this value will be set to 6 | 18 |
-| -aq | --minAltQual | Minimum consensus quality of alt allele in a read group | 60 |
-| --minRef | | Minimum consensus quality of ref allele in a read group | 2 |
-| --minAlt | | Minimum consensus quality of alt allele in a read group | 2 |
-| -z | --maxZeroQualFrac | Maximum fraction of zero-quality bases in a read family. Set to 0.1 if a noise mask is not available | 0.5 |
-| -id | --indelBed | Indel enhanced Panel of Normals (ePoN) for indel calling | None |
+| Short         | Long              | Description                                                                                                                                                                                                                                       | Default              |
+| ------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| -E            | --errprefix       | Prefix of pre-learned error files ({prefix}.amp.tn.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                         | None                 |
+| -fdr          | --fdrThreshold    | Target per-channel FDR; any candidate with a positive log-likelihood ratio is a candidate mutation, and channels whose mean FDR exceeds this get their effective threshold raised (and mutation rate re-estimated) iteratively until they meet it | 0.05                 |
+| -a            | --pseudocount     | Regularization pseudocount added to each channel's per-channel mixture-weight MLE solve, guaranteeing a root strictly between 0 and 1 for every channel                                                                                           | 0.5                  |
+| -mq           | --mapq            | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                    | 40                   |
+| -w            | --windowSize      | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                 | 100000               |
+| -bq           | --minBq           | Bases with quality below this value will be set to 6                                                                                                                                                                                              | 18                   |
+| -aq           | --minAltQual      | Minimum consensus quality of alt allele in a read group                                                                                                                                                                                           | 60                   |
+| --minRef      |                   | Minimum consensus quality of ref allele in a read group                                                                                                                                                                                           | 2                    |
+| --minAlt      |                   | Minimum consensus quality of alt allele in a read group                                                                                                                                                                                           | 2                    |
+| -z            | --maxZeroQualFrac | Maximum fraction of zero-quality bases in a read family. Set to 0.1 if a noise mask is not available                                                                                                                                              | 0.5                  |
+| -id           | --indelbed        | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                          | None                 |
+| -rt           | --regionst        | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                             | same as`--regions` |
+| --minGroupAmp |                   | Minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to amplification-error learning                                                                                                                                      | 3                    |
+| --minGroupDmg |                   | Minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to damage-error learning                                                                                                                                             | 3                    |
+| -pd           | --maxPileupDepth  | Maximum depth for samtools mpileup                                                                                                                                                                                                                | 1000000              |
 
 #### Germline and Noise Masks
 
@@ -293,27 +299,26 @@ DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estim
 
 ##### Required
 
-| Short | Long | Description |
-| --- | --- | --- |
-| -i | --prefix | Input prefix of results from `call` command |
+| Short | Long     | Description                                  |
+| ----- | -------- | -------------------------------------------- |
+| -i    | --prefix | Input prefix of results from`call` command |
 
 ##### Reference (choose one)
 
-| Short | Long | Description | Default |
-| --- | --- | --- | --- |
-| -f | --reference | FASTA file of reference genome | None |
-| -ft | --refTrinuc | Precomputed trinucleotide composition of reference genome | None |
+| Short | Long        | Description                                               | Default |
+| ----- | ----------- | --------------------------------------------------------- | ------- |
+| -f    | --reference | FASTA file of reference genome                            | None    |
+| -ft   | --refTrinuc | Precomputed trinucleotide composition of reference genome | None    |
 
 ##### Optional
 
-| Short | Long | Description | Default |
-| --- | --- | --- | --- |
-| -r | --regions | Contigs to consider for trinucleotide calculation | chr{1..22} chrX |
-| -ot | --outTrinuc | Output the computed trinucleotide composition file for future use | None |
-| -c | --clonal | Treat mutations detected in more than one molecule as one mutation | False |
-| -d | --dilute | **Archived — not needed in the latest version.** Previously used when sample and matched normal originated from the same starting DNA material | False |
-| -gb | --genebed | Gene BED file for per-gene coverage calculation | None |
-| -rb | --reestimatebed | BED file for burden re-estimation in specific regions | None |
+| Short | Long            | Description                                                        | Default         |
+| ----- | --------------- | ------------------------------------------------------------------ | --------------- |
+| -r    | --regions       | Contigs to consider for trinucleotide calculation                  | chr{1..22} chrX |
+| -ot   | --outTrinuc     | Output the computed trinucleotide composition file for future use  | None            |
+| -c    | --clonal        | Treat mutations detected in more than one molecule as one mutation | False           |
+| -gb   | --genebed       | Gene BED file for per-gene coverage calculation                    | None            |
+| -rb   | --reestimatebed | BED file for burden re-estimation in specific regions              | None            |
 
 ---
 
@@ -327,26 +332,28 @@ DupCaller.py summarize -i sample1 sample2 sample3 -o cohort_summary.txt
 
 This reads `{sample}_stats.txt`, `{sample}/SBS/{sample}_sbs_burden.txt`, `{sample}/INDEL/{sample}_indel_burden.txt`, and `{sample}/SBS/{sample}_sbs_96_corrected.txt` from each sample folder and writes four output files:
 
-| File | Description |
-| --- | --- |
-| `cohort_summary.txt` | One row per sample with burden metrics and library statistics |
+| File                                     | Description                                                                       |
+| ---------------------------------------- | --------------------------------------------------------------------------------- |
+| `cohort_summary.txt`                   | One row per sample with burden metrics and library statistics                     |
 | `cohort_summary_SBS96_uncorrected.txt` | 96-context raw mutation counts across all samples (SigProfiler-compatible format) |
-| `cohort_summary_SBS96_corrected.txt` | 96-context trinucleotide-corrected counts across all samples |
-| `cohort_summary_SBS96_genome.txt` | 96-context estimated mutations per genome across all samples |
+| `cohort_summary_SBS96_corrected.txt`   | 96-context trinucleotide-corrected counts across all samples                      |
+| `cohort_summary_SBS96_genome.txt`      | 96-context estimated mutations per genome across all samples                      |
 
 All SBS96 file can be directly input into [SigProfilerPlotting](https://github.com/SigProfilerSuite/SigProfilerPlotting)
+
 #### Parameters
 
-| Short | Long | Description |
-| --- | --- | --- |
-| -i | --input | One or more sample folders (space-separated) |
-| -o | --output | Output filename for the summary table (e.g. `cohort_summary.txt`) |
+| Short | Long     | Description                                                        |
+| ----- | -------- | ------------------------------------------------------------------ |
+| -i    | --input  | One or more sample folders (space-separated)                       |
+| -o    | --output | Output filename for the summary table (e.g.`cohort_summary.txt`) |
 
 ---
 
 ## Results
 
 For detailed column-by-column and field-by-field descriptions of every output file, see the [`docs/`](docs/) folder:
+
 - [`docs/call_outputs.md`](docs/call_outputs.md) — all files from `DupCaller.py call`
 - [`docs/estimate_outputs.md`](docs/estimate_outputs.md) — all files from `DupCaller.py estimate`
 
@@ -354,65 +361,65 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 
 ### Core Output Files
 
-| File | Description |
-| --- | --- |
-| `SBS/{sample}_sbs.vcf` | VCF of detected SNVs and MNVs |
-| `INDEL/{sample}_indel.vcf` | VCF of detected short indel mutations |
-| `DBS/{sample}_dbs.vcf` | VCF of detected dinucleotide substitution (DBS) mutations |
-| `{sample}_coverage.bed.gz` | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
-| `{sample}_coverage.bed.gz.tbi` | Tabix index for the coverage BED file |
-| `{sample}_trinuc_by_duplex_group.txt` | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation |
-| `{sample}_indel_by_duplex_group.txt` | Indel context counts grouped by duplex read number, used for indel burden estimation |
-| `{sample}_dbs_by_duplex_group.txt` | 144-class dinucleotide context counts grouped by duplex read number, used for DBS burden estimation |
-| `{sample}_duplex_family_strand_composition.txt` | Strand composition statistics for duplex read families |
-| `{sample}_duplex_family_strand_composition_heatmap.pdf` | Heatmap visualization of duplex family strand composition |
-| `{sample}_call_params.log` | Full record of all resolved parameters used for the `call` run |
-| `{sample}_stats.txt` | Overall sequencing and analysis metrics |
+| File                                                      | Description                                                                                                                                         |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SBS/{sample}_sbs.vcf`                                  | VCF of detected SNVs and MNVs                                                                                                                       |
+| `INDEL/{sample}_indel.vcf`                              | VCF of detected short indel mutations                                                                                                               |
+| `DBS/{sample}_dbs.vcf`                                  | VCF of detected dinucleotide substitution (DBS) mutations                                                                                           |
+| `{sample}_coverage.bed.gz`                              | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
+| `{sample}_coverage.bed.gz.tbi`                          | Tabix index for the coverage BED file                                                                                                               |
+| `{sample}_trinuc_by_duplex_group.txt`                   | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation                                                          |
+| `{sample}_indel_by_duplex_group.txt`                    | Indel context counts grouped by duplex read number, used for indel burden estimation                                                                |
+| `{sample}_dbs_by_duplex_group.txt`                      | 144-class dinucleotide context counts grouped by duplex read number, used for DBS burden estimation                                                 |
+| `{sample}_duplex_family_strand_composition.txt`         | Strand composition statistics for duplex read families                                                                                              |
+| `{sample}_duplex_family_strand_composition_heatmap.pdf` | Heatmap visualization of duplex family strand composition                                                                                           |
+| `{sample}_call_params.log`                              | Full record of all resolved parameters used for the`call` run                                                                                     |
+| `{sample}_stats.txt`                                    | Overall sequencing and analysis metrics                                                                                                             |
 
 ### Error Profile Files
 
-| File | Description |
-| --- | --- |
+| File                    | Description                                              |
+| ----------------------- | -------------------------------------------------------- |
 | `{sample}.amp.tn.txt` | Amplification SBS error profile by trinucleotide context |
-| `{sample}.amp.id.txt` | Amplification indel error profile |
-| `{sample}.dmg.tn.txt` | Damage SBS error profile by trinucleotide context |
-| `{sample}.dmg.id.txt` | Damage indel error profile |
+| `{sample}.amp.id.txt` | Amplification indel error profile                        |
+| `{sample}.dmg.tn.txt` | Damage SBS error profile by trinucleotide context        |
+| `{sample}.dmg.id.txt` | Damage indel error profile                               |
 
 ### Burden Estimation Files
 
-| File | Description |
-| --- | --- |
-| `SBS/{sample}_sbs_burden.txt` | SBS burden with uncorrected and corrected estimates and 95% confidence intervals |
-| `INDEL/{sample}_indel_burden.txt` | Indel burden with 95% confidence intervals, including masked and unmasked calculations |
-| `DBS/{sample}_dbs_burden.txt` | DBS burden with uncorrected and corrected estimates and 95% confidence intervals |
-| `SBS/{sample}_sbs_96_corrected.txt` | Corrected SBS counts across 96 trinucleotide contexts for signature analysis, including a `mutations_per_opportunity` column |
-| `INDEL/{sample}_indel_83_corrected.txt` | Corrected indel counts across the 83 ID contexts, including a `mutations_per_opportunity` column |
-| `DBS/{sample}_dbs_78_corrected.txt` | Corrected DBS counts across the 78 DBS contexts, including a `mutations_per_opportunity` column |
-| `SBS/{sample}_sbs_burden_by_group_size.txt` | SBS burden stratified by duplex group size, both cumulative ("min group size >= N") and exact ("group size == N"), corrected and uncorrected, with 95% CI |
-| `INDEL/{sample}_indel_burden_by_group_size.txt` | Same stratification as above, for indels |
-| `DBS/{sample}_dbs_burden_by_group_size.txt` | Same stratification as above, for DBS |
-| `{sample}_duplex_allele_counts.txt` | Duplex depths and allele counts for each unique mutation |
+| File                                              | Description                                                                                                                                               |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SBS/{sample}_sbs_burden.txt`                   | SBS burden with uncorrected and corrected estimates and 95% confidence intervals                                                                          |
+| `INDEL/{sample}_indel_burden.txt`               | Indel burden with 95% confidence intervals, including masked and unmasked calculations                                                                    |
+| `DBS/{sample}_dbs_burden.txt`                   | DBS burden with uncorrected and corrected estimates and 95% confidence intervals                                                                          |
+| `SBS/{sample}_sbs_96_corrected.txt`             | Corrected SBS counts across 96 trinucleotide contexts for signature analysis, including a`mutations_per_opportunity` column                             |
+| `INDEL/{sample}_indel_83_corrected.txt`         | Corrected indel counts across the 83 ID contexts, including a`mutations_per_opportunity` column                                                         |
+| `DBS/{sample}_dbs_78_corrected.txt`             | Corrected DBS counts across the 78 DBS contexts, including a`mutations_per_opportunity` column                                                          |
+| `SBS/{sample}_sbs_burden_by_group_size.txt`     | SBS burden stratified by duplex group size, both cumulative ("min group size >= N") and exact ("group size == N"), corrected and uncorrected, with 95% CI |
+| `INDEL/{sample}_indel_burden_by_group_size.txt` | Same stratification as above, for indels                                                                                                                  |
+| `DBS/{sample}_dbs_burden_by_group_size.txt`     | Same stratification as above, for DBS                                                                                                                     |
+| `{sample}_duplex_allele_counts.txt`             | Duplex depths and allele counts for each unique mutation                                                                                                  |
 
 ### Visualization Files
 
-| File | Description |
-| --- | --- |
-| `SBS/SBS_96_plots_{sample}.pdf` | 96-context SBS mutational signature plots (uncorrected and corrected counts) |
-| `INDEL/ID_83_plots_{sample}.pdf` | 83-context indel (ID83) mutational signature plots |
-| `DBS/DBS_78_plots_{sample}.pdf` | 78-context DBS mutational signature plots |
-| `SBS/{sample}_sbs_burden_by_group_size.pdf` | SBS burden across cumulative and exact duplex group sizes |
-| `INDEL/{sample}_indel_burden_by_group_size.pdf` | Same, for indels |
-| `DBS/{sample}_dbs_burden_by_group_size.pdf` | Same, for DBS |
+| File                                              | Description                                                                  |
+| ------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `SBS/SBS_96_plots_{sample}.pdf`                 | 96-context SBS mutational signature plots (uncorrected and corrected counts) |
+| `INDEL/ID_83_plots_{sample}.pdf`                | 83-context indel (ID83) mutational signature plots                           |
+| `DBS/DBS_78_plots_{sample}.pdf`                 | 78-context DBS mutational signature plots                                    |
+| `SBS/{sample}_sbs_burden_by_group_size.pdf`     | SBS burden across cumulative and exact duplex group sizes                    |
+| `INDEL/{sample}_indel_burden_by_group_size.pdf` | Same, for indels                                                             |
+| `DBS/{sample}_dbs_burden_by_group_size.pdf`     | Same, for DBS                                                                |
 
 ### Optional / Conditional Files
 
-| File | Condition | Description |
-| --- | --- | --- |
-| `{sample}_gene_coverage.txt` | `-gb` option | Mean duplex coverage per gene for dNdScv correction |
-| `SBS/{sample}_sbs_burden_re_estimate.txt` | `-rb` option | Re-estimated SBS burden for specific regions |
-| `INDEL/{sample}_indel_burden_re_estimate.txt` | `-rb` option | Re-estimated indel burden for specific regions |
+| File                                              | Condition      | Description                                             |
+| ------------------------------------------------- | -------------- | ------------------------------------------------------- |
+| `{sample}_gene_coverage.txt`                    | `-gb` option | Mean duplex coverage per gene for dNdScv correction     |
+| `SBS/{sample}_sbs_burden_re_estimate.txt`       | `-rb` option | Re-estimated SBS burden for specific regions            |
+| `INDEL/{sample}_indel_burden_re_estimate.txt`   | `-rb` option | Re-estimated indel burden for specific regions          |
 | `SBS/{sample}_sbs_96_corrected_re_estimate.txt` | `-rb` option | Re-estimated 96-context SBS counts for specific regions |
-| `SBS/SBS_96_plots_{sample}_re_estimate.pdf` | `-rb` option | Signature plots for re-estimated regions |
+| `SBS/SBS_96_plots_{sample}_re_estimate.pdf`     | `-rb` option | Signature plots for re-estimated regions                |
 
 ---
 
@@ -502,26 +509,27 @@ DupCaller.py estimate -i ${SAMPLE} -f ${REF} -r chr{1..22} chrX
 Pre-built reference indexes, germline VCFs, and noise masks are available for download:
 
 ### Human (GRCh38/hg38)
-| Resource | Link/Source|
-| --- | --- |
-| Reference genome | [TCGA hg38 reference file](https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834) |
-| Reference index | [Pre-built hg38 DupCaller reference](https://drive.google.com/drive/folders/1v8ut5aky01zujXlZ0b-dhCqImWMyMbiK?usp=drive_link) |
-| Germline VCF | af-only-gnomad.hg38.vcf.gz file from the legacy GATK resource bundle. A copy of the file can be found [here](https://www.bcgsc.ca/downloads/morinlab/reference/). |
-| Noise mask | NanoSeq noise mask from [Abascal et. al.](https://doi.org/10.1038/s41586-021-03477-4). Can be obtained with approved access to the dataset |
+
+| Resource         | Link/Source                                                                                                                                                     |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reference genome | [TCGA hg38 reference file](https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834)                                                                 |
+| Reference index  | [Pre-built hg38 DupCaller reference](https://drive.google.com/drive/folders/1v8ut5aky01zujXlZ0b-dhCqImWMyMbiK?usp=drive_link)                                    |
+| Germline VCF     | af-only-gnomad.hg38.vcf.gz file from the legacy GATK resource bundle. A copy of the file can be found[here](https://www.bcgsc.ca/downloads/morinlab/reference/). |
+| Noise mask       | NanoSeq noise mask from                                                                                                                                        |
 
 ### Mouse (GRCm39/mm39)
 
-| Resource | Link |
-| --- | --- |
-| Reference genome | [UCSC mm39 reference file](https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz) |
-| Reference index | [Pre-built mm39 DupCaller reference](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link) |
-| Germline VCF | [mgp_strains](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link) — includes VCF for SNPs in popular mouse strains. Use the vcf file for your strain. |
-| Noise mask | [NOISE.mm39.bed.gz](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link), in-house noise mask from mouse duplex sequencing data |
-
+| Resource         | Link                                                                                                                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Reference genome | [UCSC mm39 reference file](https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz)                                                                                              |
+| Reference index  | [Pre-built mm39 DupCaller reference](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link)                                                               |
+| Germline VCF     | [mgp_strains](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link) — includes VCF for SNPs in popular mouse strains. Use the vcf file for your strain. |
+| Noise mask       | [NOISE.mm39.bed.gz](https://drive.google.com/drive/folders/1apvqjyO3OhApQ5cnmOe1LWR2wi7_cMqK?usp=drive_link), in-house noise mask from mouse duplex sequencing data                         |
 
 ## Citation
 
-Cheng, Y. et al. Improved Mutation Detection in Duplex Sequencing Data with Sample-Specific Error Profiles. bioRxiv (2025). https://doi.org/10.1101/2025.07.13.664565
+DupCaller: Cheng, Y. et al. Improved Mutation Detection in Duplex Sequencing Data with Sample-Specific Error Profiles. bioRxiv (2025). https://doi.org/10.1101/2025.07.13.664565
+
 
 ---
 

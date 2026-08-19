@@ -3,7 +3,7 @@
 import pandas as pd
 import os
 
-from .funcs.misc import parse_stats_file, INDEL_COVERAGE_CATEGORY_LABELS
+from .funcs.misc import parse_stats_file
 
 
 def do_summarize(args):
@@ -39,15 +39,6 @@ def do_summarize(args):
             pf_reads = int(stats["Number of Pass-filter Reads"])
             pf_read_family = int(stats["Number of Effective Read Families"])
             eff_cov = int(float(stats["Effective Coverage"]))
-            # There's no single flat indel coverage figure anymore; total
-            # indel coverage is the sum of the power-weighted category
-            # columns (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py).
-            indel_eff_cov = int(
-                sum(
-                    float(stats[f"Effective Indel Coverage ({label})"])
-                    for label in INDEL_COVERAGE_CATEGORY_LABELS
-                )
-            )
             dup_rate = float(stats["Pass-filter Duplication Rate"])
             read_efficiency = float(stats["Efficiency"])
 
@@ -61,10 +52,11 @@ def do_summarize(args):
             # 6: Corrected burden 95% upper
             # 7: Corrected mutation number
             # 8: Mutation number per genome
-            # 9: Genome coverage
+            # 9: Genome coverage (effective coverage at min_group_size=1)
             # 10: Unmasked burden
             # 11: Unmasked burden 95% lower
             # 12: Unmasked burden 95% upper
+            # 13: Reference base number
             with open(snv_burden_file) as f:
                 lines = f.readlines()
                 uncorrected_burden = float(lines[0].strip("\n").split("\t")[1])
@@ -76,19 +68,21 @@ def do_summarize(args):
                 corrected_burden_uci = float(lines[6].strip("\n").split("\t")[1])
                 corrected_mutnum = float(lines[7].strip("\n").split("\t")[1])
                 mutations_per_genome = float(lines[8].strip("\n").split("\t")[1])
-                genome_length = int(float(lines[9].strip("\n").split("\t")[1]))
+                genome_length = int(float(lines[13].strip("\n").split("\t")[1]))
 
             # _indel_burden.txt line layout:
-            # 0: Indel burden
-            # 1: Indel burden 95% lower
-            # 2: Indel burden 95% upper
-            # 3: Indel number
+            # 0: Uncorrected burden
+            # 1: Uncorrected burden 95% lower
+            # 2: Uncorrected burden 95% upper
+            # 3: Uncorrected mutation number
+            # 9: Genome coverage (effective coverage at min_group_size=1)
             with open(indel_burden_file) as f:
                 lines = f.readlines()
                 indel_burden = float(lines[0].strip("\n").split("\t")[1])
                 indel_burden_lci = float(lines[1].strip("\n").split("\t")[1])
                 indel_burden_uci = float(lines[2].strip("\n").split("\t")[1])
                 indel_num = int(lines[3].strip("\n").split("\t")[1])
+                indel_eff_cov = int(float(lines[9].strip("\n").split("\t")[1]))
 
             output.write(
                 f"{sample_name}\t{pf_reads}\t{uniq_reads}\t{pf_read_family}\t{dup_rate}\t{read_efficiency}\t"

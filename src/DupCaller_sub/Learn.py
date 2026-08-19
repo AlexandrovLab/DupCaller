@@ -15,6 +15,7 @@ from matplotlib import pyplot as plt
 from .funcs.call import callBam
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
+from .funcs.misc import drop_empty_regions
 from .funcs.misc import getAlignmentObject as BAM
 
 
@@ -67,6 +68,11 @@ def do_learn(args):
     tmp_dir = os.path.join(params["output"], "tmp")
     params["tmp_dir"] = tmp_dir
     os.makedirs(tmp_dir, exist_ok=True)
+    # Learned error matrices get their own ERROR/ subfolder, matching
+    # Caller.py's internal auto-learn convention.
+    error_dir = os.path.join(params["output"], "ERROR")
+    os.makedirs(error_dir, exist_ok=True)
+    error_prefix = os.path.join(error_dir, args.output)
     bamObject = BAM(args.bam, args.reference, "rb")
 
     """
@@ -87,9 +93,11 @@ def do_learn(args):
         ]
         (
             mismatch_profile,
-            indelerr_profile,
+            hp_alt_profile,
+            str_alt_profile,
             mismatch_dmg_profile,
-            indelerr_dmg_profile,
+            hp_dmg_profile,
+            str_dmg_profile,
         ) = callBam(paramsNow, 0)
     else:
         """
@@ -135,6 +143,7 @@ def do_learn(args):
         regionSequence.append((contigs[site[0]], site[1]))
         for ii in range(site[0] + 1, len(contigs)):
             regionSequence.append((contigs[ii],))
+        regionSequence = drop_empty_regions(regionSequence, bamObject)
         print(
             "............Completed region splitting in "
             + str((time.time() - startTime) / 60)
@@ -148,7 +157,7 @@ def do_learn(args):
         callArguments = []
         startTime2 = time.time()
         print(".........Starting variant calling..............")
-        pool = Pool()
+        pool = Pool(args.threads)
         for nn in range(args.threads):
             regions = []
             while len(regionSequence) != 0:
@@ -157,6 +166,13 @@ def do_learn(args):
                 else:
                     regions.append(regionSequence.pop(0))
                     break
+            if len(regions) == 0:
+                # Fewer real chunks than -p requested (regionSequence
+                # already ran out) -- just use fewer effective parallel
+                # chunks for this pass instead of handing callBam an
+                # empty regions list, which it can't index into
+                # (regions[0]).
+                continue
             chroms = [region[0] for region in regions]
             paramsNow = params.copy()
             paramsNow["regions"] = regions
@@ -177,10 +193,11 @@ def do_learn(args):
         pool.join()
 
         mismatch_profile = sum([_[0] for _ in results]).astype(int)
-        indelerr_profile = sum([_[1] for _ in results]).astype(int)
-        mismatch_dmg_profile = sum([_[2] for _ in results]).astype(int)
-        # mismatch_F2R1_dmg_profile = sum([_[3] for _ in results]).astype(int)
-        indelerr_dmg_profile = sum([_[3] for _ in results]).astype(int)
+        hp_alt_profile = sum([_[1] for _ in results]).astype(int)
+        str_alt_profile = sum([_[2] for _ in results]).astype(int)
+        mismatch_dmg_profile = sum([_[3] for _ in results]).astype(int)
+        hp_dmg_profile = sum([_[4] for _ in results]).astype(int)
+        str_dmg_profile = sum([_[5] for _ in results]).astype(int)
 
     trinuc2num = dict()
     num2trinuc = list()
@@ -206,21 +223,28 @@ def do_learn(args):
         mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
     )
     # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-    amp_tn_pd.to_csv(params["output"] + "/" + args.output + ".amp.tn.txt", sep="\t")
-    np.savetxt(
-        params["output"] + "/" + args.output + ".amp.id.txt",
-        indelerr_profile,
-        delimiter="\t",
-        fmt="%d",
-    )
-    dmg_tn_pd.to_csv(params["output"] + "/" + args.output + ".dmg.tn.txt", sep="\t")
+    amp_tn_pd.to_csv(error_prefix + ".amp.tn.txt", sep="\t")
+    dmg_tn_pd.to_csv(error_prefix + ".dmg.tn.txt", sep="\t")
     # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
-    np.savetxt(
-        params["output"] + "/" + args.output + ".dmg.id.txt",
-        indelerr_dmg_profile,
-        delimiter="\t",
-        fmt="%d",
+
+    # Indel hp/str: see Caller.py's internal auto-learn write-out for the
+    # column/row convention (same one here).
+    hp_row_labels = [f"HP{i}" for i in range(1, 10)] + ["HP10+"]
+    hp_col_labels = [f"{b}_{d}" for b in ["A", "T", "C", "G"] for d in (-1, 0, 1)]
+    str_row_labels = ["0-1", "2-9", "10-24", "25-39", "40+"]
+    str_col_labels = [str(d) for d in range(-5, 6)]
+    amp_hp_pd = pd.DataFrame(hp_alt_profile, columns=hp_col_labels, index=hp_row_labels)
+    dmg_hp_pd = pd.DataFrame(hp_dmg_profile, columns=hp_col_labels, index=hp_row_labels)
+    amp_str_pd = pd.DataFrame(
+        str_alt_profile, columns=str_col_labels, index=str_row_labels
     )
+    dmg_str_pd = pd.DataFrame(
+        str_dmg_profile, columns=str_col_labels, index=str_row_labels
+    )
+    amp_hp_pd.to_csv(error_prefix + ".amp.hp.txt", sep="\t")
+    dmg_hp_pd.to_csv(error_prefix + ".dmg.hp.txt", sep="\t")
+    amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
+    dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
     shutil.rmtree(tmp_dir)
     print(
         "..............Completed error learning "
