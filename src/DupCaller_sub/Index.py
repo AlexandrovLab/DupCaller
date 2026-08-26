@@ -264,14 +264,21 @@ def do_index(args):
         # and don't advance the tsv stream.
         if pending_tsv_chrom is not None and pending_tsv_chrom[0] == chrom:
             for start, end, unit_length, count in pending_tsv_chrom[1]:
-                str_unit_len[start:end] = unit_length
+                # PERF's reported span can overextend past the tract's true
+                # length (start + num_units*unit_length) at the trailing
+                # boundary -- clamp so any such trailing bases aren't
+                # painted with the full tract's unit_len/count, which would
+                # contaminate HP/STR opportunity counting and error-rate
+                # learning at those positions.
+                true_end = min(end, start + unit_length * count)
+                str_unit_len[start:true_end] = unit_length
                 str_cut[start] = 1
                 # Clipped to the array's uint8 range before storing — since
                 # every position is written at most once, this is
                 # identical to storing the unclipped count and clipping
                 # the whole array afterward, just without the wider dtype
                 # in between.
-                str_hp[start:end] = min(count, 127)
+                str_hp[start:true_end] = min(count, 127)
             pending_tsv_chrom = _next_or_none(repeat_tsv_iter)
         # str_lens rows: 0 = repeat unit length, 1 = number of times the
         # repeat unit repeats (constant across the whole repeat interval),

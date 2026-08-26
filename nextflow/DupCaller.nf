@@ -13,19 +13,18 @@ process INDEX_REFERENCE {
 
     input:
     path reference
-    path repeat_bed
-    path repeat_bed_tbi
-    path str_bed
-    path str_bed_tbi
+    path repeat_tsv
 
     output:
     path "${reference}.ref.h5", emit: ref_h5
     path "${reference}.tn.h5",  emit: tn_h5
     path "${reference}.hp.h5",  emit: hp_h5
+    path "${reference}.str.h5", emit: str_h5
+    path "${reference}.dbs.h5", emit: dbs_h5
 
     script:
     """
-    DupCaller.py index -f ${reference} -rb ${repeat_bed} -s ${str_bed}
+    DupCaller.py index -f ${reference} -rt ${repeat_tsv}
     """
 }
 
@@ -144,7 +143,7 @@ process CALL_VARIANTS {
     tuple val(sample_id),
           path(tumor_bam),  path(tumor_bai),
           path(normal_bam), path(normal_bai)
-    path dc_ref             // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5
+    path dc_ref             // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5 + .str.h5 + .dbs.h5
     tuple path(germline_vcf), path(germline_tbi)
     tuple path(noise_mask),   path(noise_tbi)
     path target_bed
@@ -191,7 +190,7 @@ process ESTIMATE_BURDEN {
 
     input:
     tuple val(sample_id), path(call_dir)
-    path dc_ref        // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5
+    path dc_ref        // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5 + .str.h5 + .dbs.h5
     path gene_bed
 
     output:
@@ -200,8 +199,8 @@ process ESTIMATE_BURDEN {
     script:
     def ref_name   = file(params.reference).name
     def gene_arg   = (gene_bed.name != 'NO_GENE_BED') ? "-gb ${gene_bed}" : ""
-    def clonal_arg = params.estimate_clonal ? "-c True" : ""
-    def dilute_arg = params.estimate_dilute ? "-d True" : ""
+    def clonal_arg = params.estimate_clonal ? "-c" : ""
+    def dilute_arg = params.estimate_dilute ? "-d" : ""
     """
     DupCaller.py estimate \
         -i ${call_dir} \
@@ -233,14 +232,10 @@ workflow {
 
     // DupCaller h5 index files — may be produced by INDEX_REFERENCE or pre-existing
     if (!params.skip_index) {
-        if (!params.repeat_bed) error "params.repeat_bed is required when skip_index = false"
-        if (!params.str_bed) error "params.str_bed is required when skip_index = false"
-        repeat_ch  = Channel.fromPath(params.repeat_bed, checkIfExists: true)
-        repeat_tbi = Channel.fromPath("${params.repeat_bed}.tbi", checkIfExists: true)
-        str_ch  = Channel.fromPath(params.str_bed, checkIfExists: true)
-        str_tbi = Channel.fromPath("${params.str_bed}.tbi", checkIfExists: true)
+        if (!params.repeat_tsv) error "params.repeat_tsv is required when skip_index = false"
+        repeat_tsv_ch = Channel.fromPath(params.repeat_tsv, checkIfExists: true)
         ref_fa  = Channel.fromPath(params.reference, checkIfExists: true)
-        idx     = INDEX_REFERENCE(ref_fa, repeat_ch, repeat_tbi, str_ch, str_tbi)
+        idx     = INDEX_REFERENCE(ref_fa, repeat_tsv_ch)
         dc_ref_ch = Channel.fromPath([
             params.reference,
             "${params.reference}.fai"
@@ -248,6 +243,8 @@ workflow {
             .concat(idx.ref_h5)
             .concat(idx.tn_h5)
             .concat(idx.hp_h5)
+            .concat(idx.str_h5)
+            .concat(idx.dbs_h5)
             .collect()
     } else {
         dc_ref_ch = Channel.fromPath([
@@ -255,7 +252,9 @@ workflow {
             "${params.reference}.fai",
             "${params.reference}.ref.h5",
             "${params.reference}.tn.h5",
-            "${params.reference}.hp.h5"
+            "${params.reference}.hp.h5",
+            "${params.reference}.str.h5",
+            "${params.reference}.dbs.h5"
         ], checkIfExists: true).collect()
     }
 

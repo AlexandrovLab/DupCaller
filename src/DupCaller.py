@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 from DupCaller_sub.Caller import do_call
 from DupCaller_sub.Trim import do_trim
 from DupCaller_sub.Summarize import do_summarize
@@ -22,21 +23,31 @@ if __name__ == "__main__":
         help="Trim an ecNGS fastq file. The input should be either fastq or gzipped fastq.",
     )
     trim_parser.add_argument(
-        "-i", "--fq", type=str, help="fastq file (read 1 if paired)"
-    )
-    trim_parser.add_argument("-i2", "--fq2", type=str, help="read 2 fastq file")
-    trim_parser.add_argument(
-        "-p", "--pattern", type=str, help="pattern of sequence barcode"
+        "-i", "--fq", type=str, required=True, help="fastq file (read 1 if paired)"
     )
     trim_parser.add_argument(
-        "-o", "--output", type=str, help="prefix of the output fastq files"
+        "-i2", "--fq2", type=str, required=True, help="read 2 fastq file"
+    )
+    trim_parser.add_argument(
+        "-p", "--pattern", type=str, required=True, help="pattern of sequence barcode"
+    )
+    trim_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        required=True,
+        help="prefix of the output fastq files",
     )
     ### Call arguments
     call_parser = subparsers.add_parser(
         "call", help="Call mutations from an aligned ecNGS bam."
     )
     call_parser.add_argument(
-        "-b", "--bam", type=str, help="bam file of sample sequencing reads"
+        "-b",
+        "--bam",
+        type=str,
+        required=True,
+        help="bam file of sample sequencing reads",
     )
     call_parser.add_argument(
         "-g", "--germline", type=str, help="indexed germline vcf with AF field"
@@ -48,9 +59,11 @@ if __name__ == "__main__":
         help="minimum population af to exclude a germline mutation",
         default=0.001,
     )
-    call_parser.add_argument("-f", "--reference", type=str, help="reference fasta file")
     call_parser.add_argument(
-        "-o", "--output", type=str, help="prefix of the output files"
+        "-f", "--reference", type=str, required=True, help="reference fasta file"
+    )
+    call_parser.add_argument(
+        "-o", "--output", type=str, required=True, help="prefix of the output files"
     )
     call_parser.add_argument(
         "-r",
@@ -423,19 +436,24 @@ if __name__ == "__main__":
         "estimate", help="Estimate mutation rate and SBS96 from results"
     )
     estimate_parser.add_argument(
-        "-i", "--prefix", type=str, help="Input prefix of results from call"
+        "-i",
+        "--prefix",
+        type=str,
+        required=True,
+        help="Input prefix of results from call",
     )
     estimate_parser.add_argument(
         "-f",
         "--reference",
         type=str,
-        help="Fasta file of reference. Either -f or -ft should be set",
+        required=True,
+        help="Fasta file of reference.",
     )
     estimate_parser.add_argument(
         "-ft",
         "--refTrinuc",
         type=str,
-        help="Precomputed trinucleotide composition of reference genome. Either -f or -ft should be set",
+        help="Currently unused -- -f/--reference is always required regardless of this option.",
     )
     estimate_parser.add_argument(
         "-ot",
@@ -454,15 +472,15 @@ if __name__ == "__main__":
     estimate_parser.add_argument(
         "-c",
         "--clonal",
-        type=bool,
-        help="If True, mutations detected in more than one molecule will be considered as clonal mutations",
+        action="store_true",
+        help="If set, mutations detected in more than one molecule will be considered as clonal mutations",
         default=False,
     )
     estimate_parser.add_argument(
         "-d",
         "--dilute",
-        type=bool,
-        help="Set to true when sample and matched normal are from the same starting DNA material",
+        action="store_true",
+        help="Set when sample and matched normal are from the same starting DNA material",
         default=False,
     )
     estimate_parser.add_argument(
@@ -479,6 +497,15 @@ if __name__ == "__main__":
         help="re-estimate bed file, if burden re-estimation is needed",
         default=None,
     )
+    estimate_parser.add_argument(
+        "--seed",
+        type=int,
+        help="RNG seed for the parametric-bootstrap confidence intervals on corrected "
+        "mutation burden, so results are reproducible across repeated runs. If not set, "
+        "a random seed is generated and recorded in the run's _estimate_params.log for "
+        "later reuse",
+        default=None,
+    )
 
     summarize_parser = subparsers.add_parser(
         "summarize", help="Summarize results from multiple samples"
@@ -488,21 +515,26 @@ if __name__ == "__main__":
         "--input",
         nargs="+",
         type=str,
+        required=True,
         help="folder where DupCallerCall results are stored",
     )
-    summarize_parser.add_argument("-o", "--output", type=str, help="output filename")
+    summarize_parser.add_argument(
+        "-o", "--output", type=str, required=True, help="output filename"
+    )
 
     index_parser = subparsers.add_parser("index", help="Index reference genomes")
     index_parser.add_argument(
         "-f",
         "--reference",
         type=str,
-        help="Fasta file of reference. Either -f or -ft should be set",
+        required=True,
+        help="Fasta file of reference.",
     )
     index_parser.add_argument(
         "-rt",
         "--repeatTsv",
         type=str,
+        required=True,
         help="PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference, e.g. produced by `PERF.core -m 1 -M <N> -u 2 -i reference.fa`. Repeat unit length and repeat count are read directly from the motif and num_units columns. Entries with unit length 1 (homopolymers) are ignored -- those are self-derived from the reference sequence instead.",
     )
 
@@ -543,5 +575,11 @@ if __name__ == "__main__":
         do_index(args)
     elif args.command == "index-dbs":
         do_index_dbs(args)
-    else:
+    elif args.command == "learn":
         do_learn(args)
+    else:
+        # No subcommand given (args.command is None) -- argparse's own
+        # "invalid choice" error already rejects anything else before
+        # reaching here, so this only fires on a bare `DupCaller.py`.
+        master_parser.print_help()
+        sys.exit(1)

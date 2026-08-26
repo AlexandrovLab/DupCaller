@@ -413,14 +413,19 @@ def profileTriNucMismatches(
     # opportunity denominator for row 0, silently normalizing its rare
     # event counts against each other instead and producing wildly
     # inflated "probabilities" (observed: up to 0.58, when a real
-    # damage/amp rate should be ~1e-5 or smaller). Every antimask-
-    # passing, non-STR-annotated position independently counts here
-    # (matches misc.py's indel100_reference_bucket_indices flat rep1/
-    # rep0 credit and call.py's L_indel_len[...,0,X] lookup, both of
-    # which already treat row 0 as one shared, position-count-weighted
-    # background population regardless of indel length).
+    # damage/amp rate should be ~1e-5 or smaller). Every antimask-passing
+    # position independently counts here, INCLUDING real-STR-annotated
+    # ones -- not gated by ~is_str. A row-0-type event (a mismatched
+    # insertion/arbitrary indel unrelated to any specific repeat) is a
+    # real, independent opportunity even at a position that also has a
+    # real, different-unit STR annotation (e.g. an arbitrary "TAA"
+    # insertion inside an ATGATGATG tract isn't a repeat of the ATG unit,
+    # so it's still a genuine row-0 event there). Matches
+    # misc.py's indel100_reference_bucket_indices flat rep1/rep0 credit
+    # and call.py's L_indel_len[...,0,X] lookup, both of which likewise
+    # credit row 0 unconditionally now, not real_str-excluded.
     def _str_amp_opportunity_row0(strand_antimask, weight):
-        return np.count_nonzero(strand_antimask & ~is_str) * weight
+        return np.count_nonzero(strand_antimask) * weight
 
     str_alt_count[0, 5] += _str_amp_opportunity_row0(F1R2_antimask, m_F1R2)
     str_alt_count[0, 5] += _str_amp_opportunity_row0(F2R1_antimask, m_F2R1)
@@ -447,9 +452,10 @@ def profileTriNucMismatches(
     str_dmg_count[:, 5] += np.bincount(str_dmg_here, minlength=5) * 2
 
     # STR dmg opportunity for row 0 -- same reasoning as the amp case
-    # above, same *2 (both orientations, no base identity to
-    # complement) as the two separate-weighted amp strand passes.
-    str_dmg_count[0, 5] += np.count_nonzero(dmg_antimask & ~is_str) * 2
+    # above (unconditional, not ~is_str-excluded), same *2 (both
+    # orientations, no base identity to complement) as the two
+    # separate-weighted amp strand passes.
+    str_dmg_count[0, 5] += np.count_nonzero(dmg_antimask) * 2
 
     if m == 0:
         return (

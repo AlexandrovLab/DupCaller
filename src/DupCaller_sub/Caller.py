@@ -21,8 +21,8 @@ from matplotlib import pyplot as plt
 
 from . import __version__
 from .funcs.call import callBam  # , output_masked_mutations
-from .funcs.call import simulate_power_grid, load_error_matrices
-from .funcs.call import init_refine_worker, refine_channel_task
+from .funcs.misc import simulate_power_grid, load_error_matrices
+from .funcs.misc import init_refine_worker, refine_channel_task
 from .funcs.prob import indelErrorProbs, indelMaxLR
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
@@ -263,6 +263,11 @@ def do_call(args):
         # Monte Carlo seeding). Same base seed as params so a single -seed
         # value seeds the whole run reproducibly, not just rounds 1/2.
         "seed": args.seed,
+        # _compute_read_label (funcs/call.py) is shared unconditionally
+        # across all rounds and reads params.get("nanoSeqBam"); without
+        # this key here, a --NanoSeqBam run falls back to the DB tag
+        # during round 0 even though NanoSeq-format bams only carry MB/RB.
+        "nanoSeqBam": args.NanoSeqBam,
     }
     same_regions_flag = False
     if not params_learn["regions"]:

@@ -38,7 +38,8 @@ def left_align_indel(indel, reference_int, reference_start):
     reference_start: genomic position reference_int[0] corresponds to.
 
     Shifting simply stops early if it would run past the left edge of
-    reference_int -- identical in spirit to how repeat-context
+    reference_int, or (for a deletion) past the right edge when reading
+    reference_int[anchor + del_len] -- identical in spirit to how repeat-context
     computations elsewhere in this codebase (e.g. call.py's
     last_cut_valid) already accept degraded results right at a
     processing-window boundary, since real repeat runs are far shorter
@@ -52,6 +53,7 @@ def left_align_indel(indel, reference_int, reference_start):
         anchor = pos - reference_start
         while (
             anchor >= 0
+            and anchor + del_len < len(reference_int)
             and 0 <= reference_int[anchor] <= 3
             and 0 <= reference_int[anchor + del_len] <= 3
             and reference_int[anchor] == reference_int[anchor + del_len]

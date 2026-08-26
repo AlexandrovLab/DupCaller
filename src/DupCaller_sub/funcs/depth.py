@@ -468,8 +468,8 @@ def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
                 depth[pos - start] = int(parts[3])
                 if count_alleles:
                     acgt[pos - start] = _parse_mpileup_bases(parts[2].upper(), parts[4])
-            except:
-                1
+            except (IndexError, ValueError):
+                pass
     if count_alleles:
         return depth, indelmask, acgt
     return depth, indelmask

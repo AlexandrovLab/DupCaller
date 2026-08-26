@@ -136,6 +136,108 @@ def calculate_ref_indel100(args):
     return ref_indel100
 
 
+def redistribute_indel_cov16_to_100(
+    cov16_row, hp_run, str_unit_len, str_repeat_count, ref_base, label2num_100, out100
+):
+    """Redistribute one locus's 16 coverage.bed.gz opportunity values
+    (INDEL_COVERAGE_CATEGORY_LABELS order, funcs/misc.py -- same column
+    order as funcs/call.py's cov_mat_indel) into their indel100
+    (build_indel100_labels) destination bin(s), using this locus's own
+    hp.h5/str.h5 annotation to pick which bin(s) apply -- the re-estimate-
+    from-bed path's way of reaching indel100 resolution without the by-
+    duplex-group indel100 file (never read by this region-restricted
+    path). Every one of coverage.bed.gz's 16 values is already gated
+    exactly the way funcs/call.py's cov_mat_indel/indel100 accumulation
+    gates it (antimask_indel-only for flat/hypothetical credit,
+    str_cut/hp_cut tract-start for real credit -- see cov_mat_indel and
+    funcs/misc.py's indel100_reference_bucket_indices), so redistributing
+    by this locus's own annotation, with no extra eligibility check here,
+    reproduces the same per-locus indel100 contribution the main pipeline
+    would have accumulated directly at this same position.
+
+    Column-by-column destination (0-indexed, matching
+    INDEL_COVERAGE_CATEGORY_LABELS/cov_mat_indel exactly):
+      0  del_unit  -> delSTR{unit}_rep{count} (unit/count read off this
+         locus's own str.h5; a harmless no-op wherever this isn't a real
+         STR tract start, since the value is already 0 there)
+      1  ins_unit  -> insSTR{unit}_rep{count}, PLUS insSTR{unit}_rep0 if
+         count==1 -- the same rep1/rep0 ambiguity hedge
+         indel100_reference_bucket_indices applies to real STR-insertion
+         credit
+      2-5  del_2/3/4/5+ -> BOTH delMH_len{2,3,4,5+} AND delSTR{2,3,4,5+}_
+         rep1: both are unconditional (antimask_indel-only), scan-free,
+         identical-value credits on the main-pipeline side now (see
+         indel100_reference_bucket_indices' "Deliberately NOT gated by
+         ~real_str" comment), so this one stored value validly backs
+         both destinations at once
+      6-9  ins_A/T/C/G -> 1bpins{A,T,C,G}, single destination, exact 1:1
+      10-13  ins_len2/3/4/5+ -> BOTH insSTR{2,3,4,5+}_rep0 AND _rep1 --
+         same unconditional dual-crediting as
+         indel100_reference_bucket_indices' own flat STR-insertion credit
+      14  del_hp -> del{base}_hp{length}, base = this locus's own
+         reference base, length = this locus's own hp.h5 run length
+      15  ins_hp -> ins{base}_hp{length} (length capped at 5+; indel100
+         has no ins_hp0 bin -- see override_inshp0_with_next_base_
+         opportunity)
+
+    hp_run, str_unit_len, str_repeat_count, ref_base: this locus's own
+    hp.h5 row0 / str.h5 rows 0,1 / ref.h5 value (all plain ints).
+    Mutates out100 (100,) in place; returns nothing.
+    """
+    (
+        del_unit,
+        ins_unit,
+        del2,
+        del3,
+        del4,
+        del5p,
+        insA,
+        insT,
+        insC,
+        insG,
+        insl2,
+        insl3,
+        insl4,
+        insl5p,
+        del_hp,
+        ins_hp,
+    ) = cov16_row
+
+    unit_label = "5+" if str_unit_len >= 5 else str(max(int(str_unit_len), 2))
+    del_count_label = (
+        "6+" if str_repeat_count >= 6 else str(max(int(str_repeat_count), 1))
+    )
+    ins_count_label = (
+        "5+" if str_repeat_count >= 5 else str(max(int(str_repeat_count), 0))
+    )
+
+    out100[label2num_100[f"delSTR{unit_label}_rep{del_count_label}"]] += del_unit
+    out100[label2num_100[f"insSTR{unit_label}_rep{ins_count_label}"]] += ins_unit
+    if str_repeat_count == 1:
+        out100[label2num_100[f"insSTR{unit_label}_rep0"]] += ins_unit
+
+    # INDEL_STR_UNIT_BINS and INDEL_MH_DEL_LEN_BINS are the same
+    # ["2","3","4","5+"] list (unit size vs. deletion length happen to
+    # share bin edges) -- one zip covers both destinations.
+    for unit, v in zip(INDEL_STR_UNIT_BINS, (del2, del3, del4, del5p)):
+        out100[label2num_100[f"delMH_len{unit}"]] += v
+        out100[label2num_100[f"delSTR{unit}_rep1"]] += v
+
+    for base, v in zip("ATCG", (insA, insT, insC, insG)):
+        out100[label2num_100[f"1bpins{base}"]] += v
+
+    for unit, v in zip(INDEL_STR_UNIT_BINS, (insl2, insl3, insl4, insl5p)):
+        out100[label2num_100[f"insSTR{unit}_rep0"]] += v
+        out100[label2num_100[f"insSTR{unit}_rep1"]] += v
+
+    if 0 <= ref_base <= 3:
+        pool_base = _NUM2BASE[ref_base]
+        del_hp_label = "6+" if hp_run >= 6 else str(max(int(hp_run), 1))
+        ins_hp_label = "5+" if hp_run >= 5 else str(max(int(hp_run), 1))
+        out100[label2num_100[f"del{pool_base}_hp{del_hp_label}"]] += del_hp
+        out100[label2num_100[f"ins{pool_base}_hp{ins_hp_label}"]] += ins_hp
+
+
 def poisson_confint(k, cov, alpha=0.05):
     if cov == 0:
         return float("nan"), float("nan")
@@ -144,6 +246,46 @@ def poisson_confint(k, cov, alpha=0.05):
     if k == 0:
         low = 0
     return low / cov, high / cov
+
+
+def bootstrap_corrected_confint(
+    mut_counts, correction_ratio, cov, alpha=0.05, n_boot=10000, rng=None
+):
+    """Parametric-bootstrap CI for a correction-ratio-weighted ("corrected")
+    mutation burden -- replaces poisson_confint for corrected numbers,
+    whose exact chi-square formula assumes its count argument is a true
+    Poisson count. A correction-ratio-weighted sum of per-channel counts
+    no longer is one (channels are weighted unevenly by correction_ratio,
+    so their weighted sum isn't itself Poisson-distributed), which is
+    exactly why a closed-form Poisson interval isn't valid here.
+
+    Per draw: resample each channel's mutation count independently from
+    Poisson(observed count) -- equivalent to Poisson(rate * coverage),
+    since rate = observed_count / coverage -- then apply that draw to the
+    *same*, fixed correction_ratio and cov the point estimate itself uses
+    (only the per-channel counts vary draw to draw, not the correction
+    weights or the coverage denominator), sum, and divide by cov: the
+    same formula burden_corrected = mutnum_corrected.sum() / cov computes.
+    This lands the CI in the same units/scale as poisson_confint's own
+    return value, so any multiplier callers apply afterward (e.g.
+    do_estimate's indel_locus_multiplier) still applies identically to
+    both bounds without needing to know this is now a bootstrap CI.
+
+    mut_counts: (n_channels,) observed per-channel mutation counts.
+    correction_ratio: (n_channels,) fixed per-channel correction ratio.
+    cov: scalar coverage denominator (same one the point estimate divides
+        by), e.g. trinuc_cov.sum()/3 for SBS, indel_cov.sum() for indel.
+    """
+    if cov <= 0:
+        return float("nan"), float("nan")
+    if rng is None:
+        rng = np.random.default_rng()
+    mut_counts = np.asarray(mut_counts, dtype=float)
+    correction_ratio = np.asarray(correction_ratio, dtype=float)
+    draws = rng.poisson(mut_counts, size=(n_boot, mut_counts.shape[0]))
+    burden_draws = (draws @ correction_ratio) / cov
+    low, high = np.percentile(burden_draws, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(low), float(high)
 
 
 def _dinuc_num(dinuc):
@@ -570,7 +712,7 @@ def _safe_correction_ratio(ref_counts, obs_counts):
         return np.where(obs_frac > 0, ref_frac / obs_frac, 0.0)
 
 
-def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
+def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=None):
     """Estimate SBS96 mutation rates with per-class correction ratios.
 
     trinuc_cov_96_by_rf : (96, n_groups) — per-SBS96-class L-weighted
@@ -612,15 +754,15 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
     )  # (96,) — alt-base-specific
     mutnum = trinuc_mut.sum()
     cov = trinuc_cov.sum() / 3  # divide by 3 to get per-locus-equivalent coverage
-    burden_uncorrected[4] = mutnum / cov
+    burden_uncorrected[4] = mutnum / cov if cov > 0 else 0.0
     burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
     trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov)
     # Alt-base-specific correction: each of the 96 classes gets its own ratio
     correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov)
     mutnum_corrected = correction_ratio * trinuc_mut
-    burden_corrected[4] = mutnum_corrected.sum() / cov
-    burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
-        mutnum_corrected.sum(), cov
+    burden_corrected[4] = mutnum_corrected.sum() / cov if cov > 0 else 0.0
+    burden_corrected_lb[4], burden_corrected_ub[4] = bootstrap_corrected_confint(
+        trinuc_mut, correction_ratio, cov, rng=rng
     )
     hap_trinuc[:, 4] = trinuc_rate * ref_trinuc_96
     covs[4] = cov
@@ -630,7 +772,7 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
         trinuc_cov = trinuc_cov + trinuc_cov_96_by_rf[:, nmin == nn].sum(axis=1)
         mutnum = trinuc_mut.sum()
         cov = trinuc_cov.sum() / 3
-        burden_uncorrected[nn - 1] = mutnum / cov
+        burden_uncorrected[nn - 1] = mutnum / cov if cov > 0 else 0.0
         burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
             mutnum, cov
         )
@@ -638,10 +780,11 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
         covs[nn - 1] = cov
         correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov)
         mutnum_corrected = trinuc_mut * correction_ratio
-        burden_corrected[nn - 1] = mutnum_corrected.sum() / cov
-        burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
-            mutnum_corrected.sum(), cov
-        )
+        burden_corrected[nn - 1] = mutnum_corrected.sum() / cov if cov > 0 else 0.0
+        (
+            burden_corrected_lb[nn - 1],
+            burden_corrected_ub[nn - 1],
+        ) = bootstrap_corrected_confint(trinuc_mut, correction_ratio, cov, rng=rng)
         hap_trinuc[:, nn - 1] = trinuc_rate * ref_trinuc_96
 
     # Exact (non-cumulative) group-size bins: nmin==1,2,3,4, and nmin>=5 for
@@ -677,7 +820,9 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
         (
             burden_corrected_exact_lb[nn - 1],
             burden_corrected_exact_ub[nn - 1],
-        ) = poisson_confint(mutnum_corrected_e, cov_e)
+        ) = bootstrap_corrected_confint(
+            trinuc_mut_e, correction_ratio_e, cov_e, rng=rng
+        )
 
     # A channel with zero observed coverage (trinuc_cov, after subtracting
     # each mutant locus from its own class's coverage above) already gets
@@ -919,7 +1064,7 @@ def _grouped_indel83_correction_ratio(ref_frac, obs_frac):
     return ratio
 
 
-def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
+def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=None):
     """ID83-resolution counterpart of estimate_indel76 above: identical
     read-depth-stratified (nmin) burden/correction machinery, except the
     correction ratio for the 11 microhomology channels (72-82) is grouped
@@ -953,8 +1098,8 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
     correction_ratio = _grouped_indel83_correction_ratio(ref_frac, obs_frac)
     mutnum_corrected = correction_ratio * indel_mut
     burden_corrected[4] = mutnum_corrected.sum() / cov if cov > 0 else float("nan")
-    burden_corrected_lb[4], burden_corrected_ub[4] = poisson_confint(
-        mutnum_corrected.sum(), cov
+    burden_corrected_lb[4], burden_corrected_ub[4] = bootstrap_corrected_confint(
+        indel_mut, correction_ratio, cov, rng=rng
     )
     hap_indel83[:, 4] = indel_rate * ref_indel83
     covs[4] = cov
@@ -977,9 +1122,10 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
         burden_corrected[nn - 1] = (
             mutnum_corrected.sum() / cov if cov > 0 else float("nan")
         )
-        burden_corrected_lb[nn - 1], burden_corrected_ub[nn - 1] = poisson_confint(
-            mutnum_corrected.sum(), cov
-        )
+        (
+            burden_corrected_lb[nn - 1],
+            burden_corrected_ub[nn - 1],
+        ) = bootstrap_corrected_confint(indel_mut, correction_ratio, cov, rng=rng)
         hap_indel83[:, nn - 1] = indel_rate * ref_indel83
 
     # Exact (non-cumulative) group-size bins -- see estimate_96's matching
@@ -1015,7 +1161,7 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
         (
             burden_corrected_exact_lb[nn - 1],
             burden_corrected_exact_ub[nn - 1],
-        ) = poisson_confint(mutnum_corrected_e, cov_e)
+        ) = bootstrap_corrected_confint(indel_mut_e, correction_ratio_e, cov_e, rng=rng)
 
     # See estimate_96's matching comment: a channel with zero observed
     # coverage (indel_cov, after subtracting each mutant locus from its own
@@ -1096,7 +1242,7 @@ def _dbs78_ref_weighted(dinuc_count_16):
     return combine_raw_dbs_to_dbs78(raw144, DBS_RAW144_LABEL2NUM)
 
 
-def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
+def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=None):
     """Estimate DBS78 mutation rate and per-class correction ratios: one
     whole-sample figure, no group-size breakdown (see estimate_dbs78_by_group
     below for that).
@@ -1125,8 +1271,8 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
     correction_ratio = _safe_correction_ratio(ref_dbs_78, dbs_opp_78)
     mutnum_corrected = correction_ratio * dbs_mut_78
     burden_corrected = mutnum_corrected.sum() / cov if cov > 0 else float("nan")
-    burden_corrected_lb, burden_corrected_ub = poisson_confint(
-        mutnum_corrected.sum(), cov
+    burden_corrected_lb, burden_corrected_ub = bootstrap_corrected_confint(
+        dbs_mut_78, correction_ratio, cov, rng=rng
     )
 
     # See estimate_96's matching comment: a channel with zero observed
@@ -1149,7 +1295,7 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
     )
 
 
-def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n):
+def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n, rng=None):
     """Group-size-stratified DBS78 burden — the DBS counterpart of
     estimate_96/estimate_indel83's cumulative ("at least this group size")
     and exact ("at exactly this group size") curves, using
@@ -1185,7 +1331,7 @@ def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n):
         correction_ratio = _safe_correction_ratio(ref_dbs_78, opp78)
         mutnum_corrected = (correction_ratio * mut78).sum()
         corrected = mutnum_corrected / cov if cov > 0 else 0.0
-        c_lb, c_ub = poisson_confint(mutnum_corrected, cov)
+        c_lb, c_ub = bootstrap_corrected_confint(mut78, correction_ratio, cov, rng=rng)
         return uncorrected, u_lb, u_ub, corrected, c_lb, c_ub, cov
 
     def _five_point_curve(sel_fn):
@@ -1376,6 +1522,26 @@ def write_burden_by_group_size(
 
 
 def do_estimate(args):
+    # Resolve the bootstrap-CI base seed once, up front, same pattern as
+    # Caller.py's Monte Carlo seed: if the user didn't pass --seed,
+    # generate one now and write it back onto args so it (a) threads
+    # through every bootstrap_corrected_confint call via one shared rng
+    # and (b) shows up in the resolved-parameters log below for later
+    # reuse -- reproducing a run with no explicit --seed still requires
+    # knowing what seed it actually used.
+    if args.seed is None:
+        args.seed = int(np.random.SeedSequence().generate_state(1)[0])
+    rng = np.random.default_rng(args.seed)
+
+    log_path = args.prefix + "_estimate_params.log"
+    with open(log_path, "w") as log:
+        log.write("DupCaller estimate — parameter log\n")
+        log.write(f"Run time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Command:  {' '.join(sys.argv)}\n")
+        log.write("\n--- All parameters (resolved values) ---\n")
+        for key, value in sorted(vars(args).items()):
+            log.write(f"  {key}: {value}\n")
+
     if args.reference:
         bad_h5_files = []
         for suffix, expected_ndim in (
@@ -1620,7 +1786,11 @@ def do_estimate(args):
             uburden_exact_ub,
             cov_by_exact_group,
         ) = estimate_96(
-            trinuc_cov_96_by_rf, trinuc_mut_np, ref_trinuc, trinuc_by_rf.columns
+            trinuc_cov_96_by_rf,
+            trinuc_mut_np,
+            ref_trinuc,
+            trinuc_by_rf.columns,
+            rng=rng,
         )
         # Total reference bases actually considered (non-N, non-noise-
         # masked) across args.regions -- ref_trinuc.sum() (all 64 raw,
@@ -1829,9 +1999,9 @@ def do_estimate(args):
             indel83_mut_np[label2num_83[label], duplex_idx] += 1
             if not unique_mutations.get(mutation_key):
                 # 4th element: this event's own coverage.bed.gz column
-                # index (0-13) -- lets duplex_allele_counts.txt read this
+                # index (0-15) -- lets duplex_allele_counts.txt read this
                 # mutation's actual effective coverage at ITS alt/category,
-                # not a sum across all 14 unrelated indel categories.
+                # not a sum across all 16 unrelated indel categories.
                 unique_mutations[mutation_key] = [
                     0,
                     TAC,
@@ -1895,7 +2065,11 @@ def do_estimate(args):
             indel_burden_uncorrected_exact_ub,
             indel_cov_by_exact_group,
         ) = estimate_indel83(
-            indel83_cov_by_rf, indel83_mut_np, ref_indel83, indel100_by_rf.columns
+            indel83_cov_by_rf,
+            indel83_mut_np,
+            ref_indel83,
+            indel100_by_rf.columns,
+            rng=rng,
         )
         indel83_corrected_pd = pd.DataFrame(
             np.stack(
@@ -2071,7 +2245,7 @@ def do_estimate(args):
             dbs_burden_uncorrected_lb,
             dbs_burden_uncorrected_ub,
             dbs_cov,
-        ) = estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78)
+        ) = estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=rng)
 
         dbs78_corrected_pd = pd.DataFrame(
             np.stack(
@@ -2125,7 +2299,7 @@ def do_estimate(args):
             dbs_burden_corrected_exact_ub,
             dbs_cov_by_exact_group,
         ) = estimate_dbs78_by_group(
-            dbs_mut_by_rf, dbs144_by_rf_np, ref_dbs_78, dbs144_by_rf.columns
+            dbs_mut_by_rf, dbs144_by_rf_np, ref_dbs_78, dbs144_by_rf.columns, rng=rng
         )
         write_burden_by_group_size(
             dbs_dir,
@@ -2200,8 +2374,9 @@ def do_estimate(args):
                 # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov
                 # del_unit ins_unit del_2 del_3 del_4 del_5plus
                 # ins_A ins_T ins_C ins_G ins_len2 ins_len3 ins_len4 ins_len5plus
+                # del_hp ins_hp
                 # Columns 3-6 are per-alt-base L-weighted coverage (floats);
-                # columns 7-20 are power-weighted indel coverage per category
+                # columns 7-22 are power-weighted indel coverage per category
                 # (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py), analogous
                 # to columns 3-6 but for indel calling. Kept as a float
                 # (rounded to 3dp, not int-truncated) since this is a
@@ -2212,7 +2387,7 @@ def do_estimate(args):
                 alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
                 for row in tbx.fetch(chrom, pos - 1, pos):
                     parts = row.split("\t")
-                    if len(parts) >= 21:
+                    if len(parts) >= 23:
                         if len(ref) == 1 and len(alt) == 1 and alt in alt_col:
                             # SNV: use the coverage column for this mutation's alt base
                             duplex_depth = round(float(parts[alt_col[alt]]), 3)
@@ -2269,11 +2444,15 @@ def do_estimate(args):
                 start = int(start)
                 end = int(end)
                 gene = gene_exon.split("_")[0]
-                gene_exon_cov = 0
+                gene_exon_cov = 0.0
                 for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
                     chrom, start, end
                 ):
-                    gene_exon_cov += int(loc.split("\t")[3])
+                    # Columns 3-6 are per-alt-base (A/T/C/G) L-weighted
+                    # float coverage (see the format comment ~60 lines
+                    # below) -- sum all four for total genic SNV coverage,
+                    # not just column 3 (A).
+                    gene_exon_cov += sum(float(x) for x in loc.split("\t")[3:7])
                 if gene_dict.get(gene):
                     gene_dict[gene] += gene_exon_cov
                     cds_len[gene] += end - start + 1
@@ -2309,24 +2488,59 @@ def do_estimate(args):
         )
         trinuc_sbs_cov_64 = np.zeros((64, 4))
         trinucSbs_count = np.zeros(96)
-        indel_cov_total = 0
+        # Per-channel (indel100-resolution, then folded to ID83) coverage/
+        # mutation counts, redistributed from coverage.bed.gz's 16 stored
+        # columns via each locus's own hp.h5/str.h5 annotation
+        # (redistribute_indel_cov16_to_100) -- lets the re-estimate path
+        # apply the same correction_ratio-weighted, ID83-resolution scheme
+        # the main pipeline's estimate_indel83 uses, instead of a coarser
+        # 16-category correction.
+        label2num_100_re, _ = build_indel100_labels()
+        label2num_83, labels_indel83 = build_indel83_labels()
+        indel_cov100_re = np.zeros(100)
+        indel_mut83_re = np.zeros(83)
         revcomp = _REVCOMP
         vcf = VCF(sbs_dir + "/" + sample + "_sbs.vcf", "r")
         vcf_indel = VCF(indel_dir + "/" + sample + "_indel.vcf", "r")
+        ref_h5 = h5py.File(args.reference + ".ref.h5", "r")
+        hp_h5 = h5py.File(args.reference + ".hp.h5", "r")
+        str_h5 = h5py.File(args.reference + ".str.h5", "r")
         indel_count = 0
         for interval in TabixFile(args.reestimatebed, parser=pysam.asBed()).fetch():
+            # Whole-interval hp.h5/str.h5/ref.h5 slices, fetched once per
+            # bed interval rather than once per coverage.bed.gz row --
+            # redistribute_indel_cov16_to_100 below only needs a single
+            # position's own annotation, indexed by pos - interval.start.
+            hp_run_slice = hp_h5[interval.contig][0, interval.start : interval.end]
+            str_slice = str_h5[interval.contig][:, interval.start : interval.end]
+            ref_slice = ref_h5[interval.contig][interval.start : interval.end]
             for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
                 interval.contig, interval.start, interval.end
             ):
                 # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov
                 # del_unit ins_unit del_2 del_3 del_4 del_5plus
                 # ins_A ins_T ins_C ins_G ins_len2 ins_len3 ins_len4 ins_len5plus
+                # del_hp ins_hp
                 parts = loc.split("\t")
                 a_cov = float(parts[3])
                 t_cov = float(parts[4])
                 c_cov = float(parts[5])
                 g_cov = float(parts[6])
-                indel_cov_total += int(sum(float(v) for v in parts[7:21]))
+                pos = int(parts[1])
+                local_idx = pos - interval.start
+                # parts[7:23]: all 16 categories, including del_hp/ins_hp
+                # (14/15) -- redistributed into indel100 resolution via
+                # this locus's own hp.h5/str.h5/ref.h5 annotation, rather
+                # than corrected at the coarser 16-category resolution.
+                redistribute_indel_cov16_to_100(
+                    [float(v) for v in parts[7:23]],
+                    int(hp_run_slice[local_idx]),
+                    int(str_slice[0, local_idx]),
+                    int(str_slice[1, local_idx]),
+                    int(ref_slice[local_idx]),
+                    label2num_100_re,
+                    indel_cov100_re,
+                )
                 trinuc_idx = int(tn_int[parts[0]][int(parts[1])])
                 if trinuc_idx < 64:
                     trinuc_sbs_cov_64[trinuc_idx, 0] += a_cov
@@ -2341,6 +2555,34 @@ def do_estimate(args):
                 if rec.pos <= interval.start or rec.pos > interval.end:
                     continue
                 indel_count += 1
+                # Classify to its exact ID83 channel (funcs/misc.py's
+                # classify_indel_channel) -- same sequence-extraction logic
+                # and same hp.h5/str.h5 annotation lookup as the main
+                # indel83 pipeline above (see its own comment for why only
+                # ref_after is needed, given left-aligned VCF records), so
+                # mutation counts land at the same ID83 resolution the
+                # redistributed coverage side (indel_cov100_re, folded to
+                # ID83 below) does.
+                indel_len = len(rec.alts[0]) - len(rec.ref)
+                chrom_len = ref_h5[rec.chrom].shape[0]
+                if indel_len < 0:
+                    del_len = -indel_len
+                    indel_seq = _decode_ref_seq(
+                        ref_h5[rec.chrom][rec.pos : rec.pos + del_len]
+                    )
+                    after_start = rec.pos + del_len
+                else:
+                    indel_seq = rec.alts[0][1:].upper()
+                    after_start = rec.pos
+                after_end = min(chrom_len, after_start + INDEL_CONTEXT_WINDOW)
+                ref_after = _decode_ref_seq(ref_h5[rec.chrom][after_start:after_end])
+                anno = (
+                    int(hp_h5[rec.chrom][0, rec.pos]),
+                    int(str_h5[rec.chrom][0, rec.pos]),
+                    int(str_h5[rec.chrom][1, rec.pos]),
+                )
+                label = classify_indel_channel(indel_seq, ref_after, indel_len, anno)
+                indel_mut83_re[label2num_83[label]] += 1
             for rec in vcf.fetch():
                 if "PASS" not in rec.filter:
                     continue
@@ -2400,8 +2642,8 @@ def do_estimate(args):
         correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov_96)
         mutnum_corrected = correction_ratio * trinuc_mut
         burden_corrected = mutnum_corrected.sum() / cov
-        burden_corrected_lb, burden_corrected_ub = poisson_confint(
-            mutnum_corrected.sum(), cov
+        burden_corrected_lb, burden_corrected_ub = bootstrap_corrected_confint(
+            trinuc_mut, correction_ratio, cov, rng=rng
         )
         hap_trinuc = trinuc_rate * ref_trinuc_96
         mut_per_genome = hap_trinuc.sum()
@@ -2417,39 +2659,90 @@ def do_estimate(args):
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
             f.write(f"mutation number per genome\t{mut_per_genome}\n")
             f.write(f"genome coverage\t{genome_cov}\n")
-        # indel_cov_total sums the same 14 overlapping opportunity columns
-        # (parts[7:21] above) as INDEL_COVERAGE_CATEGORY_LABELS elsewhere in
-        # this file -- mutations/indel_cov_total is therefore per
-        # opportunity-COLUMN, not per locus, exactly the same units mismatch
-        # _indel_burden.txt's indel_locus_multiplier corrects for. This
-        # branch has no access to that multiplier (it's computed in the
-        # `if not args.reestimatebed` branch above, using ref_indel83 from
-        # the main indel83 pipeline, neither of which runs here), so
-        # recompute the reference-genome side of it directly from the index
-        # files the same way the main branch does.
-        label2num_100_re, _ = build_indel100_labels()
+        # Fold the redistributed indel100 coverage down to ID83 resolution
+        # the same way the main pipeline does (indel100 -> indel76 -> ID83,
+        # then fill the Cinshp0/Tinshp0 rep0 bins from the raw 1bpins{base}
+        # totals) -- see the `if not args.reestimatebed` branch above for
+        # the identical sequence applied to indel100_by_rf_np.
         ref_indel100_re = calculate_ref_indel100(args)
         ref_indel76_re = combine_indel100_to_indel76(ref_indel100_re, label2num_100_re)
         ref_indel83_re = expand_indel76_to_indel83(ref_indel76_re)
         ref_indel83_re = override_inshp0_with_next_base_opportunity(
             ref_indel83_re, ref_indel100_re
         )
+        indel_cov76_re = combine_indel100_to_indel76(indel_cov100_re, label2num_100_re)
+        indel_cov83_re = expand_indel76_to_indel83(indel_cov76_re)
+        indel_cov83_re = override_inshp0_with_next_base_opportunity(
+            indel_cov83_re, indel_cov100_re
+        )
+        # Subtract each observed mutant locus from its own channel's
+        # coverage, mirroring the main pipeline's indel83_cov_by_rf -
+        # indel83_mut_np step above.
+        indel_cov83_re = indel_cov83_re - indel_mut83_re
+
+        # indel_cov83_re.sum() is per opportunity-CHANNEL, not per locus
+        # (one locus can count toward several ID83 channels at once) --
+        # exactly the same units mismatch _indel_burden.txt's
+        # indel_locus_multiplier corrects for. This branch has no access
+        # to that multiplier (it's computed in the `if not
+        # args.reestimatebed` branch above, using ref_indel83 from the
+        # main indel83 pipeline, neither of which runs here), so recompute
+        # the reference-genome side of it directly from the index files
+        # the same way the main branch does.
         indel_locus_multiplier_re = ref_indel83_re.sum() / ref_trinuc.sum()
-        indel_burden_re = (
+        indel_cov_total = indel_cov83_re.sum()
+        indel_burden_re_uncorrected = (
             indel_count / float(indel_cov_total) * indel_locus_multiplier_re
             if indel_cov_total > 0
             else float("nan")
         )
-        indel_burden_re_lb, indel_burden_re_ub = poisson_confint(
-            indel_count, indel_cov_total
+        (
+            indel_burden_re_uncorrected_lb,
+            indel_burden_re_uncorrected_ub,
+        ) = poisson_confint(indel_count, indel_cov_total)
+        indel_burden_re_uncorrected_lb *= indel_locus_multiplier_re
+        indel_burden_re_uncorrected_ub *= indel_locus_multiplier_re
+
+        # Corrected: same per-channel, microhomology-grouped correction_ratio
+        # scheme as estimate_indel83 itself (_grouped_indel83_correction_
+        # ratio), now that both sides are at true ID83 resolution.
+        ref_frac_re = ref_indel83_re / ref_indel83_re.sum()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            obs_frac_re = indel_cov83_re / indel_cov83_re.sum()
+        indel_correction_ratio83_re = _grouped_indel83_correction_ratio(
+            ref_frac_re, obs_frac_re
         )
-        indel_burden_re_lb *= indel_locus_multiplier_re
-        indel_burden_re_ub *= indel_locus_multiplier_re
+        indel_mutnum_corrected = (indel_correction_ratio83_re * indel_mut83_re).sum()
+        indel_burden_re_corrected = (
+            indel_mutnum_corrected / float(indel_cov_total) * indel_locus_multiplier_re
+            if indel_cov_total > 0
+            else float("nan")
+        )
+        (
+            indel_burden_re_corrected_lb,
+            indel_burden_re_corrected_ub,
+        ) = bootstrap_corrected_confint(
+            indel_mut83_re, indel_correction_ratio83_re, indel_cov_total, rng=rng
+        )
+        indel_burden_re_corrected_lb *= indel_locus_multiplier_re
+        indel_burden_re_corrected_ub *= indel_locus_multiplier_re
         with open(indel_dir + "/" + sample + "_indel_burden_re_estimate.txt", "w") as f:
-            f.write(f"Indel burden\t{indel_burden_re}\n")
-            f.write(f"Indel burden 95% lower\t{indel_burden_re_lb}\n")
-            f.write(f"Indel burden 95% upper\t{indel_burden_re_ub}\n")
-            f.write(f"Indel number\t{indel_count}\n")
+            f.write(f"Uncorrected indel burden\t{indel_burden_re_uncorrected}\n")
+            f.write(
+                f"Uncorrected indel burden 95% lower\t{indel_burden_re_uncorrected_lb}\n"
+            )
+            f.write(
+                f"Uncorrected indel burden 95% upper\t{indel_burden_re_uncorrected_ub}\n"
+            )
+            f.write(f"Uncorrected indel number\t{indel_count}\n")
+            f.write(f"Corrected indel burden\t{indel_burden_re_corrected}\n")
+            f.write(
+                f"Corrected indel burden 95% lower\t{indel_burden_re_corrected_lb}\n"
+            )
+            f.write(
+                f"Corrected indel burden 95% upper\t{indel_burden_re_corrected_ub}\n"
+            )
+            f.write(f"Corrected indel number\t{indel_mutnum_corrected}\n")
             f.write(f"Indel coverage\t{indel_cov_total}\n")
         corrected_trinuc_pd = pd.DataFrame(
             np.stack(
