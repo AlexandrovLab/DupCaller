@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import shutil
 import time
 from multiprocessing import Pool
 import errno
@@ -13,6 +12,7 @@ from matplotlib import pyplot as plt
 
 
 from .funcs.call import callBam
+from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import drop_empty_regions
@@ -23,12 +23,22 @@ from .funcs.misc import getAlignmentObject as BAM
 def do_learn(args):
     params = {
         "tumorBam": args.bam,
-        "normalBam": None,
+        "normalBams": args.normalBams,
         "germline": args.germline,
         "reference": args.reference,
         "output": args.output,
         "regions": args.regions,
+        "region_file": None,
         "threads": args.threads,
+        # callBam's isLearn path shares the round-0/round-1/round-2 code
+        # with call.py (funcs/call.py's threshold_rng Monte Carlo seeding,
+        # _compute_read_label's NanoSeq-bam check) -- both keys are read
+        # unconditionally regardless of isLearn, so they must be present
+        # even though a standalone `learn` run has no call-specific CLI
+        # flags for them.
+        "seed": int(np.random.SeedSequence().generate_state(1)[0]),
+        "nanoSeqBam": False,
+        "rescue": False,
         "mutRate": 10e-7,
         "pcutoff": 1,
         "amperr": 1e-5,
@@ -53,6 +63,7 @@ def do_learn(args):
         "step": args.windowSize,
         "minRef": args.minRef,
         "minAlt": args.minAlt,
+        "pseudocount": args.pseudocount,
     }
     """
     Initialze run
@@ -73,7 +84,7 @@ def do_learn(args):
     error_dir = os.path.join(params["output"], "ERROR")
     os.makedirs(error_dir, exist_ok=True)
     error_prefix = os.path.join(error_dir, args.output)
-    bamObject = BAM(args.bam, args.reference, "rb")
+    bamObject = BAM(args.bam, "rb", args.reference)
 
     """
     Execulte variant calling
@@ -98,6 +109,7 @@ def do_learn(args):
             mismatch_dmg_profile,
             hp_dmg_profile,
             str_dmg_profile,
+            sbs_alt_bq_hist,
         ) = callBam(paramsNow, 0)
     else:
         """
@@ -198,6 +210,7 @@ def do_learn(args):
         mismatch_dmg_profile = sum([_[3] for _ in results]).astype(int)
         hp_dmg_profile = sum([_[4] for _ in results]).astype(int)
         str_dmg_profile = sum([_[5] for _ in results]).astype(int)
+        sbs_alt_bq_hist = sum([_[6] for _ in results]).astype(int)
 
     trinuc2num = dict()
     num2trinuc = list()
@@ -245,7 +258,36 @@ def do_learn(args):
     dmg_hp_pd.to_csv(error_prefix + ".dmg.hp.txt", sep="\t")
     amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
     dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
-    shutil.rmtree(tmp_dir)
+
+    # Amp-error base-quality histogram (SBS only): not weighted by BQ
+    # like mismatch_profile above -- instead records, per error-matrix
+    # cell, how many raw amp-error observations were seen at each base
+    # quality. Too large to flatten sensibly into a 2D CSV (64x4x
+    # {NUM_BQ}), so saved as .npz with the row/column/BQ axis labels
+    # alongside the counts -- bq_values (0..{NUM_BQ}-1) doubles as both
+    # the BQ axis labels and, since a bin's index equals its BQ value,
+    # the histogram's per-slice BQ values. A debugging/QC diagnostic, not
+    # a deliverable, so it goes to tmp_dir rather than the final ERROR/
+    # output dir -- same split as Caller.py's _indel_rate_by_hp_str.txt/
+    # _sbs96_rate_by_trinuc.txt.
+    bq_values = np.arange(NUM_BQ)
+    np.savez(
+        os.path.join(tmp_dir, os.path.basename(args.output) + ".amp.tn.bqhist.npz"),
+        hist=sbs_alt_bq_hist,
+        row_labels=np.array(num2trinuc),
+        col_labels=np.array(["A", "T", "C", "G"]),
+        bq_values=bq_values,
+    )
+
+    # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
+    # histogram above -- this, not amp.tn.txt's raw counts, is what
+    # params["amperr_file"] now points at and load_error_matrices
+    # (funcs/misc.py) reads directly for calling, replacing the old
+    # in-situ row-normalization of raw counts.
+    srd_mat = estimate_sbs_srd_rates(sbs_alt_bq_hist, params["pseudocount"])
+    srd_pd = pd.DataFrame(srd_mat, columns=["A", "T", "C", "G"], index=num2trinuc)
+    srd_pd.to_csv(error_prefix + ".amp.tn.srd.txt", sep="\t")
+
     print(
         "..............Completed error learning "
         + str((time.time() - startTime) / 60)

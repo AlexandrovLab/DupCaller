@@ -67,7 +67,17 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
 
 
 def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2):
-    Pseq[Pseq == 0] = log(0.5)
+    # Pseq is ln(base-call error rate implied by BQ): exp(Pseq) is the
+    # probability of ANY miscall, but the mixture below treats it as the
+    # probability of specifically miscalling to the ONE alternate allele
+    # under test here, so it's divided by 3 (the number of possible wrong
+    # bases) -- skipped for the "no real quality info" sentinel (Pseq
+    # coming in as exactly 0, e.g. a >2bp indel insertion, see
+    # funcs/indels.py's getIndelArr) so that case stays exactly the
+    # uninformative 50/50 log(0.5) below, not further scaled by it.
+    zero_mask = Pseq == 0
+    Pseq[zero_mask] = log(0.5)
+    Pseq[~zero_mask] -= log(3)
     bin_seq = bin_seq.astype(bool, copy=False)
 
     expP = np.exp(Pseq)

@@ -1,6 +1,15 @@
 import numpy as np
 from .indels import findIndels, getIndelArr, left_align_indel
 
+# Base-quality axis for the amp-error BQ histograms below: SAM/BAM Phred
+# scores are defined over 0-93 ('!' to '~'), so this range covers any
+# quality value a BAM can carry regardless of sequencing platform. Bin
+# index == literal BQ value, so a companion "BQ values" array is just
+# np.arange(NUM_BQ) -- callers (Learn.py) use that as the histogram's
+# BQ-axis labels when writing output.
+MAX_BQ = 93
+NUM_BQ = MAX_BQ + 1
+
 
 def profileTriNucMismatches(
     seqs, reference_start, reference_int, trinuc_int, hp_raw, str_raw, antimask, params
@@ -25,6 +34,13 @@ def profileTriNucMismatches(
     hp_dmg_count = np.zeros([10, 12])
     str_alt_count = np.zeros([5, 11])
     str_dmg_count = np.zeros([5, 11])
+    # Amp-error BQ histogram (SBS only -- no HP/STR version): unlike the
+    # count matrices above, this is not weighted/discounted by base
+    # quality -- it records, for every (trinuc, base, base-quality)
+    # triple, how many raw (unweighted) amp-error observations landed
+    # there. Mirrors mismatch_profile's (64, 4) shape with a trailing BQ
+    # axis. Feeds estimate_sbs_srd_rates below.
+    sbs_alt_bq_hist = np.zeros([64, 4, NUM_BQ])
 
     F1R2 = []
     F2R1 = []
@@ -61,6 +77,7 @@ def profileTriNucMismatches(
             np.zeros([64, 4]),
             np.zeros([10, 12]),
             np.zeros([5, 11]),
+            np.zeros([64, 4, NUM_BQ]),
         )
 
     ### Prepare sequence matrix and quality matrix for each strand
@@ -235,10 +252,12 @@ def profileTriNucMismatches(
     F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
     F1R2_antimask_positions = np.nonzero(F1R2_antimask)[0]
     F1R2_trinuc_alt_count_mat = np.zeros([96, 4])
+    F1R2_trinuc_alt_bq_hist = np.zeros([96, 4, NUM_BQ])
     F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
     for mm in range(F1R2_seq_mat.shape[0]):
         seq_masked = F1R2_seq_mat[mm, F1R2_antimask]
         ref_masked = reference_int[F1R2_antimask]
+        qual_masked = F1R2_qual_mat[mm, F1R2_antimask]
         mismatch_bool = seq_masked != ref_masked
         n_mismatch = int(mismatch_bool.sum())
         if n_mismatch == 0:
@@ -246,15 +265,29 @@ def profileTriNucMismatches(
         if n_mismatch == 1:
             F1R2_trinuc_alt_1Dmap = F1R2_trinuc_masked + seq_masked * 96
             # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
+            # Not weighted by base quality any more -- a passing base
+            # (qual > 0, i.e. > minBq: bases <= minBq were already
+            # zeroed out above) counts as exactly 1, matching "record the
+            # count for each base" rather than the old confidence-scaled
+            # 1 - 10**(-bq/10) weight.
+            valid = qual_masked > 0
             F1R2_trinuc_alt_count_mat += (
                 np.bincount(
                     F1R2_trinuc_alt_1Dmap,
-                    weights=1 - 10 ** (-F1R2_qual_mat[mm, F1R2_antimask] / 10),
+                    weights=valid.astype(float),
                     minlength=96 * 4,
                 )[0 : 4 * 96]
                 .reshape([4, 96])
                 .T
             )
+            if valid.any():
+                bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
+                flat_idx = F1R2_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
+                F1R2_trinuc_alt_bq_hist += (
+                    np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
+                    .reshape([4, 96, NUM_BQ])
+                    .transpose(1, 0, 2)
+                )
         # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[:32,:] + F1R2_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[0:64, :] + np.vstack(
@@ -263,14 +296,22 @@ def profileTriNucMismatches(
             F1R2_trinuc_alt_count_mat[:32, [1, 0, 3, 2]],
         ]
     )
+    F1R2_trinuc_alt_bq_hist_norm = F1R2_trinuc_alt_bq_hist[0:64, :, :] + np.vstack(
+        [
+            F1R2_trinuc_alt_bq_hist[32:64, [1, 0, 3, 2], :],
+            F1R2_trinuc_alt_bq_hist[:32, [1, 0, 3, 2], :],
+        ]
+    )
 
     F2R1_trinuc_alt_count_mat = np.zeros([96, 4])
+    F2R1_trinuc_alt_bq_hist = np.zeros([96, 4, NUM_BQ])
     F2R1_trinuc_masked = trinuc_int[F2R1_antimask]
     F2R1_antimask_positions = np.nonzero(F2R1_antimask)[0]
     # F1R2_alt_masked = F1R2_alt_int[F1R2_antimask]
     for mm in range(F2R1_seq_mat.shape[0]):
         seq_masked = F2R1_seq_mat[mm, F2R1_antimask]
         ref_masked = reference_int[F2R1_antimask]
+        qual_masked = F2R1_qual_mat[mm, F2R1_antimask]
         mismatch_bool = seq_masked != ref_masked
         n_mismatch = int(mismatch_bool.sum())
         if n_mismatch == 0:
@@ -278,15 +319,24 @@ def profileTriNucMismatches(
         if n_mismatch == 1:
             F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
             # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
+            valid = qual_masked > 0
             F2R1_trinuc_alt_count_mat += (
                 np.bincount(
                     F2R1_trinuc_alt_1Dmap,
-                    weights=1 - 10 ** (-F2R1_qual_mat[mm, F2R1_antimask] / 10),
+                    weights=valid.astype(float),
                     minlength=96 * 4,
                 )[0 : 4 * 96]
                 .reshape([4, 96])
                 .T
             )
+            if valid.any():
+                bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
+                flat_idx = F2R1_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
+                F2R1_trinuc_alt_bq_hist += (
+                    np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
+                    .reshape([4, 96, NUM_BQ])
+                    .transpose(1, 0, 2)
+                )
         # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[:32,:] + F2R1_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[0:64, :] + np.vstack(
@@ -295,6 +345,13 @@ def profileTriNucMismatches(
             F2R1_trinuc_alt_count_mat[:32, [1, 0, 3, 2]],
         ]
     )
+    F2R1_trinuc_alt_bq_hist_norm = F2R1_trinuc_alt_bq_hist[0:64, :, :] + np.vstack(
+        [
+            F2R1_trinuc_alt_bq_hist[32:64, [1, 0, 3, 2], :],
+            F2R1_trinuc_alt_bq_hist[:32, [1, 0, 3, 2], :],
+        ]
+    )
+    sbs_alt_bq_hist = F1R2_trinuc_alt_bq_hist_norm + F2R1_trinuc_alt_bq_hist_norm
 
     ###INDEL LEARN
     indels = set()
@@ -333,6 +390,7 @@ def profileTriNucMismatches(
             dmg_trinuc_alt_count_mat_norm,
             np.zeros([10, 12]),
             np.zeros([5, 11]),
+            sbs_alt_bq_hist,
         )
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
@@ -465,36 +523,21 @@ def profileTriNucMismatches(
             dmg_trinuc_alt_count_mat_norm,
             hp_dmg_count,
             str_dmg_count,
+            sbs_alt_bq_hist,
         )
 
-    F1R2_alt_qual = np.zeros(m)
-    F1R2_ref_qual = np.zeros(m)
-    F2R1_alt_qual = np.zeros(m)
-    F2R1_ref_qual = np.zeros(m)
     F1R2_alt_count = np.zeros(m)
     F1R2_ref_count = np.zeros(m)
     F2R1_alt_count = np.zeros(m)
     F2R1_ref_count = np.zeros(m)
     for seq in F1R2:
-        seqArr, qualArr = getIndelArr(seq, indels_masked)
-        ac = np.count_nonzero(seqArr == 1)
-        rc = np.count_nonzero(seqArr == 0)
-        aq = np.sum(qualArr[seqArr == 1])
-        rq = np.sum(qualArr[seqArr == 0])
-        F1R2_alt_qual += aq
-        F1R2_ref_qual += rq
-        F1R2_alt_count += ac
-        F1R2_ref_count += rc
+        seqArr, _ = getIndelArr(seq, indels_masked)
+        F1R2_alt_count += np.count_nonzero(seqArr == 1)
+        F1R2_ref_count += np.count_nonzero(seqArr == 0)
     for seq in F2R1:
-        seqArr, qualArr = getIndelArr(seq, indels_masked)
-        ac = np.count_nonzero(seqArr == 1)
-        rc = np.count_nonzero(seqArr == 0)
-        aq = np.sum(qualArr[seqArr == 1])
-        rq = np.sum(qualArr[seqArr == 0])
-        F2R1_alt_qual += aq
-        F2R1_ref_qual += rq
-        F2R1_alt_count += ac
-        F2R1_ref_count += rc
+        seqArr, _ = getIndelArr(seq, indels_masked)
+        F2R1_alt_count += np.count_nonzero(seqArr == 1)
+        F2R1_ref_count += np.count_nonzero(seqArr == 0)
 
     dmg_antimask = np.ones(m, dtype=bool)
     dmg_antimask[
@@ -504,8 +547,6 @@ def profileTriNucMismatches(
     ] = False
     dmg_antimask[np.logical_and(F1R2_ref_count != 0, F1R2_alt_count != 0)] = False
     dmg_antimask[np.logical_and(F2R1_ref_count != 0, F2R1_alt_count != 0)] = False
-    dmg_antimask[F1R2_ref_qual + F1R2_alt_qual < 90] = False
-    dmg_antimask[F2R1_ref_qual + F2R1_alt_qual < 90] = False
     dmg_antimask[np.logical_and(F1R2_alt_count > 0, F2R1_alt_count > 0)] = False
     F1R2_dmg_antimask = dmg_antimask.copy()
     F1R2_dmg_antimask[F1R2_alt_count == 0] = False
@@ -653,4 +694,89 @@ def profileTriNucMismatches(
         dmg_trinuc_alt_count_mat_norm,
         hp_dmg_count,
         str_dmg_count,
+        sbs_alt_bq_hist,
     )
+
+
+def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12):
+    """EM-estimate a per-trinuc-context SBS single-read-damage (SRD) rate
+    matrix from sbs_alt_bq_hist (see profileTriNucMismatches above),
+    replacing the old in-situ "row-normalize the raw amp.tn.txt counts at
+    call time" approach with a base-quality-aware mixture model fit once
+    here at learn time.
+
+    Per trinuc-context row, each read observation at base quality BQ
+    (error rate e = 10**(-BQ/10)) is modeled as coming from one of two
+    causes: a true amp-error conversion to a specific alt base b (rate
+    p_b, the thing being estimated), correctly read with prob (1-e); or
+    the true reference base, correctly read as ref with prob (1-e) but
+    occasionally miscalled to some other base with prob e/3 each. p (the
+    "no conversion" rate) is always the residual 1 - sum(p_b) over the 3
+    alt bases, never estimated independently.
+
+    E step (responsibility that an observed-b read reflects a true b
+    conversion rather than a miscalled reference read), and its symmetric
+    but unnormalized counterpart for reads observed as the reference base
+    (responsibility that a ref-observed read is really a miscalled true-b
+    conversion):
+        w_b(BQ) = p_b*(1-e) / (p_b*(1-e) + (1-p)*e/3)
+        w_r(BQ) = p_b*e/3
+        N_b = sum_BQ(hist_b[BQ]*w_b(BQ)) + sum_BQ(hist_r[BQ]*w_r(BQ))
+    M step (Dirichlet-pseudocount-smoothed MLE, `a`=pseudocount, N=total
+    raw observation count for the row across all 4 bases -- fixed across
+    iterations, unlike N_b):
+        p_b = (N_b + a) / (N + 3*a)
+        p = 1 - sum(p_b)
+
+    Returns a (64, 4) matrix in the same row (num2trinuc/build_trinuc64_
+    order) / column (A, T, C, G) convention as the old row-normalized
+    amp.tn matrix: each row's reference-base column holds p, its 3 alt
+    columns hold p_b1/p_b2/p_b3. A context with zero total observations
+    is left as an all-zero row (regularizeErrorMat, funcs/misc.py, patches
+    it downstream the same way it always has).
+    """
+    from .misc import build_trinuc64_order
+
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    _, num2trinuc = build_trinuc64_order()
+    n_bq = sbs_alt_bq_hist.shape[2]
+    bq_values = np.arange(n_bq)
+    e = 10 ** (-bq_values / 10)
+    one_minus_e = 1 - e
+    e_over_3 = e / 3
+
+    srd = np.zeros([64, 4])
+    for row in range(64):
+        ref_col = base2num[num2trinuc[row][1]]
+        alt_cols = [c for c in range(4) if c != ref_col]
+        hist_r = sbs_alt_bq_hist[row, ref_col, :]
+        hist_alt = {c: sbs_alt_bq_hist[row, c, :] for c in alt_cols}
+        N = float(sbs_alt_bq_hist[row, :, :].sum())
+        if N == 0:
+            continue
+
+        # Init from the naive (unweighted) empirical fraction.
+        p_b = {c: float(hist_alt[c].sum()) / N for c in alt_cols}
+        for _ in range(max_iter):
+            p_alt_total = sum(p_b.values())
+            new_p_b = {}
+            for c in alt_cols:
+                denom = p_b[c] * one_minus_e + p_alt_total * e_over_3
+                w_b = np.divide(
+                    p_b[c] * one_minus_e,
+                    denom,
+                    out=np.zeros_like(denom),
+                    where=denom > 0,
+                )
+                w_r = p_b[c] * e_over_3
+                N_c = float(np.dot(hist_alt[c], w_b)) + float(np.dot(hist_r, w_r))
+                new_p_b[c] = (N_c + pseudocount) / (N + 3 * pseudocount)
+            delta = max(abs(new_p_b[c] - p_b[c]) for c in alt_cols)
+            p_b = new_p_b
+            if delta < tol:
+                break
+
+        srd[row, ref_col] = 1 - sum(p_b.values())
+        for c in alt_cols:
+            srd[row, c] = p_b[c]
+    return srd

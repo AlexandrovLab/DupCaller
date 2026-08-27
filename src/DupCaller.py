@@ -103,7 +103,7 @@ if __name__ == "__main__":
         "-E",
         "--errprefix",
         type=str,
-        help="prefix for all six error files ({prefix}.amp.tn.txt, {prefix}.amp.hp.txt, "
+        help="prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, "
         "{prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, "
         "{prefix}.dmg.str.txt); overrides the default (output prefix)",
     )
@@ -375,7 +375,16 @@ if __name__ == "__main__":
         "--minBq",
         type=float,
         help="minimum base quality to be considered for training",
-        default = 18,    
+        default = 18,
+    )
+
+    learn_parser.add_argument(
+        "-a",
+        "--pseudocount",
+        type=float,
+        help="regularization pseudocount added to each trinuc-context's per-base "
+        "EM estimate of the SBS single-read-damage (SRD) rate matrix",
+        default=0.5,
     )
 
     learn_parser.add_argument(

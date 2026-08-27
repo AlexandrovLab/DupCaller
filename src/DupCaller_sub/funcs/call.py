@@ -32,7 +32,7 @@ from .prob import (
     calculateSSPosterior,
     calculateDSPosterior,
 )
-from .learn import profileTriNucMismatches
+from .learn import profileTriNucMismatches, NUM_BQ
 from .misc import getAlignmentObject as BAM
 from .misc import build_trinuc64_order
 from .misc import load_repeat_context
@@ -241,6 +241,7 @@ def _process_duplex_family(
     reference_mat_start,
     rs_reference_end,
     rs_reference_start,
+    sbs_alt_bq_hist_mat,
     setBc,
     snp_mask,
     str_alt_mat,
@@ -514,6 +515,7 @@ def _process_duplex_family(
                 mismatch_dmg_now,
                 hp_dmg_now,
                 str_dmg_now,
+                sbs_alt_bq_hist_now,
             ) = profileTriNucMismatches(
                 readSet,
                 rs_reference_start,
@@ -530,6 +532,7 @@ def _process_duplex_family(
             mismatch_dmg_mat += mismatch_dmg_now
             hp_dmg_mat += hp_dmg_now
             str_dmg_mat += str_dmg_now
+            sbs_alt_bq_hist_mat += sbs_alt_bq_hist_now
         if isLearn:
             return False  # learn mode: no calling, doesn't count toward duplex_count
         (
@@ -1264,6 +1267,11 @@ def callBam(params, processNo):
     mismatch_dmg_mat = np.zeros([64, 4])
     hp_dmg_mat = np.zeros([10, 12])
     str_dmg_mat = np.zeros([5, 11])
+    # Amp-error BQ histogram accumulated across families (SBS only) --
+    # see funcs/learn.py's profileTriNucMismatches for the (channel, BQ)
+    # shape convention and NUM_BQ, and estimate_sbs_srd_rates for how it
+    # feeds the SRD rate matrix.
+    sbs_alt_bq_hist_mat = np.zeros([64, 4, NUM_BQ])
     # Loads/regularizes ampmat/ampmat_rev/dmgmat_top/rev_top/bot/rev_bot/
     # ampmat_indel/ampmat_indel_rev/dmgmat_indel/dmgmat_indel_rev and sets
     # trinuc_convert/trinuc2num_dict/num2trinuc_list on params -- see
@@ -2132,6 +2140,7 @@ def callBam(params, processNo):
                         reference_mat_start,
                         rs_reference_end,
                         rs_reference_start,
+                        sbs_alt_bq_hist_mat,
                         setBc,
                         snp_mask,
                         str_alt_mat,
@@ -2479,6 +2488,7 @@ def callBam(params, processNo):
                 reference_mat_start,
                 rs_reference_end,
                 rs_reference_start,
+                sbs_alt_bq_hist_mat,
                 setBc,
                 snp_mask,
                 str_alt_mat,
@@ -2500,6 +2510,7 @@ def callBam(params, processNo):
             mismatch_dmg_mat,
             hp_dmg_mat,
             str_dmg_mat,
+            sbs_alt_bq_hist_mat,
         )
 
     ### SNV depth extraction, batched: gather every eligible candidate

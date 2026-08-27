@@ -1554,17 +1554,18 @@ def _normalize_indel_str_mat(mat):
     return mat_new
 
 
-def regularizeErrorMat(mat, minerr):
-    """Replace invalid cells — exact zero, or NaN from a 0/0 row-sum
-    division upstream (a trinuc/indel context with zero observed counts)
-    — with the smallest valid value found elsewhere in the matrix, so one
-    unobserved context can't leave a zero or NaN in the error model.
-    Falls back to `minerr` only if the matrix has no valid cells at all."""
-    invalid = (mat == 0) | np.isnan(mat)
-    valid = mat[~invalid]
-    mat_min = valid.min() if valid.size > 0 else minerr
-    mat[invalid] = mat_min
-    return mat
+def regularizeErrorMat(mat, pseudocount):
+    """Add `pseudocount` to every entry of mat, so no cell is ever exactly
+    zero and a real observation can never be assigned zero likelihood
+    downstream. NaN entries (from a 0/0 row-sum division upstream -- a
+    trinuc/indel context with zero observed counts) are treated as 0
+    before the pseudocount is added. Replaces the old scheme of patching
+    only invalid (zero/NaN) cells with the matrix's own smallest valid
+    value (or a last-resort `minerr` fallback if the whole matrix was
+    invalid) -- a uniform additive pseudocount makes that special-casing,
+    and the fallback, unnecessary."""
+    mat = np.nan_to_num(mat, nan=0.0)
+    return mat + pseudocount
 
 
 def load_error_matrices(params):
@@ -1604,23 +1605,20 @@ def load_error_matrices(params):
     if isLearn:
         ampmat = np.zeros([64, 4])
     else:
+        # amperr_file now points at a Learn.py/Caller.py-auto-learn-
+        # produced SRD (single-read-damage) rate matrix
+        # (funcs/learn.py's estimate_sbs_srd_rates) -- already a
+        # per-row probability distribution (p/p_b1/p_b2/p_b3 summing to
+        # 1, EM-fit directly against the per-read base-quality
+        # distribution) rather than raw mismatch counts, so no row-sum
+        # normalization here any more: the old in-situ "divide raw
+        # amp.tn.txt counts by their row sum" step now happens once at
+        # learn time instead of on every call-time load.
         ampmat = (
             pd.read_csv(params["amperr_file"], sep="\t", index_col=0)
             .to_numpy()
             .astype(float)
         )
-    # ampmat += 0.5
-    # A trinuc context with zero observed counts across all 4 alt bases
-    # has row sum 0; dividing those rows would produce NaN (0/0) instead
-    # of leaving them as exact zero, which regularizeErrorMat below can
-    # then correctly patch with the matrix's smallest valid value.
-    ampmat_row_sum = ampmat.sum(axis=1, keepdims=True)
-    ampmat_row_nonzero = (ampmat_row_sum != 0).flatten()
-    ampmat_normalized = np.zeros_like(ampmat)
-    ampmat_normalized[ampmat_row_nonzero, :] = (
-        ampmat[ampmat_row_nonzero, :] / ampmat_row_sum[ampmat_row_nonzero, :]
-    )
-    ampmat = ampmat_normalized
     # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
     ampmat_min_error = ampmat.min(axis=1, keepdims=True)
     ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)

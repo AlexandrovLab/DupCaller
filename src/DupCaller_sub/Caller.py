@@ -21,6 +21,7 @@ from matplotlib import pyplot as plt
 
 from . import __version__
 from .funcs.call import callBam  # , output_masked_mutations
+from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
 from .funcs.misc import init_refine_worker, refine_channel_task
 from .funcs.prob import indelErrorProbs, indelMaxLR
@@ -115,7 +116,7 @@ def check_input_files_exist(args):
     # Check optional error profile files
     if args.errprefix:
         for suffix, label in [
-            (".amp.tn.txt", "Amplification SBS error file"),
+            (".amp.tn.srd.txt", "Amplification SBS error file (SRD rate matrix)"),
             (".amp.hp.txt", "Amplification indel (homopolymer) error file"),
             (".amp.str.txt", "Amplification indel (STR) error file"),
             (".dmg.tn.txt", "Damage SBS error file"),
@@ -168,7 +169,7 @@ def do_call(args):
         "threads": args.threads,
         # "amperr": args.amperrs,
         # "amperri": args.amperri,
-        "amperr_file": error_prefix + ".amp.tn.txt",
+        "amperr_file": error_prefix + ".amp.tn.srd.txt",
         "amperri_file": error_prefix + ".amp.id.txt",
         "dmgerr_file": error_prefix + ".dmg.tn.txt",
         "dmgerri_file": error_prefix + ".dmg.id.txt",
@@ -202,7 +203,7 @@ def do_call(args):
         "seed": args.seed,
     }
     if args.errprefix:
-        params["amperr_file"] = args.errprefix + ".amp.tn.txt"
+        params["amperr_file"] = args.errprefix + ".amp.tn.srd.txt"
         params["amperri_file"] = args.errprefix + ".amp.id.txt"
         params["dmgerr_file"] = args.errprefix + ".dmg.tn.txt"
         params["dmgerri_file"] = args.errprefix + ".dmg.id.txt"
@@ -342,6 +343,7 @@ def do_call(args):
                 mismatch_dmg_profile,
                 hp_dmg_profile,
                 str_dmg_profile,
+                sbs_alt_bq_hist,
             ) = callBam(paramsNow, 0)
 
         else:
@@ -448,6 +450,7 @@ def do_call(args):
             mismatch_dmg_profile = sum([_[3] for _ in results]).astype(int)
             hp_dmg_profile = sum([_[4] for _ in results]).astype(int)
             str_dmg_profile = sum([_[5] for _ in results]).astype(int)
+            sbs_alt_bq_hist = sum([_[6] for _ in results]).astype(int)
 
         trinuc2num = dict()
         num2trinuc = list()
@@ -504,6 +507,31 @@ def do_call(args):
         dmg_hp_pd.to_csv(error_prefix + ".dmg.hp.txt", sep="\t")
         amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
         dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
+
+        # Amp-error BQ histogram (SBS only) -- see Learn.py's matching
+        # write-out for the shape/convention (same one here). Too large
+        # for a 2D CSV, so saved as .npz with the row/column/BQ axis
+        # labels alongside the counts. A debugging/QC diagnostic, not a
+        # deliverable, so it goes to tmp_dir rather than the final ERROR/
+        # output dir -- same split as _indel_rate_by_hp_str.txt/
+        # _sbs96_rate_by_trinuc.txt below.
+        bq_values = np.arange(NUM_BQ)
+        np.savez(
+            os.path.join(params["tmp_dir"], sample_name + ".amp.tn.bqhist.npz"),
+            hist=sbs_alt_bq_hist,
+            row_labels=np.array(num2trinuc),
+            col_labels=np.array(["A", "T", "C", "G"]),
+            bq_values=bq_values,
+        )
+
+        # SBS SRD (single-read-damage) rate matrix, EM-estimated from the
+        # BQ histogram above -- this, not amp.tn.txt's raw counts, is what
+        # params["amperr_file"] now points at and load_error_matrices
+        # (funcs/misc.py) reads directly for calling, replacing the old
+        # in-situ row-normalization of raw counts.
+        srd_mat = estimate_sbs_srd_rates(sbs_alt_bq_hist, args.pseudocount)
+        srd_pd = pd.DataFrame(srd_mat, columns=["A", "T", "C", "G"], index=num2trinuc)
+        srd_pd.to_csv(error_prefix + ".amp.tn.srd.txt", sep="\t")
         print(
             "..............Completed error estimation in "
             + str((time.time() - startTime) / 60)

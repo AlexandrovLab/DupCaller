@@ -120,9 +120,21 @@ def getIndelArr(seq, indels):
         if indelLen > 0:
             if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
                 seqArr[nn] = 1
-                qualArr[nn] = np.average(
-                    seq.query_qualities[readPos + 1 : readPos + indelLen + 1]
-                )
+                # Averaging per-base BQ across the inserted bases only
+                # approximates a real whole-insertion correctness
+                # confidence for a 1-2bp insertion; the true probability
+                # that a longer run was called correctly is a product of
+                # per-base probabilities, not their average, so averaging
+                # would badly overstate confidence there. Leave qualArr at
+                # its 0 default for >2bp insertions instead --
+                # calculateSSPosterior (funcs/prob.py) treats a literal 0
+                # Pseq as "no usable quality info" and maps it to an
+                # uninformative 50/50 log(0.5) rather than a real
+                # quality-derived rate.
+                if indelLen <= 2:
+                    qualArr[nn] = np.average(
+                        seq.query_qualities[readPos + 1 : readPos + indelLen + 1]
+                    )
             elif reference_positions[readPos + 1] - reference_positions[readPos] != -1:
                 seqArr[nn] = 0
                 qualArr[nn] = seq.query_qualities[readPos + 1]
