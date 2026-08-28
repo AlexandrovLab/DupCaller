@@ -120,18 +120,8 @@ def getIndelArr(seq, indels):
         if indelLen > 0:
             if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
                 seqArr[nn] = 1
-                # Sum (not average) BQ across the inserted window, any
-                # length -- a sum in log-error-probability space is a
-                # product of per-base error probabilities, the correct
-                # way to compound evidence across bases. An average would
-                # collapse a multi-base run to one representative value
-                # regardless of how many bases actually back it.
-                qualArr[nn] = np.sum(
-                    seq.query_qualities[readPos + 1 : readPos + indelLen + 1]
-                )
             elif reference_positions[readPos + 1] - reference_positions[readPos] != -1:
                 seqArr[nn] = 0
-                qualArr[nn] = seq.query_qualities[readPos + 1]
             else:
                 seqArr[nn] = -1
         if indelLen < 0 and reference_positions.size > readPos:
@@ -141,19 +131,29 @@ def getIndelArr(seq, indels):
                 == -indelLen + 1
             ):
                 seqArr[nn] = 1
-                qualArr[nn] = seq.query_qualities[readPos + 1]
             elif (
                 reference_positions[readPos + 1] != -1
                 and (reference_positions[readPos + 1] - reference_positions[readPos])
                 == 1
             ):
                 seqArr[nn] = 0
-                # Sum (not average) BQ across the reference bases spanning
-                # the would-be deletion, same reasoning as the insertion
-                # case above.
-                qualArr[nn] = np.sum(
-                    seq.query_qualities[readPos + 1 : readPos - indelLen + 1]
-                )
             else:
                 seqArr[nn] = -1
+
+        if seqArr[nn] == -1:
+            continue
+
+        # BQ is the median over a window of |indelLen| bases immediately
+        # following the anchor, in read-coordinate space -- for an
+        # insertion this is exactly the inserted bases; for a deletion
+        # (which consumes reference, not read bases) this is the
+        # |indelLen| real read bases immediately after the deletion
+        # point, since there's nothing "inside" a deletion to read a
+        # quality from. Same window and same aggregation regardless of
+        # ALT/REF status, so a read's quality contribution doesn't depend
+        # on which side of the call it happens to support.
+        window_len = abs(indelLen)
+        qualArr[nn] = np.median(
+            seq.query_qualities[readPos + 1 : readPos + 1 + window_len]
+        )
     return seqArr, qualArr
