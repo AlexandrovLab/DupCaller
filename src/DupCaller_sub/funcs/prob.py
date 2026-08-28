@@ -581,14 +581,14 @@ def genotypeDSIndel(
     f2r1_ref_count = np.zeros(m)
 
     for nn, seq in enumerate(F1R2):
-        seqArr, qualArr = getIndelArr(seq, indels_masked)
+        seqArr, qualArr = getIndelArr(seq, indels_masked, params["minBq"])
         mask_multiallele[seqArr == -1] = 0
         f1r2_seq[nn, :] = seqArr > 0
         f1r2_prob[nn, :] = qualArr
         f1r2_alt_count += (seqArr == 1).astype(int)
         f1r2_ref_count += (seqArr == 0).astype(int)
     for nn, seq in enumerate(F2R1):
-        seqArr, qualArr = getIndelArr(seq, indels_masked)
+        seqArr, qualArr = getIndelArr(seq, indels_masked, params["minBq"])
         mask_multiallele[seqArr == -1] = 0
         f2r1_seq[nn, :] = seqArr > 0
         f2r1_prob[nn, :] = qualArr

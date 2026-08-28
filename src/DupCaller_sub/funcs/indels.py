@@ -95,7 +95,7 @@ def findIndels(seq):
     return indels
 
 
-def getIndelArr(seq, indels):
+def getIndelArr(seq, indels, min_bq):
     refPosList = seq.get_reference_positions(full_length=True)
     refPosListNoNone = [_ if _ else -1 for _ in refPosList]
     reference_positions = np.array(refPosListNoNone, dtype=int)
@@ -153,7 +153,18 @@ def getIndelArr(seq, indels):
         # ALT/REF status, so a read's quality contribution doesn't depend
         # on which side of the call it happens to support.
         window_len = abs(indelLen)
-        qualArr[nn] = np.median(
+        median_bq = np.median(
             seq.query_qualities[readPos + 1 : readPos + 1 + window_len]
         )
+
+        # A read whose representative BQ doesn't clear min_bq is dropped
+        # entirely for this candidate -- reusing the existing -1
+        # "uninformative" sentinel means it's excluded the same way
+        # everywhere getIndelArr's output is consumed: mask_multiallele
+        # in the calling paths, and the ==1/==0 count filters in both
+        # calling and learning, all already only count seqArr in {0, 1}.
+        if median_bq <= min_bq:
+            seqArr[nn] = -1
+            continue
+        qualArr[nn] = median_bq
     return seqArr, qualArr

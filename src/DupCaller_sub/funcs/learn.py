@@ -531,11 +531,11 @@ def profileTriNucMismatches(
     F2R1_alt_count = np.zeros(m)
     F2R1_ref_count = np.zeros(m)
     for seq in F1R2:
-        seqArr, _ = getIndelArr(seq, indels_masked)
+        seqArr, _ = getIndelArr(seq, indels_masked, params["minBq"])
         F1R2_alt_count += np.count_nonzero(seqArr == 1)
         F1R2_ref_count += np.count_nonzero(seqArr == 0)
     for seq in F2R1:
-        seqArr, _ = getIndelArr(seq, indels_masked)
+        seqArr, _ = getIndelArr(seq, indels_masked, params["minBq"])
         F2R1_alt_count += np.count_nonzero(seqArr == 1)
         F2R1_ref_count += np.count_nonzero(seqArr == 0)
 
