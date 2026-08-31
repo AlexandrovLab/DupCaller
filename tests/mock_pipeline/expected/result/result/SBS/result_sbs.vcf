@@ -1,0 +1,40 @@
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call">
+##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the *_rescued reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on">
+##FILTER=<ID=underpowered,Description="Passed the default calling threshold but failed the FDR-refined per-channel threshold">
+##FILTER=<ID=high_nm,Description="Read family kept under --rescue despite failing the NM/blacklist filter">
+##FILTER=<ID=low_mapq,Description="Read family kept under --rescue despite failing the mapq filter">
+##FILTER=<ID=low_ASXS,Description="Read family kept under --rescue despite failing the AS-XS filter">
+##FILTER=<ID=ncov_rescued,Description="Mutation kept under --rescue despite failing the coverage-depth mask; no coverage/depth extracted">
+##FILTER=<ID=nm_rescued,Description="Mutation kept under --rescue despite failing the per-family NM mask at this position; no coverage/depth extracted">
+##FILTER=<ID=trim_rescued,Description="Mutation kept under --rescue despite falling in the read-end trim zone; no coverage/depth extracted">
+##FILTER=<ID=indelregion_rescued,Description="Indel kept under --rescue despite failing indel_mask; no coverage/depth extracted">
+##FILTER=<ID=masked_rescued,Description="Mutation kept under --rescue despite failing a mask not covered by a more specific *_rescued reason above; no coverage/depth extracted">
+##FILTER=<ID=no_good_alt_read,Description="Kept under --rescue despite real depth-extraction finding zero alt-supporting reads in the tumor BAM pileup (LR cleared its channel's threshold on family-consensus evidence alone) -- real AC/RC/DP attached">
+##FILTER=<ID=duplex_vaf,Description="Kept under --rescue despite the extracted tumor allele fraction (AC/DP) exceeding --maxAF -- real AC/RC/DP attached">
+##FILTER=<ID=normal_vaf,Description="Kept under --rescue despite the extracted matched-normal allele fraction exceeding --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached">
+##FILTER=<ID=n_cov_mask,Description="Kept under --rescue despite matched-normal depth at this position falling below --minNdepth once real depth was extracted -- real AC/RC/DP attached">
+##INFO=<ID=F1R2,Number=1,Type=Integer,Description="Number of F1R2 read(s) in the read bundle">
+##INFO=<ID=F2R1,Number=1,Type=Integer,Description="Number of F2R1 read(s) in the read bundle">
+##INFO=<ID=LR,Number=1,Type=Float,Description="Log-Likelihood ratio of major base over minor base">
+##INFO=<ID=LM,Number=1,Type=Float,Description="maximum log-Likelihood ratio of major base over minor base">
+##INFO=<ID=TC,Number=4,Type=Integer,Description="Top strand base count">
+##INFO=<ID=BC,Number=4,Type=Float,Description="Bottom strand base count">
+##INFO=<ID=DF,Number=1,Type=Integer,Description="Distance from fragment end">
+##INFO=<ID=DR,Number=1,Type=Integer,Description="Distance from read end">
+##INFO=<ID=TAG1,Number=1,Type=String,Description="Barcode of top strand 5 prime">
+##INFO=<ID=TAG2,Number=1,Type=String,Description="Barcode of bottom strand 5 prime">
+##INFO=<ID=SP,Number=1,Type=Integer,Description="Read family reference start position">
+##INFO=<ID=TN,Number=1,Type=String,Description="trinucleotide context">
+##INFO=<ID=HP,Number=1,Type=Integer,Description="Homopolymer length. Always 0 for SBS">
+##INFO=<ID=STR,Number=1,Type=Integer,Description="reference allele length bin of short tandem repeats. 0: no STR or less than 10bp. 1: 10-24bp. 2: 25-39bp. 3: 40bp+. Always 0 for SBS">
+##INFO=<ID=SNPM,Number=1,Type=Integer,Description="1 if this position falls in snp_mask. A candidate blocked only by snp_mask/noise_mask (see NOISEM) is still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but stays filter=masked rather than PASS -- never set on a PASS record. SBS only, always 0 for indel.">
+##INFO=<ID=NOISEM,Number=1,Type=Integer,Description="1 if this position (or, for indels, any base of its span) falls in noise_mask. A candidate blocked only by snp_mask/noise_mask is still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but stays filter=masked rather than PASS -- never set on a PASS record">
+##INFO=<ID=FDR,Number=1,Type=Float,Description="Local false discovery rate for this call: 1/(1+rawLR*mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).">
+##FORMAT=<ID=AC,Number=1,Type=Integer,Description="Count of alt allele">
+##FORMAT=<ID=RC,Number=1,Type=Integer,Description="Count of ref allele">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth at the location">
+##contig=<ID=mockchr1,length=3200>
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR	NORMAL
+mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=15.999973262906055;LM=15.99999999131411;TC=3,0,0,0;BC=3,0,0,0;DF=61;DR=33;TAG1=GGC;TAG2=AAG;SP=940;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=1.6000985061281208e-15	AC:RC:DP	2:0:2	0:0:0
+mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=15.999973262906055;LM=15.99999999131411;TC=3,0,0,0;BC=3,0,0,0;DF=31;DR=31;TAG1=CGT;TAG2=CAA;SP=970;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=1.6000985061281208e-15	AC:RC:DP	2:0:2	0:0:0

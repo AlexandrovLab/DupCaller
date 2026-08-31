@@ -1,0 +1,12 @@
+Number of Read Families	16
+Number of Pass-filter Reads	96
+Number of Effective Read Families	16
+Effective Coverage	3792.0
+Unmasked Coverage	3792.0
+Unmasked Indel Coverage	15824.0
+Per Read Family Coverage 	237.0
+Pass-filter Duplication Rate	        0.8333333333333334
+Efficiency	0.16666666666666666
+Total SBS FDR	1.6000985061281208e-15
+Total Indel FDR	4.666953976192749e-16
+Total DBS FDR	nan

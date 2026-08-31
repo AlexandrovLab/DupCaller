@@ -1,0 +1,11 @@
+Uncorrected burden	0.0
+Uncorrected burden 95% lower	0.0
+Uncorrected burden 95% upper	0.0029582032510937733
+Uncorrected mutation number	0
+Corrected burden	0.0
+Corrected burden 95% lower	0.0
+Corrected burden 95% upper	0.0
+Corrected mutation number	0.0
+Mutation number per genome	0.0
+Genome coverage	1247.0
+Reference base number	3198.0

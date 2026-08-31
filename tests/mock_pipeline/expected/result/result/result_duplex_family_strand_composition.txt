@@ -1,0 +1,2 @@
+duplex_group_strand_composition	read_family_number	duplex_group_number	effective_coverage
+3+3	16	16	1264

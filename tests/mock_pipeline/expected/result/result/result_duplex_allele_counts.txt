@@ -1,0 +1,2 @@
+chromosome	position_start	ref	alt	count	duplex_depth	bam_alt_count	bam_depth	duplex_vaf	bam_vaf	gene
+mockchr1	1001	C	A	2	2.0	2	2	1.0	1.0	.

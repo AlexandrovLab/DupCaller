@@ -26,3 +26,28 @@ jobs:
 
       - name: Smoke test
         run: DupCaller.py --help
+
+  mock-pipeline:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment with pipeline dependencies
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.12"
+          channels: bioconda,conda-forge
+          channel-priority: strict
+
+      - name: Install bwa, samtools, gatk4
+        run: conda install -y bwa=0.7.17 samtools=1.22.1 gatk4=4.6.2.0
+
+      - name: Install DupCaller
+        run: pip install .[test]
+
+      - name: Run mock end-to-end pipeline test
+        run: pytest tests/mock_pipeline/ -v

@@ -50,3 +50,9 @@ nextflow/test_pipeline.sh
 
 # Reference mask data (large BED files)
 masks/
+
+# Committed mock-pipeline install-check fixtures: DupCaller writes some
+# outputs under a "tmp" subdirectory, which the generic tmp/ rule above
+# would otherwise swallow.
+!tests/mock_pipeline/expected/**/tmp/
+!tests/mock_pipeline/expected/**/tmp/**

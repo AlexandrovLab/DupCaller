@@ -1,0 +1,5 @@
+contig=mockchr1 length=3200
+SBS: pos(0-based)=1000 ref=C alt=A molecules=2
+INDEL: pos(0-based, first deleted base)=2053 ref=AA alt=A molecules=1 (in 8xA homopolymer starting at 2050)
+STR: AC x8 at [2900,2916)
+read pairs: 48

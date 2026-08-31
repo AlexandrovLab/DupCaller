@@ -20,4 +20,7 @@ setup(
         "h5py==3.15.0",
         "sigProfilerPlotting==1.4.3",
     ],
+    extras_require={
+        "test": ["pytest"],
+    },
 )

@@ -1,0 +1,6 @@
+read_number	min_group_size_Uncorrected_burden	min_group_size_Uncorrected_burden_lower	min_group_size_Uncorrected_burden_upper	min_group_size_Coverage_base	min_group_size_Corrected_burden	min_group_size_Corrected_burden_lower	min_group_size_Corrected_burden_upper	group_size_Uncorrected_burden	group_size_Uncorrected_burden_lower	group_size_Uncorrected_burden_upper	group_size_Coverage_base	group_size_Corrected_burden	group_size_Corrected_burden_lower	group_size_Corrected_burden_upper
+1	0.00158311345646438	0.0001917223840717401	0.00571875013276303	1263.3333333333333	0.0014318159375925742	0.0	0.003579539843981436	0.0			0.0	0.0		
+2	0.00158311345646438	0.0001917223840717401	0.00571875013276303	1263.3333333333333	0.0014318159375925742	0.0	0.003579539843981436	0.0			0.0	0.0		
+3	0.00158311345646438	0.0001917223840717401	0.00571875013276303	1263.3333333333333	0.0014318159375925742	0.0	0.003579539843981436	0.00158311345646438	0.0001917223840717401	0.00571875013276303	1263.3333333333333	0.0014318159375925742	0.0	0.003579539843981436
+4	0.0			0.0	0.0			0.0			0.0	0.0		
+5	0.0			0.0	0.0			0.0			0.0	0.0		
