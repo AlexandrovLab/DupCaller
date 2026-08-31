@@ -508,13 +508,9 @@ def do_call(args):
         amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
         dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
 
-        # Amp-error BQ histogram (SBS only) -- see Learn.py's matching
-        # write-out for the shape/convention (same one here). Too large
-        # for a 2D CSV, so saved as .npz with the row/column/BQ axis
-        # labels alongside the counts. A debugging/QC diagnostic, not a
-        # deliverable, so it goes to tmp_dir rather than the final ERROR/
-        # output dir -- same split as _indel_rate_by_hp_str.txt/
-        # _sbs96_rate_by_trinuc.txt below.
+        # QC diagnostic, not a deliverable, so it goes to tmp_dir rather than
+        # the final ERROR/ output dir. Saved as .npz (not CSV) since it's a
+        # 3D histogram; row/col/BQ axis labels are stored alongside the counts.
         bq_values = np.arange(NUM_BQ)
         np.savez(
             os.path.join(params["tmp_dir"], sample_name + ".amp.tn.bqhist.npz"),
@@ -524,11 +520,9 @@ def do_call(args):
             bq_values=bq_values,
         )
 
-        # SBS SRD (single-read-damage) rate matrix, EM-estimated from the
-        # BQ histogram above -- this, not amp.tn.txt's raw counts, is what
-        # params["amperr_file"] now points at and load_error_matrices
-        # (funcs/misc.py) reads directly for calling, replacing the old
-        # in-situ row-normalization of raw counts.
+        # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
+        # histogram above; this is what params["amperr_file"] points at and
+        # load_error_matrices (funcs/misc.py) reads directly for calling.
         srd_mat = estimate_sbs_srd_rates(sbs_alt_bq_hist, args.pseudocount)
         srd_pd = pd.DataFrame(srd_mat, columns=["A", "T", "C", "G"], index=num2trinuc)
         srd_pd.to_csv(error_prefix + ".amp.tn.srd.txt", sep="\t")

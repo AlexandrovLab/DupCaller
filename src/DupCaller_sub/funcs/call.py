@@ -369,7 +369,6 @@ def _process_duplex_family(
             str_raw_np[:, start_ind:end_ind],
             params,
         )
-        # print(LR_max)
         # No CS-based prefilter -- every genotyped candidate indel
         # is emitted, tagged "masked" or "PASS" by the
         # antimask/LR_pass_bool checks below.
@@ -923,30 +922,6 @@ def _process_duplex_family(
                     cov_mat_indel[:, 6 + b],
                     np.ones(window_len, dtype=bool),
                 )
-        """
-        (
-            LR_old,
-            b1_int_old,
-            unmasked_antimask_old,
-            F1R2_count_old,
-            F2R1_count_old,
-            prob1_old,prob2_old,prob3_old,prob4_old
-        ) = oldDSSnv(
-            readSet,
-            ref_np[start_ind:end_ind],
-            trinuc_np[start_ind:end_ind],
-            prior_mat[start_ind:end_ind, :],
-            np.copy(unmasked_antimask),
-            params,
-        )
-        """
-        # prob1_diff = prob1-prob1_old
-        # notice1 = np.abs(prob1_diff) >=1
-        # prob3_diff = prob3-prob3_old
-        # notice2 = np.abs(prob3_diff) >=1
-        # if np.any(notice1):
-        # print("pr1",prob1[notice1],prob1_old[notice1],F1R2_count[:,unmasked_antimask_old][:,notice1])
-
         ref_int = ref_np[start_ind:end_ind]
         n_win = ref_int.size
         # No CS-based prefilter -- every genotyped candidate
@@ -973,7 +948,6 @@ def _process_duplex_family(
         pass_bool = np.copy(unmasked_pass_bool)
         pass_bool[~antimask] = False
         pos = [mut_ind + start_ind + reference_mat_start for mut_ind in muts_ind]
-        # muts_ind = np.nonzero(np.logical_and(mut_bool,pass_bool))[0].tolist()
         mut_positions = [
             mut_ind + start_ind + reference_mat_start + 1 for mut_ind in muts_ind
         ]
@@ -1083,10 +1057,6 @@ def _process_duplex_family(
                 num2base,
             )
         )
-        """
-        if isLearn:
-            continue
-        """
         if flt_rs == "PASS":
             coverage[start_ind:end_ind][pass_bool] += cov_mat[pass_bool]
             duplex_read_num_dict[duplex_no][1] += np.count_nonzero(pass_bool)

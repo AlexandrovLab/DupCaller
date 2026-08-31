@@ -1522,13 +1522,9 @@ def write_burden_by_group_size(
 
 
 def do_estimate(args):
-    # Resolve the bootstrap-CI base seed once, up front, same pattern as
-    # Caller.py's Monte Carlo seed: if the user didn't pass --seed,
-    # generate one now and write it back onto args so it (a) threads
-    # through every bootstrap_corrected_confint call via one shared rng
-    # and (b) shows up in the resolved-parameters log below for later
-    # reuse -- reproducing a run with no explicit --seed still requires
-    # knowing what seed it actually used.
+    # If --seed wasn't passed, generate one and write it back onto args so
+    # every bootstrap_corrected_confint call shares one rng and the actual
+    # seed used gets recorded in the resolved-parameters log below.
     if args.seed is None:
         args.seed = int(np.random.SeedSequence().generate_state(1)[0])
     rng = np.random.default_rng(args.seed)

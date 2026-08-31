@@ -51,6 +51,9 @@ nextflow/test_pipeline.sh
 # Reference mask data (large BED files)
 masks/
 
+# SLURM job logs
+slurm-*.out
+
 # Committed mock-pipeline install-check fixtures: DupCaller writes some
 # outputs under a "tmp" subdirectory, which the generic tmp/ rule above
 # would otherwise swallow.
