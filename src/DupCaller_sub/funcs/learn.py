@@ -718,8 +718,11 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
     conversion rather than a miscalled reference read), and its symmetric
     but unnormalized counterpart for reads observed as the reference base
     (responsibility that a ref-observed read is really a miscalled true-b
-    conversion):
-        w_b(BQ) = p_b*(1-e) / (p_b*(1-e) + (1-p)*e/3)
+    conversion). The competing "background" cause for an observed-b read is
+    a true-ref read miscalled to b, which occurs at rate p (not 1-p, the
+    total alt-conversion rate -- those are near-complements of each other
+    since p is close to 1):
+        w_b(BQ) = p_b*(1-e) / (p_b*(1-e) + p*e/3)
         w_r(BQ) = p_b*e/3
         N_b = sum_BQ(hist_b[BQ]*w_b(BQ)) + sum_BQ(hist_r[BQ]*w_r(BQ))
     M step (Dirichlet-pseudocount-smoothed MLE, `a`=pseudocount, N=total
@@ -759,9 +762,10 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
         p_b = {c: float(hist_alt[c].sum()) / N for c in alt_cols}
         for _ in range(max_iter):
             p_alt_total = sum(p_b.values())
+            p_ref = 1 - p_alt_total
             new_p_b = {}
             for c in alt_cols:
-                denom = p_b[c] * one_minus_e + p_alt_total * e_over_3
+                denom = p_b[c] * one_minus_e + p_ref * e_over_3
                 w_b = np.divide(
                     p_b[c] * one_minus_e,
                     denom,
