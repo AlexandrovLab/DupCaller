@@ -158,13 +158,17 @@ def getIndelArr(seq, indels, min_bq):
         )
 
         # A read whose representative BQ doesn't clear min_bq is dropped
-        # entirely for this candidate -- reusing the existing -1
-        # "uninformative" sentinel means it's excluded the same way
-        # everywhere getIndelArr's output is consumed: mask_multiallele
-        # in the calling paths, and the ==1/==0 count filters in both
-        # calling and learning, all already only count seqArr in {0, 1}.
+        # from this candidate's alt/ref counts -- but with a sentinel
+        # distinct from the -1 used above for "read doesn't cover/can't
+        # classify this position". Both values exclude the read from the
+        # ==1/==0 count filters in prob.py/learn.py identically, but
+        # prob.py's mask_multiallele only reacts to -1: that mask exists
+        # to drop a whole candidate when a read is structurally ambiguous
+        # for it, not to drop a whole candidate because one read happened
+        # to be low quality (which single low-BQ reads would do routinely
+        # once minBq gating is reused as the same sentinel).
         if median_bq <= min_bq:
-            seqArr[nn] = -1
+            seqArr[nn] = -2
             continue
         qualArr[nn] = median_bq
     return seqArr, qualArr

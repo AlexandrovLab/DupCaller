@@ -2385,10 +2385,25 @@ def do_estimate(args):
                 # duplex_depth==0 check below) any sub-1.0 but real
                 # single-family site, and bias duplex_vaf's denominator low.
                 alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
-                for row in tbx.fetch(chrom, pos - 1, pos):
+                is_snv = len(ref) == 1 and len(alt) == 1 and alt in alt_col
+                # For an indel, coverage.bed.gz's per-category columns
+                # (see indel_coverage_category_index / cov_mat_indel in
+                # funcs/call.py) are keyed one position after this
+                # record's own left-aligned VCF anchor -- POS marks the
+                # unchanged base before the event, not the event itself
+                # (a deletion's first deleted base, or an insertion's
+                # first potentially-run-extending reference base, both
+                # sit at anchor+1). Verified against real coverage.bed.gz
+                # rows for both deletions and insertions: querying at POS
+                # itself reads a column that's structurally 0 here (the
+                # hp/str "cut" flag lives on the adjacent base), while
+                # POS (used directly as the 0-based anchor+1 coordinate)
+                # reads the real, non-zero credit.
+                query_pos = pos - 1 if is_snv else pos
+                for row in tbx.fetch(chrom, query_pos, query_pos + 1):
                     parts = row.split("\t")
                     if len(parts) >= 23:
-                        if len(ref) == 1 and len(alt) == 1 and alt in alt_col:
+                        if is_snv:
                             # SNV: use the coverage column for this mutation's alt base
                             duplex_depth = round(float(parts[alt_col[alt]]), 3)
                         else:

@@ -463,12 +463,19 @@ def _process_duplex_family(
                 "alt": indel_alt,
                 "filter": flt,
                 "infos": {
-                    "F1R2": int(
-                        F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]]
-                    ),
-                    "F2R1": int(
-                        F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]]
-                    ),
+                    # Read-bundle (whole duplex family) totals, matching the
+                    # documented F1R2/F2R1 INFO contract and the SBS side's
+                    # own convention (call.py's SBS mut dict, above) -- NOT
+                    # the locus-specific alt+ref count at this indel's own
+                    # position (that's TC/BC, below). The two counts can
+                    # differ when a read doesn't span this exact position or
+                    # fails the post-anchor base-quality check in
+                    # getIndelArr, and Estimate.py's duplex-group lookup
+                    # keys strictly off F1R2+F2R1, so using the locus count
+                    # here could point at a duplex group that was never
+                    # recorded as having any coverage.
+                    "F1R2": int(F1R2),
+                    "F2R1": int(F2R1),
                     # "LR": LR[pass_inds[0]],
                     "LR": LR_raw[pass_inds[nn]],
                     "LM": LR_max[pass_inds[nn]],
@@ -1007,7 +1014,12 @@ def _process_duplex_family(
                 continue
             if pass_bool[muts_ind[nn]]:
                 flt = flt_rs
-            elif unmasked_pass_bool[muts_ind[nn]]:
+            elif masks[0, muts_ind[nn]] or masks[1, muts_ind[nn]]:
+                # snp_mask/noise_mask specifically (masks rows 0/1, same as
+                # SNPM/NOISEM below) -- was `unmasked_pass_bool[muts_ind[nn]]`,
+                # which is unconditionally True for every muts_ind entry, so it
+                # mislabeled any ncov/nm/trim/include block as "masked" too and
+                # made the rescue branch below unreachable for those cases.
                 flt = "masked"
             elif params["rescue"] and rescue_antimask[muts_ind[nn]]:
                 flt = _rescue_reason_label(
@@ -2166,9 +2178,21 @@ def callBam(params, processNo):
     _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool)
     # See the matching comment on the equivalent block earlier in this
     # function: floor the window at this final batch's true minimum read
-    # start too, for the same reason.
-    batch_min_start = min(
-        r.reference_start for entry in currentReadDict.values() for r in entry["seqs"]
+    # start too, for the same reason. currentReadDict can be empty here --
+    # unlike the equivalent mid-stream flush, this final flush runs
+    # unconditionally even when this process's assigned region (e.g. a
+    # --rescue run with a sparse -R bed covering only a few chromosomes)
+    # never accumulated a single read -- so guard the min() rather than
+    # crash on an empty iterable; batch_min_start is only read inside the
+    # loop below, which is a no-op when currentReadDict is empty.
+    batch_min_start = (
+        min(
+            r.reference_start
+            for entry in currentReadDict.values()
+            for r in entry["seqs"]
+        )
+        if currentReadDict
+        else None
     )
 
     for key in currentReadDict.keys():
