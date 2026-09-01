@@ -27,6 +27,26 @@ jobs:
       - name: Smoke test
         run: DupCaller.py --help
 
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install .[test]
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v
+
   mock-pipeline:
     runs-on: ubuntu-latest
     defaults:

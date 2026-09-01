@@ -73,7 +73,6 @@ def prepare_reference_mats(
     params,
 ):
     ### Define and Initialize
-    af_miss = params["mutRate"]
     af_cutoff = params["germline_cutoff"]
     m = end - start
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
@@ -85,12 +84,9 @@ def prepare_reference_mats(
     n_cov_mask = np.full(m, False, dtype=bool)
     nm_mask = np.full(m, False, dtype=bool)
 
-    ### Initialize prior mat as no germline resource
     noise_mask[reference_int == 4] = True
     noise_mask[trinuc_int == 96] = True
     reference_int[reference_int == 4] = 0
-    prior_mat = np.full([m, 4], af_miss, dtype=float)
-    prior_mat[np.ogrid[:m], reference_int] = 1 - 3 * af_miss
 
     ### Adjust by germline
     if germline_bed != None:
@@ -104,8 +100,6 @@ def prepare_reference_mats(
             if len(ref) == 1:
                 for ii, alt in enumerate(rec.alts):
                     if len(alt) == 1:
-                        # prior_mat[ind, base2num[alt]] = afs[ii]
-                        # has_snp = True
                         if afs[ii] >= af_cutoff:
                             snp_mask[ind] = True
                     elif afs[ii] >= af_cutoff:
@@ -182,7 +176,6 @@ def prepare_reference_mats(
         # nm_mask = nm_avg >= params["maxNM"]/2
 
     return (
-        prior_mat,
         snp_mask,
         indel_mask,
         noise_mask,
@@ -233,7 +226,6 @@ def _process_duplex_family(
     num2base,
     num2trinuc,
     params,
-    prior_mat,
     processed_read_names,
     readSet,
     ref_np,
@@ -555,7 +547,6 @@ def _process_duplex_family(
             rs_reference_start,
             ref_np[start_ind:end_ind],
             trinuc_np[start_ind:end_ind],
-            prior_mat[start_ind:end_ind, :],
             np.copy(unmasked_antimask),
             # Wide (rescue) scope -- see the matching call site
             # earlier in this function for the full explanation.
@@ -1138,6 +1129,18 @@ def _process_duplex_family(
     return bool(pass_bool.any())
 
 
+def _collect_call_barcode(call_barcodes, key, mut):
+    """Record one more founding duplex family's (TAG1, TAG2) barcode pair
+    as supporting this candidate -- shared by the SNV/indel/DBS depth-
+    extraction loops below, each of which needs this same accounting so
+    extractDepthBatchSnv/Indel/Dbs's call_barcodes arg can exempt a
+    founding-family read from the minBq filter regardless of base
+    quality."""
+    call_barcodes.setdefault(key, set()).add(
+        (mut["infos"]["TAG1"], mut["infos"]["TAG2"])
+    )
+
+
 def callBam(params, processNo):
     # Get parameters
     bam = params["tumorBam"]
@@ -1198,7 +1201,6 @@ def callBam(params, processNo):
     ##for ch in all_chroms:
     # Add this record to our list
     minMapq = params["mapq"]
-    mutRate = params["mutRate"]
     pcut = params["pcutoff"]
     isLearn = params.get("isLearn", False)
     nn = processNo
@@ -2044,7 +2046,6 @@ def callBam(params, processNo):
                             :, reference_mat_start:reference_mat_end
                         ]
                         (
-                            prior_mat,
                             snp_mask,
                             indel_mask,
                             noise_mask,
@@ -2114,7 +2115,6 @@ def callBam(params, processNo):
                         num2base,
                         num2trinuc,
                         params,
-                        prior_mat,
                         processed_read_names,
                         readSet,
                         ref_np,
@@ -2404,7 +2404,6 @@ def callBam(params, processNo):
                     :, reference_mat_start:reference_mat_end
                 ]
                 (
-                    prior_mat,
                     snp_mask,
                     indel_mask,
                     noise_mask,
@@ -2474,7 +2473,6 @@ def callBam(params, processNo):
                 num2base,
                 num2trinuc,
                 params,
-                prior_mat,
                 processed_read_names,
                 readSet,
                 ref_np,
@@ -2524,6 +2522,15 @@ def callBam(params, processNo):
     deferred_depth_keys = params.get("deferred_depth_keys", frozenset())
     mut_dict = dict()
     snv_candidate_keys = []
+    # (TAG1, TAG2) of every duplex family that itself supports each
+    # candidate -- tumor depth extraction below counts a primary read
+    # toward a candidate's depth regardless of base quality when its own
+    # duplex barcode pair matches one of these (either orientation), since
+    # it's one of the founding reads of the call being verified. A
+    # candidate can be supported by more than one duplex family, so this
+    # collects every one seen among this candidate's own eligible mut
+    # records, not just the first.
+    call_barcodes = {}
     for mut in muts:
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
         if coverage_only:
@@ -2531,6 +2538,7 @@ def callBam(params, processNo):
                 continue
         elif mut["filter"] != "PASS":
             continue
+        _collect_call_barcode(call_barcodes, key, mut)
         if key not in mut_dict:
             mut_dict[key] = None
             snv_candidate_keys.append(key)
@@ -2538,7 +2546,11 @@ def callBam(params, processNo):
     if snv_candidate_keys:
         _snv_depth_t0 = time.time()
         tumor_snv_depths = extractDepthBatchSnv(
-            tumorBam, snv_candidate_keys, params, minbq=params["minBq"]
+            tumorBam,
+            snv_candidate_keys,
+            params,
+            minbq=params["minBq"],
+            call_barcodes=call_barcodes,
         )
         normal_snv_depths = (
             [
@@ -2609,9 +2621,7 @@ def callBam(params, processNo):
         # never the final mutsAll/indelsAll directly, so a `continue` here
         # would be invisible to the real keep/drop decision.
         if eligible:
-            if ta == 0:
-                mut["filter"] = "no_good_alt_read"
-            elif ta / tdp > params["maxAF"]:
+            if tdp > 0 and ta / tdp > params["maxAF"]:
                 mut["filter"] = "duplex_vaf"
             # if ti >= 1:
             # continue
@@ -2628,6 +2638,8 @@ def callBam(params, processNo):
     ### above.
     muts_indels_dict = dict()
     indel_candidate_keys = []
+    # Same founding-family barcode collection as the SNV loop above.
+    indel_call_barcodes = {}
     for mut in muts_indels:
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
         if coverage_only:
@@ -2635,6 +2647,7 @@ def callBam(params, processNo):
                 continue
         elif mut["filter"] != "PASS":
             continue
+        _collect_call_barcode(indel_call_barcodes, key, mut)
         if key not in muts_indels_dict:
             muts_indels_dict[key] = None
             indel_candidate_keys.append(key)
@@ -2642,7 +2655,11 @@ def callBam(params, processNo):
     if indel_candidate_keys:
         _indel_depth_t0 = time.time()
         tumor_indel_depths = extractDepthBatchIndel(
-            tumorBam, indel_candidate_keys, params, minbq=params["minBq"]
+            tumorBam,
+            indel_candidate_keys,
+            params,
+            minbq=params["minBq"],
+            call_barcodes=indel_call_barcodes,
         )
         normal_indel_depths = (
             [
@@ -2708,11 +2725,9 @@ def callBam(params, processNo):
         # as an unconditional drop, not one of the labeled reasons -- never
         # reported regardless of --rescue.
         if eligible:
-            if ta == 0:
-                mut["filter"] = "no_good_alt_read"
             # if ti > 0:
             # continue
-            elif ta / tdp > params["maxAF"]:
+            if tdp > 0 and ta / tdp > params["maxAF"]:
                 mut["filter"] = "duplex_vaf"
             elif normalBams:
                 if ndp < params["minNdepth"]:
@@ -2736,8 +2751,11 @@ def callBam(params, processNo):
     if not coverage_only:
         muts_dbs_dict = dict()
         dbs_candidate_keys = []
+        # Same founding-family barcode collection as the SNV loop above.
+        dbs_call_barcodes = {}
         for mut in muts_dbs:
             key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+            _collect_call_barcode(dbs_call_barcodes, key, mut)
             if key not in muts_dbs_dict:
                 muts_dbs_dict[key] = None
                 dbs_candidate_keys.append(key)
@@ -2745,7 +2763,11 @@ def callBam(params, processNo):
         if dbs_candidate_keys:
             _dbs_depth_t0 = time.time()
             tumor_dbs_depths = extractDepthBatchDbs(
-                tumorBam, dbs_candidate_keys, params, minbq=params["minBq"]
+                tumorBam,
+                dbs_candidate_keys,
+                params,
+                minbq=params["minBq"],
+                call_barcodes=dbs_call_barcodes,
             )
             normal_dbs_depths = (
                 [
@@ -2784,9 +2806,7 @@ def callBam(params, processNo):
             ref = mut["ref"]
             alt = mut["alt"]
             ta, tr, ti, tdp, na, nr, ni, ndp = muts_dbs_dict[(chrom, pos, ref, alt)]
-            if ta == 0:
-                continue
-            if ta / tdp > params["maxAF"]:
+            if tdp > 0 and ta / tdp > params["maxAF"]:
                 continue
             if normalBams:
                 if ndp < params["minNdepth"]:

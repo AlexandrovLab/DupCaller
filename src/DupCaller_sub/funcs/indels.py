@@ -108,8 +108,9 @@ def getIndelArr(seq, indels, min_bq):
     seqArr = np.zeros(len(indels), dtype=int)
     qualArr = np.zeros(len(indels))
     for nn, indel in enumerate(indels):
-        refPos = int(indel.split(":")[0])
-        indelLen = int(indel.split(":")[1])
+        indel_parts = indel.split(":")
+        refPos = int(indel_parts[0])
+        indelLen = int(indel_parts[1])
         if refPos >= seq.reference_end or refPos < seq.reference_start:
             seqArr[nn] = -1
             continue
@@ -119,7 +120,23 @@ def getIndelArr(seq, indels, min_bq):
         readPos = readPos[0]
         if indelLen > 0:
             if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
-                seqArr[nn] = 1
+                # Unaligned isn't enough on its own -- a soft-clip (or an
+                # unrelated insertion) also leaves these positions with no
+                # reference coordinate. Only count this as real support for
+                # THIS candidate if the actual read bases sitting in that
+                # unaligned window spell out the candidate's own inserted
+                # sequence. A mismatch here is scored 0 (uninformative for
+                # this candidate), not -1: -1 is prob.py's multiallele-
+                # conflict sentinel (mask_multiallele), which drops the
+                # WHOLE candidate the moment any single read trips it --
+                # an unrelated soft-clip elsewhere in the family shouldn't
+                # be able to silently kill a candidate this way.
+                inserted_seq = indel_parts[2]
+                read_window = seq.query_sequence[readPos + 1 : readPos + 1 + indelLen]
+                if read_window.upper() == inserted_seq.upper():
+                    seqArr[nn] = 1
+                else:
+                    seqArr[nn] = 0
             elif reference_positions[readPos + 1] - reference_positions[readPos] != -1:
                 seqArr[nn] = 0
             else:

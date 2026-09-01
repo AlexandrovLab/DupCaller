@@ -114,7 +114,6 @@ def genotypeDSSnv(
     reference_start,
     reference_int,
     trinuc_int,
-    prior_mat,
     antimask,
     mut_antimask_scope,
     params,

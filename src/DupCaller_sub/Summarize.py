@@ -11,9 +11,9 @@ def do_summarize(args):
     with open(args.output, "w") as output:
         output.write(
             f"sample\tpass_filter_reads\tunique_reads\tread_families\tduplication_rate\tread_family_efficiency\t"
-            f"snv_effective_coverage\tuncorrected_mutations\tuncorrected_burden\tuncorrected_burden_upper_ci\tuncorrected_burden_lower_ci\t"
+            f"sbs_base_coverage\tuncorrected_mutations\tuncorrected_burden\tuncorrected_burden_upper_ci\tuncorrected_burden_lower_ci\t"
             f"corrected_mutations\tmutations_per_genome\tgenome_length\tcorrected_burden\tcorrected_burden_upper_ci\tcorrected_burden_lower_ci\t"
-            f"indel_effective_coverage\tindel_number\tindel_burden\tindel_burden_upper_ci\tindel_burden_lower_ci\n"
+            f"indel_base_coverage\tindel_number\tindel_burden\tindel_burden_upper_ci\tindel_burden_lower_ci\tdbs_base_coverage\n"
         )
         for nn, sample in enumerate(samples):
             sample = sample.strip("/")
@@ -38,7 +38,9 @@ def do_summarize(args):
             uniq_reads = int(stats["Number of Read Families"])
             pf_reads = int(stats["Number of Pass-filter Reads"])
             pf_read_family = int(stats["Number of Effective Read Families"])
-            eff_cov = int(float(stats["Effective Coverage"]))
+            sbs_base_cov = float(stats["SBS Base Coverage"])
+            indel_base_cov = float(stats["Indel Base Coverage"])
+            dbs_base_cov = float(stats["DBS Base Coverage"])
             dup_rate = float(stats["Pass-filter Duplication Rate"])
             read_efficiency = float(stats["Efficiency"])
 
@@ -51,8 +53,10 @@ def do_summarize(args):
             # 5: Corrected burden 95% lower
             # 6: Corrected burden 95% upper
             # 7: Corrected mutation number
-            # 8: Mutation number per genome
-            # 9: Genome coverage (effective coverage at min_group_size=1)
+            # 8: Corrected mutation number (duplicate; no longer a distinct
+            #    genome-extrapolated figure -- mutations_per_genome below is
+            #    always numerically identical to corrected_mutations)
+            # 9: Duplex coverage (effective coverage at min_group_size=1)
             # 10: Unmasked burden
             # 11: Unmasked burden 95% lower
             # 12: Unmasked burden 95% upper
@@ -75,20 +79,19 @@ def do_summarize(args):
             # 1: Uncorrected burden 95% lower
             # 2: Uncorrected burden 95% upper
             # 3: Uncorrected mutation number
-            # 9: Genome coverage (effective coverage at min_group_size=1)
+            # 9: Duplex coverage (effective coverage at min_group_size=1)
             with open(indel_burden_file) as f:
                 lines = f.readlines()
                 indel_burden = float(lines[0].strip("\n").split("\t")[1])
                 indel_burden_lci = float(lines[1].strip("\n").split("\t")[1])
                 indel_burden_uci = float(lines[2].strip("\n").split("\t")[1])
                 indel_num = int(lines[3].strip("\n").split("\t")[1])
-                indel_eff_cov = int(float(lines[9].strip("\n").split("\t")[1]))
 
             output.write(
                 f"{sample_name}\t{pf_reads}\t{uniq_reads}\t{pf_read_family}\t{dup_rate}\t{read_efficiency}\t"
-                f"{eff_cov}\t{uncorrected_mutnum}\t{uncorrected_burden}\t{uncorrected_burden_uci}\t{uncorrected_burden_lci}\t"
+                f"{sbs_base_cov}\t{uncorrected_mutnum}\t{uncorrected_burden}\t{uncorrected_burden_uci}\t{uncorrected_burden_lci}\t"
                 f"{corrected_mutnum}\t{mutations_per_genome}\t{genome_length}\t{corrected_burden}\t{corrected_burden_uci}\t{corrected_burden_lci}\t"
-                f"{indel_eff_cov}\t{indel_num}\t{indel_burden}\t{indel_burden_uci}\t{indel_burden_lci}\n"
+                f"{indel_base_cov}\t{indel_num}\t{indel_burden}\t{indel_burden_uci}\t{indel_burden_lci}\t{dbs_base_cov}\n"
             )
 
             sbs96_pd_now = pd.read_csv(sbs96_file, sep="\t", index_col=0)

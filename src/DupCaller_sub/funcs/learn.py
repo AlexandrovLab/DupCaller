@@ -56,17 +56,27 @@ def profileTriNucMismatches(
     m_F2R1 = len(F2R1)
 
     # Minimum reads-per-strand for a family to contribute to amp/damage
-    # learning, independently adjustable since damage (single-strand-
-    # specific errors) and amp (errors shared by both consensus reads)
-    # need different amounts of depth to reliably separate signal from
-    # noise. The family-level floor below (below which NOTHING can be
-    # learned from this family, amp or damage) is the smaller of the two --
-    # each learning track's own, possibly-stricter minimum is applied
+    # learning -- kept as two separate constants (not CLI-adjustable; no
+    # params entry has ever fed them) since damage (single-strand-specific
+    # errors) and amp (errors shared by both consensus reads) need
+    # different amounts of depth to reliably separate signal from noise.
+    # The family-level floor below (below which NOTHING can be learned
+    # from this family, amp or damage) is the smaller of the two -- each
+    # learning track's own, possibly-stricter minimum is applied
     # separately at its own antimask further down, so a family passing
     # only the lower of the two still contributes to whichever track it
     # actually qualifies for.
-    min_group_amp = params.get("minGroupAmp", 3)
-    min_group_dmg = params.get("minGroupDmg", 3)
+    min_group_amp = 3
+    min_group_dmg = 3
+    # --minRef/--minAlt: every per-position depth floor below (SBS's dmg/
+    # amp antimasks and the indel antimasks further down) is a single
+    # total-depth count (ref+alt reads together), not split out by ref vs
+    # alt identity, so there's no separate ref-count/alt-count to gate
+    # individually. Both bounds are combined as the stricter (larger) of
+    # the two instead of picking one arbitrarily. --minAltQual gates the
+    # SBS dmg antimask's per-strand summed consensus base quality.
+    min_depth = max(params.get("minRef", 3), params.get("minAlt", 3))
+    min_alt_qual = params.get("minAltQual", 90)
     if m_F1R2 < min(min_group_amp, min_group_dmg) or m_F2R1 < min(
         min_group_amp, min_group_dmg
     ):
@@ -185,15 +195,16 @@ def profileTriNucMismatches(
     ] = False  # mask strand discordant
     dmg_antimask[
         np.logical_or(
-            (F1R2_count_mat).sum(axis=0) < 3, (F2R1_count_mat).sum(axis=0) < 3
+            (F1R2_count_mat).sum(axis=0) < min_depth,
+            (F2R1_count_mat).sum(axis=0) < min_depth,
         )
-    ] = False  # mask locations with depth < 3
+    ] = False  # mask locations with depth < min_depth
     dmg_antimask[
         np.logical_or(
-            (F1R2_qual_mat_merged).sum(axis=0) < 90,
-            (F2R1_qual_mat_merged).sum(axis=0) < 90,
+            (F1R2_qual_mat_merged).sum(axis=0) < min_alt_qual,
+            (F2R1_qual_mat_merged).sum(axis=0) < min_alt_qual,
         )
-    ] = False  # mask locations where consensus bases is less than 90
+    ] = False  # mask locations where summed consensus quality is less than min_alt_qual
 
     F1R2_alleles = np.argmax(F1R2_count_mat, axis=0)
     F2R1_alleles = np.argmax(F2R1_count_mat, axis=0)
@@ -231,7 +242,7 @@ def profileTriNucMismatches(
 
     F1R2_antimask[ds_alt] = False
     F1R2_count_sum = F1R2_count_mat.sum(axis=0)
-    F1R2_antimask[F1R2_count_sum < 3] = False
+    F1R2_antimask[F1R2_count_sum < min_depth] = False
     F1R2_ref_count = F1R2_count_mat[reference_int, np.ogrid[: reference_int.size]]
     F1R2_antimask[F1R2_count_sum - F1R2_ref_count >= 2] = False
     F1R2_antimask[
@@ -241,7 +252,7 @@ def profileTriNucMismatches(
 
     F2R1_antimask[ds_alt] = False
     F2R1_count_sum = F2R1_count_mat.sum(axis=0)
-    F2R1_antimask[F2R1_count_sum < 3] = False
+    F2R1_antimask[F2R1_count_sum < min_depth] = False
     F2R1_ref_count = F2R1_count_mat[reference_int, np.ogrid[: reference_int.size]]
     F2R1_antimask[F2R1_count_sum - F2R1_ref_count >= 2] = False
     F2R1_antimask[
@@ -542,7 +553,8 @@ def profileTriNucMismatches(
     dmg_antimask = np.ones(m, dtype=bool)
     dmg_antimask[
         np.logical_or(
-            (F1R2_ref_count + F1R2_alt_count) < 3, (F2R1_ref_count + F2R1_alt_count) < 3
+            (F1R2_ref_count + F1R2_alt_count) < min_depth,
+            (F2R1_ref_count + F2R1_alt_count) < min_depth,
         )
     ] = False
     dmg_antimask[np.logical_and(F1R2_ref_count != 0, F1R2_alt_count != 0)] = False
@@ -558,11 +570,11 @@ def profileTriNucMismatches(
     F2R1_antimask = np.ones(m, dtype=bool)
 
     F1R2_antimask[F1R2_ref_count == 0] = False
-    F1R2_antimask[F1R2_ref_count + F1R2_alt_count < 3] = False
+    F1R2_antimask[F1R2_ref_count + F1R2_alt_count < min_depth] = False
     F1R2_antimask[F1R2_alt_count > 1] = False
 
     F2R1_antimask[F2R1_ref_count == 0] = False
-    F2R1_antimask[F2R1_ref_count + F2R1_alt_count < 3] = False
+    F2R1_antimask[F2R1_ref_count + F2R1_alt_count < min_depth] = False
     F2R1_antimask[F2R1_alt_count > 1] = False
 
     # m == 1 here (m>=2 and m==0 both returned above), so this loop runs

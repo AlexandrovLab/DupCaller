@@ -39,8 +39,22 @@ def _cluster_positions(positions, max_gap):
     return clusters
 
 
+def _barcode_pair_matches(bc_pairs, read_bc1, read_bc2):
+    for bc1, bc2 in bc_pairs:
+        if (read_bc1 == bc1 and read_bc2 == bc2) or (
+            read_bc1 == bc2 and read_bc2 == bc1
+        ):
+            return True
+    return False
+
+
 def extractDepthBatchSnv(
-    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+    bam,
+    candidates,
+    params,
+    minbq=18,
+    max_gap=_DEPTH_BATCH_MAX_GAP,
+    call_barcodes=None,
 ):
     """Batched equivalent of extractDepthSnv: resolves many (chrom, pos,
     ref, alt) candidates with one sequential pileup() scan per cluster of
@@ -54,7 +68,24 @@ def extractDepthBatchSnv(
     Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
     Candidates with zero pileup coverage are simply absent from the
     result — same information as extractDepthSnv returning all zeros.
+
+    call_barcodes, when given, is {(chrom, pos, ref, alt): {(bc1, bc2), ...}}
+    -- the duplex barcode pair(s) of every family that itself supports that
+    candidate (used for the tumor BAM: a candidate can be supported by more
+    than one duplex family). This switches on barcode-aware base-quality
+    handling: the pileup itself only requires BQ>0 (min_base_quality=1)
+    instead of minbq, and a primary read whose own duplex barcode pair
+    matches one of a candidate's call_barcodes (either orientation) counts
+    toward that candidate's depth regardless of its base quality, since
+    it's one of the founding reads of the call being verified -- every
+    other read is still held to minbq, checked manually per read since
+    pysam's pileup only supports one global threshold. Deletions have no
+    base quality to check at all, so (as when call_barcodes is None) they
+    always count.
     """
+    barcode_aware = call_barcodes is not None
+    pileup_minbq = 1 if barcode_aware else minbq
+    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -67,7 +98,7 @@ def extractDepthBatchSnv(
                 chrom,
                 cluster[0] - 1,
                 cluster[-1],
-                min_base_quality=minbq,
+                min_base_quality=pileup_minbq,
                 truncated=True,
                 max_depth=params["maxDepth"],
             ):
@@ -80,6 +111,14 @@ def extractDepthBatchSnv(
                 ref_counts = [0] * n
                 other_counts = [0] * n
                 indel_counts = [0] * n
+                bc_pairs_by_spec = (
+                    [
+                        call_barcodes.get((chrom, pos, ref, alt), ())
+                        for ref, alt in specs
+                    ]
+                    if barcode_aware
+                    else None
+                )
                 processed_read_names = {}
                 for pileupread in pileupcolumn.pileups:
                     aln = pileupread.alignment
@@ -101,7 +140,21 @@ def extractDepthBatchSnv(
                         if is_indel
                         else aln.query_sequence[pileupread.query_position]
                     )
+                    if barcode_aware:
+                        quality_ok = (
+                            pileupread.query_position is None
+                            or aln.query_qualities[pileupread.query_position] >= minbq
+                        )
+                        if not quality_ok:
+                            read_bc1, read_bc2 = get_duplex_barcode(
+                                aln, nanoseq_bam
+                            ).split("-")
                     for i, (ref, alt) in enumerate(specs):
+                        if barcode_aware and not quality_ok:
+                            if not _barcode_pair_matches(
+                                bc_pairs_by_spec[i], read_bc1, read_bc2
+                            ):
+                                continue
                         if is_indel:
                             indel_counts[i] += 1
                             other_counts[i] += 1
@@ -126,13 +179,22 @@ def extractDepthBatchSnv(
 
 
 def extractDepthBatchIndel(
-    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+    bam,
+    candidates,
+    params,
+    minbq=18,
+    max_gap=_DEPTH_BATCH_MAX_GAP,
+    call_barcodes=None,
 ):
-    """Batched equivalent of extractDepthIndel — see extractDepthBatchSnv.
+    """Batched equivalent of extractDepthIndel — see extractDepthBatchSnv,
+    including the call_barcodes barcode-aware base-quality handling.
 
     candidates: iterable of (chrom, pos, ref, alt).
     Returns: {(chrom, pos, ref, alt): (altCount, refCount, otherIndelCount, depth)}
     """
+    barcode_aware = call_barcodes is not None
+    pileup_minbq = 1 if barcode_aware else minbq
+    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -145,7 +207,7 @@ def extractDepthBatchIndel(
                 chrom,
                 cluster[0] - 1,
                 cluster[-1],
-                min_base_quality=minbq,
+                min_base_quality=pileup_minbq,
                 truncate=True,
                 max_depth=params["maxDepth"],
             ):
@@ -158,6 +220,14 @@ def extractDepthBatchIndel(
                 ref_counts = [0] * n
                 other_counts = [0] * n
                 other_indel_counts = [0] * n
+                bc_pairs_by_spec = (
+                    [
+                        call_barcodes.get((chrom, pos, ref, alt), ())
+                        for ref, alt, _ in specs
+                    ]
+                    if barcode_aware
+                    else None
+                )
                 processed_read_names = {}
                 for pileupread in pileupcolumn.pileups:
                     aln = pileupread.alignment
@@ -174,7 +244,21 @@ def extractDepthBatchIndel(
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
                         continue
+                    if barcode_aware:
+                        quality_ok = (
+                            pileupread.query_position is None
+                            or aln.query_qualities[pileupread.query_position] >= minbq
+                        )
+                        if not quality_ok:
+                            read_bc1, read_bc2 = get_duplex_barcode(
+                                aln, nanoseq_bam
+                            ).split("-")
                     for i, (ref, alt, indel_size) in enumerate(specs):
+                        if barcode_aware and not quality_ok:
+                            if not _barcode_pair_matches(
+                                bc_pairs_by_spec[i], read_bc1, read_bc2
+                            ):
+                                continue
                         if pileupread.indel == indel_size:
                             alt_counts[i] += 1
                         elif pileupread.indel == 0:
@@ -198,7 +282,12 @@ def extractDepthBatchIndel(
 
 
 def extractDepthBatchDbs(
-    bam, candidates, params, minbq=18, max_gap=_DEPTH_BATCH_MAX_GAP
+    bam,
+    candidates,
+    params,
+    minbq=18,
+    max_gap=_DEPTH_BATCH_MAX_GAP,
+    call_barcodes=None,
 ):
     """Batched DBS depth extraction: for each (chrom, pos, ref, alt)
     candidate (pos = 1-based position of the dinucleotide's FIRST base;
@@ -222,7 +311,21 @@ def extractDepthBatchDbs(
     Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
     Candidates with zero reads spanning both positions are simply absent
     from the result.
+
+    call_barcodes, when given, is the same barcode-aware base-quality
+    switch as extractDepthBatchSnv/Indel: both columns are pileup'd at
+    BQ>0 (min_base_quality=1) instead of minbq, and a read whose own
+    duplex barcode pair matches one of a candidate's call_barcodes
+    (either orientation) counts toward that candidate's depth regardless
+    of its base quality at either position; otherwise it still needs
+    BOTH of its bases to individually meet minbq (matching what the
+    single shared min_base_quality=minbq pileup filter used to enforce
+    per column). Deletions have no base quality to check, same as
+    extractDepthBatchSnv/Indel.
     """
+    barcode_aware = call_barcodes is not None
+    pileup_minbq = 1 if barcode_aware else minbq
+    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -237,12 +340,19 @@ def extractDepthBatchDbs(
             for p in cluster:
                 wanted_cols.add(p)
                 wanted_cols.add(p + 1)
-            col_bases = {}  # 1-based pos -> {read_name: base or None (indel)}
+            # 1-based pos -> {read_name: entry}. entry is base-or-None
+            # (indel) when call_barcodes is None (unchanged); with
+            # call_barcodes it's (base_or_None, quality_ok, bc1, bc2) so
+            # the correlation step below can apply the barcode-match
+            # exemption per candidate, since the same column can serve as
+            # candidate A's own position and candidate B's pos+1, each
+            # with its own call_barcodes.
+            col_bases = {}
             for pileupcolumn in bam.pileup(
                 chrom,
                 cluster[0] - 1,
                 cluster[-1] + 1,
-                min_base_quality=minbq,
+                min_base_quality=pileup_minbq,
                 truncated=True,
                 max_depth=params["maxDepth"],
             ):
@@ -266,11 +376,32 @@ def extractDepthBatchDbs(
                     if aln.is_duplicate:
                         continue
                     is_indel = pileupread.is_del or pileupread.indel != 0
-                    reads[aln.query_name] = (
+                    base = (
                         None
                         if is_indel
                         else aln.query_sequence[pileupread.query_position]
                     )
+                    if barcode_aware:
+                        quality_ok = (
+                            pileupread.query_position is None
+                            or aln.query_qualities[pileupread.query_position] >= minbq
+                        )
+                        # Barcode lookup deferred to only the reads that
+                        # actually need it (this column's own quality
+                        # already failed) -- mirrors extractDepthBatchSnv/
+                        # Indel's per-read gating. A read whose OTHER
+                        # column needs its barcode but this one doesn't
+                        # still gets it from that other column at
+                        # correlation time below.
+                        if quality_ok:
+                            read_bc1 = read_bc2 = None
+                        else:
+                            read_bc1, read_bc2 = get_duplex_barcode(
+                                aln, nanoseq_bam
+                            ).split("-")
+                        reads[aln.query_name] = (base, quality_ok, read_bc1, read_bc2)
+                    else:
+                        reads[aln.query_name] = base
                 col_bases[pos] = reads
                 wanted_cols.discard(pos)
                 if not wanted_cols:
@@ -281,9 +412,29 @@ def extractDepthBatchDbs(
                 shared_reads = bases0.keys() & bases1.keys()
                 for ref, alt in pos_to_specs[p]:
                     alt_count = ref_count = other_count = indel_count = 0
+                    bc_pairs = (
+                        call_barcodes.get((chrom, p, ref, alt), ())
+                        if barcode_aware
+                        else None
+                    )
                     for rn in shared_reads:
-                        b0 = bases0[rn]
-                        b1 = bases1[rn]
+                        if barcode_aware:
+                            b0, q0_ok, bc1_0, bc2_0 = bases0[rn]
+                            b1, q1_ok, bc1_1, bc2_1 = bases1[rn]
+                            if not (q0_ok and q1_ok):
+                                # At least one column has quality_ok False,
+                                # so at least one of these pairs was
+                                # actually computed (non-None) -- prefer
+                                # col0's, fall back to col1's.
+                                read_bc1 = bc1_0 if bc1_0 is not None else bc1_1
+                                read_bc2 = bc2_0 if bc2_0 is not None else bc2_1
+                                if not _barcode_pair_matches(
+                                    bc_pairs, read_bc1, read_bc2
+                                ):
+                                    continue
+                        else:
+                            b0 = bases0[rn]
+                            b1 = bases1[rn]
                         if b0 is None or b1 is None:
                             other_count += 1
                             indel_count += 1
@@ -526,8 +677,8 @@ def prepareAlignMask(bam, chrom, start, end, params):
 
     max_nm_f = np.zeros(end - start)
     max_nm_r = np.zeros(end - start)
-    min_asxs_f = np.zeros(end - start)
-    min_asxs_r = np.zeros(end - start)
+    min_asxs_f = np.full(end - start, np.inf)
+    min_asxs_r = np.full(end - start, np.inf)
 
     bam = BAM(bam, "rb")
     for rec in bam.fetch(chrom, start, end):
@@ -543,49 +694,20 @@ def prepareAlignMask(bam, chrom, start, end, params):
             rec.is_reverse and rec.cigartuples[-1][0] == 4
         ):
             continue
-        ##Check covered base
-        # qualities_pass_with_indel = np.zeros(rec.reference_end-rec.reference_start,dtype=bool)
-        # qualities_pass = (np.array(rec.query_alignment_qualities) >= params["minBq"])
-
-        ##NM average
+        ##NM average, indel-corrected: NM includes indel bases (each
+        ## inserted/deleted base counts individually against NM), so back
+        ## those out and credit exactly one mismatch-equivalent per indel
+        ## event instead -- same correction as funcs/call.py's
+        ## read-blacklist NM_no_id.
         id_length = 0
         id_num = 0
-        """
-        current_seq_ind = 0
-        reference_ind = 0
-        for ct in rec.cigartuples:
-            if ct[0] == 0:
-                qualities_pass_with_indel[
-                    reference_ind : reference_ind + ct[1]
-                ] = qualities_pass[current_seq_ind : current_seq_ind + ct[1]]
-                current_seq_ind += ct[1]
-                reference_ind += ct[1]
-            elif ct[0] == 1:
-                current_seq_ind += ct[1]
-            elif ct[0] == 2:
-                qualities_pass_with_indel[
-                    reference_ind : reference_ind + ct[1]
-                ] = False
-                reference_ind += ct[1]
-            else:
-                current_seq_ind += ct[1]
-
-        qualities_pass_trimmed = qualities_pass_with_indel[max(start - rec.reference_start,0):min(end - rec.reference_start,end-start)]
-        """
-
+        for cigar in rec.cigartuples:
+            if cigar[0] == 1 or cigar[0] == 2:
+                id_length += cigar[1]
+                id_num += 1
         NM_no_id = rec.get_tag("NM") - id_length + id_num
         asxs = rec.get_tag("AS") - rec.get_tag("XS")
         if rec.is_forward:
-            """
-            sum_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += NM_no_id
-            sum_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += asxs
-            count_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += 1
-            
-            max_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
-                np.maximum(max_nm_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],NM_no_id)
-            min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
-                np.minimum(min_asxs_f[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],asxs)
-            """
             sum_nm_f[
                 max(rec.reference_start - start, 0) : min(
                     rec.reference_end - start, end - start
@@ -628,16 +750,6 @@ def prepareAlignMask(bam, chrom, start, end, params):
             )
 
         if rec.is_reverse:
-            """
-            sum_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += NM_no_id
-            sum_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += asxs
-            count_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] += 1
-
-            max_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
-                np.maximum(max_nm_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],NM_no_id)
-            min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed] = \
-                np.minimum(min_asxs_r[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)][qualities_pass_trimmed],asxs)
-            """
             sum_nm_r[
                 max(rec.reference_start - start, 0) : min(
                     rec.reference_end - start, end - start

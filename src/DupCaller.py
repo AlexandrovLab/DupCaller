@@ -108,17 +108,10 @@ if __name__ == "__main__":
         "{prefix}.dmg.str.txt); overrides the default (output prefix)",
     )
     call_parser.add_argument(
-        "-mr",
-        "--mutRate",
+        "-lfdr",
+        "--lfdrThreshold",
         type=float,
-        help="estimated somatic mutation rate per base",
-        default=3e-10,
-    )
-    call_parser.add_argument(
-        "-fdr",
-        "--fdrThreshold",
-        type=float,
-        help="target per-channel FDR (max of 1/(1+LR*mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised and mutation rate re-estimated iteratively",
+        help="target per-channel lFDR (max of (1-mutation_rate)/(LR*mutation_rate+1-mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised and mutation rate re-estimated iteratively",
         default=0.05,
     )
     call_parser.add_argument(
@@ -134,8 +127,8 @@ if __name__ == "__main__":
         action="store_true",
         help="skip round 2 (the coverage-only pass): no duplex depth / per-locus coverage.bed.gz, "
         "no duplex-family composition or by-duplex-group output files, and masked candidates "
-        "that only clear the final FDR-refined threshold get no real depth. Only round 1 calling "
-        "and FDR-threshold determination run; VCFs and a trimmed _stats.txt are still written. "
+        "that only clear the final lFDR-refined threshold get no real depth. Only round 1 calling "
+        "and lFDR-threshold determination run; VCFs and a trimmed _stats.txt are still written. "
         "Roughly halves total runtime.",
         default=False,
     )
@@ -222,39 +215,27 @@ if __name__ == "__main__":
         "-aq",
         "--minAltQual",
         type=float,
-        help="minimum consensus quality of alt allele, if not 0, in a read group to be considered for training",
-        default=60,
+        help="minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it",
+        default=90,
     )
 
     call_parser.add_argument(
         "--minRef",
         type=float,
-        help="minimum number of ref allele, if not 0, in a read group to be considered for training",
-        default=2,
+        help="minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of --minRef/--minAlt is applied, since the underlying check doesn't separate ref vs alt counts",
+        default=3,
     )
     call_parser.add_argument(
         "--minAlt",
         type=float,
-        help="minimum number of alt allele, if not 0, in a read group to be considered for training",
-        default=2,
+        help="minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of --minRef/--minAlt is applied, since the underlying check doesn't separate ref vs alt counts",
+        default=3,
     )
     call_parser.add_argument(
         "--naf",
         type=float,
         help="maximum VAF in matched normal for a mutation to be called",
         default=0.01,
-    )
-    call_parser.add_argument(
-        "--minGroupAmp",
-        type=int,
-        help="minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to amplification-error learning",
-        default=3,
-    )
-    call_parser.add_argument(
-        "--minGroupDmg",
-        type=int,
-        help="minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to damage-error learning",
-        default=3,
     )
     call_parser.add_argument(
         "--rescue",
@@ -281,8 +262,8 @@ if __name__ == "__main__":
         "--NanoSeqBam",
         "-nb",
         action="store_true",
-        help="bam uses NanoSeq-style per-mate RB/MB tags instead of a DB tag: the duplex "
-        "barcode is read as {MB}-{RB} for read 1 and {RB}-{MB} for read 2",
+        help="bam uses NanoSeq-style per-mate rb/mb tags instead of a DB tag: the duplex "
+        "barcode is read as {mb}-{rb} for read 1 and {rb}-{mb} for read 2",
         default=False,
     )
     call_parser.add_argument(

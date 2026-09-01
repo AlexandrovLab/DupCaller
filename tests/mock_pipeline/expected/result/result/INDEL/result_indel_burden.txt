@@ -6,8 +6,8 @@ Corrected burden	0.0
 Corrected burden 95% lower	0.0
 Corrected burden 95% upper	0.0
 Corrected mutation number	0.0
-Mutation number per genome	0.0
-Genome coverage	1264.5775382831416
+Corrected mutation number	0.0
+Duplex coverage	1264.5775382831416
 Unmasked burden	0.0017382222268594314
 Unmasked burden 95% lower	4.400797657365184e-05
 Unmasked burden 95% upper	0.009684754382264444

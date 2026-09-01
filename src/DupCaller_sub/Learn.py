@@ -39,7 +39,6 @@ def do_learn(args):
         "seed": int(np.random.SeedSequence().generate_state(1)[0]),
         "nanoSeqBam": False,
         "rescue": False,
-        "mutRate": 10e-7,
         "pcutoff": 1,
         "amperr": 1e-5,
         "amperr_file": None,

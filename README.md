@@ -2,7 +2,7 @@
 
 [![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://github.com/AlexandrovLab/DupCaller/blob/main/README.md) [![License](<https://img.shields.io/badge/License-BSD%202--Clause-orange.svg>)](https://opensource.org/licenses/BSD-2-Clause) [![Build Status](https://github.com/AlexandrovLab/DupCaller/actions/workflows/test.yml/badge.svg)](https://github.com/AlexandrovLab/DupCaller/actions)[![Uptime Robot status](https://img.shields.io/uptimerobot/status/m795312784-02766a79f207f67626cef289)](https://stats.uptimerobot.com/jjqW4Ulymx)
 
-DupCaller is a universal tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS) data with matched normal (e.x. NanoSeq, UDSeq).
+DupCaller is a tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS/duplex sequencing) data with matched normal (e.x. NanoSeq, UDSeq).
 
 ---
 
@@ -60,26 +60,26 @@ pip install .
 
 ### Docker / Singularity
 
-A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.1.0-amd64`.
+A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.0-amd64`.
 
 **Pull and run with Singularity:**
 
 Pull the image from Docker Hub (only needed once):
 
 ```bash
-singularity pull dupcaller-1.1.0.sif docker://yuhecheng62/dupcaller:1.1.0-amd64
+singularity pull dupcaller-1.2.0.sif docker://yuhecheng62/dupcaller:1.2.0-amd64
 ```
 
 For quick verification:
 
 ```bash
-singularity exec dupcaller-1.1.0.sif DupCaller.py --help
+singularity exec dupcaller-1.2.0.sif DupCaller.py --help
 ```
 
 For installation-free execution of DupCaller commands, run all DupCaller.py commands with `singularity exec` and binding of current directories:
 
 ```bash
-singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your commands}
+singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.0.sif DupCaller.py {your commands}
 ```
 
 ---
@@ -90,14 +90,14 @@ singularity exec --bind $(pwd):$(pwd) dupcaller-1.1.0.sif DupCaller.py {your com
 
 DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching, trinucleotide context lookup, and repeat (homopolymer/short tandem repeat, STR) annotation used to improve indel calling near repetitive regions.
 
-Repeat annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder), a tandem-repeat scanner — DupCaller reads PERF's own output format directly, no BED conversion needed. First, run PERF against the reference FASTA:
+Repeat annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder). First, run PERF against the reference FASTA:
 
 ```bash
 python3 -m PERF.core -m 1 -M 10 -u 2 -i reference.fa -o repeats.tsv
 ```
 
 - `-m`/`-M` — min/max repeat unit (motif) size to search for. `-M 10` covers homopolymers through 10bp-unit STRs; going much higher increases PERF's runtime and memory non-trivially.
-- `-u 2` (`--min-units`) — minimum number of repeat copies to report. **Always pass this explicitly** — if neither `-u` nor `-l`/`--min-length` is given, PERF silently defaults to a 12bp minimum length, which under-represents shorter/lower-copy repeats of larger units.
+- `-u 2` (`--min-units`) — minimum number of repeat copies to report.
 
 Then index the reference, passing PERF's tsv directly:
 
@@ -115,7 +115,6 @@ For human reference genome hg38 and mouse reference genome mm39, we provided pre
 | ----- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | -f    | --reference | Reference genome fasta file (required)                                                                                                                                                                               |
 | -rt   | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns. |
-
 
 ### Step 2: Trim Barcodes
 
@@ -236,8 +235,7 @@ The effect of changing these parameters should be evaluated before implementatio
 | -ax      | --minMeanASXS      | Minimum mean AS-XS alignment score difference for a read group to be considered                                                                                                                                                                                                                                                                                                           | 50      |
 | -gaf     | --germlineAfCutoff | Skip positions with germline AF above this threshold                                                                                                                                                                                                                                                                                                                                      | 0.001   |
 | -d       | --minNdepth        | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                                            | 10      |
-| -mr      | --mutRate          | Estimated somatic mutation rate per base, used as the prior for per-channel FDR refinement                                                                                                                                                                                                                                                                                                | 3e-10   |
-| -sc      | --skipCoveragePass | Skip round 2 (the coverage-only pass): no duplex depth / per-locus`coverage.bed.gz`, no duplex-family composition or by-duplex-group output files, and masked candidates that only clear the final FDR-refined threshold get no real depth. Only round 1 calling and FDR-threshold determination run; VCFs and a trimmed `_stats.txt` are still written. Roughly halves total runtime | False   |
+| -sc      | --skipCoveragePass | Skip round 2 (the coverage-only pass): no duplex depth / per-locus`coverage.bed.gz`, no duplex-family composition or by-duplex-group output files, and masked candidates that only clear the final lFDR-refined threshold get no real depth. Only round 1 calling and lFDR-threshold determination run; VCFs and a trimmed `_stats.txt` are still written. Roughly halves total runtime | False   |
 
 ##### Advanced
 
@@ -245,20 +243,18 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 
 | Short         | Long              | Description                                                                                                                                                                                                                                       | Default              |
 | ------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| -E            | --errprefix       | Prefix of pre-learned error files ({prefix}.amp.tn.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                         | None                 |
-| -fdr          | --fdrThreshold    | Target per-channel FDR; any candidate with a positive log-likelihood ratio is a candidate mutation, and channels whose mean FDR exceeds this get their effective threshold raised (and mutation rate re-estimated) iteratively until they meet it | 0.05                 |
+| -E            | --errprefix       | Prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                        | None                 |
+| -lfdr         | --lfdrThreshold   | Target per-channel lFDR (max of `(1-mutation_rate)/(LR*mutation_rate+1-mutation_rate)` over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised and mutation rate re-estimated iteratively | 0.05                 |
 | -a            | --pseudocount     | Regularization pseudocount added to each channel's per-channel mixture-weight MLE solve, guaranteeing a root strictly between 0 and 1 for every channel                                                                                           | 0.5                  |
 | -mq           | --mapq            | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                    | 40                   |
 | -w            | --windowSize      | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                 | 100000               |
 | -bq           | --minBq           | Bases with quality below this value will be set to 6                                                                                                                                                                                              | 18                   |
-| -aq           | --minAltQual      | Minimum consensus quality of alt allele in a read group                                                                                                                                                                                           | 60                   |
-| --minRef      |                   | Minimum consensus quality of ref allele in a read group                                                                                                                                                                                           | 2                    |
-| --minAlt      |                   | Minimum consensus quality of alt allele in a read group                                                                                                                                                                                           | 2                    |
+| -aq           | --minAltQual      | Minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it                                                                                                                                             | 90                   |
+| --minRef      |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of `--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                            | 3                    |
+| --minAlt      |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of `--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                            | 3                    |
 | -z            | --maxZeroQualFrac | Maximum fraction of zero-quality bases in a read family. Set to 0.1 if a noise mask is not available                                                                                                                                              | 0.5                  |
 | -id           | --indelbed        | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                          | None                 |
 | -rt           | --regionst        | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                             | same as`--regions` |
-| --minGroupAmp |                   | Minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to amplification-error learning                                                                                                                                      | 3                    |
-| --minGroupDmg |                   | Minimum reads on each strand (F1R2/F2R1) a duplex family needs to contribute to damage-error learning                                                                                                                                             | 3                    |
 | -pd           | --maxPileupDepth  | Maximum depth for samtools mpileup                                                                                                                                                                                                                | 1000000              |
 
 #### Germline and Noise Masks
@@ -356,6 +352,7 @@ For detailed column-by-column and field-by-field descriptions of every output fi
 
 - [`docs/call_outputs.md`](docs/call_outputs.md) — all files from `DupCaller.py call`
 - [`docs/estimate_outputs.md`](docs/estimate_outputs.md) — all files from `DupCaller.py estimate`
+- [`docs/summarize_outputs.md`](docs/summarize_outputs.md) — the cohort summary table from `DupCaller.py summarize`
 
 Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific outputs (VCFs, corrected-context tables, burden files, and signature plots) are written into per-type `SBS/`, `INDEL/`, and `DBS/` subfolders under the sample's output directory, rather than at the sample's top level.
 
@@ -378,12 +375,15 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 
 ### Error Profile Files
 
-| File                    | Description                                              |
-| ----------------------- | -------------------------------------------------------- |
-| `{sample}.amp.tn.txt` | Amplification SBS error profile by trinucleotide context |
-| `{sample}.amp.id.txt` | Amplification indel error profile                        |
-| `{sample}.dmg.tn.txt` | Damage SBS error profile by trinucleotide context        |
-| `{sample}.dmg.id.txt` | Damage indel error profile                               |
+| File                        | Description                                                                     |
+| --------------------------- | -------------------------------------------------------------------------------- |
+| `{sample}.amp.tn.txt`     | Raw amplification SBS mismatch profile by trinucleotide context (diagnostic only) |
+| `{sample}.amp.tn.srd.txt` | SRD-EM-fitted amplification SBS error rate matrix actually used for calling      |
+| `{sample}.dmg.tn.txt`     | Damage SBS error profile by trinucleotide context                                |
+| `{sample}.amp.hp.txt`     | Amplification indel error rates for homopolymer contexts                         |
+| `{sample}.amp.str.txt`    | Amplification indel error rates for short-tandem-repeat contexts                 |
+| `{sample}.dmg.hp.txt`     | Damage indel error rates for homopolymer contexts                                |
+| `{sample}.dmg.str.txt`    | Damage indel error rates for short-tandem-repeat contexts                        |
 
 ### Burden Estimation Files
 
@@ -515,7 +515,7 @@ Pre-built reference indexes, germline VCFs, and noise masks are available for do
 | Reference genome | [TCGA hg38 reference file](https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834)                                                                 |
 | Reference index  | [Pre-built hg38 DupCaller reference](https://drive.google.com/drive/folders/1v8ut5aky01zujXlZ0b-dhCqImWMyMbiK?usp=drive_link)                                    |
 | Germline VCF     | af-only-gnomad.hg38.vcf.gz file from the legacy GATK resource bundle. A copy of the file can be found[here](https://www.bcgsc.ca/downloads/morinlab/reference/). |
-| Noise mask       | NanoSeq noise mask from                                                                                                                                        |
+| Noise mask       | NanoSeq noise mask from                                                                                                                                         |
 
 ### Mouse (GRCm39/mm39)
 
@@ -529,7 +529,6 @@ Pre-built reference indexes, germline VCFs, and noise masks are available for do
 ## Citation
 
 DupCaller: Cheng, Y. et al. Improved Mutation Detection in Duplex Sequencing Data with Sample-Specific Error Profiles. bioRxiv (2025). https://doi.org/10.1101/2025.07.13.664565
-
 
 ---
 

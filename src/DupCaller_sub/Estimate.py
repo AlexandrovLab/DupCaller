@@ -1871,13 +1871,13 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{burden_lb[0]}\n")
             f.write(f"Corrected burden 95% upper\t{burden_ub[0]}\n")
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
-            f.write(f"Mutation number per genome\t{corrected_trinuc_num.sum()}\n")
+            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
             # Effective coverage at min_group_size=1 (cov_by_minread[0], the
             # same cumulative "at least 1 read on each strand" figure as
             # _sbs_burden_by_group_size.txt's min_group_size=1 row) rather
             # than the reference genome's raw trinucleotide total -- that
             # total is still available below as Reference base number.
-            f.write(f"Genome coverage\t{cov_by_minread[0]}\n")
+            f.write(f"Duplex coverage\t{cov_by_minread[0]}\n")
             f.write(f"Unmasked burden\t{unmasked_sbs_burden}\n")
             f.write(f"Unmasked burden 95% lower\t{unmasked_sbs_burden_lb}\n")
             f.write(f"Unmasked burden 95% upper\t{unmasked_sbs_burden_ub}\n")
@@ -2196,7 +2196,7 @@ def do_estimate(args):
                 f"{indel_burden_corrected_ub[0] * indel_locus_multiplier}\n"
             )
             f.write(f"Corrected mutation number\t{indel_mut_corrected.sum()}\n")
-            f.write(f"Mutation number per genome\t{corrected_indel_num.sum()}\n")
+            f.write(f"Corrected mutation number\t{indel_mut_corrected.sum()}\n")
             # Effective coverage at min_group_size=1, rescaled to the same
             # per-reference-locus units as the burden values above (see
             # indel_locus_multiplier comment above) -- matches
@@ -2204,7 +2204,7 @@ def do_estimate(args):
             # Coverage_base -- rather than the reference genome's raw
             # opportunity-column total (Reference base number below).
             f.write(
-                f"Genome coverage\t"
+                f"Duplex coverage\t"
                 f"{indel_cov_by_minread[0] / indel_locus_multiplier}\n"
             )
             f.write(
@@ -2331,20 +2331,26 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{dbs_burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{dbs_burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{dbs_mut_corrected.sum()}\n")
-            # dbs_mut_corrected.sum() is already the genome-wide
-            # extrapolated DBS count (correction_ratio == ref/opp per
-            # channel here, with no MH-style grouping the way indel83
-            # has, so it's algebraically identical to a rate*ref "hap"
-            # sum -- no separate hap array needed) -- hence the same value
-            # is used for both "Corrected mutation number" and "Mutation
-            # number per genome" below.
-            f.write(f"Mutation number per genome\t{dbs_mut_corrected.sum()}\n")
+            f.write(f"Corrected mutation number\t{dbs_mut_corrected.sum()}\n")
             # Effective coverage at min_group_size=1 (dbs_cov_by_minread[0],
             # matching _dbs_burden_by_group_size.txt's min_group_size=1 row)
             # rather than the reference genome's raw dinucleotide total
             # (Reference base number below).
-            f.write(f"Genome coverage\t{dbs_cov_by_minread[0]}\n")
+            f.write(f"Duplex coverage\t{dbs_cov_by_minread[0]}\n")
             f.write(f"Reference base number\t{reference_base_number}\n")
+
+        # SBS/INDEL/DBS base coverage (opportunity coverage normalized by
+        # opportunity-per-genome, same values as each _*_burden.txt's Duplex
+        # coverage line above) can only be computed here, once all three
+        # burden sections have run -- appended to the stats.txt Caller.py
+        # already wrote, rather than duplicating call-time bookkeeping.
+        with open(f"{prefix}/{sample}_stats.txt", "a") as f:
+            f.write(f"SBS Base Coverage\t{cov_by_minread[0]}\n")
+            f.write(
+                f"Indel Base Coverage\t"
+                f"{indel_cov_by_minread[0] / indel_locus_multiplier}\n"
+            )
+            f.write(f"DBS Base Coverage\t{dbs_cov_by_minread[0]}\n")
 
         # Process unique mutations to extract duplex depths and create allele counts table
         print("......Processing unique mutations for duplex allele counts.......")
@@ -2448,31 +2454,51 @@ def do_estimate(args):
         print(f"Duplex allele counts written to: {allele_counts_file}")
         if args.genebed:
             print(f"Calculating per-gene duplex coverage")
-            gene_dict = dict()
+            gene_sbs_cov = dict()
+            gene_indel_cov = dict()
             cds_len = dict()
+            coverage_tbx = TabixFile(f"{prefix}/{sample}_coverage.bed.gz")
             for rec in TabixFile(args.genebed).fetch():
                 (chrom, start, end, gene_exon) = rec.split("\t")[0:4]
                 start = int(start)
                 end = int(end)
                 gene = gene_exon.split("_")[0]
-                gene_exon_cov = 0.0
-                for loc in TabixFile(f"{prefix}/{sample}_coverage.bed.gz").fetch(
-                    chrom, start, end
-                ):
+                exon_sbs_cov = 0.0
+                exon_indel_cov = 0.0
+                for loc in coverage_tbx.fetch(chrom, start, end):
+                    parts = loc.split("\t")
                     # Columns 3-6 are per-alt-base (A/T/C/G) L-weighted
                     # float coverage (see the format comment ~60 lines
-                    # below) -- sum all four for total genic SNV coverage,
-                    # not just column 3 (A).
-                    gene_exon_cov += sum(float(x) for x in loc.split("\t")[3:7])
-                if gene_dict.get(gene):
-                    gene_dict[gene] += gene_exon_cov
+                    # below) -- always exactly 3 nonzero entries per locus
+                    # (the self/ref-base column is 0), so summing all four
+                    # and dividing by 3 below gives the true per-base SNV
+                    # depth -- same opportunity-to-base normalization as
+                    # _sbs_burden.txt's Duplex coverage.
+                    exon_sbs_cov += sum(float(x) for x in parts[3:7])
+                    # Columns 7-22 are the 16-category power-weighted indel
+                    # coverage; dividing their sum by indel_locus_multiplier
+                    # (computed above from the genome-wide ID83 opportunity
+                    # composition) converts from per-opportunity-channel
+                    # units to true per-base indel depth -- same
+                    # normalization as _indel_burden.txt's Duplex coverage.
+                    exon_indel_cov += sum(float(x) for x in parts[7:23])
+                if gene in cds_len:
+                    gene_sbs_cov[gene] += exon_sbs_cov
+                    gene_indel_cov[gene] += exon_indel_cov
                     cds_len[gene] += end - start + 1
                 else:
-                    gene_dict[gene] = gene_exon_cov
+                    gene_sbs_cov[gene] = exon_sbs_cov
+                    gene_indel_cov[gene] = exon_indel_cov
                     cds_len[gene] = end - start + 1
+            coverage_tbx.close()
             with open(args.prefix + "/" + sample + "_gene_coverage.txt", "w") as f:
-                for gene in gene_dict.keys():
-                    f.write(f"{gene}\t{gene_dict[gene]/cds_len[gene]}\n")
+                f.write("gene\tsbs_duplex_depth\tindel_duplex_depth\n")
+                for gene in cds_len.keys():
+                    sbs_depth = gene_sbs_cov[gene] / 3 / cds_len[gene]
+                    indel_depth = (
+                        gene_indel_cov[gene] / indel_locus_multiplier / cds_len[gene]
+                    )
+                    f.write(f"{gene}\t{sbs_depth}\t{indel_depth}\n")
 
     else:
         print("Re-estimating mutational burden from provided bed file")
@@ -2657,7 +2683,6 @@ def do_estimate(args):
             trinuc_mut, correction_ratio, cov, rng=rng
         )
         hap_trinuc = trinuc_rate * ref_trinuc_96
-        mut_per_genome = hap_trinuc.sum()
 
         with open(sbs_dir + "/" + sample + "_sbs_burden_re_estimate.txt", "w") as f:
             f.write(f"Uncorrected burden\t{burden_uncorrected}\n")
@@ -2668,8 +2693,15 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
-            f.write(f"mutation number per genome\t{mut_per_genome}\n")
-            f.write(f"genome coverage\t{genome_cov}\n")
+            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
+            # cov (per-locus-equivalent duplex coverage, the actual burden
+            # denominator above), not genome_cov/ref_trinuc_sum -- this
+            # block has no cov_by_minread breakdown the way the main
+            # sbs_burden.txt does, so `cov` is the duplex-coverage
+            # equivalent here; the reference genome base total is kept
+            # separately below as Reference base number.
+            f.write(f"Duplex coverage\t{cov}\n")
+            f.write(f"Reference base number\t{genome_cov}\n")
         # Fold the redistributed indel100 coverage down to ID83 resolution
         # the same way the main pipeline does (indel100 -> indel76 -> ID83,
         # then fill the Cinshp0/Tinshp0 rep0 bins from the raw 1bpins{base}

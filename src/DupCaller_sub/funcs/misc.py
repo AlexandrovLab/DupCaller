@@ -12,7 +12,7 @@ import pandas as pd
 from scipy.optimize import brentq
 
 
-from .prob import calculateSSPosterior, calculateDSPosterior, indelErrorProbs
+from .prob import calculateSSPosterior, calculateDSPosterior
 
 
 # ======================================================================
@@ -1278,15 +1278,15 @@ def get_duplex_barcode(rec, nanoseq_bam=False):
     """Return the "bc1-bc2" duplex barcode string for an aligned read.
 
     Normally this is just the DB tag written by DupCaller trim. With
-    nanoseq_bam, the bam instead carries NanoSeq-style per-mate RB/MB tags
+    nanoseq_bam, the bam instead carries NanoSeq-style per-mate rb/mb tags
     (own-read barcode / mate barcode); the DB-equivalent string is
-    reconstructed as {MB}-{RB} for read 1 and {RB}-{MB} for read 2, so it
+    reconstructed as {mb}-{rb} for read 1 and {rb}-{mb} for read 2, so it
     can be split the same way DB is everywhere else.
     """
     if not nanoseq_bam:
         return rec.get_tag("DB")
-    mb_tag = rec.get_tag("MB")
-    rb_tag = rec.get_tag("RB")
+    mb_tag = rec.get_tag("mb")
+    rb_tag = rec.get_tag("rb")
     if rec.is_read2:
         return f"{rb_tag}-{mb_tag}"
     return f"{mb_tag}-{rb_tag}"
@@ -1851,165 +1851,73 @@ def simulate_power_grid(
 _REFINE_WORKER_CTX = {}
 
 
-def init_refine_worker(
-    depth_by_trinuc,
-    depth_by_hpstr,
-    all_quals,
-    ampmat,
-    ampmat_rev,
-    dmgmat_top,
-    dmgmat_rev_top,
-    dmgmat_bot,
-    dmgmat_rev_bot,
-    trinuc_convert,
-    ampmat_hp,
-    dmgmat_hp,
-    ampmat_str,
-    dmgmat_str,
-    seed,
-):
+def init_refine_worker(depth_by_trinuc, depth_by_hpstr):
     """Pool initializer for the per-channel FDR-threshold refinement pool
     (refine_channel_task below): stashes the read-only context every
-    channel's Eeff simulation needs as worker-global state once per
-    process, instead of re-pickling it into each of the ~200 per-channel
-    tasks Caller.py's do_call dispatches. trinuc2num/num2trinuc are
-    rebuilt locally (build_trinuc64_order takes no args and is
-    deterministic) rather than also being passed through initargs.
-
-    `seed` is the run's base Monte Carlo seed (params["seed"], resolved
-    once in Caller.py's do_call), stashed here rather than a live RNG
-    instance -- _channel_eeff_at_threshold derives a fresh, threshold-
-    specific RNG per call (see threshold_rng) instead of mutating one
-    shared generator, so results don't depend on which worker or how many
-    -p workers end up evaluating which threshold.
+    channel's Eeff lookup needs as worker-global state once per process,
+    instead of re-pickling it into each of the ~200 per-channel tasks
+    Caller.py's do_call dispatches. _channel_eeff_at_threshold's Eeff is a
+    raw (unweighted) depth sum with no per-threshold simulation, so it
+    only ever reads depth_by_trinuc/depth_by_hpstr/n1_mask -- no
+    amp/dmg matrices, quality histogram, or seed needed here at all.
     """
     global _REFINE_WORKER_CTX
-    trinuc2num, num2trinuc = build_trinuc64_order()
     _REFINE_WORKER_CTX = dict(
         depth_by_trinuc=depth_by_trinuc,
         depth_by_hpstr=depth_by_hpstr,
-        all_quals=all_quals,
-        ampmat=ampmat,
-        ampmat_rev=ampmat_rev,
-        dmgmat_top=dmgmat_top,
-        dmgmat_rev_top=dmgmat_rev_top,
-        dmgmat_bot=dmgmat_bot,
-        dmgmat_rev_bot=dmgmat_rev_bot,
-        trinuc_convert=trinuc_convert,
-        ampmat_hp=ampmat_hp,
-        dmgmat_hp=dmgmat_hp,
-        ampmat_str=ampmat_str,
-        dmgmat_str=dmgmat_str,
-        trinuc2num=trinuc2num,
-        num2trinuc=num2trinuc,
-        base2num={"A": 0, "T": 1, "C": 2, "G": 3},
-        seed=seed,
         n1_mask=np.minimum(*np.indices((10, 10))) >= 1,
     )
 
 
-def _channel_eeff_at_threshold(kind, ctx_key, threshold):
-    """Detection-power-weighted opportunity (Eeff) for one channel at one
-    LR threshold. Picklable top-level dispatch on channel kind, so one
-    per-channel worker task (refine_channel_task) can call this instead of
-    needing a different closure per kind -- closures aren't picklable
-    across a Pool.
-
-    rng is derived fresh from (base seed, threshold) on every call via
-    threshold_rng rather than reused from worker state, so the same
-    threshold always simulates the same grid regardless of which worker
-    or how many -p workers are running.
+def _channel_eeff_at_threshold(kind, ctx_key):
+    """Raw opportunity (Eeff) for one channel: total real-duplex depth in
+    this channel's context, summed with no detection-power weighting --
+    every covered base counts equally regardless of this channel's actual
+    amp/damage error rates or the calling threshold. Picklable top-level
+    dispatch on channel kind, so one per-channel worker task
+    (refine_channel_task) can call this instead of needing a different
+    closure per kind -- closures aren't picklable across a Pool.
     """
     c = _REFINE_WORKER_CTX
-    rng = threshold_rng(c["seed"], threshold)
     if kind == "sbs96":
         t_fwd, b_fwd, t_rc = ctx_key
-        ref_base_idx = c["base2num"][c["num2trinuc"][t_fwd][1]]
-        tc = int(c["trinuc_convert"][t_fwd, b_fwd])
-        probs = (
-            c["ampmat"][tc, ref_base_idx],
-            c["ampmat_rev"][tc, ref_base_idx],
-            c["dmgmat_top"][tc, ref_base_idx],
-            c["dmgmat_rev_top"][tc, ref_base_idx],
-            c["dmgmat_bot"][tc, ref_base_idx],
-            c["dmgmat_rev_bot"][tc, ref_base_idx],
-        )
-        grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
         n1_mask = c["n1_mask"]
-        eeff = float(np.sum(c["depth_by_trinuc"][:, :, t_fwd] * grid * n1_mask))
-        eeff += float(np.sum(c["depth_by_trinuc"][:, :, t_rc] * grid * n1_mask))
+        eeff = float(np.sum(c["depth_by_trinuc"][:, :, t_fwd] * n1_mask))
+        eeff += float(np.sum(c["depth_by_trinuc"][:, :, t_rc] * n1_mask))
         return eeff
     if kind == "hp":
         # HP channels only ever exist for id_len in {-1, 1} now -- there's
         # no hp.txt column for multi-bp lengths any more (those are always
-        # STR-context, see indelErrorProbs). inserted_base is passed equal
-        # to `base` (the position's own reference base) since this is
-        # enumerating "the true opportunity for a real same-base
-        # homopolymer-extending event at a position with this base" --
-        # exactly what depth_by_hpstr's base axis already represents, not
-        # an arbitrary hypothetical mismatched insertion (that background
-        # rate has its own str.txt row-0 context, not tied to hp_len/base
-        # at all). Restricted to just this channel's own pool's 2 bases
-        # (base2num order A,T,C,G -- "T" pool is A/T, "C" pool is C/G,
-        # matching classify_indel_channel's own base pooling and
-        # Caller.py's raw_lr_hp accumulation) rather than all 4, now that
-        # each pool is its own channel with its own threshold.
+        # STR-context, see indelErrorProbs). Restricted to just this
+        # channel's own pool's 2 bases (base2num order A,T,C,G -- "T" pool
+        # is A/T, "C" pool is C/G, matching classify_indel_channel's own
+        # base pooling and Caller.py's raw_lr_hp accumulation) rather than
+        # all 4, now that each pool is its own channel with its own
+        # threshold.
         hp_len, id_len, pool = ctx_key
         total = 0.0
         for base in (0, 1) if pool == "T" else (2, 3):
-            probs = indelErrorProbs(
-                hp_len,
-                0,
-                id_len,
-                base,
-                base,
-                c["ampmat_hp"],
-                c["dmgmat_hp"],
-                c["ampmat_str"],
-                c["dmgmat_str"],
-            )
-            grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
-            total += float(
-                np.sum(c["depth_by_hpstr"][:, :, base * 10 + hp_len - 1] * grid)
-            )
+            total += float(np.sum(c["depth_by_hpstr"][:, :, base * 10 + hp_len - 1]))
         return total
     if kind == "str":
         # str_bin in {1,2,3,4} for real STR-length contexts (>=2bp
-        # events): ref_allele/inserted_base are irrelevant there (no base
-        # identity in that branch of indelErrorProbs). str_bin==0 with
-        # id_len==1 is the mismatched-insertion background channel (the
-        # only way to reach str.txt row 0 for a +-1bp event) -- forced by
-        # passing two different dummy base values (0 != 1) so
-        # indelErrorProbs takes the mismatch branch regardless; harmless
-        # for the multi-bp case since that branch ignores both args.
+        # events). str_bin==0 with id_len==1 is the mismatched-insertion
+        # background channel.
         str_bin, id_len = ctx_key
-        probs = indelErrorProbs(
-            1,
-            str_bin,
-            id_len,
-            0,
-            1,
-            c["ampmat_hp"],
-            c["dmgmat_hp"],
-            c["ampmat_str"],
-            c["dmgmat_str"],
-        )
-        grid = simulate_power_grid(*probs, threshold, c["all_quals"], rng)
         if str_bin == 0:
             # No per-context depth bucket exists for "not a real repeat"
             # (depth_by_hpstr's 39+strs_for_row buckets only ever populate
             # for strs_for_row>=1 -- 39+0 would collide with the last real
             # HP bucket, base G/hp_len=10, not a dedicated background
             # slot). A mismatched-insertion opportunity isn't tied to any
-            # hp/str context anyway (row 0's Pamp/Pdmg have no context
-            # dependence), so the correct denominator is genuinely
-            # "covered at this (n_top, n_bot) depth, anywhere" --
-            # depth_by_trinuc summed across all 64 contexts is exactly
-            # that count, already computed for the SBS side.
+            # hp/str context anyway, so the correct denominator is
+            # genuinely "covered here, anywhere" -- depth_by_trinuc summed
+            # across all 64 contexts is exactly that count, already
+            # computed for the SBS side.
             depth = c["depth_by_trinuc"].sum(axis=2)
         else:
             depth = c["depth_by_hpstr"][:, :, 39 + str_bin]
-        return float(np.sum(depth * grid))
+        return float(np.sum(depth))
     raise ValueError(f"unknown channel kind {kind!r}")
 
 
@@ -2019,8 +1927,8 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     mu0 (this channel's round-1 MLE mixture weight, from the direct
     brentq solve in refine_channel_task) is taken as the channel's
     mutation rate outright -- no re-simulation/re-MLE step-up loop. The LR
-    threshold whose local fdr 1/(1+LR*mu0) equals fdr_thr is solved for
-    directly (LR = (1-fdr_thr)/(fdr_thr*mu0)); mu0 itself is also what
+    threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals fdr_thr is
+    solved for directly (LR = (1-fdr_thr)*(1-mu0)/(fdr_thr*mu0)); mu0 itself is also what
     every PASS call's own local FDR is computed against downstream
     (Caller.py's per-call FDR stamping).
 
@@ -2032,13 +1940,14 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     round 2's post-hoc re-filter (no bam rescan) could never recover it
     even if mu0 alone would justify a looser threshold here.
 
-    mu0 == 0 (this channel had zero effective coverage in round 1 -- see
-    refine_channel_task's Eeff0 == 0 short-circuit) makes the local-fdr
-    formula's implied LR threshold a division by zero (mu0/(1-mu0) == 0).
-    There is no mutation-rate evidence for this channel at all, so instead
-    of solving for a finite cutoff, report nothing as PASS in round 2 for
-    it: a threshold of +inf fails every finite LR in Caller.py's
-    LR < threshold re-filter.
+    mu0 == 0 (this channel had too little effective coverage relative to
+    its candidate count in round 1, including zero coverage outright --
+    see refine_channel_task's n - Eeff0 + pseudocount >= 0 short-circuit)
+    makes the local-fdr formula's implied LR threshold a division by zero
+    (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
+    channel at all, so instead of solving for a finite cutoff, report
+    nothing as PASS in round 2 for it: a threshold of +inf fails every
+    finite LR in Caller.py's LR < threshold re-filter.
     """
     if mu0 == 0:
         return float("inf")
@@ -2048,7 +1957,7 @@ def _refine_channel(mu0, threshold0, fdr_thr):
 
 def refine_channel_task(job):
     """One independent unit of work for the FDR-threshold pool: computes
-    this channel's Eeff at its default threshold, then solves directly for
+    this channel's raw (unweighted) Eeff, then solves directly for
     this channel's MLE mixture weight (mu0) and the LR threshold at which
     its local fdr (using mu0) equals fdr_thr, clamped to never go below
     threshold0 -- see _refine_channel. Channels (each SBS96 class / each
@@ -2063,25 +1972,27 @@ def refine_channel_task(job):
     division, which would raise ZeroDivisionError instead); g(1) works out
     to n - Eeff0 + pseudocount (n = len(raw_lr_list), since each
     raw_lr/(1-1+1*raw_lr) term is exactly 1), so a bracketing sign change
-    is only guaranteed when Eeff0 > n + pseudocount, not for every
-    Eeff0 > 0. In practice this always holds -- candidate mutations are
-    rare relative to a channel's total effective coverage (n/Eeff0 << 1)
-    -- except when Eeff0 itself is essentially zero (rounds down to
-    around 1) while the channel still has n >= 1 candidates, the one
-    realistic way to violate it (without this term, g has a trivial root
-    sitting at mu=0 itself).
+    (g(0) = +inf, g(1) < 0) is only guaranteed when n - Eeff0 + pseudocount
+    < 0, not for every Eeff0 > 0. In practice this always holds --
+    candidate mutations are rare relative to a channel's total effective
+    coverage (n/Eeff0 << 1) -- but a channel with too little effective
+    coverage relative to its candidate count (up to and including
+    Eeff0 == 0) can still violate it.
 
-    Eeff0 == 0 (zero effective coverage for this channel in round 1) is
-    the one case brentq can't solve: every term of g is non-negative
-    then, so g never crosses zero anywhere in (0, 1) and brentq raises
-    for failing to bracket a root. Short-circuit to mu0 = 0 directly --
-    there's no coverage to estimate a mutation rate from anyway.
+    n - Eeff0 + pseudocount >= 0 is the exact case brentq can't solve:
+    g(1) >= 0 there, so g stays non-negative on the whole (0, 1) bracket
+    (every raw_lr/(1-mu+mu*raw_lr) term is >= 0 and only grows smaller
+    than its mu=1 value as mu shrinks toward 0, while pseudocount/mu only
+    grows) and brentq raises for failing to bracket a root. Short-circuit
+    to mu0 = 0 directly -- there isn't enough coverage relative to the
+    candidate count to estimate a mutation rate from anyway.
     """
     name, kind, ctx_key, raw_lr_list, threshold0, fdr_thr, pseudocount = job
-    Eeff0 = _channel_eeff_at_threshold(kind, ctx_key, threshold0)
+    Eeff0 = _channel_eeff_at_threshold(kind, ctx_key)
     raw_lr = np.asarray(raw_lr_list, dtype=float)
+    n = len(raw_lr_list)
 
-    if Eeff0 == 0:
+    if n - Eeff0 + pseudocount >= 0:
         mu0 = 0.0
     else:
 

@@ -173,7 +173,6 @@ def do_call(args):
         "amperri_file": error_prefix + ".amp.id.txt",
         "dmgerr_file": error_prefix + ".dmg.tn.txt",
         "dmgerri_file": error_prefix + ".dmg.id.txt",
-        "mutRate": args.mutRate,
         # ts/ti removed: every candidate with LR>0 is treated as a
         # candidate mutation (see the >0 gates in funcs/call.py); FDR
         # refinement (-fdr) is the only thing that can raise this baseline
@@ -197,8 +196,6 @@ def do_call(args):
         "rescue": args.rescue,
         "maxZeroQualFrac": args.maxZeroQualFrac,
         "maxDepth": args.maxPileupDepth,
-        "minGroupAmp": args.minGroupAmp,
-        "minGroupDmg": args.minGroupDmg,
         "nanoSeqBam": args.NanoSeqBam,
         "seed": args.seed,
     }
@@ -234,7 +231,6 @@ def do_call(args):
         "regions": args.regionst,
         "region_file": None,
         "threads": args.threads,
-        "mutRate": 10e-7,
         "pcutoff": 2,
         "amperr": 1e-5,
         "amperr_file": None,
@@ -267,7 +263,7 @@ def do_call(args):
         # _compute_read_label (funcs/call.py) is shared unconditionally
         # across all rounds and reads params.get("nanoSeqBam"); without
         # this key here, a --NanoSeqBam run falls back to the DB tag
-        # during round 0 even though NanoSeq-format bams only carry MB/RB.
+        # during round 0 even though NanoSeq-format bams only carry mb/rb.
         "nanoSeqBam": args.NanoSeqBam,
     }
     same_regions_flag = False
@@ -807,7 +803,7 @@ def do_call(args):
         "FDR": [
             1,
             "Float",
-            "Local false discovery rate for this call: 1/(1+rawLR*mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).",
+            "Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).",
         ],
     }
     dbsInfoDict = {
@@ -826,7 +822,7 @@ def do_call(args):
     }
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
-        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the *_rescued reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
+        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the *_rescued reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
         "underpowered": "Passed the default calling threshold but failed the FDR-refined per-channel threshold",
         "high_nm": "Read family kept under --rescue despite failing the NM/blacklist filter",
         "low_mapq": "Read family kept under --rescue despite failing the mapq filter",
@@ -836,7 +832,6 @@ def do_call(args):
         "trim_rescued": "Mutation kept under --rescue despite falling in the read-end trim zone; no coverage/depth extracted",
         "indelregion_rescued": "Indel kept under --rescue despite failing indel_mask; no coverage/depth extracted",
         "masked_rescued": "Mutation kept under --rescue despite failing a mask not covered by a more specific *_rescued reason above; no coverage/depth extracted",
-        "no_good_alt_read": "Kept under --rescue despite real depth-extraction finding zero alt-supporting reads in the tumor BAM pileup (LR cleared its channel's threshold on family-consensus evidence alone) -- real AC/RC/DP attached",
         "duplex_vaf": "Kept under --rescue despite the extracted tumor allele fraction (AC/DP) exceeding --maxAF -- real AC/RC/DP attached",
         "normal_vaf": "Kept under --rescue despite the extracted matched-normal allele fraction exceeding --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached",
         "n_cov_mask": "Kept under --rescue despite matched-normal depth at this position falling below --minNdepth once real depth was extracted -- real AC/RC/DP attached",
@@ -863,26 +858,10 @@ def do_call(args):
     label2num_192, index_192 = build_trinuc192_labels(num2trinuc_64)
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
 
-    # load_error_matrices(params) runs here so the initial, pre-refinement
-    # per-channel Eeff estimate can use the exact same fresh-simulation
-    # machinery as every later refinement iteration, instead of round-1
-    # coverage (which round 1 no longer computes -- see call.py's
-    # coverage_only gating). It sets ampmat/dmgmat_top/etc/trinuc_convert
-    # on params; all_quals_fdr feeds simulate_power_grid (each refinement
-    # worker builds its own rng, see init_refine_worker).
+    # load_error_matrices(params) sets ampmat/dmgmat_top/etc/trinuc_convert
+    # on params, read directly by _indel_ctx_threshold below (threshold0
+    # solve) and by round 1/2 calling itself (funcs/call.py).
     load_error_matrices(params)
-    all_quals_fdr = []
-    reads_sampled_fdr = 0
-    for read in tBam.fetch():
-        if not read.is_unmapped and read.query_alignment_qualities is not None:
-            quals = np.array(read.query_alignment_qualities, dtype=float)
-            all_quals_fdr.extend(quals[quals > params["minBq"]].tolist())
-            reads_sampled_fdr += 1
-            if reads_sampled_fdr >= 1000:
-                break
-    if not all_quals_fdr:
-        all_quals_fdr = [30]
-    all_quals_fdr = np.array(all_quals_fdr, dtype=float)
 
     def _indel_ctx_threshold(hps_c, strs_c, id_len, pool=None):
         # Uniform default cutoff, capped per-context by the theoretical
@@ -930,11 +909,11 @@ def do_call(args):
             maxLR_ctx = _maxlr(0, 0)
         return min(pcutoffi, maxLR_ctx)
 
-    # _channel_eeff_at_threshold (funcs/call.py) is a single, picklable,
+    # _channel_eeff_at_threshold (funcs/misc.py) is a single, picklable,
     # top-level dispatch on channel kind, callable from inside the
-    # per-channel refinement Pool below -- closures over depth_by_trinuc/
-    # depth_by_hpstr/all_quals_fdr/rng_fdr/params can't be pickled across
-    # a Pool, so each per-channel Eeff/refine step can run in parallel here.
+    # per-channel refinement Pool below -- a closure over depth_by_trinuc/
+    # depth_by_hpstr couldn't be pickled across a Pool, so each per-channel
+    # Eeff/refine step can run in parallel here.
 
     # trinuc_by_duplex_group.txt (row_idx_192/col_idx_192/duplex_read_num_
     # trinuc-derived) also moved to after round 2, alongside the other
@@ -982,7 +961,7 @@ def do_call(args):
                 (t_fwd, b_fwd, t_rc),
                 raw_lr_96_n1[k],
                 params["pcutoff"],
-                args.fdrThreshold,
+                args.lfdrThreshold,
                 args.pseudocount,
             )
         )
@@ -1088,7 +1067,7 @@ def do_call(args):
             (0, 1),
             raw_lr_str0,
             _indel_ctx_threshold(0, 0, 1),
-            args.fdrThreshold,
+            args.lfdrThreshold,
             args.pseudocount,
         )
     ]
@@ -1103,7 +1082,7 @@ def do_call(args):
                         (hp_len, id_len, pool),
                         raw_lr_hp[(hp_len, id_len, pool)],
                         threshold0,
-                        args.fdrThreshold,
+                        args.lfdrThreshold,
                         args.pseudocount,
                     )
                 )
@@ -1117,7 +1096,7 @@ def do_call(args):
                     (str_bin, id_len),
                     raw_lr_str[(str_bin, id_len)],
                     threshold0,
-                    args.fdrThreshold,
+                    args.lfdrThreshold,
                     args.pseudocount,
                 )
             )
@@ -1127,7 +1106,7 @@ def do_call(args):
     # mixture weight at its default threshold0, from a direct brentq solve
     # regularized by args.pseudocount) is taken as the channel's mutation
     # rate outright, with no iterative re-simulation/re-MLE step-up. The LR
-    # threshold whose local fdr 1/(1+LR*mu0) equals args.fdrThreshold is
+    # threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals args.lfdrThreshold is
     # solved for directly and used unconditionally as this channel's round
     # 2 calling threshold -- see funcs/call.py's _refine_channel. The
     # pseudocount regularization guarantees mu0 has a real root in (0, 1)
@@ -1144,23 +1123,7 @@ def do_call(args):
     refine_pool = Pool(
         args.threads,
         initializer=init_refine_worker,
-        initargs=(
-            depth_by_trinuc,
-            depth_by_hpstr,
-            all_quals_fdr,
-            params["ampmat"],
-            params["ampmat_rev"],
-            params["dmgmat_top"],
-            params["dmgmat_rev_top"],
-            params["dmgmat_bot"],
-            params["dmgmat_rev_bot"],
-            params["trinuc_convert"],
-            params["ampmat_hp"],
-            params["dmgmat_hp"],
-            params["ampmat_str"],
-            params["dmgmat_str"],
-            params["seed"],
-        ),
+        initargs=(depth_by_trinuc, depth_by_hpstr),
     )
     refine_results = refine_pool.map(refine_channel_task, sbs_jobs + indel_jobs)
     refine_pool.close()
@@ -1457,8 +1420,8 @@ def do_call(args):
         # masked candidates whose LR now clears their channel's final
         # threshold) back into round 1's mutsAll/indelsAll, by position key.
         # Carries filter along with samples: call.py relabels a deferred
-        # candidate to a reject-reason filter (no_good_alt_read/duplex_vaf/
-        # normal_vaf/n_cov_mask) when real depth fails a post-hoc sanity
+        # candidate to a reject-reason filter (duplex_vaf/normal_vaf/
+        # n_cov_mask) when real depth fails a post-hoc sanity
         # check, or leaves it "masked" (with real depth) when it clears
         # everything -- either way the region-local round-2 record is the
         # source of truth, since round 1 never saw real depth for these.
@@ -1654,11 +1617,19 @@ def do_call(args):
     # --rescue's "junk mutations that may carry real biological signal"
     # opt-in; otherwise drop them here so they never reach either VCF, same
     # as any other non-rescued reject. This is the single, centralized
-    # keep/drop decision for these four labels -- call.py itself never
-    # drops them, since a round-2 record is only a region-local copy that
-    # feeds the merge above, not the final mutsAll/indelsAll directly.
+    # keep/drop decision for these labels -- call.py itself never drops
+    # them, since a round-2 record is only a region-local copy that feeds
+    # the merge above, not the final mutsAll/indelsAll directly.
+    #
+    # "no_good_alt_read" (zero tumor alt-supporting reads, ta==0) no
+    # longer exists as a reject reason -- call.py's eligible branch used
+    # to relabel any eligible ta==0 record to it, but that relabeling was
+    # removed once tumor depth-extraction started counting a candidate's
+    # own founding-family reads toward depth regardless of base quality
+    # (see extractDepthBatchSnv's call_barcodes), which makes tdp/ta
+    # genuinely reflect real coverage instead of needing this backstop.
     if not params["rescue"]:
-        _reject_reasons = {"no_good_alt_read", "duplex_vaf", "normal_vaf", "n_cov_mask"}
+        _reject_reasons = {"duplex_vaf", "normal_vaf", "n_cov_mask"}
         mutsAll = [m for m in mutsAll if m.get("filter", "PASS") not in _reject_reasons]
         indelsAll = [
             m for m in indelsAll if m.get("filter", "PASS") not in _reject_reasons
@@ -1667,14 +1638,15 @@ def do_call(args):
     # "masked" (SNPM/NOISEM-blocked) records that never went through
     # round 2's deferred depth-extraction -- raw LR below the channel's
     # final refined threshold, or --skipCoveragePass -- still carry
-    # round 1's zero-depth placeholder in "samples". A masked record that
-    # *did* get real depth can never land back here with an all-zero
-    # tumor triple: call.py's eligible branch relabels ta==0 to
-    # "no_good_alt_read" instead of leaving it "masked" (see its
-    # eligible-branch comment). So filter=="masked" + all-zero samples
-    # unambiguously means "never depth-extracted", and those shouldn't
-    # reach the fail vcf without --rescue -- same opt-in as every other
-    # no-real-depth reason above.
+    # round 1's zero-depth placeholder in "samples". Without the old
+    # ta==0 relabeling (see above), a masked record that *did* get real
+    # depth extracted can now in principle land back here with an
+    # all-zero tumor triple too, if depth-extraction genuinely found zero
+    # reads at all (not just zero alt) -- so filter=="masked" +
+    # all-zero samples is no longer an airtight "never depth-extracted"
+    # signal, just the best cheap proxy for it; those records still
+    # shouldn't reach the fail vcf without --rescue, same opt-in as every
+    # other no-real-depth reason above.
     if not params["rescue"]:
 
         def _masked_no_depth(m):
@@ -1687,8 +1659,8 @@ def do_call(args):
         indelsAll = [m for m in indelsAll if not _masked_no_depth(m)]
 
     # Per-call FDR: the same local-fdr formula every channel already uses
-    # internally (1/(1+rawLR*mu0), mu0 being that call's own channel's
-    # round-1 MLE mutation rate -- see _refine_channel). Computed and
+    # internally ((1-mu0)/(rawLR*mu0+1-mu0), mu0 being that call's own
+    # channel's round-1 MLE mutation rate -- see _refine_channel). Computed and
     # stamped onto every SBS/indel record's own "FDR" INFO field (not
     # just PASS -- a fail.vcf record's own FDR is exactly what explains
     # why it didn't clear its channel), and separately averaged over just
@@ -1711,14 +1683,18 @@ def do_call(args):
         rc_alt = _REVCOMP[alt]
         return f"SBS96:{rc_trinuc[0]}[{rc_trinuc[1]}>{rc_alt}]{rc_trinuc[2]}"
 
+    def _local_fdr(log10_lr, mu):
+        """(1-mu)/(rawLR*mu+1-mu) -- must stay the same formula
+        _refine_channel (funcs/misc.py) solves for its LR threshold, so a
+        future change to one has to be mirrored in the other."""
+        return (1.0 - mu) / ((10**log10_lr) * mu + (1.0 - mu))
+
     sbs_local_fdrs = []
     pos_to_local_fdr = {}
     for mut in mutsAll:
         name = _sbs_channel_name(mut["infos"]["TN"], mut["alt"])
         mu = channel_final_mu.get(name)
-        local_fdr = (
-            1.0 / (1.0 + (10 ** mut["infos"]["LR"]) * mu) if mu is not None else 1.0
-        )
+        local_fdr = _local_fdr(mut["infos"]["LR"], mu) if mu is not None else 1.0
         mut["infos"]["FDR"] = local_fdr
         pos_to_local_fdr[(mut["chrom"], mut["pos"])] = local_fdr
         if mu is not None and mut.get("filter", "PASS") == "PASS":
@@ -1740,9 +1716,7 @@ def do_call(args):
         else:
             name = None
         mu = channel_final_mu.get(name)
-        local_fdr = (
-            1.0 / (1.0 + (10 ** indel["infos"]["LR"]) * mu) if mu is not None else 1.0
-        )
+        local_fdr = _local_fdr(indel["infos"]["LR"], mu) if mu is not None else 1.0
         indel["infos"]["FDR"] = local_fdr
         if mu is not None and indel.get("filter", "PASS") == "PASS":
             indel_local_fdrs.append(local_fdr)
@@ -1773,7 +1747,10 @@ def do_call(args):
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
         if coverage_pass_enabled:
-            f.write(f"Effective Coverage\t{coverage}\n")
+            # SBS/INDEL/DBS base coverage (opportunity coverage normalized
+            # by opportunity-per-genome) is written by the estimate step
+            # instead -- it needs cov_by_minread/indel_locus_multiplier/
+            # dbs_cov_by_minread, none of which exist yet at call time.
             f.write(f"Unmasked Coverage\t{unmasked_coverage}\n")
             # Single aggregate total, not broken out per
             # INDEL_COVERAGE_CATEGORY_LABELS category -- every consumer
