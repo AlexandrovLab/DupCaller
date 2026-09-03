@@ -157,9 +157,16 @@ def splitBamRegions(bams, num, contigs, step, ref):  # , regionFile):
         np.arange(1, num) * chunkSize,
     )
     cut_contigs = np.searchsorted(window_nums_cumulative, cut_inds)
-    cut_pos = (
-        cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]
-    ) * step
+    targets = np.arange(1, num) * chunkSize
+    window_start_reads = np.concatenate([[0], total_reads_by_windows_cumulative])[cut_inds]
+    window_counts = total_reads_by_windows[cut_inds]
+    frac = np.where(window_counts > 0, (targets - window_start_reads) / np.maximum(window_counts, 1), 0)
+    frac = np.clip(frac, 0, 1)
+    cut_pos = np.round(
+            (
+            cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]
+        ) * step + frac * step
+    ).astype(int)
     for nn in range(cut_inds.size):
         cutSite.append((cut_contigs[nn], cut_pos[nn]))
     return cutSite, chunkSize, contigs_sorted
