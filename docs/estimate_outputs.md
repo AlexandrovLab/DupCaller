@@ -27,7 +27,9 @@ The `SBS_96_plots_*.pdf`/`ID_83_plots_*.pdf`/`DBS_78_plots_*.pdf` filenames are 
 
 Tab-separated key–value files (one metric per line, no header), each computed at the most inclusive stratum: minimum duplex group size = 1 (i.e. `min(F1R2, F2R1) >= 1`, all groups combined). All three files share the same field order and meaning; differences are called out below.
 
-**`Corrected mutation number` intentionally appears twice in a row** in all three files. This is a recent redesign: that second line used to report a different, genome-wide-extrapolated `Mutation number per genome` figure, but as of the change that added `Duplex coverage`/`Base Coverage` reporting, it was changed to just repeat the corrected-mutation-number value above it, since the true per-context genome-extrapolated figure remains available separately (in `_sbs_96_corrected.txt`'s/`_indel_83_corrected.txt`'s/`_dbs_78_corrected.txt`'s own `mutation_number_genome` column, per-context rather than a single aggregate). Do not rely on the second occurrence being a distinct value — parse it by line position (index 8, 0-based) if you need to, but expect it to equal line 7.
+Each file's `Corrected mutation number` line is immediately followed by three genome-wide-extrapolated figures — `Mutation number per genome` and its 95% lower/upper bounds — computed as `Corrected burden × Reference base number` (and the corresponding CI bounds scaled the same way): a genuine extrapolation to the full considered reference footprint, not just the effective duplex-covered subset, so it reads larger than `Corrected mutation number`. This is distinct from the per-context `mutation_number_genome` column in `_sbs_96_corrected.txt`/`_indel_83_corrected.txt`/`_dbs_78_corrected.txt` (one value per SBS96/ID83/DBS78 channel rather than a single aggregate).
+
+**Confidence interval method:** `Uncorrected burden`'s CI (and `Unmasked burden`'s) is the standard exact Poisson interval (chi-square-based). `Corrected burden`'s CI (and `Mutation number per genome`'s, scaled from it) instead uses the Fay-Feuer method (Fay & Feuer 1997) — the same one behind age-standardized-rate CIs (e.g. SEER*Stat) — because a correction-ratio-weighted sum of per-channel counts isn't itself Poisson-distributed, so the closed-form Poisson interval doesn't apply to it. Fay-Feuer models the weighted sum as a gamma distribution matched to its first two moments (mean and variance under a per-channel Poisson-MLE assumption), with a built-in conservative correction for the upper bound (one hypothetical extra event in the single largest-weight channel) that keeps it well-defined and non-degenerate even when zero mutations are observed. Deterministic — no RNG/seed involved.
 
 `Duplex coverage` (recently renamed from `Genome coverage`) is the opportunity coverage at `min_group_size=1`, normalized to true per-base units:
 - **SBS:** the raw per-alt-base coverage sum, divided by 3 (the 3 non-ref alt bases per locus).
@@ -44,8 +46,10 @@ These same three normalized values are also appended to `_stats.txt` as `SBS Bas
 | `Uncorrected burden 95% lower/upper` | Poisson 95% confidence interval on the uncorrected burden. |
 | `Uncorrected mutation number` | Total count of `PASS` SNVs used in the estimate (only those whose SBS96 class has nonzero observed coverage). |
 | `Corrected burden` | Trinucleotide-corrected SNV burden (see method below). |
-| `Corrected burden 95% lower/upper` | Poisson-bootstrap 95% CI on corrected burden. |
-| `Corrected mutation number` (×2, see above) | Sum of correction-ratio-weighted per-SBS96-class mutation counts. |
+| `Corrected burden 95% lower/upper` | Fay-Feuer 95% CI on corrected burden (see CI method above). |
+| `Corrected mutation number` | Sum of correction-ratio-weighted per-SBS96-class mutation counts. |
+| `Mutation number per genome` | Genome-wide extrapolation (see above). |
+| `Mutation number per genome 95% lower/upper` | Fay-Feuer CI on `Corrected burden`, scaled to genome-wide units. |
 | `Duplex coverage` | See normalization above. |
 | `Unmasked burden` | SNV burden including PASS calls plus noise-masked candidates that cleared LR and got real depth extracted (i.e. before the noise mask is applied as a filter). |
 | `Unmasked burden 95% lower/upper` | Poisson 95% CI on unmasked burden. |
@@ -63,11 +67,11 @@ This reweights mutation counts so the burden estimate reflects what would be obs
 
 ### `INDEL/{sample}_indel_burden.txt`
 
-Same field list and order as `_sbs_burden.txt` (`Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number` ×2, `Duplex coverage`, `Unmasked burden`, `..95% lower/upper`, `Reference base number`), correction here being per-ID83-channel instead of per-SBS96-class. All burden/mutation-number values are rescaled by `indel_locus_multiplier` so they read in the same per-reference-base units as SBS/DBS.
+Same field list and order as `_sbs_burden.txt` (`Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number`, `Mutation number per genome`, `..95% lower/upper`, `Duplex coverage`, `Unmasked burden`, `..95% lower/upper`, `Reference base number`), correction here being per-ID83-channel instead of per-SBS96-class. All burden/mutation-number values are rescaled by `indel_locus_multiplier` so they read in the same per-reference-base units as SBS/DBS.
 
 ### `DBS/{sample}_dbs_burden.txt`
 
-Same field list, minus the three `Unmasked burden*` lines (DBS calling has no masked tier — `_detect_dbs_pairs` only ever emits `filter=="PASS"` events, so there's no unmasked-vs-masked distinction to report): `Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number` ×2, `Duplex coverage`, `Reference base number`.
+Same field list, minus the three `Unmasked burden*` lines (DBS calling has no masked tier — `_detect_dbs_pairs` only ever emits `filter=="PASS"` events, so there's no unmasked-vs-masked distinction to report): `Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number`, `Mutation number per genome`, `..95% lower/upper`, `Duplex coverage`, `Reference base number`.
 
 ---
 
@@ -188,7 +192,7 @@ Intended as gene-level sequencing-depth input for tools like dNdScv. (Older vers
 
 ## `{sample}_estimate_params.log`
 
-Plain-text run log: run timestamp, the exact command line invoked, and the fully resolved value of every `estimate` argument (including the RNG `--seed` used for the parametric-bootstrap confidence intervals on corrected burden, generated automatically and recorded here if not passed explicitly).
+Plain-text run log: run timestamp, the exact command line invoked, and the fully resolved value of every `estimate` argument. `estimate` has no RNG-dependent step (all confidence intervals are computed by closed-form/deterministic methods — see the CI method note above) and takes no `--seed`.
 
 ---
 
@@ -204,8 +208,9 @@ Same field list as `_sbs_burden.txt`'s uncorrected/corrected block, computed ove
 | --- | --- |
 | `Uncorrected burden`, `..95% lower/upper` | SNV burden and Poisson CI within the re-estimation region. |
 | `Uncorrected mutation number` | SNV count within the region. |
-| `Corrected burden`, `..95% lower/upper` | Trinucleotide-corrected burden and bootstrap CI. |
-| `Corrected mutation number` (×2) | Correction-ratio-weighted mutation count (same value repeated, matching the main burden file's convention above). |
+| `Corrected burden`, `..95% lower/upper` | Trinucleotide-corrected burden and Fay-Feuer CI. |
+| `Corrected mutation number` | Correction-ratio-weighted mutation count. |
+| `Mutation number per genome`, `..95% lower/upper` | Genome-wide extrapolation (`Corrected burden × Reference base number`, CI scaled the same way), matching the main `_sbs_burden.txt` convention. |
 | `Duplex coverage` | Real per-locus-equivalent duplex coverage within the region (`trinuc_cov_96.sum()/3`) — not the reference genome's raw trinucleotide total. |
 | `Reference base number` | Reference genome trinucleotide total within the region. |
 
@@ -217,8 +222,9 @@ A separate, shorter field set (note the field *names* differ slightly from the m
 | --- | --- |
 | `Uncorrected indel burden`, `..95% lower/upper` | Indel burden and Poisson CI within the region. |
 | `Uncorrected indel number` | Indel count within the region. |
-| `Corrected indel burden`, `..95% lower/upper` | Corrected burden and bootstrap CI. |
+| `Corrected indel burden`, `..95% lower/upper` | Corrected burden and Fay-Feuer CI. |
 | `Corrected indel number` | Correction-ratio-weighted indel count. |
+| `Mutation number per genome`, `..95% lower/upper` | Genome-wide extrapolation (`Corrected indel burden × Reference base number`, CI scaled the same way), matching the main `_sbs_burden.txt` convention. |
 | `Indel coverage` | Total ID83-resolution opportunity coverage within the region (not rescaled by `indel_locus_multiplier` — unlike the main `_indel_burden.txt`, this file's burden values are already computed directly against this same raw denominator, so no rescaling is needed here). |
 
 ### `SBS/{sample}_sbs_96_corrected_re_estimate.txt`

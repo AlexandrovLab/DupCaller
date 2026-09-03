@@ -1,18 +1,18 @@
 ##fileformat=VCFv4.2
 ##FILTER=<ID=PASS,Description="All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call">
-##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the *_rescued reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on">
+##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on">
 ##FILTER=<ID=underpowered,Description="Passed the default calling threshold but failed the FDR-refined per-channel threshold">
-##FILTER=<ID=high_nm,Description="Read family kept under --rescue despite failing the NM/blacklist filter">
-##FILTER=<ID=low_mapq,Description="Read family kept under --rescue despite failing the mapq filter">
-##FILTER=<ID=low_ASXS,Description="Read family kept under --rescue despite failing the AS-XS filter">
-##FILTER=<ID=ncov_rescued,Description="Mutation kept under --rescue despite failing the coverage-depth mask; no coverage/depth extracted">
-##FILTER=<ID=nm_rescued,Description="Mutation kept under --rescue despite failing the per-family NM mask at this position; no coverage/depth extracted">
-##FILTER=<ID=trim_rescued,Description="Mutation kept under --rescue despite falling in the read-end trim zone; no coverage/depth extracted">
-##FILTER=<ID=indelregion_rescued,Description="Indel kept under --rescue despite failing indel_mask; no coverage/depth extracted">
-##FILTER=<ID=masked_rescued,Description="Mutation kept under --rescue despite failing a mask not covered by a more specific *_rescued reason above; no coverage/depth extracted">
-##FILTER=<ID=duplex_vaf,Description="Kept under --rescue despite the extracted tumor allele fraction (AC/DP) exceeding --maxAF -- real AC/RC/DP attached">
-##FILTER=<ID=normal_vaf,Description="Kept under --rescue despite the extracted matched-normal allele fraction exceeding --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached">
-##FILTER=<ID=n_cov_mask,Description="Kept under --rescue despite matched-normal depth at this position falling below --minNdepth once real depth was extracted -- real AC/RC/DP attached">
+##FILTER=<ID=high_nm,Description="Read family failed the NM/blacklist filter -- only reported under --rescue">
+##FILTER=<ID=low_mapq,Description="Read family failed the mapq filter -- only reported under --rescue">
+##FILTER=<ID=low_ASXS,Description="Read family failed the AS-XS filter -- only reported under --rescue">
+##FILTER=<ID=cov_mask,Description="Blocked by the coverage-depth mask (n_cov_mask); no coverage/depth extracted -- only reported under --rescue">
+##FILTER=<ID=nm_mask,Description="Blocked by the per-family NM mask at this position; no coverage/depth extracted -- only reported under --rescue">
+##FILTER=<ID=trim_mask,Description="Falls in the read-end trim zone; no coverage/depth extracted -- only reported under --rescue">
+##FILTER=<ID=indel_mask,Description="Indel blocked by indel_mask; no coverage/depth extracted -- only reported under --rescue">
+##FILTER=<ID=other_mask,Description="Blocked by a mask not covered by a more specific reason above; no coverage/depth extracted -- only reported under --rescue">
+##FILTER=<ID=duplex_vaf,Description="The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue">
+##FILTER=<ID=normal_vaf,Description="The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue">
+##FILTER=<ID=n_cov_mask,Description="Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue">
 ##INFO=<ID=F1R2,Number=1,Type=Integer,Description="Number of F1R2 read(s) in the read bundle">
 ##INFO=<ID=F2R1,Number=1,Type=Integer,Description="Number of F2R1 read(s) in the read bundle">
 ##INFO=<ID=TAG1,Number=1,Type=String,Description="Barcode of top strand 5 prime">

@@ -42,7 +42,7 @@ from .misc import (
     determineTrimLength,
     nums2str,
     get_bed_file_for_position,
-    _rescue_reason_label,
+    _filter_reason_label,
     bamIterateMultipleRegion,
     _detect_dbs_pairs,
     _compute_dbs_opportunity,
@@ -315,8 +315,18 @@ def _process_duplex_family(
     learn_antimask = np.all(~masks[3:, :], axis=0)
     learn_antimask[trinuc_np[start_ind:end_ind] > 64] = False
     learn_antimask[ref_np[start_ind:end_ind] == 4] = False
-    ### If the whole reads are masked:
-    if not np.any(unmasked_antimask):
+    ### If the whole reads are masked: under --rescue, only include_mask is
+    ### truly non-rescuable (rescue_antimask == ~include_mask, matching the
+    ### per-site rescue-eligibility checks below), so gate on that wider
+    ### definition of "has an analyzable position" instead of
+    ### unmasked_antimask (which also requires clearing n_cov/nm/trim).
+    ### Otherwise a family blocked only by those masks across its whole
+    ### span would be dropped here before ever reaching the per-site
+    ### logic that's supposed to report it as a filtered-but-rescued call.
+    if params["rescue"]:
+        if not np.any(rescue_antimask):
+            return False  # no site in this family survives even rescue
+    elif not np.any(unmasked_antimask):
         return False  # this family never reaches pass_bool -- doesn't count
     indel_bool = [("I" in seq.cigarstring or "D" in seq.cigarstring) for seq in readSet]
     # if any(indel_bool):
@@ -437,12 +447,12 @@ def _process_duplex_family(
             elif unmasked_antimask_indel[indel_slice].all():
                 flt = "masked"
             elif params["rescue"] and rescue_antimask_indel[indel_slice].all():
-                flt = _rescue_reason_label(
+                flt = _filter_reason_label(
                     masks_indel[2, indel_slice],
                     masks_indel[5, indel_slice],
                     masks_indel[3, indel_slice],
                     extra_flag=masks_indel[0, indel_slice],
-                    extra_label="indelregion_rescued",
+                    extra_label="indel_mask",
                 )
             else:
                 continue
@@ -987,7 +997,7 @@ def _process_duplex_family(
                 # made the rescue branch below unreachable for those cases.
                 flt = "masked"
             elif params["rescue"] and rescue_antimask[muts_ind[nn]]:
-                flt = _rescue_reason_label(
+                flt = _filter_reason_label(
                     masks[2, muts_ind[nn]],
                     masks[4, muts_ind[nn]],
                     masks[5, muts_ind[nn]],

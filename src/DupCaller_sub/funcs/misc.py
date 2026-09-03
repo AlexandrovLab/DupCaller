@@ -1400,31 +1400,35 @@ def get_bed_file_for_position(
         return locus_bed
 
 
-def _rescue_reason_label(
+def _filter_reason_label(
     ncov_flag, nm_flag, trim_flag, extra_flag=None, extra_label=None
 ):
-    """Pick a single, specific rescue-reason filter label for a
-    --rescue-eligible candidate that reached the masked-rescue fallback
-    (snp_mask/noise_mask no longer block calling at all -- see the
-    unmasked_pass_bool/unmasked_antimask switch below -- and include_mask
-    is never rescuable, so by construction whatever's left blocking this
-    candidate is one or more of: n_cov_mask, nm_mask, trim, and -- indel
-    side only -- indel_mask). Args are booleans or boolean arrays covering
-    the candidate's own position(s); a plain scalar bool works too since
-    np.any() accepts one. extra_flag/extra_label covers indel_mask, which
-    has no SNV analogue. Checked in a fixed priority order so a position
-    blocked by more than one mask still gets exactly one label rather than
-    silently picking whichever happened to be checked last.
+    """Pick a single, specific filter label naming the mask that's
+    actually blocking a --rescue-eligible candidate that reached the
+    masked-rescue fallback (snp_mask/noise_mask no longer block calling at
+    all -- see the unmasked_pass_bool/unmasked_antimask switch below --
+    and include_mask is never rescuable, so by construction whatever's
+    left blocking this candidate is one or more of: n_cov_mask, nm_mask,
+    trim, and -- indel side only -- indel_mask). The label names the
+    reason the candidate is filtered, not the fact that --rescue is what
+    made it visible -- that's already implied by it only ever reaching the
+    fail vcf when --rescue is on. Args are booleans or boolean arrays
+    covering the candidate's own position(s); a plain scalar bool works
+    too since np.any() accepts one. extra_flag/extra_label covers
+    indel_mask, which has no SNV analogue. Checked in a fixed priority
+    order so a position blocked by more than one mask still gets exactly
+    one label rather than silently picking whichever happened to be
+    checked last.
     """
     if extra_flag is not None and np.any(extra_flag):
         return extra_label
     if np.any(ncov_flag):
-        return "ncov_rescued"
+        return "cov_mask"
     if np.any(nm_flag):
-        return "nm_rescued"
+        return "nm_mask"
     if np.any(trim_flag):
-        return "trim_rescued"
-    return "masked_rescued"
+        return "trim_mask"
+    return "other_mask"
 
 
 def _compute_read_label(rec, params):
@@ -1957,27 +1961,38 @@ def _refine_channel(mu0, threshold0, fdr_thr):
 
 def refine_channel_task(job):
     """One independent unit of work for the FDR-threshold pool: computes
-    this channel's raw (unweighted) Eeff, then solves directly for
-    this channel's MLE mixture weight (mu0) and the LR threshold at which
-    its local fdr (using mu0) equals fdr_thr, clamped to never go below
-    threshold0 -- see _refine_channel. Channels (each SBS96 class / each
-    HP-length x indel-length / STR-bin x indel-length combo, ~200 total)
-    are fully independent -- own raw_lr list, own Eeff formula -- so
-    do_call dispatches these across a Pool (one task per channel) instead
-    of running them one at a time in the main process.
+    this channel's raw (unweighted) Eeff, then either takes mu0 from
+    Caller.py's -mr/--muterateprefix override (mu0_override, if not None)
+    or solves directly for this channel's own MLE mixture weight (mu0)
+    from raw_lr_list/Eeff0 -- either way, the LR threshold at which its
+    local fdr (using mu0) equals fdr_thr is then solved for, clamped to
+    never go below threshold0 -- see _refine_channel. Channels (each SBS96
+    class / each HP-length x indel-length / STR-bin x indel-length combo,
+    ~200 total) are fully independent -- own raw_lr list, own Eeff formula
+    -- so do_call dispatches these across a Pool (one task per channel)
+    instead of running them one at a time in the main process.
 
-    mu0 solves g(mu) = sum(raw_lr/(1-mu+mu*raw_lr)) - Eeff0 + pseudocount/mu
-    == 0 directly via brentq. The pseudocount/mu term sends g(0) to
-    literally +inf (np.divide(pseudocount, 0.0) rather than plain float
-    division, which would raise ZeroDivisionError instead); g(1) works out
-    to n - Eeff0 + pseudocount (n = len(raw_lr_list), since each
+    Eeff0 is always computed fresh from this run's own real coverage
+    (cheap, no Monte Carlo) even when mu0_override is supplied -- it still
+    feeds this run's own diagnostic rate-table output (mutnum/Eeff
+    columns) and the FDR-at-mu0 threshold solve below, which should use
+    this run's own opportunity even when its mutation-rate estimate comes
+    from elsewhere.
+
+    Without an override, mu0 solves
+    g(mu) = sum(raw_lr/(1-mu+mu*raw_lr)) - Eeff0 + pseudocount/mu == 0
+    directly via brentq. The pseudocount/mu term sends g(0) to literally
+    +inf (np.divide(pseudocount, 0.0) rather than plain float division,
+    which would raise ZeroDivisionError instead); g(1) works out to
+    n - Eeff0 + pseudocount (n = len(raw_lr_list), since each
     raw_lr/(1-1+1*raw_lr) term is exactly 1), so a bracketing sign change
     (g(0) = +inf, g(1) < 0) is only guaranteed when n - Eeff0 + pseudocount
     < 0, not for every Eeff0 > 0. In practice this always holds --
     candidate mutations are rare relative to a channel's total effective
     coverage (n/Eeff0 << 1) -- but a channel with too little effective
     coverage relative to its candidate count (up to and including
-    Eeff0 == 0) can still violate it.
+    Eeff0 == 0) can still violate it; this is exactly the small-region
+    scenario -mr/--muterateprefix exists to sidestep.
 
     n - Eeff0 + pseudocount >= 0 is the exact case brentq can't solve:
     g(1) >= 0 there, so g stays non-negative on the whole (0, 1) bracket
@@ -1987,24 +2002,37 @@ def refine_channel_task(job):
     to mu0 = 0 directly -- there isn't enough coverage relative to the
     candidate count to estimate a mutation rate from anyway.
     """
-    name, kind, ctx_key, raw_lr_list, threshold0, fdr_thr, pseudocount = job
+    (
+        name,
+        kind,
+        ctx_key,
+        raw_lr_list,
+        threshold0,
+        fdr_thr,
+        pseudocount,
+        mu0_override,
+    ) = job
     Eeff0 = _channel_eeff_at_threshold(kind, ctx_key)
-    raw_lr = np.asarray(raw_lr_list, dtype=float)
-    n = len(raw_lr_list)
 
-    if n - Eeff0 + pseudocount >= 0:
-        mu0 = 0.0
+    if mu0_override is not None:
+        mu0 = mu0_override
     else:
+        raw_lr = np.asarray(raw_lr_list, dtype=float)
+        n = len(raw_lr_list)
 
-        def g(mu):
-            with np.errstate(divide="ignore"):
-                return (
-                    np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
-                    - Eeff0
-                    + np.divide(pseudocount, mu)
-                )
+        if n - Eeff0 + pseudocount >= 0:
+            mu0 = 0.0
+        else:
 
-        mu0 = brentq(g, 0.0, 1.0)
+            def g(mu):
+                with np.errstate(divide="ignore"):
+                    return (
+                        np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
+                        - Eeff0
+                        + np.divide(pseudocount, mu)
+                    )
+
+            mu0 = brentq(g, 0.0, 1.0)
     new_threshold = _refine_channel(mu0, threshold0, fdr_thr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 

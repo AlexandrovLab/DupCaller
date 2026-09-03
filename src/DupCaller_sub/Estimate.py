@@ -7,7 +7,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 import sigProfilerPlotting as sigPlt
 from pysam import VariantFile as VCF, TabixFile
-from scipy.stats import chi2, barnard_exact
+from scipy.stats import gamma, barnard_exact
 import pysam
 from .funcs.misc import check_h5_usable
 from .funcs.misc import log_progress
@@ -238,54 +238,68 @@ def redistribute_indel_cov16_to_100(
         out100[label2num_100[f"ins{pool_base}_hp{ins_hp_label}"]] += ins_hp
 
 
-def poisson_confint(k, cov, alpha=0.05):
-    if cov == 0:
-        return float("nan"), float("nan")
-    low = chi2.ppf(alpha / 2, 2 * k) / 2
-    high = chi2.ppf(1 - alpha / 2, 2 * (k + 1)) / 2
-    if k == 0:
-        low = 0
-    return low / cov, high / cov
+def fay_feuer_confint(mut_counts, correction_ratio, cov, alpha=0.05):
+    """Fay-Feuer confidence interval (Fay & Feuer 1997) for a correction-
+    ratio-weighted ("corrected") mutation burden. A correction-ratio-
+    weighted sum of per-channel counts isn't itself Poisson-distributed
+    (channels are weighted unevenly), so a closed-form Poisson interval
+    isn't directly valid there -- but passing correction_ratio=1 (a scalar,
+    or an array of ones) recovers the *exact* classic Poisson/chi-square
+    interval as a special case (see the derivation below), so this one
+    function covers both the corrected burden's CI and the plain
+    "uncorrected"/unweighted one -- callers just pass mut_counts=k (the
+    total observed count, scalar or array) and correction_ratio=1.0.
 
+    Treats each channel's observed count as its own Poisson MLE (mean ==
+    variance == observed count), so the weighted sum Y = sum(w_i*count_i)
+    has mean y = sum(w_i*count_i) and variance v = sum(w_i^2*count_i); a
+    gamma(shape=y^2/v, scale=v/y) distribution matches those first two
+    moments -- the standard method behind age-standardized-rate CIs (e.g.
+    SEER*Stat), applied here with correction_ratio as the weights instead
+    of population-standardization weights. Fay & Feuer's upper-bound
+    correction (one hypothetical extra event in the largest-weight channel:
+    y* = y + w_max, v* = v + w_max^2) keeps the upper bound well-defined
+    and non-degenerate even at y == 0 -- unlike a Poisson(0)-based
+    parametric bootstrap, which is a point mass at 0 and can't produce a
+    nonzero upper bound there without ad hoc special-casing.
 
-def bootstrap_corrected_confint(
-    mut_counts, correction_ratio, cov, alpha=0.05, n_boot=10000, rng=None
-):
-    """Parametric-bootstrap CI for a correction-ratio-weighted ("corrected")
-    mutation burden -- replaces poisson_confint for corrected numbers,
-    whose exact chi-square formula assumes its count argument is a true
-    Poisson count. A correction-ratio-weighted sum of per-channel counts
-    no longer is one (channels are weighted unevenly by correction_ratio,
-    so their weighted sum isn't itself Poisson-distributed), which is
-    exactly why a closed-form Poisson interval isn't valid here.
+    With correction_ratio == 1 everywhere: y = v = k (all weights 1), so
+    the gamma(shape=y, scale=1) lower bound is exactly
+    chi2.ppf(alpha/2, 2k)/2 (a chi-square with 2k degrees of freedom is
+    2*Gamma(shape=k, scale=1)), and the upper bound (y*=v*=k+1) is exactly
+    chi2.ppf(1-alpha/2, 2*(k+1))/2 -- bit-for-bit the classic Clopper-
+    Pearson-style exact Poisson confidence interval, including its usual
+    k==0 convention (handled here by the y>0/y_star>0 guards below, since
+    gamma.ppf(alpha/2, a=0, ...) isn't well-defined).
 
-    Per draw: resample each channel's mutation count independently from
-    Poisson(observed count) -- equivalent to Poisson(rate * coverage),
-    since rate = observed_count / coverage -- then apply that draw to the
-    *same*, fixed correction_ratio and cov the point estimate itself uses
-    (only the per-channel counts vary draw to draw, not the correction
-    weights or the coverage denominator), sum, and divide by cov: the
-    same formula burden_corrected = mutnum_corrected.sum() / cov computes.
-    This lands the CI in the same units/scale as poisson_confint's own
-    return value, so any multiplier callers apply afterward (e.g.
-    do_estimate's indel_locus_multiplier) still applies identically to
-    both bounds without needing to know this is now a bootstrap CI.
-
-    mut_counts: (n_channels,) observed per-channel mutation counts.
-    correction_ratio: (n_channels,) fixed per-channel correction ratio.
+    mut_counts: (n_channels,) observed per-channel mutation counts, or a
+        scalar total count k (with correction_ratio=1.0) for a plain
+        (unweighted) Poisson-equivalent interval.
+    correction_ratio: (n_channels,) fixed per-channel correction ratio (the
+        weights), or the scalar 1.0 for an unweighted burden.
     cov: scalar coverage denominator (same one the point estimate divides
-        by), e.g. trinuc_cov.sum()/3 for SBS, indel_cov.sum() for indel.
+        by), e.g. trinuc_cov.sum()/3 for SBS, indel_cov.sum() for indel --
+        the returned bounds are pre-divided by it.
     """
     if cov <= 0:
         return float("nan"), float("nan")
-    if rng is None:
-        rng = np.random.default_rng()
     mut_counts = np.asarray(mut_counts, dtype=float)
     correction_ratio = np.asarray(correction_ratio, dtype=float)
-    draws = rng.poisson(mut_counts, size=(n_boot, mut_counts.shape[0]))
-    burden_draws = (draws @ correction_ratio) / cov
-    low, high = np.percentile(burden_draws, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    return float(low), float(high)
+    y = np.sum(correction_ratio * mut_counts)
+    v = np.sum(correction_ratio**2 * mut_counts)
+    w_max = float(correction_ratio.max()) if correction_ratio.size else 0.0
+
+    low = gamma.ppf(alpha / 2, a=y**2 / v, scale=v / y) if y > 0 else 0.0
+
+    y_star = y + w_max
+    v_star = v + w_max**2
+    high = (
+        gamma.ppf(1 - alpha / 2, a=y_star**2 / v_star, scale=v_star / y_star)
+        if y_star > 0
+        else 0.0
+    )
+
+    return float(low / cov), float(high / cov)
 
 
 def _dinuc_num(dinuc):
@@ -712,7 +726,7 @@ def _safe_correction_ratio(ref_counts, obs_counts):
         return np.where(obs_frac > 0, ref_frac / obs_frac, 0.0)
 
 
-def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=None):
+def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
     """Estimate SBS96 mutation rates with per-class correction ratios.
 
     trinuc_cov_96_by_rf : (96, n_groups) — per-SBS96-class L-weighted
@@ -755,14 +769,16 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=Non
     mutnum = trinuc_mut.sum()
     cov = trinuc_cov.sum() / 3  # divide by 3 to get per-locus-equivalent coverage
     burden_uncorrected[4] = mutnum / cov if cov > 0 else 0.0
-    burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
+    burden_uncorrected_lb[4], burden_uncorrected_ub[4] = fay_feuer_confint(
+        mutnum, 1.0, cov
+    )
     trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov)
     # Alt-base-specific correction: each of the 96 classes gets its own ratio
     correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov)
     mutnum_corrected = correction_ratio * trinuc_mut
     burden_corrected[4] = mutnum_corrected.sum() / cov if cov > 0 else 0.0
-    burden_corrected_lb[4], burden_corrected_ub[4] = bootstrap_corrected_confint(
-        trinuc_mut, correction_ratio, cov, rng=rng
+    burden_corrected_lb[4], burden_corrected_ub[4] = fay_feuer_confint(
+        trinuc_mut, correction_ratio, cov
     )
     hap_trinuc[:, 4] = trinuc_rate * ref_trinuc_96
     covs[4] = cov
@@ -773,9 +789,10 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=Non
         mutnum = trinuc_mut.sum()
         cov = trinuc_cov.sum() / 3
         burden_uncorrected[nn - 1] = mutnum / cov if cov > 0 else 0.0
-        burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
-            mutnum, cov
-        )
+        (
+            burden_uncorrected_lb[nn - 1],
+            burden_uncorrected_ub[nn - 1],
+        ) = fay_feuer_confint(mutnum, 1.0, cov)
         trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov)
         covs[nn - 1] = cov
         correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov)
@@ -784,7 +801,7 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=Non
         (
             burden_corrected_lb[nn - 1],
             burden_corrected_ub[nn - 1],
-        ) = bootstrap_corrected_confint(trinuc_mut, correction_ratio, cov, rng=rng)
+        ) = fay_feuer_confint(trinuc_mut, correction_ratio, cov)
         hap_trinuc[:, nn - 1] = trinuc_rate * ref_trinuc_96
 
     # Exact (non-cumulative) group-size bins: nmin==1,2,3,4, and nmin>=5 for
@@ -811,7 +828,7 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=Non
         (
             burden_uncorrected_exact_lb[nn - 1],
             burden_uncorrected_exact_ub[nn - 1],
-        ) = poisson_confint(mutnum_e, cov_e)
+        ) = fay_feuer_confint(mutnum_e, 1.0, cov_e)
         correction_ratio_e = _safe_correction_ratio(ref_trinuc_96, trinuc_cov_e)
         mutnum_corrected_e = (trinuc_mut_e * correction_ratio_e).sum()
         burden_corrected_exact[nn - 1] = (
@@ -820,16 +837,13 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n, rng=Non
         (
             burden_corrected_exact_lb[nn - 1],
             burden_corrected_exact_ub[nn - 1],
-        ) = bootstrap_corrected_confint(
-            trinuc_mut_e, correction_ratio_e, cov_e, rng=rng
-        )
+        ) = fay_feuer_confint(trinuc_mut_e, correction_ratio_e, cov_e)
 
-    # A channel with zero observed coverage (trinuc_cov, after subtracting
-    # each mutant locus from its own class's coverage above) already gets
-    # correction_ratio 0 (_safe_correction_ratio) -- but its raw
-    # (uncorrected) mutnum can still be nonzero, e.g. a class whose only
-    # covered locus is itself the mutant one, subtracted away to 0. Force
-    # it to 0 too, consistent with correction_ratio, so
+    # A channel with zero observed coverage already gets correction_ratio 0
+    # (_safe_correction_ratio) -- this guard keeps mutnum consistent with
+    # that in the same (now-rare, since coverage no longer excludes mutant
+    # loci) case, e.g. a mask/region change made a channel's only-ever-
+    # covered locus retroactively uncovered. Force it to 0 too, so
     # "mutation_number_uncorrected" never shows a mutation count with no
     # observed genome behind it.
     # 0 (not 0.0): trinuc_mut is int-dtype (mutation counts); np.where with
@@ -1064,7 +1078,7 @@ def _grouped_indel83_correction_ratio(ref_frac, obs_frac):
     return ratio
 
 
-def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=None):
+def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
     """ID83-resolution counterpart of estimate_indel76 above: identical
     read-depth-stratified (nmin) burden/correction machinery, except the
     correction ratio for the 11 microhomology channels (72-82) is grouped
@@ -1091,15 +1105,17 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=N
     mutnum = indel_mut.sum()
     cov = indel_cov.sum()
     burden_uncorrected[4] = mutnum / cov if cov > 0 else float("nan")
-    burden_uncorrected_lb[4], burden_uncorrected_ub[4] = poisson_confint(mutnum, cov)
+    burden_uncorrected_lb[4], burden_uncorrected_ub[4] = fay_feuer_confint(
+        mutnum, 1.0, cov
+    )
     indel_rate = _safe_rate(indel_mut, indel_cov)
     with np.errstate(divide="ignore", invalid="ignore"):
         obs_frac = indel_cov / indel_cov.sum()
     correction_ratio = _grouped_indel83_correction_ratio(ref_frac, obs_frac)
     mutnum_corrected = correction_ratio * indel_mut
     burden_corrected[4] = mutnum_corrected.sum() / cov if cov > 0 else float("nan")
-    burden_corrected_lb[4], burden_corrected_ub[4] = bootstrap_corrected_confint(
-        indel_mut, correction_ratio, cov, rng=rng
+    burden_corrected_lb[4], burden_corrected_ub[4] = fay_feuer_confint(
+        indel_mut, correction_ratio, cov
     )
     hap_indel83[:, 4] = indel_rate * ref_indel83
     covs[4] = cov
@@ -1110,9 +1126,10 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=N
         mutnum = indel_mut.sum()
         cov = indel_cov.sum()
         burden_uncorrected[nn - 1] = mutnum / cov if cov > 0 else float("nan")
-        burden_uncorrected_lb[nn - 1], burden_uncorrected_ub[nn - 1] = poisson_confint(
-            mutnum, cov
-        )
+        (
+            burden_uncorrected_lb[nn - 1],
+            burden_uncorrected_ub[nn - 1],
+        ) = fay_feuer_confint(mutnum, 1.0, cov)
         indel_rate = _safe_rate(indel_mut, indel_cov)
         covs[nn - 1] = cov
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -1125,7 +1142,7 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=N
         (
             burden_corrected_lb[nn - 1],
             burden_corrected_ub[nn - 1],
-        ) = bootstrap_corrected_confint(indel_mut, correction_ratio, cov, rng=rng)
+        ) = fay_feuer_confint(indel_mut, correction_ratio, cov)
         hap_indel83[:, nn - 1] = indel_rate * ref_indel83
 
     # Exact (non-cumulative) group-size bins -- see estimate_96's matching
@@ -1150,7 +1167,7 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=N
         (
             burden_uncorrected_exact_lb[nn - 1],
             burden_uncorrected_exact_ub[nn - 1],
-        ) = poisson_confint(mutnum_e, cov_e)
+        ) = fay_feuer_confint(mutnum_e, 1.0, cov_e)
         with np.errstate(divide="ignore", invalid="ignore"):
             obs_frac_e = indel_cov_e / indel_cov_e.sum()
         correction_ratio_e = _grouped_indel83_correction_ratio(ref_frac, obs_frac_e)
@@ -1161,12 +1178,12 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n, rng=N
         (
             burden_corrected_exact_lb[nn - 1],
             burden_corrected_exact_ub[nn - 1],
-        ) = bootstrap_corrected_confint(indel_mut_e, correction_ratio_e, cov_e, rng=rng)
+        ) = fay_feuer_confint(indel_mut_e, correction_ratio_e, cov_e)
 
     # See estimate_96's matching comment: a channel with zero observed
-    # coverage (indel_cov, after subtracting each mutant locus from its own
-    # class's coverage upstream) already gets correction_ratio 0, but its
-    # raw mutnum can still be nonzero -- force it to 0 too.
+    # coverage already gets correction_ratio 0, but its raw mutnum can
+    # still be nonzero (e.g. a mask/region change made its only-ever-
+    # covered locus retroactively uncovered) -- force it to 0 too.
     # 0, not 0.0 -- see estimate_96's matching comment (preserve int dtype).
     indel_mut = np.where(indel_cov > 0, indel_mut, 0)
 
@@ -1242,7 +1259,7 @@ def _dbs78_ref_weighted(dinuc_count_16):
     return combine_raw_dbs_to_dbs78(raw144, DBS_RAW144_LABEL2NUM)
 
 
-def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=None):
+def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
     """Estimate DBS78 mutation rate and per-class correction ratios: one
     whole-sample figure, no group-size breakdown (see estimate_dbs78_by_group
     below for that).
@@ -1266,13 +1283,13 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=None):
     cov = dbs_opp_78.sum() / 9
     mutnum = dbs_mut_78.sum()
     burden_uncorrected = mutnum / cov if cov > 0 else float("nan")
-    burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(mutnum, cov)
+    burden_uncorrected_lb, burden_uncorrected_ub = fay_feuer_confint(mutnum, 1.0, cov)
 
     correction_ratio = _safe_correction_ratio(ref_dbs_78, dbs_opp_78)
     mutnum_corrected = correction_ratio * dbs_mut_78
     burden_corrected = mutnum_corrected.sum() / cov if cov > 0 else float("nan")
-    burden_corrected_lb, burden_corrected_ub = bootstrap_corrected_confint(
-        dbs_mut_78, correction_ratio, cov, rng=rng
+    burden_corrected_lb, burden_corrected_ub = fay_feuer_confint(
+        dbs_mut_78, correction_ratio, cov
     )
 
     # See estimate_96's matching comment: a channel with zero observed
@@ -1295,7 +1312,7 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=None):
     )
 
 
-def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n, rng=None):
+def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n):
     """Group-size-stratified DBS78 burden — the DBS counterpart of
     estimate_96/estimate_indel83's cumulative ("at least this group size")
     and exact ("at exactly this group size") curves, using
@@ -1327,11 +1344,11 @@ def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n, rng=
         cov = opp78.sum() / 9
         mutnum = mut78.sum()
         uncorrected = mutnum / cov if cov > 0 else 0.0
-        u_lb, u_ub = poisson_confint(mutnum, cov)
+        u_lb, u_ub = fay_feuer_confint(mutnum, 1.0, cov)
         correction_ratio = _safe_correction_ratio(ref_dbs_78, opp78)
         mutnum_corrected = (correction_ratio * mut78).sum()
         corrected = mutnum_corrected / cov if cov > 0 else 0.0
-        c_lb, c_ub = bootstrap_corrected_confint(mut78, correction_ratio, cov, rng=rng)
+        c_lb, c_ub = fay_feuer_confint(mut78, correction_ratio, cov)
         return uncorrected, u_lb, u_ub, corrected, c_lb, c_ub, cov
 
     def _five_point_curve(sel_fn):
@@ -1381,14 +1398,16 @@ def estimate_id(trinuc_cov_by_rf, muts_by_rf, n):
     mutnum = muts_by_rf[:, nmin >= 5].sum(axis=1).sum()
     cov = trinuc_cov.sum() / 3
     burden_indel[4] = mutnum / cov
-    burden_indel_lb[4], burden_indel_ub[4] = poisson_confint(mutnum, cov)
+    burden_indel_lb[4], burden_indel_ub[4] = fay_feuer_confint(mutnum, 1.0, cov)
     # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     for nn in range(4, 0, -1):
         trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
         mutnum = muts_by_rf[:, nmin >= nn].sum(axis=1).sum()
         cov = trinuc_cov.sum() / 3
         burden_indel[nn - 1] = mutnum / cov
-        burden_indel_lb[nn - 1], burden_indel_ub[nn - 1] = poisson_confint(mutnum, cov)
+        burden_indel_lb[nn - 1], burden_indel_ub[nn - 1] = fay_feuer_confint(
+            mutnum, 1.0, cov
+        )
 
     return (burden_indel, burden_indel_lb, burden_indel_ub, mutnum)
 
@@ -1521,14 +1540,28 @@ def write_burden_by_group_size(
     plt.close(fig)
 
 
-def do_estimate(args):
-    # If --seed wasn't passed, generate one and write it back onto args so
-    # every bootstrap_corrected_confint call shares one rng and the actual
-    # seed used gets recorded in the resolved-parameters log below.
-    if args.seed is None:
-        args.seed = int(np.random.SeedSequence().generate_state(1)[0])
-    rng = np.random.default_rng(args.seed)
+def write_genome_extrapolation(f, point, lb, ub, scale):
+    """Write the shared 3-line genome-wide-extrapolation block ("Mutation
+    number per genome" + 95% lower/upper) common to every _*_burden.txt /
+    _*_burden_re_estimate.txt writer below.
 
+    point/lb/ub: the already-computed corrected burden (and its Fay-Feuer
+        CI bounds), in whatever per-locus units that file's own burden
+        lines use (already combined with any locus_multiplier the caller
+        needs -- e.g. indel's indel_locus_multiplier -- before calling
+        this).
+    scale: total reference base count to extrapolate to (this file's own
+        reference_base_number/genome_cov) -- a genuine genome-wide
+        extrapolation, larger than the plain corrected mutation number
+        since it's scaled to the total considered reference footprint, not
+        just the effective duplex-covered subset.
+    """
+    f.write(f"Mutation number per genome\t{point * scale}\n")
+    f.write(f"Mutation number per genome 95% lower\t{lb * scale}\n")
+    f.write(f"Mutation number per genome 95% upper\t{ub * scale}\n")
+
+
+def do_estimate(args):
     log_path = args.prefix + "_estimate_params.log"
     with open(log_path, "w") as log:
         log.write("DupCaller estimate — parameter log\n")
@@ -1686,8 +1719,8 @@ def do_estimate(args):
             if unmasked_cov > 0
             else float("nan")
         )
-        unmasked_sbs_burden_lb, unmasked_sbs_burden_ub = poisson_confint(
-            unmasked_mut_count, unmasked_cov
+        unmasked_sbs_burden_lb, unmasked_sbs_burden_ub = fay_feuer_confint(
+            unmasked_mut_count, 1.0, unmasked_cov
         )
         snv_progress = {"start": time.time(), "last": time.time()}
         for i, rec in enumerate(vcf.fetch()):
@@ -1743,20 +1776,23 @@ def do_estimate(args):
                 alt = revcomp[raw_alt]
             trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
             # Skip the SBS96 numerator for a DBS-forming position (already
-            # counted once in dbs_mut_78 above) — but still subtract it from
-            # the raw (un-folded) (trinuc, alt) coverage cell below: the
-            # locus genuinely isn't non-mutant coverage either way, it's
-            # just categorized as a DBS event rather than an SBS one.
+            # counted once in dbs_mut_78 above) -- avoids double-reporting
+            # the same physical event as both 1 DBS event and 1 SBS
+            # mutation. Its coverage cell is deliberately left untouched:
+            # per-locus coverage (trinuc_by_rf_np, from cov_mat in
+            # funcs/prob.py) is a fixed examined-opportunity value -- a
+            # function of read depth/orientation and the reference
+            # trinucleotide context only, never of the base actually
+            # observed there -- so a mutant (or DBS-forming) locus's own
+            # coverage contribution is no different from any other examined
+            # locus's, and belongs in the denominator exactly like every
+            # other examined locus: burden = mutations / all examined loci
+            # for that channel, not mutations / (examined loci minus the
+            # mutations themselves).
             if (chrom, pos) not in dbs_snv_positions:
                 trinuc_mut_np[
                     TRINUCSBS2NUM_96[trinucSbs], duplex_no_dict[duplex_no]
                 ] += 1
-            # Subtract from the raw (un-folded) (trinuc, alt) coverage cell —
-            # using the mutation's actual, as-reported orientation, not the
-            # pyrimidine-folded one — so this mutant locus isn't also
-            # counted as effective non-mutant coverage.
-            raw_idx_192 = label2num_192[f"{raw_trinuc}>{raw_alt}"]
-            trinuc_by_rf_np[raw_idx_192, duplex_no_dict[duplex_no]] -= 1
 
         print("......Estimating mutational burden and SBS96 profile........")
         trinuc_cov_96_by_rf = combine_raw192_to_sbs96(trinuc_by_rf_np, label2num_192)
@@ -1786,7 +1822,6 @@ def do_estimate(args):
             trinuc_mut_np,
             ref_trinuc,
             trinuc_by_rf.columns,
-            rng=rng,
         )
         # Total reference bases actually considered (non-N, non-noise-
         # masked) across args.regions -- ref_trinuc.sum() (all 64 raw,
@@ -1871,7 +1906,9 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{burden_lb[0]}\n")
             f.write(f"Corrected burden 95% upper\t{burden_ub[0]}\n")
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
-            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
+            write_genome_extrapolation(
+                f, burden[0], burden_lb[0], burden_ub[0], reference_base_number
+            )
             # Effective coverage at min_group_size=1 (cov_by_minread[0], the
             # same cumulative "at least 1 read on each strand" figure as
             # _sbs_burden_by_group_size.txt's min_group_size=1 row) rather
@@ -2010,8 +2047,8 @@ def do_estimate(args):
             if unmasked_indel_cov > 0
             else float("nan")
         )
-        unmasked_indel_burden_lb, unmasked_indel_burden_ub = poisson_confint(
-            unmasked_indel_count, unmasked_indel_cov
+        unmasked_indel_burden_lb, unmasked_indel_burden_ub = fay_feuer_confint(
+            unmasked_indel_count, 1.0, unmasked_indel_cov
         )
 
         print("......Estimating indel83 profile and corrected burden........")
@@ -2033,12 +2070,11 @@ def do_estimate(args):
         ref_indel83 = override_inshp0_with_next_base_opportunity(
             ref_indel83, ref_indel100
         )
-        # Subtract each observed mutant locus from its own channel's
-        # coverage so it isn't also counted as effective non-mutant
-        # coverage — mirrors the same step for SNVs above, just applied
-        # after folding/expansion since the mutation side and the coverage
-        # side are no longer classified at the same raw resolution.
-        indel83_cov_by_rf = indel83_cov_by_rf - indel83_mut_np
+        # A mutant locus's own coverage is intentionally left in
+        # indel83_cov_by_rf (not subtracted) -- see the matching comment in
+        # the SNV loop above: coverage is a fixed examined-opportunity
+        # value, independent of whether the locus turned out mutant, so it
+        # belongs in the denominator like every other examined locus.
         (
             indel_mut,
             indel_mut_corrected,
@@ -2065,7 +2101,6 @@ def do_estimate(args):
             indel83_mut_np,
             ref_indel83,
             indel100_by_rf.columns,
-            rng=rng,
         )
         indel83_corrected_pd = pd.DataFrame(
             np.stack(
@@ -2196,7 +2231,17 @@ def do_estimate(args):
                 f"{indel_burden_corrected_ub[0] * indel_locus_multiplier}\n"
             )
             f.write(f"Corrected mutation number\t{indel_mut_corrected.sum()}\n")
-            f.write(f"Corrected mutation number\t{indel_mut_corrected.sum()}\n")
+            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
+            # corrected per-locus burden (already rescaled by
+            # indel_locus_multiplier above) times the total considered
+            # reference bases.
+            write_genome_extrapolation(
+                f,
+                indel_burden_corrected[0],
+                indel_burden_corrected_lb[0],
+                indel_burden_corrected_ub[0],
+                indel_locus_multiplier * reference_base_number,
+            )
             # Effective coverage at min_group_size=1, rescaled to the same
             # per-reference-locus units as the burden values above (see
             # indel_locus_multiplier comment above) -- matches
@@ -2241,7 +2286,7 @@ def do_estimate(args):
             dbs_burden_uncorrected_lb,
             dbs_burden_uncorrected_ub,
             dbs_cov,
-        ) = estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78, rng=rng)
+        ) = estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78)
 
         dbs78_corrected_pd = pd.DataFrame(
             np.stack(
@@ -2295,7 +2340,7 @@ def do_estimate(args):
             dbs_burden_corrected_exact_ub,
             dbs_cov_by_exact_group,
         ) = estimate_dbs78_by_group(
-            dbs_mut_by_rf, dbs144_by_rf_np, ref_dbs_78, dbs144_by_rf.columns, rng=rng
+            dbs_mut_by_rf, dbs144_by_rf_np, ref_dbs_78, dbs144_by_rf.columns
         )
         write_burden_by_group_size(
             dbs_dir,
@@ -2331,7 +2376,16 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{dbs_burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{dbs_burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{dbs_mut_corrected.sum()}\n")
-            f.write(f"Corrected mutation number\t{dbs_mut_corrected.sum()}\n")
+            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
+            # corrected per-base burden times the total considered reference
+            # bases.
+            write_genome_extrapolation(
+                f,
+                dbs_burden_corrected,
+                dbs_burden_corrected_lb,
+                dbs_burden_corrected_ub,
+                reference_base_number,
+            )
             # Effective coverage at min_group_size=1 (dbs_cov_by_minread[0],
             # matching _dbs_burden_by_group_size.txt's min_group_size=1 row)
             # rather than the reference genome's raw dinucleotide total
@@ -2673,14 +2727,16 @@ def do_estimate(args):
         mutnum = trinuc_mut.sum()
         cov = trinuc_cov_96.sum() / 3  # per-locus-equivalent coverage
         burden_uncorrected = mutnum / cov
-        burden_uncorrected_lb, burden_uncorrected_ub = poisson_confint(mutnum, cov)
+        burden_uncorrected_lb, burden_uncorrected_ub = fay_feuer_confint(
+            mutnum, 1.0, cov
+        )
         trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov_96)
         # Per-SBS96-class correction ratio — no np.repeat needed
         correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov_96)
         mutnum_corrected = correction_ratio * trinuc_mut
         burden_corrected = mutnum_corrected.sum() / cov
-        burden_corrected_lb, burden_corrected_ub = bootstrap_corrected_confint(
-            trinuc_mut, correction_ratio, cov, rng=rng
+        burden_corrected_lb, burden_corrected_ub = fay_feuer_confint(
+            trinuc_mut, correction_ratio, cov
         )
         hap_trinuc = trinuc_rate * ref_trinuc_96
 
@@ -2693,7 +2749,16 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
-            f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
+            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
+            # corrected per-base burden times the total considered reference
+            # bases.
+            write_genome_extrapolation(
+                f,
+                burden_corrected,
+                burden_corrected_lb,
+                burden_corrected_ub,
+                genome_cov,
+            )
             # cov (per-locus-equivalent duplex coverage, the actual burden
             # denominator above), not genome_cov/ref_trinuc_sum -- this
             # block has no cov_by_minread breakdown the way the main
@@ -2718,10 +2783,9 @@ def do_estimate(args):
         indel_cov83_re = override_inshp0_with_next_base_opportunity(
             indel_cov83_re, indel_cov100_re
         )
-        # Subtract each observed mutant locus from its own channel's
-        # coverage, mirroring the main pipeline's indel83_cov_by_rf -
-        # indel83_mut_np step above.
-        indel_cov83_re = indel_cov83_re - indel_mut83_re
+        # A mutant locus's own coverage is intentionally left in
+        # indel_cov83_re (not subtracted) -- mirrors the main pipeline's
+        # indel83_cov_by_rf above.
 
         # indel_cov83_re.sum() is per opportunity-CHANNEL, not per locus
         # (one locus can count toward several ID83 channels at once) --
@@ -2742,7 +2806,7 @@ def do_estimate(args):
         (
             indel_burden_re_uncorrected_lb,
             indel_burden_re_uncorrected_ub,
-        ) = poisson_confint(indel_count, indel_cov_total)
+        ) = fay_feuer_confint(indel_count, 1.0, indel_cov_total)
         indel_burden_re_uncorrected_lb *= indel_locus_multiplier_re
         indel_burden_re_uncorrected_ub *= indel_locus_multiplier_re
 
@@ -2764,8 +2828,8 @@ def do_estimate(args):
         (
             indel_burden_re_corrected_lb,
             indel_burden_re_corrected_ub,
-        ) = bootstrap_corrected_confint(
-            indel_mut83_re, indel_correction_ratio83_re, indel_cov_total, rng=rng
+        ) = fay_feuer_confint(
+            indel_mut83_re, indel_correction_ratio83_re, indel_cov_total
         )
         indel_burden_re_corrected_lb *= indel_locus_multiplier_re
         indel_burden_re_corrected_ub *= indel_locus_multiplier_re
@@ -2786,6 +2850,19 @@ def do_estimate(args):
                 f"Corrected indel burden 95% upper\t{indel_burden_re_corrected_ub}\n"
             )
             f.write(f"Corrected indel number\t{indel_mutnum_corrected}\n")
+            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
+            # corrected per-locus burden (already in per-reference-locus
+            # units via indel_locus_multiplier_re above) times the total
+            # considered reference bases (genome_cov == ref_trinuc.sum(),
+            # the same denominator indel_locus_multiplier_re was scaled
+            # against).
+            write_genome_extrapolation(
+                f,
+                indel_burden_re_corrected,
+                indel_burden_re_corrected_lb,
+                indel_burden_re_corrected_ub,
+                genome_cov,
+            )
             f.write(f"Indel coverage\t{indel_cov_total}\n")
         corrected_trinuc_pd = pd.DataFrame(
             np.stack(

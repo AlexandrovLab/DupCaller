@@ -46,6 +46,52 @@ import pysam
 # below in do_call.
 
 
+def _load_mutation_rate_override(prefix):
+    """Load a previously-computed per-channel mutation-rate table pair --
+    {prefix}_sbs96_rate_n1.txt and {prefix}_indel_rate_by_hp_str.txt, the
+    exact two files do_call's own refine step writes out every run (see
+    sbs96_rate_n1/indel_rate_by_hp_str below) -- into one
+    {channel_name: mutation_rate_mle} dict, keyed by the same job-name
+    strings used throughout do_call (sbs_jobs/indel_jobs, channel_
+    final_mu, channel_thresholds). Used by -mr/--muterateprefix so a call
+    over a small region (e.g. --rescue debugging of a single locus) can
+    reuse a full genome-wide run's own per-channel mutation-rate (mu0)
+    estimates instead of re-deriving noisy ones from just the small
+    region's own tiny candidate count/coverage -- see refine_channel_task
+    (funcs/misc.py) for where the override value is actually substituted.
+
+    The SBS table's own "context" column already IS the job-name string
+    (e.g. "SBS96:A[C>A]A"). The indel table's "context"/"indel_length"
+    columns don't carry the full name directly -- reconstructed here from
+    the exact same naming convention indel_jobs below builds it with
+    (name == "STR0_len1" for the mismatched-insertion background,
+    "HP{hp_len}_len{id_len}_{pool}" for homopolymer channels,
+    "STR{str_bin}_len{id_len}" for STR-length channels).
+    """
+    sbs_table = pd.read_csv(prefix + "_sbs96_rate_n1.txt", sep="\t")
+    indel_table = pd.read_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t")
+    override = dict(zip(sbs_table["context"], sbs_table["mutation_rate_mle"]))
+    for context, indel_length, mu0 in zip(
+        indel_table["context"],
+        indel_table["indel_length"],
+        indel_table["mutation_rate_mle"],
+    ):
+        if context == "STR0" and indel_length == 1:
+            name = "STR0_len1"
+        elif context.startswith("HP"):
+            hp_len_str, pool = context[2:].rsplit("_", 1)
+            name = f"HP{hp_len_str}_len{indel_length}_{pool}"
+        elif context.startswith("STR"):
+            name = f"{context}_len{indel_length}"
+        else:
+            raise ValueError(
+                f"unrecognized indel mutation-rate-table context {context!r} "
+                f"in {prefix}_indel_rate_by_hp_str.txt"
+            )
+        override[name] = mu0
+    return override
+
+
 def check_input_files_exist(args):
     """
     Check if all required input files exist and exit gracefully if not.
@@ -126,6 +172,16 @@ def check_input_files_exist(args):
             path = args.errprefix + suffix
             if not os.path.exists(path):
                 missing_files.append(f"{label} (from -E): {path}")
+
+    # Check optional mutation-rate override table pair
+    if args.muterateprefix:
+        for suffix, label in [
+            ("_sbs96_rate_n1.txt", "SBS96 mutation-rate table"),
+            ("_indel_rate_by_hp_str.txt", "Indel mutation-rate table"),
+        ]:
+            path = args.muterateprefix + suffix
+            if not os.path.exists(path):
+                missing_files.append(f"{label} (from -mr): {path}")
 
     # If any files are missing, print error and exit
     if missing_files:
@@ -822,19 +878,19 @@ def do_call(args):
     }
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
-        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the *_rescued reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
+        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
         "underpowered": "Passed the default calling threshold but failed the FDR-refined per-channel threshold",
-        "high_nm": "Read family kept under --rescue despite failing the NM/blacklist filter",
-        "low_mapq": "Read family kept under --rescue despite failing the mapq filter",
-        "low_ASXS": "Read family kept under --rescue despite failing the AS-XS filter",
-        "ncov_rescued": "Mutation kept under --rescue despite failing the coverage-depth mask; no coverage/depth extracted",
-        "nm_rescued": "Mutation kept under --rescue despite failing the per-family NM mask at this position; no coverage/depth extracted",
-        "trim_rescued": "Mutation kept under --rescue despite falling in the read-end trim zone; no coverage/depth extracted",
-        "indelregion_rescued": "Indel kept under --rescue despite failing indel_mask; no coverage/depth extracted",
-        "masked_rescued": "Mutation kept under --rescue despite failing a mask not covered by a more specific *_rescued reason above; no coverage/depth extracted",
-        "duplex_vaf": "Kept under --rescue despite the extracted tumor allele fraction (AC/DP) exceeding --maxAF -- real AC/RC/DP attached",
-        "normal_vaf": "Kept under --rescue despite the extracted matched-normal allele fraction exceeding --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached",
-        "n_cov_mask": "Kept under --rescue despite matched-normal depth at this position falling below --minNdepth once real depth was extracted -- real AC/RC/DP attached",
+        "high_nm": "Read family failed the NM/blacklist filter -- only reported under --rescue",
+        "low_mapq": "Read family failed the mapq filter -- only reported under --rescue",
+        "low_ASXS": "Read family failed the AS-XS filter -- only reported under --rescue",
+        "cov_mask": "Blocked by the coverage-depth mask (n_cov_mask); no coverage/depth extracted -- only reported under --rescue",
+        "nm_mask": "Blocked by the per-family NM mask at this position; no coverage/depth extracted -- only reported under --rescue",
+        "trim_mask": "Falls in the read-end trim zone; no coverage/depth extracted -- only reported under --rescue",
+        "indel_mask": "Indel blocked by indel_mask; no coverage/depth extracted -- only reported under --rescue",
+        "other_mask": "Blocked by a mask not covered by a more specific reason above; no coverage/depth extracted -- only reported under --rescue",
+        "duplex_vaf": "The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue",
+        "normal_vaf": "The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue",
+        "n_cov_mask": "Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue",
     }
 
     # Each mutation type gets its own SBS/INDEL/DBS subfolder (matching
@@ -919,6 +975,26 @@ def do_call(args):
     # trinuc-derived) also moved to after round 2, alongside the other
     # duplex-group report files.
 
+    # -mr/--muterateprefix: reuse a previously-computed per-channel
+    # mutation-rate (mu0) table instead of solving mu0 fresh from this
+    # run's own round-1 candidates/coverage below -- see
+    # _load_mutation_rate_override's own docstring for why (small-region
+    # runs, e.g. --rescue debugging of a single locus, otherwise get a
+    # noisy, run-specific mu0 that can flip a PASS/underpowered verdict
+    # relative to a full genome-wide production run over the same
+    # locus/evidence). validate_override below fails loudly if the
+    # supplied table is missing any channel this run's own job list
+    # expects, rather than silently falling back to a fresh solve for
+    # just that channel.
+    mu0_override_table = (
+        _load_mutation_rate_override(args.muterateprefix)
+        if args.muterateprefix
+        else None
+    )
+
+    def _mu0_for(name):
+        return mu0_override_table.get(name) if mu0_override_table is not None else None
+
     # SBS-96 mutation rate per channel (mutnum/Eeff/mutation_rate_mle),
     # written out below alongside indel_rate_by_hp_str once sbs_results is
     # available -- same columns/source (the per-channel brentq/pseudocount
@@ -963,6 +1039,7 @@ def do_call(args):
                 params["pcutoff"],
                 args.lfdrThreshold,
                 args.pseudocount,
+                _mu0_for(f"SBS96:{label}"),
             )
         )
 
@@ -1069,6 +1146,7 @@ def do_call(args):
             _indel_ctx_threshold(0, 0, 1),
             args.lfdrThreshold,
             args.pseudocount,
+            _mu0_for("STR0_len1"),
         )
     ]
     for hp_len in range(1, 11):
@@ -1084,6 +1162,7 @@ def do_call(args):
                         threshold0,
                         args.lfdrThreshold,
                         args.pseudocount,
+                        _mu0_for(f"HP{hp_len}_len{id_len}_{pool}"),
                     )
                 )
     for str_bin in range(0, 5):
@@ -1098,6 +1177,7 @@ def do_call(args):
                     threshold0,
                     args.lfdrThreshold,
                     args.pseudocount,
+                    _mu0_for(f"STR{str_bin}_len{id_len}"),
                 )
             )
 
@@ -1120,6 +1200,16 @@ def do_call(args):
     # args.threads to match what -p promises the user (same as round 1/
     # round 2's pools -- all four Pool() calls in this file are capped at
     # args.threads rather than left to default to os.cpu_count()).
+    if mu0_override_table is not None:
+        all_job_names = {job[0] for job in sbs_jobs + indel_jobs}
+        missing = sorted(all_job_names - mu0_override_table.keys())
+        if missing:
+            raise ValueError(
+                f"-mr/--muterateprefix table {args.muterateprefix!r} is missing "
+                f"{len(missing)} channel(s) this run expects (e.g. "
+                f"{missing[:5]}) -- likely a stale or mismatched-version table; "
+                "regenerate it from a full run with the current DupCaller version."
+            )
     refine_pool = Pool(
         args.threads,
         initializer=init_refine_worker,
@@ -1294,11 +1384,12 @@ def do_call(args):
     # NOISEM is always set on every record reaching this check -- the
     # eligibility rule is purely LR>=threshold and (SNPM or NOISEM),
     # independent of --rescue. --rescue is a separate, earlier concern in
-    # call.py: it only controls whether *_rescued-labeled records (a
-    # different filter value entirely, for candidates blocked by n_cov/nm/
-    # trim/indel_mask) are emitted into the output VCF at all -- those
-    # never get real depth either way, regardless of rescue, per rescue's
-    # own "no depth" semantics.
+    # call.py: it only controls whether cov_mask/nm_mask/trim_mask/
+    # indel_mask/other_mask-labeled records (a different filter value
+    # entirely, for candidates blocked by n_cov/nm/trim/indel_mask) are
+    # emitted into the output VCF at all -- those never get real depth
+    # either way, regardless of rescue, per rescue's own "no depth"
+    # semantics.
     def _mut_key(m):
         return (m["chrom"], m["pos"], m["ref"], m["alt"])
 

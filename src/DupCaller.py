@@ -115,6 +115,21 @@ if __name__ == "__main__":
         default=0.05,
     )
     call_parser.add_argument(
+        "-mr",
+        "--muterateprefix",
+        type=str,
+        help="prefix for a previously-computed per-channel mutation-rate table pair "
+        "({prefix}_sbs96_rate_n1.txt, {prefix}_indel_rate_by_hp_str.txt) -- the exact "
+        "files this same command writes out itself every run. Overrides this run's own "
+        "round-1 per-channel mutation-rate (mu0) estimate with the supplied one instead "
+        "of re-deriving it from just this run's own candidates/coverage, so a call over "
+        "a small region (e.g. --rescue debugging of a single locus) can reuse a full "
+        "genome-wide run's mutation-rate estimates rather than noisy small-region ones. "
+        "Each channel's LR threshold is still solved fresh against this run's own "
+        "-lfdr/--lfdrThreshold using the supplied mutation rate",
+        default=None,
+    )
+    call_parser.add_argument(
         "-a",
         "--pseudocount",
         type=float,
@@ -421,6 +436,15 @@ if __name__ == "__main__":
         help="file with one error file prefix per line",
     )
     aggregate_parser.add_argument("-o", "--output", type=str, help="output filename")
+    aggregate_parser.add_argument(
+        "-a",
+        "--pseudocount",
+        type=float,
+        help="regularization pseudocount for the SBS single-read-damage (SRD) rate "
+        "matrix EM re-fit on the aggregated BQ histogram (same convention as learn's "
+        "-a/--pseudocount)",
+        default=0.5,
+    )
 
     estimate_parser = subparsers.add_parser(
         "estimate", help="Estimate mutation rate and SBS96 from results"
@@ -487,16 +511,6 @@ if __name__ == "__main__":
         help="re-estimate bed file, if burden re-estimation is needed",
         default=None,
     )
-    estimate_parser.add_argument(
-        "--seed",
-        type=int,
-        help="RNG seed for the parametric-bootstrap confidence intervals on corrected "
-        "mutation burden, so results are reproducible across repeated runs. If not set, "
-        "a random seed is generated and recorded in the run's _estimate_params.log for "
-        "later reuse",
-        default=None,
-    )
-
     summarize_parser = subparsers.add_parser(
         "summarize", help="Summarize results from multiple samples"
     )

@@ -45,17 +45,17 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 
 | Value | Meaning |
 | --- | --- |
-| `high_nm` | Read family kept under `--rescue` despite failing the NM/blacklist filter. |
-| `low_mapq` | Read family kept under `--rescue` despite failing the mapq filter. |
-| `low_ASXS` | Read family kept under `--rescue` despite failing the AS-XS filter. |
-| `ncov_rescued` | Kept under `--rescue` despite failing the coverage-depth mask; no coverage/depth extracted. |
-| `nm_rescued` | Kept under `--rescue` despite failing the per-family NM mask at this position; no coverage/depth extracted. |
-| `trim_rescued` | Kept under `--rescue` despite falling in the read-end trim zone; no coverage/depth extracted. |
-| `indelregion_rescued` | Indel kept under `--rescue` despite failing `indel_mask`; no coverage/depth extracted. |
-| `masked_rescued` | Kept under `--rescue` despite failing a mask type not covered by a more specific `*_rescued` reason above; no coverage/depth extracted. |
-| `duplex_vaf` | Kept under `--rescue` despite the extracted tumor allele fraction (AC/DP) exceeding `--maxAF` — real AC/RC/DP attached. |
-| `normal_vaf` | Kept under `--rescue` despite the extracted matched-normal allele fraction exceeding `--naf` (likely germline or a systematic artifact) — real AC/RC/DP attached. |
-| `n_cov_mask` | Kept under `--rescue` despite matched-normal depth at this position falling below `--minNdepth` once real depth was extracted — real AC/RC/DP attached. |
+| `high_nm` | Read family failed the NM/blacklist filter. |
+| `low_mapq` | Read family failed the mapq filter. |
+| `low_ASXS` | Read family failed the AS-XS filter. |
+| `cov_mask` | Blocked by the coverage-depth mask (`n_cov_mask`); no coverage/depth extracted. |
+| `nm_mask` | Blocked by the per-family NM mask at this position; no coverage/depth extracted. |
+| `trim_mask` | Falls in the read-end trim zone; no coverage/depth extracted. |
+| `indel_mask` | Indel blocked by `indel_mask`; no coverage/depth extracted. |
+| `other_mask` | Blocked by a mask type not covered by a more specific reason above; no coverage/depth extracted. |
+| `duplex_vaf` | The extracted tumor allele fraction (AC/DP) exceeds `--maxAF` — real AC/RC/DP attached. |
+| `normal_vaf` | The extracted matched-normal allele fraction exceeds `--naf` (likely germline or a systematic artifact) — real AC/RC/DP attached. |
+| `n_cov_mask` | Matched-normal depth at this position fell below `--minNdepth` once real depth was extracted — real AC/RC/DP attached. |
 
 ### INFO fields — SBS and INDEL records
 

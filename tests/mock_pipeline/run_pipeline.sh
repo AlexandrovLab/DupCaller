@@ -50,6 +50,6 @@ echo "[5/6] call"
     -r mockchr1 -p 1 -w 5000 --seed 1
 
 echo "[6/6] estimate"
-"$DUPCALLER" estimate -i result/result -f reference.fa -r mockchr1 --seed 1
+"$DUPCALLER" estimate -i result/result -f reference.fa -r mockchr1
 
 echo "done"
