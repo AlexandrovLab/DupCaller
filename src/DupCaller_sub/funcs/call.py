@@ -2631,7 +2631,9 @@ def callBam(params, processNo):
         # never the final mutsAll/indelsAll directly, so a `continue` here
         # would be invisible to the real keep/drop decision.
         if eligible:
-            if tdp > 0 and ta / tdp > params["maxAF"]:
+            if ta == 0:
+                mut["filter"] = "no_good_alt_read"
+            elif ta / tdp > params["maxAF"]:
                 mut["filter"] = "duplex_vaf"
             # if ti >= 1:
             # continue
@@ -2735,9 +2737,11 @@ def callBam(params, processNo):
         # as an unconditional drop, not one of the labeled reasons -- never
         # reported regardless of --rescue.
         if eligible:
+            if ta == 0:
+                mut["filter"] = "no_good_alt_read"
             # if ti > 0:
             # continue
-            if tdp > 0 and ta / tdp > params["maxAF"]:
+            elif ta / tdp > params["maxAF"]:
                 mut["filter"] = "duplex_vaf"
             elif normalBams:
                 if ndp < params["minNdepth"]:

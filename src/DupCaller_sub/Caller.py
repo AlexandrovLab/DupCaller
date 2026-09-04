@@ -878,7 +878,7 @@ def do_call(args):
     }
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
-        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
+        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
         "underpowered": "Passed the default calling threshold but failed the FDR-refined per-channel threshold",
         "high_nm": "Read family failed the NM/blacklist filter -- only reported under --rescue",
         "low_mapq": "Read family failed the mapq filter -- only reported under --rescue",
@@ -888,6 +888,7 @@ def do_call(args):
         "trim_mask": "Falls in the read-end trim zone; no coverage/depth extracted -- only reported under --rescue",
         "indel_mask": "Indel blocked by indel_mask; no coverage/depth extracted -- only reported under --rescue",
         "other_mask": "Blocked by a mask not covered by a more specific reason above; no coverage/depth extracted -- only reported under --rescue",
+        "no_good_alt_read": "Real depth-extraction found zero alt-supporting reads in the tumor BAM pileup (LR cleared its channel's threshold on family-consensus evidence alone) -- real AC/RC/DP attached; only reported under --rescue",
         "duplex_vaf": "The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue",
         "normal_vaf": "The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue",
         "n_cov_mask": "Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue",
@@ -1712,15 +1713,16 @@ def do_call(args):
     # them, since a round-2 record is only a region-local copy that feeds
     # the merge above, not the final mutsAll/indelsAll directly.
     #
-    # "no_good_alt_read" (zero tumor alt-supporting reads, ta==0) no
-    # longer exists as a reject reason -- call.py's eligible branch used
-    # to relabel any eligible ta==0 record to it, but that relabeling was
-    # removed once tumor depth-extraction started counting a candidate's
-    # own founding-family reads toward depth regardless of base quality
-    # (see extractDepthBatchSnv's call_barcodes), which makes tdp/ta
-    # genuinely reflect real coverage instead of needing this backstop.
+    # "no_good_alt_read" (zero tumor alt-supporting reads, ta==0): even
+    # though tumor depth-extraction now counts a candidate's own
+    # founding-family reads toward depth regardless of base quality (see
+    # extractDepthBatchSnv's call_barcodes), a real ta==0 still means the
+    # independent pileup re-verification found no alt-supporting read at
+    # all -- kept as a labeled reject reason (real AC/RC/DP attached) so
+    # it's only reported under --rescue, same as every other post-hoc
+    # sanity-check failure here.
     if not params["rescue"]:
-        _reject_reasons = {"duplex_vaf", "normal_vaf", "n_cov_mask"}
+        _reject_reasons = {"no_good_alt_read", "duplex_vaf", "normal_vaf", "n_cov_mask"}
         mutsAll = [m for m in mutsAll if m.get("filter", "PASS") not in _reject_reasons]
         indelsAll = [
             m for m in indelsAll if m.get("filter", "PASS") not in _reject_reasons
@@ -1729,15 +1731,14 @@ def do_call(args):
     # "masked" (SNPM/NOISEM-blocked) records that never went through
     # round 2's deferred depth-extraction -- raw LR below the channel's
     # final refined threshold, or --skipCoveragePass -- still carry
-    # round 1's zero-depth placeholder in "samples". Without the old
-    # ta==0 relabeling (see above), a masked record that *did* get real
-    # depth extracted can now in principle land back here with an
-    # all-zero tumor triple too, if depth-extraction genuinely found zero
-    # reads at all (not just zero alt) -- so filter=="masked" +
-    # all-zero samples is no longer an airtight "never depth-extracted"
-    # signal, just the best cheap proxy for it; those records still
-    # shouldn't reach the fail vcf without --rescue, same opt-in as every
-    # other no-real-depth reason above.
+    # round 1's zero-depth placeholder in "samples". A masked record that
+    # *did* get real depth can never land back here with an all-zero
+    # tumor triple: call.py's eligible branch relabels ta==0 to
+    # "no_good_alt_read" instead of leaving it "masked" (see its
+    # eligible-branch comment). So filter=="masked" + all-zero samples
+    # unambiguously means "never depth-extracted", and those shouldn't
+    # reach the fail vcf without --rescue -- same opt-in as every other
+    # no-real-depth reason above.
     if not params["rescue"]:
 
         def _masked_no_depth(m):

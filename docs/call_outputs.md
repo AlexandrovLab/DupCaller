@@ -53,6 +53,7 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | `trim_mask` | Falls in the read-end trim zone; no coverage/depth extracted. |
 | `indel_mask` | Indel blocked by `indel_mask`; no coverage/depth extracted. |
 | `other_mask` | Blocked by a mask type not covered by a more specific reason above; no coverage/depth extracted. |
+| `no_good_alt_read` | Real depth-extraction found zero alt-supporting reads in the tumor BAM pileup, even though LR cleared its channel's threshold on family-consensus evidence alone — real AC/RC/DP attached. |
 | `duplex_vaf` | The extracted tumor allele fraction (AC/DP) exceeds `--maxAF` — real AC/RC/DP attached. |
 | `normal_vaf` | The extracted matched-normal allele fraction exceeds `--naf` (likely germline or a systematic artifact) — real AC/RC/DP attached. |
 | `n_cov_mask` | Matched-normal depth at this position fell below `--minNdepth` once real depth was extracted — real AC/RC/DP attached. |
