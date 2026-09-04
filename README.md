@@ -93,7 +93,7 @@ DupCaller uses a numpyrized reference genome to perform memory-efficient referen
 Repeat annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder). First, run PERF against the reference FASTA:
 
 ```bash
-python3 -m PERF.core -m 1 -M 10 -u 2 -i reference.fa -o repeats.tsv
+PERF -m 1 -M 10 -u 2 -i reference.fa -o repeats.tsv
 ```
 
 - `-m`/`-M` — min/max repeat unit (motif) size to search for. `-M 10` covers homopolymers through 10bp-unit STRs; going much higher increases PERF's runtime and memory non-trivially.
