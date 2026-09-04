@@ -10,7 +10,4 @@ Mutation number per genome	0.0
 Mutation number per genome 95% lower	0.0
 Mutation number per genome 95% upper	12.911078089398774
 Duplex coverage	1264.6138944783602
-Unmasked burden	0.0017382222268594314
-Unmasked burden 95% lower	4.400797657365184e-05
-Unmasked burden 95% upper	0.009684754382264444
 Reference base number	3198.0

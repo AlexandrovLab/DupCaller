@@ -1839,20 +1839,25 @@ def do_call(args):
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
         if coverage_pass_enabled:
-            # SBS/INDEL/DBS base coverage (opportunity coverage normalized
-            # by opportunity-per-genome) is written by the estimate step
-            # instead -- it needs cov_by_minread/indel_locus_multiplier/
-            # dbs_cov_by_minread, none of which exist yet at call time.
-            f.write(f"Unmasked Coverage\t{unmasked_coverage}\n")
-            # Single aggregate total, not broken out per
-            # INDEL_COVERAGE_CATEGORY_LABELS category -- every consumer
-            # (Estimate.py's unmasked_indel_cov) summed the per-category
-            # breakdown back into one number anyway, and the per-category
-            # "Effective"/"Unmasked Indel Coverage (label)" lines this used
-            # to write alongside it were never read by anything.
-            f.write(f"Unmasked Indel Coverage\t{unmasked_coverage_indel_cat.sum()}\n")
+            # DBS base coverage (opportunity coverage normalized by
+            # opportunity-per-genome) is written by the estimate step
+            # instead -- it needs dbs_cov_by_minread, which doesn't exist
+            # yet at call time. Unmasked Coverage/Per Read Family Coverage
+            # are SNV-only and already divided here by 3 (the fixed number
+            # of possible alt bases per locus, same normalization
+            # Estimate.py applies to trinuc_cov elsewhere), since that
+            # correction needs no reference-wide computation and doesn't
+            # have to wait for estimate.
+            #
+            # There is no indel equivalent: an indel-opportunity sum can't
+            # be normalized to true per-base units without
+            # indel_locus_multiplier, a reference-genome-wide ratio only
+            # estimate computes -- so an "Unmasked Indel Coverage" line
+            # here could only ever be raw, not-yet-comparable opportunity
+            # units, and was removed rather than kept misleading.
+            f.write(f"Unmasked Coverage\t{unmasked_coverage / 3}\n")
             f.write(
-                f"Per Read Family Coverage \t{coverage/duplex_num if duplex_num > 0 else 0.0}\n"
+                f"Per Read Family Coverage \t{(coverage / 3) / duplex_num if duplex_num > 0 else 0.0}\n"
             )
         f.write(
             f"Pass-filter Duplication Rate\t\

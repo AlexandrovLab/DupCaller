@@ -1642,12 +1642,10 @@ def do_estimate(args):
                 sbs_dir + "/" + sample + "_sbs_flt.vcf", "w", header=vcf.header
             )
         stats = parse_stats_file(f"{prefix}/{sample}_stats.txt")
-        # "Unmasked Coverage" in stats.txt is the opportunity coverage
-        # (L-weighted coverage summed over the 3 possible alt bases per
-        # locus); divide by 3 to get the base (per-locus) coverage, as is
-        # done for trinuc_cov elsewhere in this file.
-        unmasked_cov = int(float(stats["Unmasked Coverage"])) / 3
-        unmasked_indel_cov = int(float(stats["Unmasked Indel Coverage"]))
+        # "Unmasked Coverage" in stats.txt is already the base (per-locus)
+        # coverage -- call.py divides its raw opportunity sum (summed over
+        # the 3 possible alt bases per locus) by 3 before writing it.
+        unmasked_cov = float(stats["Unmasked Coverage"])
         ###Read DBS events up front: classify each PASS event into its
         ### DBS78 channel (used later, in the DBS burden section), and
         ### record its two constituent genomic positions so the SBS96
@@ -1948,23 +1946,6 @@ def do_estimate(args):
         hp_h5 = h5py.File(args.reference + ".hp.h5", "r")
         str_h5 = h5py.File(args.reference + ".str.h5", "r")
 
-        # Unmasked burden numerator: PASS (below, from vcf_indel) +
-        # noise-masked candidates that cleared LR and got real depth
-        # extracted (from _indel_fail.vcf, filter=="masked" with NOISEM set
-        # and DP>0 -- see the matching SNV block above for the full
-        # eligibility explanation; indels have no SNPM tag, only NOISEM).
-        vcf_indel_fail = VCF(f"{indel_dir}/{sample}_indel_fail.vcf", "r")
-        unmasked_indel_count = 0
-        for rec in vcf_indel_fail.fetch():
-            if not (
-                "masked" in rec.filter
-                and rec.info.get("NOISEM")
-                and rec.samples["TUMOR"]["DP"] > 0
-            ):
-                continue
-            unmasked_indel_count += 1
-        vcf_indel_fail.close()
-
         indel_count = 0
         indel_progress = {"start": time.time(), "last": time.time()}
         for i, rec in enumerate(vcf_indel.fetch()):
@@ -1974,7 +1955,6 @@ def do_estimate(args):
                 i,
                 extra=f"{rec.chrom}:{rec.pos}",
             )
-            unmasked_indel_count += 1
             indel_count += 1
             mutation_key = (rec.chrom, rec.pos, rec.ref, rec.alts[0])
             TAC = rec.samples["TUMOR"]["AC"]
@@ -2042,14 +2022,6 @@ def do_estimate(args):
                     indel_coverage_category_index(indel_seq, ref_after, indel_len),
                 ]
             unique_mutations[mutation_key][0] += 1
-        unmasked_indel_burden = (
-            unmasked_indel_count / unmasked_indel_cov
-            if unmasked_indel_cov > 0
-            else float("nan")
-        )
-        unmasked_indel_burden_lb, unmasked_indel_burden_ub = fay_feuer_confint(
-            unmasked_indel_count, 1.0, unmasked_indel_cov
-        )
 
         print("......Estimating indel83 profile and corrected burden........")
         indel76_cov_by_rf = combine_indel100_to_indel76(
@@ -2187,12 +2159,13 @@ def do_estimate(args):
             indel_burden_corrected_exact_ub * indel_locus_multiplier,
             indel_cov_by_exact_group / indel_locus_multiplier,
         )
-        # Field order/naming mirrors _sbs_burden.txt exactly (uncorrected
-        # block, corrected block, per-genome number, opportunity/coverage,
-        # ref base number) — the first 4 lines are read by Summarize.py by
-        # fixed line number, and still correspond to the uncorrected
-        # burden/mutation count, so no Summarize.py index changes are
-        # needed.
+        # Field order/naming mirrors _sbs_burden.txt (uncorrected block,
+        # corrected block, per-genome number, opportunity/coverage, ref base
+        # number); the 3 "Unmasked burden" lines are omitted, same reason
+        # and same omission as _dbs_burden.txt below -- there's no
+        # indel_locus_multiplier-corrected raw opportunity denominator to
+        # build an indel "Unmasked burden" from (see Caller.py's
+        # _stats.txt writer).
         with open(indel_dir + "/" + sample + "_indel_burden.txt", "w") as f:
             # Uncorrected burden must share the exact same (ID83-resolution)
             # coverage denominator as Corrected burden below -- both are
@@ -2252,17 +2225,14 @@ def do_estimate(args):
                 f"Duplex coverage\t"
                 f"{indel_cov_by_minread[0] / indel_locus_multiplier}\n"
             )
-            f.write(
-                f"Unmasked burden\t{unmasked_indel_burden * indel_locus_multiplier}\n"
-            )
-            f.write(
-                f"Unmasked burden 95% lower\t"
-                f"{unmasked_indel_burden_lb * indel_locus_multiplier}\n"
-            )
-            f.write(
-                f"Unmasked burden 95% upper\t"
-                f"{unmasked_indel_burden_ub * indel_locus_multiplier}\n"
-            )
+            # No "Unmasked burden" block here, unlike _sbs_burden.txt --
+            # its numerator (an indel-opportunity sum) can't be normalized
+            # to true per-base units without indel_locus_multiplier, which
+            # doesn't exist until this same function computes it, so
+            # there's no correctable raw denominator to build it from (see
+            # Caller.py's _stats.txt writer, which removed "Unmasked Indel
+            # Coverage" for the same reason). Same omission _dbs_burden.txt
+            # already has, below.
             f.write(f"Reference base number\t{reference_base_number}\n")
 
         ###Calculate DBS burden

@@ -1,13 +1,13 @@
 # `DupCaller.py estimate` — Output File Reference
 
-All files are written under the sample directory specified by `-i / --prefix` (call it `{prefix}`, with sample name `{sample}` = the basename of `-i`), following the same `SBS/`, `INDEL/`, `DBS/` subfolder layout `call` uses. Files that are shared across mutation types (`_duplex_allele_counts.txt`, `_gene_coverage.txt`, `_estimate_params.log`, and the appended `_stats.txt` lines) stay at the top level of `{prefix}`.
+All files are written under the sample directory specified by `-i / --prefix` (call it `{prefix}`, with sample name `{sample}` = the basename of `-i`), following the same `SBS/`, `INDEL/`, `DBS/` subfolder layout `call` uses. Files that are shared across mutation types (`_duplex_allele_counts.txt`, `_estimate_params.log`, `_gene_coverage.txt`, and the appended `_stats.txt` lines) stay at the top level of `{prefix}`.
 
 ```
 {prefix}/
-├── {sample}_stats.txt                  (three lines appended by this step — see call_outputs.md)
 ├── {sample}_duplex_allele_counts.txt
-├── {sample}_gene_coverage.txt          (conditional, -gb)
 ├── {sample}_estimate_params.log
+├── {sample}_gene_coverage.txt          (conditional, -gb)
+├── {sample}_stats.txt                  (three lines appended by this step — see call_outputs.md)
 ├── SBS/   _sbs_burden.txt, _sbs_96_corrected.txt, SBS_96_plots_{sample}.pdf,
 │          _sbs_burden_by_group_size.txt/.pdf,
 │          _sbs_burden_re_estimate.txt, _sbs_96_corrected_re_estimate.txt,
@@ -67,7 +67,7 @@ This reweights mutation counts so the burden estimate reflects what would be obs
 
 ### `INDEL/{sample}_indel_burden.txt`
 
-Same field list and order as `_sbs_burden.txt` (`Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number`, `Mutation number per genome`, `..95% lower/upper`, `Duplex coverage`, `Unmasked burden`, `..95% lower/upper`, `Reference base number`), correction here being per-ID83-channel instead of per-SBS96-class. All burden/mutation-number values are rescaled by `indel_locus_multiplier` so they read in the same per-reference-base units as SBS/DBS.
+Same field list as `_sbs_burden.txt`, minus the three `Unmasked burden*` lines (same omission and same reason as `_dbs_burden.txt` below: normalizing an indel-opportunity sum to true per-base units needs `indel_locus_multiplier`, which doesn't exist at `call` time, so there's no `call`-time "Unmasked Indel Coverage" denominator in `_stats.txt` to build it from): `Uncorrected burden`, `..95% lower/upper`, `Uncorrected mutation number`, `Corrected burden`, `..95% lower/upper`, `Corrected mutation number`, `Mutation number per genome`, `..95% lower/upper`, `Duplex coverage`, `Reference base number`. Correction here is per-ID83-channel instead of per-SBS96-class, and all burden/mutation-number values are rescaled by `indel_locus_multiplier` so they read in the same per-reference-base units as SBS/DBS.
 
 ### `DBS/{sample}_dbs_burden.txt`
 
@@ -174,6 +174,12 @@ Tab-separated table, one row per unique `PASS` mutation (SNV or indel) detected 
 
 ---
 
+## `{sample}_estimate_params.log`
+
+Plain-text run log: run timestamp, the exact command line invoked, and the fully resolved value of every `estimate` argument. `estimate` has no RNG-dependent step (all confidence intervals are computed by closed-form/deterministic methods — see the CI method note above) and takes no `--seed`.
+
+---
+
 ## `{sample}_gene_coverage.txt`
 
 **Condition:** only written when `-gb/--genebed` is provided (a BED file: chrom, start, end, and a 4th column of the form `GENE_exonN` — everything before the first `_` is taken as the gene name).
@@ -187,12 +193,6 @@ Tab-separated, **with a header row**, one row per gene:
 | `indel_duplex_depth` | Mean per-base indel duplex depth: summed `_coverage.bed.gz` columns 8–23 (all 16 indel-opportunity categories), divided by the genome-wide `indel_locus_multiplier`, divided by the same exon length. |
 
 Intended as gene-level sequencing-depth input for tools like dNdScv. (Older versions of this file had no header and only a single, un-normalized SBS-only coverage column — if you have scripts parsing the old 2-column format, they will need updating for the new 3-column, header-bearing format.)
-
----
-
-## `{sample}_estimate_params.log`
-
-Plain-text run log: run timestamp, the exact command line invoked, and the fully resolved value of every `estimate` argument. `estimate` has no RNG-dependent step (all confidence intervals are computed by closed-form/deterministic methods — see the CI method note above) and takes no `--seed`.
 
 ---
 
@@ -214,6 +214,14 @@ Same field list as `_sbs_burden.txt`'s uncorrected/corrected block, computed ove
 | `Duplex coverage` | Real per-locus-equivalent duplex coverage within the region (`trinuc_cov_96.sum()/3`) — not the reference genome's raw trinucleotide total. |
 | `Reference base number` | Reference genome trinucleotide total within the region. |
 
+### `SBS/{sample}_sbs_96_corrected_re_estimate.txt`
+
+Same structure as `_sbs_96_corrected.txt`, computed over the re-estimation region, but with **no** `mutations_per_opportunity` column (5 columns: `mutation_number_uncorrected`, `mutation_number_corrected`, `correction_ratio`, `mutation_number_genome`, `trinuc_number_genome`).
+
+### `SBS_96_plots_{sample}_re_estimate.pdf`
+
+Same two-page structure as `SBS_96_plots_{sample}.pdf` (uncorrected, corrected), for the re-estimation region.
+
 ### `INDEL/{sample}_indel_burden_re_estimate.txt`
 
 A separate, shorter field set (note the field *names* differ slightly from the main `_indel_burden.txt` — "Indel" rather than a bare noun):
@@ -226,11 +234,3 @@ A separate, shorter field set (note the field *names* differ slightly from the m
 | `Corrected indel number` | Correction-ratio-weighted indel count. |
 | `Mutation number per genome`, `..95% lower/upper` | Genome-wide extrapolation (`Corrected indel burden × Reference base number`, CI scaled the same way), matching the main `_sbs_burden.txt` convention. |
 | `Indel coverage` | Total ID83-resolution opportunity coverage within the region (not rescaled by `indel_locus_multiplier` — unlike the main `_indel_burden.txt`, this file's burden values are already computed directly against this same raw denominator, so no rescaling is needed here). |
-
-### `SBS/{sample}_sbs_96_corrected_re_estimate.txt`
-
-Same structure as `_sbs_96_corrected.txt`, computed over the re-estimation region, but with **no** `mutations_per_opportunity` column (5 columns: `mutation_number_uncorrected`, `mutation_number_corrected`, `correction_ratio`, `mutation_number_genome`, `trinuc_number_genome`).
-
-### `SBS_96_plots_{sample}_re_estimate.pdf`
-
-Same two-page structure as `SBS_96_plots_{sample}.pdf` (uncorrected, corrected), for the re-estimation region.

@@ -4,11 +4,11 @@ All files are written under the directory specified by `-o / --output` (call it 
 
 ```
 {out}/
-├── {sample}_stats.txt
+├── {sample}_call_params.log
 ├── {sample}_coverage.bed.gz(.tbi)
 ├── {sample}_duplex_family_strand_composition.txt
 ├── {sample}_duplex_family_strand_composition_heatmap.pdf
-├── {sample}_call_params.log
+├── {sample}_stats.txt
 ├── SBS/{sample}_sbs.vcf, _sbs_fail.vcf, _sbs_flt.vcf, _trinuc_by_duplex_group.txt
 ├── INDEL/{sample}_indel.vcf, _indel_fail.vcf, _indel_by_duplex_group.txt
 ├── DBS/{sample}_dbs.vcf, _dbs_fail.vcf, _dbs_by_duplex_group.txt
@@ -110,6 +110,33 @@ A filtered subset of `_sbs.vcf` that excludes variants with a statistically sign
 
 ---
 
+## `SBS/{sample}_trinuc_by_duplex_group.txt`
+
+Tab-separated matrix, one row per **raw, un-folded** (trinucleotide context, alt base) combination — 64 contexts × 3 non-ref alt bases = **192 rows**, labeled `{trinuc}>{alt}` (e.g. `ACC>T`). Reverse-complement pairs are only combined into the 96 canonical (pyrimidine-only) SBS96 classes later, at estimation time.
+
+- **Columns:** duplex-group labels in `F1R2+F2R1` format (e.g. `1+1`, `1+2`, `2+2`), restricted to groups that actually occurred (`duplex_group_number > 0` in the strand-composition table in `_duplex_family_strand_composition.txt` below).
+- **Values:** number of callable genomic positions in that (trinuc, alt) context, observed in read families belonging to that duplex group.
+
+---
+
+## `INDEL/{sample}_indel_by_duplex_group.txt`
+
+Same shape and purpose as `SBS/{sample}_trinuc_by_duplex_group.txt` above, but for indel opportunity: 100 rows (the raw indel100 resolution, `build_indel100_labels` in `funcs/misc.py`) × the same duplex-group columns.
+
+---
+
+## `DBS/{sample}_dbs_by_duplex_group.txt`
+
+Same shape and purpose, for DBS opportunity: 144 rows (raw dinucleotide-substitution resolution, `build_dbs_raw144_labels`) × the same duplex-group columns.
+
+---
+
+## `{sample}_call_params.log`
+
+Plain-text run log: DupCaller version, run timestamp, the exact command line invoked, the fully resolved value of every `call` argument (including the RNG `--seed`, generated automatically and recorded here if not passed explicitly), and the resolved paths of the four error-profile files actually used for calling (`amperr_file`, `amperri_file`, `dmgerr_file`, `dmgerri_file`).
+
+---
+
 ## `{sample}_coverage.bed.gz`
 
 **Condition:** only written unless `--skipCoveragePass` is set.
@@ -149,37 +176,6 @@ These 16 columns are not mutually exclusive with each other in the sense of "whi
 
 ---
 
-## `{sample}_stats.txt`
-
-Tab-separated key–value file (one metric per line) with library and calling statistics. **Written in two stages**: most lines are written immediately by `call`; the last three (`SBS Base Coverage`, `Indel Base Coverage`, `DBS Base Coverage`) are appended later by `estimate`, once it has computed the opportunity-normalized coverage figures — a `_stats.txt` from a `call`-only run (before `estimate` has ever been run on it) will not yet have those three lines.
-
-| Field | Formula / Source | Description |
-| --- | --- | --- |
-| Number of Read Families | `unique_read_num` | Total distinct read families (barcode + fragment-start groups) identified. Each represents one original DNA molecule, regardless of whether both strands were captured. |
-| Number of Pass-filter Reads | `pass_read_num` | Total individual reads passing alignment quality filters (properly paired, not supplementary/secondary/QC-failed, no synthetic duplex-tag marking, not 5′ soft-clipped). |
-| Number of Effective Read Families | `duplex_count` | Read families where **both** strand orientations are captured (F1R2 ≥ 1 **and** F2R1 ≥ 1) **and** the family covers at least one callable genomic position. Only these families contribute to variant calling. |
-| Unmasked Coverage | `sum(unmasked_coverage)` | Total power-weighted SNV coverage from effective read families, computed **before** the noise mask is applied. Used to report the pre-masking (unmasked) SNV burden in `_sbs_burden.txt`. (Sums the same 3-of-4-nonzero A/T/C/G columns as `_coverage.bed.gz`, so it carries the same ×3 unit as the raw coverage sum — `estimate` divides by 3 to recover a true per-base figure.) |
-| Unmasked Indel Coverage | `sum(unmasked_coverage_indel_cat)` | Indel coverage before noise masking, summed across all 16 opportunity categories. Used for the pre-masking (unmasked) indel burden in `_indel_burden.txt`. |
-| Per Read Family Coverage | `sum(coverage) / Number of Effective Read Families` | Mean number of callable positions covered per effective read family (using the raw, un-normalized coverage total). Reflects how much of the target each duplex molecule spans. |
-| Pass-filter Duplication Rate | `1 − (Number of Read Families / Number of Pass-filter Reads)` | Fraction of pass-filter reads that are PCR duplicates within their family. Near 0 = little amplification; higher = more copies per molecule. Only pass-filter reads are in the denominator, so this can read higher than duplication estimates from other tools. |
-| Efficiency | `Number of Effective Read Families / total alignment records read from the BAM` | Considers read *number* only, not base number; modulated by duplication rate and by other conditions (shallow matched normal, large read1/read2 overlap, etc.) that reduce the number of duplex bases. |
-| Total SBS FDR | mean local `FDR` (INFO field) over `PASS` SBS calls whose channel has a determinable `mu` | Mean per-call local false discovery rate actually realized among the SBS calls that passed. `NaN` if there are no such calls. |
-| Total Indel FDR | same, over `PASS` indel calls | Mean realized local FDR among passing indel calls. |
-| Total DBS FDR | same, over `PASS` DBS calls | Mean realized local FDR among passing DBS calls (each combined from its two constituent SBS positions' FDRs). |
-| SBS Base Coverage | *(appended by `estimate`)* | SNV opportunity coverage normalized to true per-base units (divided by 3) at `min_group_size=1` — same value as `_sbs_burden.txt`'s `Duplex coverage` line. |
-| Indel Base Coverage | *(appended by `estimate`)* | Indel opportunity coverage normalized to true per-base units (divided by the genome-wide `indel_locus_multiplier`) at `min_group_size=1` — same value as `_indel_burden.txt`'s `Duplex coverage` line. |
-| DBS Base Coverage | *(appended by `estimate`)* | DBS opportunity coverage (already per-locus, no further normalization needed) — same value as `_dbs_burden.txt`'s `Duplex coverage` line. |
-
-`Unmasked Coverage`, `Unmasked Indel Coverage`, and `Per Read Family Coverage` are all only written when the coverage pass ran (i.e. `--skipCoveragePass` was **not** set).
-
----
-
-## `{sample}_call_params.log`
-
-Plain-text run log: DupCaller version, run timestamp, the exact command line invoked, the fully resolved value of every `call` argument (including the RNG `--seed`, generated automatically and recorded here if not passed explicitly), and the resolved paths of the four error-profile files actually used for calling (`amperr_file`, `amperri_file`, `dmgerr_file`, `dmgerri_file`).
-
----
-
 ## `{sample}_duplex_family_strand_composition.txt`
 
 Tab-separated table describing how read families are distributed across strand-count combinations.
@@ -201,23 +197,6 @@ Heatmap visualization of the strand-composition table above. The x-axis is F1R2 
 
 ---
 
-## `SBS/{sample}_trinuc_by_duplex_group.txt`
-
-Tab-separated matrix, one row per **raw, un-folded** (trinucleotide context, alt base) combination — 64 contexts × 3 non-ref alt bases = **192 rows**, labeled `{trinuc}>{alt}` (e.g. `ACC>T`). Reverse-complement pairs are only combined into the 96 canonical (pyrimidine-only) SBS96 classes later, at estimation time.
-
-- **Columns:** duplex-group labels in `F1R2+F2R1` format (e.g. `1+1`, `1+2`, `2+2`), restricted to groups that actually occurred (`duplex_group_number > 0` in the strand-composition table above).
-- **Values:** number of callable genomic positions in that (trinuc, alt) context, observed in read families belonging to that duplex group.
-
-## `INDEL/{sample}_indel_by_duplex_group.txt`
-
-Same shape and purpose as the SBS file above, but for indel opportunity: 100 rows (the raw indel100 resolution, `build_indel100_labels` in `funcs/misc.py`) × the same duplex-group columns.
-
-## `DBS/{sample}_dbs_by_duplex_group.txt`
-
-Same shape and purpose, for DBS opportunity: 144 rows (raw dinucleotide-substitution resolution, `build_dbs_raw144_labels`) × the same duplex-group columns.
-
----
-
 ## Error Profile Files (`{out}/ERROR/`)
 
 These seven files capture the sample-specific error model learned automatically before variant calling, unless `-E/--errprefix` points at an already-learned set (in which case learning is skipped and those files are read from the given prefix instead — six of the seven are required: `.amp.tn.srd.txt`, `.amp.hp.txt`, `.amp.str.txt`, `.dmg.tn.txt`, `.dmg.hp.txt`, `.dmg.str.txt`). Learning is also skipped, even without `-E`, if a prior run already left a complete set of six at the default `ERROR/{sample}` prefix.
@@ -231,3 +210,27 @@ These seven files capture the sample-specific error model learned automatically 
 | `{sample}.dmg.hp.txt` | Damage indel error rates for homopolymer contexts. |
 | `{sample}.amp.str.txt` | Amplification indel error rates for short-tandem-repeat (STR) contexts. |
 | `{sample}.dmg.str.txt` | Damage indel error rates for short-tandem-repeat (STR) contexts. |
+
+---
+
+## `{sample}_stats.txt`
+
+Tab-separated key–value file (one metric per line) with library and calling statistics. **Written in two stages**: most lines are written immediately by `call`; the last three (`SBS Base Coverage`, `Indel Base Coverage`, `DBS Base Coverage`) are appended later by `estimate`, once it has computed the opportunity-normalized coverage figures — a `_stats.txt` from a `call`-only run (before `estimate` has ever been run on it) will not yet have those three lines.
+
+| Field | Formula / Source | Description |
+| --- | --- | --- |
+| Number of Read Families | `unique_read_num` | Total distinct read families (barcode + fragment-start groups) identified. Each represents one original DNA molecule, regardless of whether both strands were captured. |
+| Number of Pass-filter Reads | `pass_read_num` | Total individual reads passing alignment quality filters (properly paired, not supplementary/secondary/QC-failed, no synthetic duplex-tag marking, not 5′ soft-clipped). |
+| Number of Effective Read Families | `duplex_count` | Read families where **both** strand orientations are captured (F1R2 ≥ 1 **and** F2R1 ≥ 1) **and** the family covers at least one callable genomic position. Only these families contribute to variant calling. |
+| Unmasked Coverage | `sum(unmasked_coverage) / 3` | Total power-weighted SNV coverage from effective read families, computed **before** the noise mask is applied, already normalized to true per-base units (divided by 3, the number of possible alt bases per locus — same normalization `SBS Base Coverage` below applies). Used to report the pre-masking (unmasked) SNV burden in `_sbs_burden.txt`. |
+| Per Read Family Coverage | `(sum(coverage) / 3) / Number of Effective Read Families` | Mean number of callable positions covered per effective read family, in true per-base units. Reflects how much of the target each duplex molecule spans. |
+| Pass-filter Duplication Rate | `1 − (Number of Read Families / Number of Pass-filter Reads)` | Fraction of pass-filter reads that are PCR duplicates within their family. Near 0 = little amplification; higher = more copies per molecule. Only pass-filter reads are in the denominator, so this can read higher than duplication estimates from other tools. |
+| Efficiency | `Number of Effective Read Families / total alignment records read from the BAM` | Considers read *number* only, not base number; modulated by duplication rate and by other conditions (shallow matched normal, large read1/read2 overlap, etc.) that reduce the number of duplex bases. |
+| Total SBS FDR | mean local `FDR` (INFO field) over `PASS` SBS calls whose channel has a determinable `mu` | Mean per-call local false discovery rate actually realized among the SBS calls that passed. `NaN` if there are no such calls. |
+| Total Indel FDR | same, over `PASS` indel calls | Mean realized local FDR among passing indel calls. |
+| Total DBS FDR | same, over `PASS` DBS calls | Mean realized local FDR among passing DBS calls (each combined from its two constituent SBS positions' FDRs). |
+| SBS Base Coverage | *(appended by `estimate`)* | SNV opportunity coverage normalized to true per-base units (divided by 3) at `min_group_size=1` — same value as `_sbs_burden.txt`'s `Duplex coverage` line. |
+| Indel Base Coverage | *(appended by `estimate`)* | Indel opportunity coverage normalized to true per-base units (divided by the genome-wide `indel_locus_multiplier`) at `min_group_size=1` — same value as `_indel_burden.txt`'s `Duplex coverage` line. |
+| DBS Base Coverage | *(appended by `estimate`)* | DBS opportunity coverage (already per-locus, no further normalization needed) — same value as `_dbs_burden.txt`'s `Duplex coverage` line. |
+
+`Unmasked Coverage` and `Per Read Family Coverage` are both SNV-only and only written when the coverage pass ran (i.e. `--skipCoveragePass` was **not** set). There is no indel equivalent of `Unmasked Coverage`: unlike the SNV `/3` correction above, normalizing an indel-opportunity sum to true per-base units needs the genome-wide `indel_locus_multiplier`, which only exists once `estimate` has run — so a call-time "Unmasked Indel Coverage" field could only ever be raw, not-yet-comparable opportunity units, and isn't written. `_indel_burden.txt` correspondingly has no `Unmasked burden` row (see [`estimate_outputs.md`](estimate_outputs.md)).
