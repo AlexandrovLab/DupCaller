@@ -83,7 +83,10 @@ def findIndels(seq):
         if cigar[0] == 0:
             refPos += cigar[1]
             readPos += cigar[1]
-        if cigar[0] in [3, 4]:
+        if cigar[0] == 3:
+            # N: reference skip, unlike S below consumes ref not query.
+            refPos += cigar[1]
+        if cigar[0] == 4:
             readPos += cigar[1]
         if cigar[0] == 1:
             sequence = seq.query_sequence[readPos : readPos + cigar[1]]
@@ -120,17 +123,11 @@ def getIndelArr(seq, indels, min_bq):
         readPos = readPos[0]
         if indelLen > 0:
             if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
-                # Unaligned isn't enough on its own -- a soft-clip (or an
-                # unrelated insertion) also leaves these positions with no
-                # reference coordinate. Only count this as real support for
-                # THIS candidate if the actual read bases sitting in that
-                # unaligned window spell out the candidate's own inserted
-                # sequence. A mismatch here is scored 0 (uninformative for
-                # this candidate), not -1: -1 is prob.py's multiallele-
-                # conflict sentinel (mask_multiallele), which drops the
-                # WHOLE candidate the moment any single read trips it --
-                # an unrelated soft-clip elsewhere in the family shouldn't
-                # be able to silently kill a candidate this way.
+                # Unaligned could mean a real insertion here, or just a
+                # soft clip -- check whether the read bases actually spell
+                # out this candidate's inserted sequence before calling it
+                # ALT, instead of assuming a conflict (-1, which drops the
+                # whole candidate).
                 inserted_seq = indel_parts[2]
                 read_window = seq.query_sequence[readPos + 1 : readPos + 1 + indelLen]
                 if read_window.upper() == inserted_seq.upper():
@@ -142,17 +139,18 @@ def getIndelArr(seq, indels, min_bq):
             else:
                 seqArr[nn] = -1
         if indelLen < 0 and reference_positions.size > readPos:
+            next_refpos = reference_positions[readPos + 1]
             if (
-                reference_positions[readPos + 1] != -1
-                and (reference_positions[readPos + 1] - reference_positions[readPos])
-                == -indelLen + 1
+                next_refpos != -1
+                and next_refpos - reference_positions[readPos] == -indelLen + 1
             ):
                 seqArr[nn] = 1
-            elif (
-                reference_positions[readPos + 1] != -1
-                and (reference_positions[readPos + 1] - reference_positions[readPos])
-                == 1
-            ):
+            elif next_refpos != -1 and next_refpos - reference_positions[readPos] == 1:
+                seqArr[nn] = 0
+            elif next_refpos == -1 and readPos + 1 >= seq.query_alignment_end:
+                # Unaligned because the read is soft-clipped right here,
+                # not a competing indel -- same reasoning as the insertion
+                # branch above.
                 seqArr[nn] = 0
             else:
                 seqArr[nn] = -1
