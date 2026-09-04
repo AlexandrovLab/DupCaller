@@ -1225,22 +1225,46 @@ def splitBamRegions(bams, num, contigs, step, ref=None, regionFile=None):
         np.arange(1, num) * chunkSize,
     )
     cut_contigs = np.searchsorted(window_nums_cumulative, cut_inds)
-    cut_pos = (
-        cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]
-    ) * step
+    # Interpolate the cut position within its window by the fraction of
+    # that window's reads needed to reach the target read count, instead
+    # of always snapping to the window's start (window_index * step) --
+    # a window with a disproportionate read count can otherwise absorb
+    # more than one of the np.arange(1, num) * chunkSize targets at the
+    # same window_index, producing duplicate/zero-length cut sites.
+    targets = np.arange(1, num) * chunkSize
+    # An oversaturated -p (see the clamp below) can pin cut_inds at
+    # total_reads_by_windows.size, one past its last valid index --
+    # cap it here so the indexing below stays in bounds; the clamp on
+    # cut_pos already handles putting the resulting site back on the
+    # contig regardless of what frac comes out to.
+    cut_inds_capped = np.minimum(cut_inds, total_reads_by_windows.size - 1)
+    window_start_reads = np.concatenate([[0], total_reads_by_windows_cumulative])[
+        cut_inds_capped
+    ]
+    window_counts = total_reads_by_windows[cut_inds_capped]
+    frac = np.where(
+        window_counts > 0,
+        (targets - window_start_reads) / np.maximum(window_counts, 1),
+        0,
+    )
+    frac = np.clip(frac, 0, 1)
+    cut_pos = np.round(
+        (cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]) * step
+        + frac * step
+    ).astype(int)
     # window_nums's last window per contig is a partial window whenever
-    # contig_len isn't an exact multiple of step, so window_index * step
-    # can overshoot that contig's real length. That only actually happens
-    # when cut_inds saturates at window_nums_cumulative[-1] (i.e. a
-    # requested thread count -p asks for more chunks than there's read
-    # data to fill -- the trailing np.arange(1, num) * chunkSize targets
-    # exceed the total read count and searchsorted pins them at the very
-    # last window index). Left unclamped this produces a cut site past
-    # the chromosome end, which downstream becomes a region with
-    # start > end (or start beyond the contig) and crashes when that
-    # range is fetched. Clamping to the contig's real length instead
-    # collapses those trailing, over-saturated cut sites onto the
-    # legitimate end-of-contig boundary, where the dedup below then
+    # contig_len isn't an exact multiple of step, so the interpolated
+    # position above can overshoot that contig's real length. That only
+    # actually happens when cut_inds saturates at
+    # window_nums_cumulative[-1] (i.e. a requested thread count -p asks
+    # for more chunks than there's read data to fill -- the trailing
+    # targets exceed the total read count and searchsorted pins them at
+    # the very last window index). Left unclamped this produces a cut
+    # site past the chromosome end, which downstream becomes a region
+    # with start > end (or start beyond the contig) and crashes when
+    # that range is fetched. Clamping to the contig's real length
+    # instead collapses those trailing, over-saturated cut sites onto
+    # the legitimate end-of-contig boundary, where the dedup below then
     # merges them into one.
     cut_pos = np.minimum(cut_pos, contig_lens[cut_contigs])
     for nn in range(cut_inds.size):
