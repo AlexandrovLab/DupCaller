@@ -85,7 +85,6 @@ def extractDepthBatchSnv(
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
-    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -146,9 +145,7 @@ def extractDepthBatchSnv(
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
                         if not quality_ok:
-                            read_bc1, read_bc2 = get_duplex_barcode(
-                                aln, nanoseq_bam
-                            ).split("-")
+                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
                     for i, (ref, alt) in enumerate(specs):
                         if barcode_aware and not quality_ok:
                             if not _barcode_pair_matches(
@@ -194,7 +191,6 @@ def extractDepthBatchIndel(
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
-    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -250,9 +246,7 @@ def extractDepthBatchIndel(
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
                         if not quality_ok:
-                            read_bc1, read_bc2 = get_duplex_barcode(
-                                aln, nanoseq_bam
-                            ).split("-")
+                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
                     for i, (ref, alt, indel_size) in enumerate(specs):
                         if barcode_aware and not quality_ok:
                             if not _barcode_pair_matches(
@@ -325,7 +319,6 @@ def extractDepthBatchDbs(
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
-    nanoseq_bam = params.get("nanoSeqBam")
     results = {}
     by_chrom = defaultdict(lambda: defaultdict(list))
     for chrom, pos, ref, alt in candidates:
@@ -396,9 +389,7 @@ def extractDepthBatchDbs(
                         if quality_ok:
                             read_bc1 = read_bc2 = None
                         else:
-                            read_bc1, read_bc2 = get_duplex_barcode(
-                                aln, nanoseq_bam
-                            ).split("-")
+                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
                         reads[aln.query_name] = (base, quality_ok, read_bc1, read_bc2)
                     else:
                         reads[aln.query_name] = base
@@ -846,9 +837,7 @@ def detectOverlapDiscord(
                     or pileupread.is_del
                 ):
                     continue
-                read_bc1, read_bc2 = get_duplex_barcode(
-                    pileupread.alignment, params.get("nanoSeqBam")
-                ).split("-")
+                read_bc1, read_bc2 = get_duplex_barcode(pileupread.alignment, params)
                 if (
                     (
                         (read_bc1 == bc1 and read_bc2 == bc2)

@@ -1298,22 +1298,49 @@ def getAlignmentObject(bam, mode, refpath=None):
     return bamObject
 
 
-def get_duplex_barcode(rec, nanoseq_bam=False):
-    """Return the "bc1-bc2" duplex barcode string for an aligned read.
+def parse_barcode_option(value):
+    """Parse the --barcode/-bc "TAG,NORMALIZE,SEP" option string into a dict
+    of {"tag", "normalize", "sep"}.
 
-    Normally this is just the DB tag written by DupCaller trim. With
-    nanoseq_bam, the bam instead carries NanoSeq-style per-mate rb/mb tags
-    (own-read barcode / mate barcode); the DB-equivalent string is
-    reconstructed as {mb}-{rb} for read 1 and {rb}-{mb} for read 2, so it
-    can be split the same way DB is everywhere else.
+    TAG is the read tag holding the molecular/duplex barcode. NORMALIZE is
+    "1" if TAG holds an unnormalized "bc1<SEP>bc2" pair that still needs
+    read-orientation-based reordering to group both strand-copies of a
+    duplex molecule together (DupCaller's own DB tag behaves this way), or
+    "0" if TAG already holds a single orientation-independent duplex-family
+    barcode, so SEP is unused and grouping relies solely on read flags.
     """
-    if not nanoseq_bam:
-        return rec.get_tag("DB")
-    mb_tag = rec.get_tag("mb")
-    rb_tag = rec.get_tag("rb")
-    if rec.is_read2:
-        return f"{rb_tag}-{mb_tag}"
-    return f"{mb_tag}-{rb_tag}"
+    parts = value.split(",")
+    if len(parts) != 3:
+        raise ValueError(
+            f"--barcode/-bc expects 'TAG,NORMALIZE,SEP' (e.g. 'DB,1,-'), got {value!r}"
+        )
+    tag, normalize_str, sep = parts
+    if not tag:
+        raise ValueError(f"--barcode/-bc: TAG must not be empty, got {value!r}")
+    if normalize_str not in ("0", "1"):
+        raise ValueError(
+            f"--barcode/-bc: NORMALIZE must be 0 or 1, got {normalize_str!r} in {value!r}"
+        )
+    return {"tag": tag, "normalize": normalize_str == "1", "sep": sep}
+
+
+def get_duplex_barcode(rec, params):
+    """Return the (bc1, bc2) duplex barcode pair for an aligned read.
+
+    Reads params["barcodeTag"] (default "DB", DupCaller trim's own tag). If
+    params["barcodeNormalize"] (default True), the tag is treated as an
+    unnormalized "bc1<SEP>bc2" pair (SEP = params["barcodeSep"], default
+    "-") and returned as (bc1, bc2) for the caller to reorder by read
+    orientation. If barcodeNormalize is False, the tag already holds a
+    single orientation-independent duplex-family barcode, so it is returned
+    unsplit as (value, value) -- reordering by orientation then becomes a
+    no-op, and strand-of-origin (F1R2 vs F2R1) is tracked solely from read
+    flags elsewhere.
+    """
+    raw = rec.get_tag(params.get("barcodeTag", "DB"))
+    if not params.get("barcodeNormalize", True):
+        return raw, raw
+    return tuple(raw.split(params.get("barcodeSep", "-")))
 
 
 def bamIterateMultipleRegion(bam, regions, ref, regionFile=None):
@@ -1457,7 +1484,7 @@ def _filter_reason_label(
 
 def _compute_read_label(rec, params):
     """Duplex-family label for rec: barcode pair plus signed template_length."""
-    bc1, bc2 = get_duplex_barcode(rec, params.get("nanoSeqBam")).split("-")
+    bc1, bc2 = get_duplex_barcode(rec, params)
     if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
         return bc1 + "+" + bc2 + "+" + str(rec.template_length)
     else:

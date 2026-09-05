@@ -32,12 +32,14 @@ def do_learn(args):
         "threads": args.threads,
         # callBam's isLearn path shares the round-0/round-1/round-2 code
         # with call.py (funcs/call.py's threshold_rng Monte Carlo seeding,
-        # _compute_read_label's NanoSeq-bam check) -- both keys are read
+        # _compute_read_label's barcode-tag lookup) -- both keys are read
         # unconditionally regardless of isLearn, so they must be present
         # even though a standalone `learn` run has no call-specific CLI
         # flags for them.
         "seed": int(np.random.SeedSequence().generate_state(1)[0]),
-        "nanoSeqBam": False,
+        "barcodeTag": "DB",
+        "barcodeNormalize": True,
+        "barcodeSep": "-",
         "rescue": False,
         "pcutoff": 1,
         "amperr": 1e-5,

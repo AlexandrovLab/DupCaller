@@ -37,6 +37,7 @@ from .funcs.misc import build_indel100_labels
 from .funcs.misc import build_dbs_raw144_labels
 from .funcs.misc import _ensure_type_subdirs
 from .funcs.misc import load_repeat_context
+from .funcs.misc import parse_barcode_option
 from pysam import TabixFile as BED
 import pysam
 
@@ -204,6 +205,11 @@ def do_call(args):
     # requires knowing what seed it actually used.
     if args.seed is None:
         args.seed = int(np.random.SeedSequence().generate_state(1)[0])
+    try:
+        barcode_spec = parse_barcode_option(args.barcode)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     output_dir = args.output
     sample_name = os.path.basename(args.output)
     os.makedirs(output_dir, exist_ok=True)
@@ -252,7 +258,9 @@ def do_call(args):
         "rescue": args.rescue,
         "maxZeroQualFrac": args.maxZeroQualFrac,
         "maxDepth": args.maxPileupDepth,
-        "nanoSeqBam": args.NanoSeqBam,
+        "barcodeTag": barcode_spec["tag"],
+        "barcodeNormalize": barcode_spec["normalize"],
+        "barcodeSep": barcode_spec["sep"],
         "seed": args.seed,
     }
     if args.errprefix:
@@ -317,10 +325,12 @@ def do_call(args):
         # value seeds the whole run reproducibly, not just rounds 1/2.
         "seed": args.seed,
         # _compute_read_label (funcs/call.py) is shared unconditionally
-        # across all rounds and reads params.get("nanoSeqBam"); without
-        # this key here, a --NanoSeqBam run falls back to the DB tag
-        # during round 0 even though NanoSeq-format bams only carry mb/rb.
-        "nanoSeqBam": args.NanoSeqBam,
+        # across all rounds and reads params["barcodeTag"]/["barcodeNormalize"]/
+        # ["barcodeSep"]; without these keys here, a --barcode run would fall
+        # back to DupCaller's own DB-tag defaults during round 0.
+        "barcodeTag": barcode_spec["tag"],
+        "barcodeNormalize": barcode_spec["normalize"],
+        "barcodeSep": barcode_spec["sep"],
     }
     same_regions_flag = False
     if not params_learn["regions"]:

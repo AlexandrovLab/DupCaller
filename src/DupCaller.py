@@ -274,12 +274,17 @@ if __name__ == "__main__":
         default=1000000,
     )
     call_parser.add_argument(
-        "--NanoSeqBam",
-        "-nb",
-        action="store_true",
-        help="bam uses NanoSeq-style per-mate rb/mb tags instead of a DB tag: the duplex "
-        "barcode is read as {mb}-{rb} for read 1 and {rb}-{mb} for read 2",
-        default=False,
+        "--barcode",
+        "-bc",
+        type=str,
+        default="DB,1,-",
+        help="Molecular/duplex barcode read tag, as 'TAG,NORMALIZE,SEP' (default 'DB,1,-'). "
+        "TAG is the bam tag holding the barcode. NORMALIZE is 1 if TAG holds an unnormalized "
+        "'bc1<SEP>bc2' pair that still needs read-orientation-based reordering to group both "
+        "strand-copies of a duplex molecule together (DupCaller's own DB tag), or 0 if TAG "
+        "already holds a single orientation-independent duplex-family barcode, in which case "
+        "SEP is ignored and grouping relies solely on read flags. Example: a tag 'RB' that is "
+        "already a normalized duplex barcode would be passed as '-bc RB,0,-'.",
     )
     call_parser.add_argument(
         "--seed",
