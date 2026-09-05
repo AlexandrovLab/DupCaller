@@ -1855,8 +1855,15 @@ def callBam(params, processNo):
                                 (f1r2_blacklist_num + f2r1_blacklist_num) / len(readSet)
                                 >= 0.5
                             )
-                            or f1r2_blacklist_num == f1r2_count
-                            or f2r1_blacklist_num == f2r1_count
+                            # simplex branch: f1r2_count/f2r1_count == 0 for the
+                            # absent side of a simplex family makes
+                            # blacklist_num == count vacuously true (0 == 0),
+                            # which would silently reject every simplex family
+                            # here regardless of the relaxed gate above. Only
+                            # apply the "this strand is entirely blacklisted"
+                            # check to a strand that actually has reads.
+                            or (f1r2_count > 0 and f1r2_blacklist_num == f1r2_count)
+                            or (f2r1_count > 0 and f2r1_blacklist_num == f2r1_count)
                         ):
                             if params["rescue"]:
                                 flt_rs = "high_nm"
@@ -2252,8 +2259,10 @@ def callBam(params, processNo):
                             f2r1_blacklist_num += 1
                 if (
                     ((f1r2_blacklist_num + f2r1_blacklist_num) / len(readSet) >= 0.5)
-                    or f1r2_blacklist_num == f1r2_count
-                    or f2r1_blacklist_num == f2r1_count
+                    # simplex branch: see matching comment at the mid-batch
+                    # flush site above.
+                    or (f1r2_count > 0 and f1r2_blacklist_num == f1r2_count)
+                    or (f2r1_count > 0 and f2r1_blacklist_num == f2r1_count)
                 ):
                     if params["rescue"]:
                         flt_rs = "high_nm"
