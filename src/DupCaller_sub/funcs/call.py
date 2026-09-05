@@ -428,10 +428,17 @@ def _process_duplex_family(
                     abs(max_ref_len) - readPos,
                     readPos + 1,
                 )
-            if F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]] == 0:
-                continue
-            if F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]] == 0:
-                continue
+            # simplex branch: this local-coverage re-check only makes sense
+            # for a family that is genuinely dual-strand overall (catches
+            # e.g. soft-clip-induced dropout at this specific position); for
+            # a pure simplex family the absent side's count is trivially 0
+            # everywhere, so skip the re-check rather than reject every
+            # candidate outright.
+            if F1R2 > 0 and F2R1 > 0:
+                if F1R2_alt_count[pass_inds[nn]] + F1R2_ref_count[pass_inds[nn]] == 0:
+                    continue
+                if F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]] == 0:
+                    continue
             if indel_size > 0:
                 offset = 0
             else:
@@ -979,10 +986,12 @@ def _process_duplex_family(
                 )
             FPs.append(readPos5p)
             RPs.append(readPos3p)
-            if F1R2_count[:, muts_ind[nn]].sum() == 0:
-                continue
-            if F2R1_count[:, muts_ind[nn]].sum() == 0:
-                continue
+            # simplex branch: see matching comment at the indel re-check above.
+            if F1R2 > 0 and F2R1 > 0:
+                if F1R2_count[:, muts_ind[nn]].sum() == 0:
+                    continue
+                if F2R1_count[:, muts_ind[nn]].sum() == 0:
+                    continue
             # See the matching block earlier in this function for
             # the full explanation.
             if not LR_pass_bool[muts_ind[nn]]:
@@ -1816,7 +1825,15 @@ def callBam(params, processNo):
                     # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
                 duplex_read_num_dict[duplex_no][2] += 1
                 unique_read_num += 1
-                if F2R1 >= 1 and F1R2 >= 1:
+                # simplex branch: round-0 error learning (isLearn=True) keeps
+                # the strict duplex requirement unchanged (profileTriNucMismatches'
+                # amp/damage decomposition is fundamentally a strand-discordance
+                # comparison and has no meaning for a single-strand family);
+                # only the calling rounds (isLearn=False) admit simplex families.
+                family_has_evidence = (
+                    (F2R1 >= 1 and F1R2 >= 1) if isLearn else (F2R1 >= 1 or F1R2 >= 1)
+                )
+                if family_has_evidence:
                     if params["maxNM"]:
                         f1r2_blacklist_num = 0
                         f2r1_blacklist_num = 0
@@ -2214,7 +2231,11 @@ def callBam(params, processNo):
             # unmasked_duplex_read_num_dict_trinuc[duplex_no] = np.zeros(96, dtype=int)
         duplex_read_num_dict[duplex_no][2] += 1
         unique_read_num += 1
-        if F2R1 >= 1 and F1R2 >= 1:
+        # simplex branch: see matching comment at the mid-batch flush site above.
+        family_has_evidence = (
+            (F2R1 >= 1 and F1R2 >= 1) if isLearn else (F2R1 >= 1 or F1R2 >= 1)
+        )
+        if family_has_evidence:
             if params["maxNM"]:
                 f1r2_blacklist_num = 0
                 f2r1_blacklist_num = 0

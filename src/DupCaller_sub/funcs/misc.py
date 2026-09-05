@@ -1920,7 +1920,13 @@ def init_refine_worker(depth_by_trinuc, depth_by_hpstr):
     _REFINE_WORKER_CTX = dict(
         depth_by_trinuc=depth_by_trinuc,
         depth_by_hpstr=depth_by_hpstr,
-        n1_mask=np.minimum(*np.indices((10, 10))) >= 1,
+        # simplex branch: was np.minimum(...)>=1 (both strands required),
+        # matching the old duplex-only calling gate. Now that calling admits
+        # simplex families too, this must count simplex depth (either axis
+        # >=1) in the Eeff denominator as well, or mu/FDR get computed
+        # against an artificially small opportunity relative to the new
+        # simplex-inclusive call numerator.
+        n1_mask=np.maximum(*np.indices((10, 10))) >= 1,
     )
 
 
