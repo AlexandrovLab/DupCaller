@@ -188,7 +188,7 @@ DupCaller.py call -b ${sample}.mkdped.bam -f reference.fa -o {output_prefix} \
 
 > Note: DupCaller partitions jobs by genomic region; multithreading is less effective for small targeted panels. In this case, use at most one thread per distinct targeted region.
 
-**NanoSeq-tagged BAMs:** BAMs produced by DupCaller's own `trim` (Step 2) carry a shared `DB:Z:{bc1}-{bc2}` tag per read pair. If instead you are calling directly from a BAM produced by the Sanger NanoSeq pipeline, which tags each read with its own `RB`/`MB` (read/mate barcode) tags rather than a single `DB` tag, pass `-nb`/`--NanoSeqBam` so `call` reconstructs the duplex barcode as `{MB}-{RB}` for read 1 and `{RB}-{MB}` for read 2 instead of reading `DB` directly.
+**Non-default barcode tags:** BAMs produced by DupCaller's own `trim` (Step 2) carry a shared `DB:Z:{bc1}-{bc2}` tag per read pair, and this is what `call` reads by default. If instead you are calling directly from a BAM that stores the duplex barcode differently, pass `-bc`/`--barcode TAG,NORMALIZE,SEP`: `TAG` is the bam tag holding the barcode, and `NORMALIZE` says whether it still needs splitting/reordering. For example, the Sanger NanoSeq pipeline tags each read with a single `RB` tag that already identifies the duplex family (e.g. `chrom,fragment_start,fragment_end,bc1,bc2`) independent of read orientation — pass `-bc RB,0,-` to read it directly (`SEP` is ignored in this case). DupCaller's own `DB:Z:{bc1}-{bc2}` tag is the `NORMALIZE=1` case (the default, `-bc DB,1,-`): it's an unnormalized `bc1<SEP>bc2` pair that still needs read-orientation-based reordering to group both strand-copies of a molecule together.
 
 **Input validation:** DupCaller checks for the existence of all required files (BAM, reference, h5 index files, and optional files) before starting analysis, providing clear error messages for missing files.
 
@@ -221,7 +221,7 @@ These options should be understood and customized accordingly.
 | -maf  | --maxAF      | Maximum allele fraction to call a somatic mutation. Must be set when matched normal (`-n`) is unavailable               | 1               |
 | -tt   | --trimF      | Ignore mutations less than n bp from template ends                                                                        | 7               |
 | -tr   | --trimR      | Ignore mutations less than n bp from read ends                                                                            | 7               |
-| -nb   | --NanoSeqBam | Read the duplex barcode from NanoSeq-style per-mate`RB`/`MB` BAM tags instead of a shared `DB` tag (see note above) | False           |
+| -bc   | --barcode    | Molecular/duplex barcode read tag, as `TAG,NORMALIZE,SEP` (see note above)                                                | DB,1,-          |
 
 ##### Optional
 
