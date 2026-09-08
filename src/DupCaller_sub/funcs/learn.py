@@ -248,7 +248,7 @@ def profileTriNucMismatches(
     F1R2_antimask[
         np.logical_and((F1R2_count_mat >= 1).sum(axis=0) < 2, F1R2_ref_count == 0)
     ] = False
-    # F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
+    F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
 
     F2R1_antimask[ds_alt] = False
     F2R1_count_sum = F2R1_count_mat.sum(axis=0)
@@ -258,7 +258,7 @@ def profileTriNucMismatches(
     F2R1_antimask[
         np.logical_and((F2R1_count_mat >= 1).sum(axis=0) < 2, F2R1_ref_count == 0)
     ] = False
-    # F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
+    F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
 
     F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
     F1R2_antimask_positions = np.nonzero(F1R2_antimask)[0]

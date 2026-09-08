@@ -91,6 +91,11 @@ def prepare_reference_mats(
     ### Adjust by germline
     if germline_bed != None:
         for rec in germline_bed.fetch(chrom, start, end):
+            if rec.alts is None:
+                # ALT="." -- a non-variant record (e.g. a reference-confirmation
+                # row some multi-strain-merged VCFs carry alongside real calls);
+                # nothing to mask.
+                continue
             ind = rec.pos - 1 - start
             ref = rec.ref
             try:
