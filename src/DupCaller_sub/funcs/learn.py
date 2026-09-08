@@ -248,7 +248,7 @@ def profileTriNucMismatches(
     F1R2_antimask[
         np.logical_and((F1R2_count_mat >= 1).sum(axis=0) < 2, F1R2_ref_count == 0)
     ] = False
-    F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
+    # F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
 
     F2R1_antimask[ds_alt] = False
     F2R1_count_sum = F2R1_count_mat.sum(axis=0)
@@ -258,7 +258,7 @@ def profileTriNucMismatches(
     F2R1_antimask[
         np.logical_and((F2R1_count_mat >= 1).sum(axis=0) < 2, F2R1_ref_count == 0)
     ] = False
-    F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
+    # F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
 
     F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
     F1R2_antimask_positions = np.nonzero(F1R2_antimask)[0]
@@ -281,7 +281,12 @@ def profileTriNucMismatches(
             # zeroed out above) counts as exactly 1, matching "record the
             # count for each base" rather than the old confidence-scaled
             # 1 - 10**(-bq/10) weight.
-            valid = qual_masked > 0
+            # seq_masked < 4 excludes N/deletion/off-read positions -- an N
+            # occasionally carries a non-zero quality (survives the minBq
+            # zeroing above), and its base index (4) falls outside the 4*96
+            # ATCG range that F1R2_trinuc_alt_bq_hist's bincount is reshaped
+            # into, crashing the reshape below if left in.
+            valid = (qual_masked > 0) & (seq_masked < 4)
             F1R2_trinuc_alt_count_mat += (
                 np.bincount(
                     F1R2_trinuc_alt_1Dmap,
@@ -330,7 +335,8 @@ def profileTriNucMismatches(
         if n_mismatch == 1:
             F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
             # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
-            valid = qual_masked > 0
+            # See the matching F1R2 comment above.
+            valid = (qual_masked > 0) & (seq_masked < 4)
             F2R1_trinuc_alt_count_mat += (
                 np.bincount(
                     F2R1_trinuc_alt_1Dmap,
