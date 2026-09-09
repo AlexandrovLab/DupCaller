@@ -145,7 +145,8 @@ process CALL_VARIANTS {
           path(normal_bam), path(normal_bai)
     path dc_ref             // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5 + .str.h5 + .dbs.h5
     tuple path(germline_vcf), path(germline_tbi)
-    tuple path(noise_mask),   path(noise_tbi)
+    path noise_mask_files     // all noise/snp mask .bed.gz + .bed.gz.tbi files staged together (may be empty)
+    val  noise_mask_names     // basenames of just the mask files (not their .tbi), in -m order
     path target_bed
     path indel_bed
 
@@ -156,7 +157,7 @@ process CALL_VARIANTS {
     def ref_name     = file(params.reference).name
     def normal_arg   = (normal_bam.name   != 'NO_FILE')        ? "-n ${normal_bam}"    : ""
     def germline_arg = (germline_vcf.name != 'NO_GERMLINE_VCF') ? "-g ${germline_vcf}" : ""
-    def noise_arg    = (noise_mask.name   != 'NO_NOISE_MASK')   ? "-m ${noise_mask}"   : ""
+    def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.join(' ')          : ""
     def target_arg   = (target_bed.name   != 'NO_TARGET_BED')   ? "-R ${target_bed}"   : ""
     def indel_arg    = (indel_bed.name    != 'NO_INDEL_BED')    ? "-id ${indel_bed}"   : ""
     """
@@ -202,6 +203,12 @@ process ESTIMATE_BURDEN {
     def clonal_arg = params.estimate_clonal ? "-c" : ""
     def dilute_arg = params.estimate_dilute ? "-d" : ""
     """
+    # sigProfilerPlotting's plotSBS() caches a template pickle inside its own
+    # site-packages install dir by default, which fails under a container's
+    # read-only root filesystem; redirect it into the (always-writable) task
+    # work dir instead.
+    export SIGPROFILERPLOTTING_VOLUME=\$PWD/spp_templates
+
     DupCaller.py estimate \
         -i ${call_dir} \
         -f ${ref_name} \
@@ -267,12 +274,18 @@ workflow {
           ])
         : Channel.value([file('NO_GERMLINE_VCF'), file('NO_GERMLINE_TBI')])
 
-    noise_ch = params.noise_mask
-        ? Channel.value([
-            file(params.noise_mask,             checkIfExists: true),
-            file("${params.noise_mask}.tbi",    checkIfExists: true)
-          ])
-        : Channel.value([file('NO_NOISE_MASK'), file('NO_NOISE_TBI')])
+    // params.noise_mask may be a single path or a list of paths (DupCaller.py
+    // call's -m/--noise takes nargs="+" -- e.g. a SNP mask and a noise mask
+    // together, as the real benchmark runs do); normalize to a list.
+    noise_mask_list = params.noise_mask
+        ? (params.noise_mask instanceof List ? params.noise_mask : [params.noise_mask])
+        : []
+    noise_files_ch = Channel.value(
+        noise_mask_list.collectMany { m ->
+            [file(m, checkIfExists: true), file("${m}.tbi", checkIfExists: true)]
+        }
+    )
+    noise_names_ch = Channel.value(noise_mask_list.collect { file(it).name })
 
     target_ch = params.target_bed
         ? Channel.value(file(params.target_bed, checkIfExists: true))
@@ -329,7 +342,8 @@ workflow {
         call_input_ch,
         dc_ref_ch,
         germline_ch,
-        noise_ch,
+        noise_files_ch,
+        noise_names_ch,
         target_ch,
         indel_ch
     )
