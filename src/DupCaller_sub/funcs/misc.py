@@ -1555,6 +1555,88 @@ def _drain_rugged_pool(chrom, position, rugged_reads_pool, params, currentReadDi
             )
 
 
+_REF_CONSUMING_CIGAR_OPS = set("MDN=X")
+
+
+def _mate_reference_end(rec):
+    """Mate's reference_end, computed from rec's own MC tag (mate CIGAR)
+    plus rec.next_reference_start -- without a random-access mate()
+    lookup. Returns None if rec has no MC tag (e.g. produced by an older
+    aligner/pipeline stage that doesn't write one)."""
+    if not rec.has_tag("MC"):
+        return None
+    consumed = 0
+    for length_str, op in re.findall(r"(\d+)([MIDNSHPX=])", rec.get_tag("MC")):
+        if op in _REF_CONSUMING_CIGAR_OPS:
+            consumed += int(length_str)
+    return rec.next_reference_start + consumed
+
+
+def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
+    """Like bamIterateMultipleRegion, but if this worker's assigned span
+    has an explicit end (regions[-1] is a full (chrom, start, end) tuple
+    -- i.e. there's a following worker to hand off to), also yields an
+    "overflow" continuation past that end for any read whose downstream
+    mate crosses the boundary (computed from the MC tag, not a fixed
+    buffer), so a duplex family split across a chunk boundary can still
+    be fully reconstructed by the worker that saw its upstream anchor.
+
+    This fixes a real undercount: _index_rugged_mates/_drain_rugged_pool
+    (above) reconcile a family whose PCR-duplicate copies disagree
+    slightly on their downstream mate's position (alignment noise) by
+    redirecting the minority copy into the majority position's batch --
+    but that redirect only completes if THIS SAME worker's scan later
+    reaches the majority position. If a chunk boundary falls between the
+    minority and majority positions, the worker holding the upstream
+    anchor queues the redirect but exits before ever draining it, and the
+    other worker (owning the majority position) never saw the upstream
+    anchor at all -- the family's evidence silently drops from 2 copies
+    to 1. This is exact-integer thread-count-dependent drift, not
+    floating-point noise (confirmed against real amp.tn.txt/dmg.tn.txt
+    differences between -p 32 and -p 64 reruns of the same BAM).
+
+    Kept exactly-once (no double-count) by a matching check on the
+    RECEIVING side: callBam's main loop skips any read whose mate starts
+    before its own region's start (see the prev_boundary check in
+    callBam) -- that read is this function's overflow pass's
+    responsibility, not the next worker's own normal scan.
+    """
+    boundary_chrom = None
+    boundary_pos = None
+    if len(regions[-1]) == 3:
+        boundary_chrom = regions[-1][0]
+        boundary_pos = regions[-1][2]
+    last_end = boundary_pos
+
+    for rec, region in bamIterateMultipleRegion(bam, regions, ref, region_file):
+        if (
+            boundary_chrom is not None
+            and rec.reference_name == boundary_chrom
+            and not rec.is_supplementary
+            and not rec.is_secondary
+            and not rec.is_qcfail
+            and rec.is_proper_pair
+        ):
+            mate_end = _mate_reference_end(rec)
+            if mate_end is not None and mate_end > last_end:
+                last_end = mate_end
+        yield rec, region
+
+    if boundary_chrom is not None and last_end > boundary_pos:
+        overflow_region = (boundary_chrom, boundary_pos + 1, int(last_end) + 1)
+        for rec, region in bamIterateMultipleRegion(
+            bam, [overflow_region], ref, region_file
+        ):
+            if rec.next_reference_start >= boundary_pos:
+                # Not a continuation of a family whose anchor was in this
+                # worker's own normal region -- belongs to whatever the
+                # next worker independently discovers in its own normal
+                # scan (or is simply unrelated to any boundary-crossing
+                # family). Skip it here rather than risk double-counting.
+                continue
+            yield rec, region
+
+
 # ======================================================================
 # Error-matrix normalization and loading
 # ======================================================================

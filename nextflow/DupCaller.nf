@@ -71,7 +71,7 @@ process BWA_MEM {
     script:
     def ref_name = file(params.reference).name
     """
-    bwa mem -C \
+    bwa mem -C -T 0 \
         -t ${task.cpus} \
         -R "@RG\\tID:${sample_id}_${type}\\tSM:${sample_id}\\tPL:ILLUMINA" \
         ${ref_name} ${read1} ${read2} \
@@ -116,11 +116,20 @@ process MARK_DUPLICATES {
           path("${sample_id}_${type}.mkdped.bam.bai")
 
     script:
+    // MarkDuplicates' external sort spills large intermediate chunks to
+    // disk once it exceeds its in-memory buffer -- without an explicit
+    // TMP_DIR it falls back to Java's default tmp dir, which is usually
+    // the compute node's small local /tmp, not sized for a real BAM's
+    // spill files ("No space left on device" on anything but a tiny
+    // input). Point it at the task's own work dir instead, which is
+    // always on whatever (large) filesystem -w points at.
+    def heap_gb = Math.max(1, (task.memory.toGiga() * 0.8) as int)
     """
-    gatk MarkDuplicates \
+    gatk --java-options "-Xmx${heap_gb}g -Djava.io.tmpdir=\$PWD" MarkDuplicates \
         -I ${bam} \
         -O ${sample_id}_${type}.mkdped.bam \
         -M ${sample_id}_${type}.mkdp_metrics.txt \
+        --TMP_DIR \$PWD \
         --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*\$" \
         --DUPLEX_UMI \
         --TAGGING_POLICY OpticalOnly \
@@ -160,6 +169,10 @@ process CALL_VARIANTS {
     def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.join(' ')          : ""
     def target_arg   = (target_bed.name   != 'NO_TARGET_BED')   ? "-R ${target_bed}"   : ""
     def indel_arg    = (indel_bed.name    != 'NO_INDEL_BED')    ? "-id ${indel_bed}"   : ""
+    // Omitted by default (DupCaller.py call itself then generates a fresh
+    // random seed every run) -- set params.seed to pin it, e.g. to
+    // reproduce/compare against a specific prior run's exact seed.
+    def seed_arg     = params.seed != null                      ? "--seed ${params.seed}" : ""
     """
     DupCaller.py call \
         -b  ${tumor_bam} \
@@ -172,6 +185,7 @@ process CALL_VARIANTS {
         ${noise_arg} \
         ${target_arg} \
         ${indel_arg} \
+        ${seed_arg} \
         -maf ${params.max_af} \
         -gaf ${params.germline_af_cutoff} \
         -d   ${params.min_n_depth} \

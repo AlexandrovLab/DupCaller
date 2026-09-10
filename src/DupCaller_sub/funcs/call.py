@@ -44,6 +44,7 @@ from .misc import (
     get_bed_file_for_position,
     _filter_reason_label,
     bamIterateMultipleRegion,
+    bamIterateMultipleRegionWithOverflow,
     _detect_dbs_pairs,
     _compute_dbs_opportunity,
     _accumulate_depth_matrix,
@@ -1161,6 +1162,18 @@ def callBam(params, processNo):
     bam = params["tumorBam"]
     nbams = params["normalBams"]
     regions = params["regions"]
+    # prev_boundary_*: the raw, un-adjusted start of this worker's own
+    # first region, used ONLY to keep bamIterateMultipleRegionWithOverflow
+    # exactly-once for family-batching purposes (see its docstring) --
+    # kept deliberately separate from regions_start_pos below, which
+    # serves a different purpose (coverage.bed file routing) and is left
+    # untouched. None when this worker's first region starts at position
+    # 0, i.e. there is no preceding worker to hand off from.
+    prev_boundary_chrom = None
+    prev_boundary_pos = None
+    if len(regions[0]) > 1 and regions[0][1] != 0:
+        prev_boundary_chrom = regions[0][0]
+        prev_boundary_pos = regions[0][1]
     if len(regions[0]) == 1:
         regions_start_chrom = regions[0][0]
         regions_start_pos = 0
@@ -1343,7 +1356,11 @@ def callBam(params, processNo):
         )
         read_blacklist = set()
         rec_num = 0
-        for rec, region in bamIterateMultipleRegion(
+        # Overflow-aware here too so a read this worker's main pass will
+        # later pull in from past its own region_end (see
+        # bamIterateMultipleRegionWithOverflow) gets the same NM-based
+        # screening as everything else, instead of silently skipping it.
+        for rec, region in bamIterateMultipleRegionWithOverflow(
             bam, regions, params.get("reference"), params.get("region_file")
         ):
             rec_num += 1
@@ -1705,7 +1722,7 @@ def callBam(params, processNo):
     # it (see the purge below) instead of leaking for the rest of the
     # process's lifetime.
     rugged_pool_chrom = None
-    for rec, region in bamIterateMultipleRegion(
+    for rec, region in bamIterateMultipleRegionWithOverflow(
         bam, regions, params.get("reference"), params.get("region_file")
     ):
         recCount += 1
@@ -1735,6 +1752,18 @@ def callBam(params, processNo):
         if (rec.is_forward and rec.cigartuples[0][0] != 0) or (
             rec.is_reverse and rec.cigartuples[-1][0] != 0
         ):
+            continue
+        if (
+            prev_boundary_chrom is not None
+            and rec.reference_name == prev_boundary_chrom
+            and rec.next_reference_start < prev_boundary_pos
+        ):
+            # This read's mate starts before this worker's own region --
+            # it's the receiving half of a family whose upstream anchor
+            # was in the PREVIOUS worker's region, already claimed and
+            # (about to be) fully reconstructed by that worker's own
+            # bamIterateMultipleRegionWithOverflow overflow pass. Skip it
+            # here to keep family-counting exactly-once.
             continue
         pass_read_num += 1
         if rec.template_length < 0 and rec.query_name in rugged_reads_index:
@@ -2510,13 +2539,21 @@ def callBam(params, processNo):
     Calling block ends
     """
     if isLearn:
+        # These six matrices are pure whole-number counts by this point;
+        # cast to int here (the single shared return site for both the
+        # -p1 direct-call path and every multiprocessing worker) so a
+        # sum() over per-worker results is already int and doesn't depend
+        # on an aggregation-side .astype(int) that the -p1 path skips --
+        # previously left as np.zeros' default float64, which made
+        # *.amp.hp.txt/*.amp.str.txt/*.dmg.hp.txt/*.dmg.str.txt render as
+        # "82.0" at -p1 but "82" at -p>1 despite identical values.
         return (
-            mismatch_mat,
-            hp_alt_mat,
-            str_alt_mat,
-            mismatch_dmg_mat,
-            hp_dmg_mat,
-            str_dmg_mat,
+            mismatch_mat.astype(int),
+            hp_alt_mat.astype(int),
+            str_alt_mat.astype(int),
+            mismatch_dmg_mat.astype(int),
+            hp_dmg_mat.astype(int),
+            str_dmg_mat.astype(int),
             sbs_alt_bq_hist_mat,
         )
 
