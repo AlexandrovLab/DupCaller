@@ -1950,14 +1950,63 @@ def do_call(args):
     )
 
 
+def _max_bed_start_position(path):
+    """Largest integer `start` coordinate in a coverage bed file, or None if
+    the file doesn't exist or has no data rows. Used to detect how far an
+    overflow-extended `next_region` file (bamIterateMultipleRegionWithOverflow,
+    funcs/misc.py, can push a worker's flush arbitrarily far past its own
+    nominal region_end to correctly attribute a boundary-crossing duplex
+    family) reaches into the following worker's own main coverage file, so
+    that file's leading rows within that reach can be folded into the
+    boundary merge below instead of assuming a plain concatenation is
+    already sorted.
+    """
+    if not os.path.exists(path):
+        return None
+    max_pos = None
+    with bgzf.open(path, "rt") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            start = int(parts[1])
+            if max_pos is None or start > max_pos:
+                max_pos = start
+    return max_pos
+
+
+def _split_bed_by_start(path, cutoff, below_path, above_path):
+    """Stream-split a start-ascending coverage bed file (guaranteed by
+    callBam's max_flushed_pos watermark) into rows with start <= cutoff
+    (below_path) and start > cutoff (above_path)."""
+    with bgzf.open(path, "rt") as fin, bgzf.open(below_path, "wt") as fbelow, bgzf.open(
+        above_path, "wt"
+    ) as fabove:
+        for line in fin:
+            if not line.strip():
+                continue
+            start = int(line.split("\t", 2)[1])
+            (fbelow if start <= cutoff else fabove).write(line)
+
+
 def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
     """
-    1. Merge adjacent next_region and prev_region files by summing all numeric columns
-    2. Combine all files in the correct order using cat
+    1. Merge adjacent next_region/prev_region files -- plus, whenever an
+       overflow-extended next_region file reaches past the following
+       worker's own region_start, that worker's own leading main-coverage
+       rows within that reach -- by summing all numeric columns for
+       matching positions.
+    2. Combine all files (each worker's main file now peeled down to only
+       the rows past any such reach, so already correctly ordered by
+       construction) and bgzip.
     """
     print("Merging adjacent region files and combining coverage files...")
 
-    # Step 1: Create overlap files by merging adjacent regions
+    # Step 1: Create overlap files by merging adjacent regions. Track, per
+    # worker whose main file got peeled, the path to its remainder (the
+    # rows NOT folded into the overlap merge) to use in step 2 instead of
+    # its original (untouched) main file.
+    remainder_files = {}
     for n in range(nprocess - 1):
         next_file = os.path.join(
             sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz"
@@ -1968,15 +2017,39 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
         overlap_file = os.path.join(
             sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"
         )
+        main_next_file = os.path.join(
+            sample_dir, f"{sample_name}_{n+1}_coverage.bed.gz"
+        )
 
-        merge_adjacent_bed_files(next_file, prev_file, overlap_file)
+        overlap_max_pos = _max_bed_start_position(next_file)
+        extra_files = []
+        if overlap_max_pos is not None and os.path.exists(main_next_file):
+            peeled_file = os.path.join(
+                sample_dir, f"{sample_name}_{n+1}_coverage_peeled.tmp.bed.gz"
+            )
+            remainder_file = os.path.join(
+                sample_dir, f"{sample_name}_{n+1}_coverage_remainder.tmp.bed.gz"
+            )
+            _split_bed_by_start(
+                main_next_file, overlap_max_pos, peeled_file, remainder_file
+            )
+            extra_files.append(peeled_file)
+            remainder_files[n + 1] = remainder_file
+
+        merge_adjacent_bed_files(next_file, prev_file, overlap_file, extra_files)
+
+        for f in extra_files:
+            os.remove(f)
 
     # Step 2: Create list of files in the correct order
     files_to_combine = []
 
     for n in range(nprocess):
-        # Add main coverage file
-        main_file = os.path.join(sample_dir, f"{sample_name}_{n}_coverage.bed.gz")
+        # Use the peeled remainder in place of the original main file for
+        # any worker whose leading rows were folded into an overlap merge.
+        main_file = remainder_files.get(
+            n, os.path.join(sample_dir, f"{sample_name}_{n}_coverage.bed.gz")
+        )
         if not os.path.exists(main_file):
             raise FileNotFoundError(f"Expected coverage file not found: {main_file}")
         files_to_combine.append(main_file)
@@ -1992,15 +2065,19 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
                 )
             files_to_combine.append(overlap_file)
 
-    # Step 3: Combine files using cat command
+    # Step 3: Combine files (order is now correct by construction; sort
+    # anyway as cheap defense-in-depth) then bgzip. `pipefail` via bash so a
+    # zcat/sort failure isn't masked by bgzip's own exit code.
     if files_to_combine:
         final_output = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
-
-        # Use cat to combine files
-        cmd = f"cat {' '.join(files_to_combine)} > {final_output}"
+        cmd = (
+            f"set -o pipefail; zcat {' '.join(files_to_combine)} | "
+            f"LC_ALL=C sort -k1,1 -k2,2n -T {sample_dir} | "
+            f"bgzip > {final_output}"
+        )
 
         try:
-            subprocess.run(cmd, shell=True, check=True)
+            subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
             print(f"Combined coverage file created: {final_output}")
 
             # Index the combined bed file with tabix
@@ -2014,19 +2091,24 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
         except subprocess.CalledProcessError as e:
             print(f"Error combining files: {e}")
 
-        # Clean up temporary files
+        # Clean up temporary files (including any peeled remainders)
         cleanup_temp_files(sample_name, sample_dir, nprocess)
+        for remainder_file in remainder_files.values():
+            if os.path.exists(remainder_file):
+                os.remove(remainder_file)
     else:
         print("No coverage files found to combine")
 
 
-def merge_adjacent_bed_files(next_file, prev_file, output_file):
+def merge_adjacent_bed_files(next_file, prev_file, output_file, extra_files=None):
     """
-    Merge two adjacent bed files by summing every numeric column (everything
-    after chrom/start/end) for matching positions. Column count is read from
-    the data rather than hardcoded, so this stays correct as the coverage
-    bed schema grows (currently: cov_A/T/C/G and 6 indel category coverage
-    columns).
+    Merge adjacent-boundary bed files -- plus any extra sources (e.g. a
+    following worker's main-coverage rows peeled off because an overflow-
+    extended `next_file` reaches past them, see merge_and_combine_coverage_
+    files) -- by summing every numeric column (everything after chrom/
+    start/end) for matching positions. Column count is read from the data
+    rather than hardcoded, so this stays correct as the coverage bed schema
+    grows (currently: cov_A/T/C/G and 6 indel category coverage columns).
     """
     coverage_dict = {}
 
@@ -2054,10 +2136,17 @@ def merge_adjacent_bed_files(next_file, prev_file, output_file):
 
     accumulate(next_file)
     accumulate(prev_file)
+    for path in extra_files or []:
+        accumulate(path)
 
-    # Write merged result only if there's data
+    # Write merged result only if there's data. Sort numerically (start/end
+    # are strings at this point) -- a lexicographic sort would misorder
+    # e.g. "100000" before "99999".
     with bgzf.open(output_file, "wt") as f:
-        for (chrom, start, end), values in sorted(coverage_dict.items()):
+        for (chrom, start, end), values in sorted(
+            coverage_dict.items(),
+            key=lambda kv: (kv[0][0], int(kv[0][1]), int(kv[0][2])),
+        ):
             f.write("\t".join([chrom, start, end] + [str(v) for v in values]) + "\n")
 
 
