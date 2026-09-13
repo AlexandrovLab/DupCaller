@@ -521,7 +521,9 @@ def _process_duplex_family(
     ### Calculate genotype probability
     # if not any(indel_bool) or isLearn:
     if 1:
-        if isLearn and F1R2 > 2 and F2R1 > 2:
+        if isLearn:
+            # Per-strand/per-family gating (srdMinRead/ssmMinRead) is
+            # applied inside profileTriNucMismatches, not here.
             (
                 mismatch_now,
                 hp_alt_now,
@@ -1162,19 +1164,19 @@ def callBam(params, processNo):
     bam = params["tumorBam"]
     nbams = params["normalBams"]
     regions = params["regions"]
-    # prev_boundary_*: the raw, un-adjusted start of this worker's own
-    # first region, used ONLY to keep bamIterateMultipleRegionWithOverflow
-    # exactly-once for family-batching purposes (see its docstring) --
-    # kept deliberately separate from regions_start_pos below, which
-    # serves a different purpose (coverage.bed file routing) and is left
-    # untouched. None when this worker's first region starts at position
-    # 0, i.e. there is no preceding worker to hand off from.
+    # prev_boundary_*: raw start of this worker's first region, used only
+    # to keep bamIterateMultipleRegionWithOverflow exactly-once (see its
+    # docstring). Separate from regions_start_pos below, which routes
+    # coverage.bed output. None if there's no preceding worker.
     prev_boundary_chrom = None
     prev_boundary_pos = None
     if len(regions[0]) > 1 and regions[0][1] != 0:
         prev_boundary_chrom = regions[0][0]
         prev_boundary_pos = regions[0][1]
-    if len(regions[0]) == 1:
+    coverage_start = params.get("coverage_start")
+    if coverage_start is not None and coverage_start[0] == regions[0][0]:
+        regions_start_chrom, regions_start_pos = coverage_start
+    elif len(regions[0]) == 1:
         regions_start_chrom = regions[0][0]
         regions_start_pos = 0
     else:

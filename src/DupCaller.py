@@ -8,6 +8,21 @@ from DupCaller_sub.Learn import do_learn
 from DupCaller_sub.AggregateProfile import do_aggregate
 from DupCaller_sub.Index import do_index, do_index_dbs
 
+
+def positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return value
+
+
 # from Estimate import do_estimate
 if __name__ == "__main__":
     """
@@ -106,6 +121,15 @@ if __name__ == "__main__":
         help="prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, "
         "{prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, "
         "{prefix}.dmg.str.txt); overrides the default (output prefix)",
+    )
+    call_parser.add_argument(
+        "-lo",
+        "--learnOnly",
+        action="store_true",
+        help="stop after estimating/writing the error-rate files (ERROR/ dir); skip "
+        "variant calling entirely. No-op (still exits after nothing to do) if the "
+        "error files already exist, since learning is then skipped too -- pass "
+        "-E/--errprefix elsewhere or remove the existing files to force re-learning.",
     )
     call_parser.add_argument(
         "-lfdr",
@@ -213,6 +237,13 @@ if __name__ == "__main__":
         default=5,
     )
     call_parser.add_argument(
+        "--minChunkLength",
+        "--min-chunk-length",
+        type=positive_int,
+        default=10000,
+        help="minimum chunk length in bases; shorter contigs stay unsplit (default: 10000)",
+    )
+    call_parser.add_argument(
         "-w",
         "--windowSize",
         type=int,
@@ -244,6 +275,18 @@ if __name__ == "__main__":
         "--minAlt",
         type=float,
         help="minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of --minRef/--minAlt is applied, since the underlying check doesn't separate ref vs alt counts",
+        default=3,
+    )
+    call_parser.add_argument(
+        "--srdMinRead",
+        type=nonnegative_int,
+        help="minimum reads on a single strand (F1R2 or F2R1) for that strand's reads to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand -- a family can contribute its F1R2 reads even if F2R1 doesn't meet this, or vice versa. Also gates, per site within a qualifying strand, the minimum number of BQ>minBq bases required for that site to be counted",
+        default=3,
+    )
+    call_parser.add_argument(
+        "--ssmMinRead",
+        type=nonnegative_int,
+        help="minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand-mutation (SSM)/damage-rate calculation",
         default=3,
     )
     call_parser.add_argument(

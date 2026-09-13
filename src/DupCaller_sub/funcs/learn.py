@@ -1,12 +1,8 @@
 import numpy as np
 from .indels import findIndels, getIndelArr, left_align_indel
 
-# Base-quality axis for the amp-error BQ histograms below: SAM/BAM Phred
-# scores are defined over 0-93 ('!' to '~'), so this range covers any
-# quality value a BAM can carry regardless of sequencing platform. Bin
-# index == literal BQ value, so a companion "BQ values" array is just
-# np.arange(NUM_BQ) -- callers (Learn.py) use that as the histogram's
-# BQ-axis labels when writing output.
+# BQ axis for the amp-error BQ histograms below: covers SAM/BAM's full
+# Phred range (0-93); bin index == literal BQ value.
 MAX_BQ = 93
 NUM_BQ = MAX_BQ + 1
 
@@ -24,22 +20,18 @@ def profileTriNucMismatches(
     trinuc2num = params["trinuc2num_dict"]
     # hp_alt_count/hp_dmg_count: (10, 12) -- rows hp run length 1-10+
     # (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}
-    # (idLen=0 is the reference/opportunity column). str_alt_count/
-    # str_dmg_count: (5, 11) -- rows STR-length bin 0="0-1" (not a real
-    # repeat) / 1="2-9" / 2="10-24" / 3="25-39" / 4="40+", columns
-    # idLen+5 for idLen in -5..5 (idLen=0 the opportunity column). See
-    # funcs/prob.py's indelErrorProbs for the matching call-time
-    # selection logic these are built to feed.
+    # (idLen=0 the reference/opportunity column). str_alt_count/
+    # str_dmg_count: (5, 11) -- rows STR-length bin 0="0-1"/1="2-9"/
+    # 2="10-24"/3="25-39"/4="40+", columns idLen+5 for idLen in -5..5
+    # (idLen=0 the opportunity column). See funcs/prob.py's
+    # indelErrorProbs for the matching selection logic.
     hp_alt_count = np.zeros([10, 12])
     hp_dmg_count = np.zeros([10, 12])
     str_alt_count = np.zeros([5, 11])
     str_dmg_count = np.zeros([5, 11])
-    # Amp-error BQ histogram (SBS only -- no HP/STR version): unlike the
-    # count matrices above, this is not weighted/discounted by base
-    # quality -- it records, for every (trinuc, base, base-quality)
-    # triple, how many raw (unweighted) amp-error observations landed
-    # there. Mirrors mismatch_profile's (64, 4) shape with a trailing BQ
-    # axis. Feeds estimate_sbs_srd_rates below.
+    # Amp-error BQ histogram (SBS only): raw count per (trinuc, base,
+    # base-quality) triple. Mirrors mismatch_profile's (64, 4) shape with
+    # a trailing BQ axis. Feeds estimate_sbs_srd_rates below.
     sbs_alt_bq_hist = np.zeros([64, 4, NUM_BQ])
 
     F1R2 = []
@@ -55,40 +47,17 @@ def profileTriNucMismatches(
     m_F1R2 = len(F1R2)
     m_F2R1 = len(F2R1)
 
-    # Minimum reads-per-strand for a family to contribute to amp/damage
-    # learning -- kept as two separate constants (not CLI-adjustable; no
-    # params entry has ever fed them) since damage (single-strand-specific
-    # errors) and amp (errors shared by both consensus reads) need
-    # different amounts of depth to reliably separate signal from noise.
-    # The family-level floor below (below which NOTHING can be learned
-    # from this family, amp or damage) is the smaller of the two -- each
-    # learning track's own, possibly-stricter minimum is applied
-    # separately at its own antimask further down, so a family passing
-    # only the lower of the two still contributes to whichever track it
-    # actually qualifies for.
-    min_group_amp = 3
-    min_group_dmg = 3
-    # --minRef/--minAlt: every per-position depth floor below (SBS's dmg/
-    # amp antimasks and the indel antimasks further down) is a single
-    # total-depth count (ref+alt reads together), not split out by ref vs
-    # alt identity, so there's no separate ref-count/alt-count to gate
-    # individually. Both bounds are combined as the stricter (larger) of
-    # the two instead of picking one arbitrarily. --minAltQual gates the
-    # SBS dmg antimask's per-strand summed consensus base quality.
+    # Minimum reads-per-strand for the SRD (amp-error) and SSM/damage
+    # tracks, CLI-adjustable via --srdMinRead/--ssmMinRead. Evaluated
+    # per-track below (see F1R2_antimask/F2R1_antimask/dmg_antimask); a
+    # family too small for a track just gets an all-False antimask there.
+    srd_min_read = params.get("srdMinRead", 3)
+    ssm_min_read = params.get("ssmMinRead", 3)
+    # Per-position depth floor (ref+alt combined) and summed consensus
+    # base-quality floor for the SBS dmg antimask and the indel antimasks
+    # below.
     min_depth = max(params.get("minRef", 3), params.get("minAlt", 3))
     min_alt_qual = params.get("minAltQual", 90)
-    if m_F1R2 < min(min_group_amp, min_group_dmg) or m_F2R1 < min(
-        min_group_amp, min_group_dmg
-    ):
-        return (
-            np.zeros([64, 4]),
-            np.zeros([10, 12]),
-            np.zeros([5, 11]),
-            np.zeros([64, 4]),
-            np.zeros([10, 12]),
-            np.zeros([5, 11]),
-            np.zeros([64, 4, NUM_BQ]),
-        )
 
     ### Prepare sequence matrix and quality matrix for each strand
     n = len(reference_int)
@@ -164,12 +133,15 @@ def profileTriNucMismatches(
 
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
-    if m_F1R2 < min_group_amp or m_F2R1 < min_group_amp:
+    # SRD: each strand's inclusion is independent.
+    if m_F1R2 < srd_min_read:
         F1R2_antimask[:] = False
+    if m_F2R1 < srd_min_read:
         F2R1_antimask[:] = False
 
     dmg_antimask = antimask.copy()
-    if m_F1R2 < min_group_dmg or m_F2R1 < min_group_dmg:
+    # SSM/damage: requires BOTH strands to meet ssm_min_read.
+    if m_F1R2 < ssm_min_read or m_F2R1 < ssm_min_read:
         dmg_antimask[:] = False
 
     F1R2_qual_mat_merged = np.zeros([4, n])
@@ -240,23 +212,39 @@ def profileTriNucMismatches(
         ]
     )
 
+    # BQ-qualifying (qual>0 post-zeroing above) per-position counts --
+    # these, not the raw *_count_mat, gate SRD site inclusion below.
+    F1R2_hq_count_mat = np.zeros([4, n], dtype=int)
+    F2R1_hq_count_mat = np.zeros([4, n], dtype=int)
+    for nn in range(0, 4):
+        F1R2_hq_count_mat[nn, :] = ((F1R2_seq_mat == nn) & (F1R2_qual_mat > 0)).sum(
+            axis=0
+        )
+        F2R1_hq_count_mat[nn, :] = ((F2R1_seq_mat == nn) & (F2R1_qual_mat > 0)).sum(
+            axis=0
+        )
+    F1R2_hq_count_sum = F1R2_hq_count_mat.sum(axis=0)
+    F2R1_hq_count_sum = F2R1_hq_count_mat.sum(axis=0)
+    F1R2_hq_ref_count = F1R2_hq_count_mat[reference_int, np.ogrid[: reference_int.size]]
+    F2R1_hq_ref_count = F2R1_hq_count_mat[reference_int, np.ogrid[: reference_int.size]]
+
     F1R2_antimask[ds_alt] = False
-    F1R2_count_sum = F1R2_count_mat.sum(axis=0)
-    F1R2_antimask[F1R2_count_sum < min_depth] = False
-    F1R2_ref_count = F1R2_count_mat[reference_int, np.ogrid[: reference_int.size]]
-    F1R2_antimask[F1R2_count_sum - F1R2_ref_count >= 2] = False
+    # Site needs >=srd_min_read BQ-qualifying bases, and is excluded if
+    # 2+ of those mismatch the reference. All checks use the
+    # BQ-qualifying counts (F1R2_hq_count_mat/F1R2_hq_ref_count), never
+    # the raw (BQ-blind) F1R2_count_mat.
+    F1R2_antimask[F1R2_hq_count_sum < srd_min_read] = False
+    F1R2_antimask[F1R2_hq_count_sum - F1R2_hq_ref_count >= 2] = False
     F1R2_antimask[
-        np.logical_and((F1R2_count_mat >= 1).sum(axis=0) < 2, F1R2_ref_count == 0)
+        np.logical_and((F1R2_hq_count_mat >= 1).sum(axis=0) < 2, F1R2_hq_ref_count == 0)
     ] = False
     # F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False
 
     F2R1_antimask[ds_alt] = False
-    F2R1_count_sum = F2R1_count_mat.sum(axis=0)
-    F2R1_antimask[F2R1_count_sum < min_depth] = False
-    F2R1_ref_count = F2R1_count_mat[reference_int, np.ogrid[: reference_int.size]]
-    F2R1_antimask[F2R1_count_sum - F2R1_ref_count >= 2] = False
+    F2R1_antimask[F2R1_hq_count_sum < srd_min_read] = False
+    F2R1_antimask[F2R1_hq_count_sum - F2R1_hq_ref_count >= 2] = False
     F2R1_antimask[
-        np.logical_and((F2R1_count_mat >= 1).sum(axis=0) < 2, F2R1_ref_count == 0)
+        np.logical_and((F2R1_hq_count_mat >= 1).sum(axis=0) < 2, F2R1_hq_ref_count == 0)
     ] = False
     # F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
 
@@ -267,44 +255,34 @@ def profileTriNucMismatches(
     F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
     for mm in range(F1R2_seq_mat.shape[0]):
         seq_masked = F1R2_seq_mat[mm, F1R2_antimask]
-        ref_masked = reference_int[F1R2_antimask]
         qual_masked = F1R2_qual_mat[mm, F1R2_antimask]
-        mismatch_bool = seq_masked != ref_masked
-        n_mismatch = int(mismatch_bool.sum())
-        if n_mismatch == 0:
-            continue
-        if n_mismatch == 1:
-            F1R2_trinuc_alt_1Dmap = F1R2_trinuc_masked + seq_masked * 96
-            # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
-            # Not weighted by base quality any more -- a passing base
-            # (qual > 0, i.e. > minBq: bases <= minBq were already
-            # zeroed out above) counts as exactly 1, matching "record the
-            # count for each base" rather than the old confidence-scaled
-            # 1 - 10**(-bq/10) weight.
-            # seq_masked < 4 excludes N/deletion/off-read positions -- an N
-            # occasionally carries a non-zero quality (survives the minBq
-            # zeroing above), and its base index (4) falls outside the 4*96
-            # ATCG range that F1R2_trinuc_alt_bq_hist's bincount is reshaped
-            # into, crashing the reshape below if left in.
-            valid = (qual_masked > 0) & (seq_masked < 4)
-            F1R2_trinuc_alt_count_mat += (
-                np.bincount(
-                    F1R2_trinuc_alt_1Dmap,
-                    weights=valid.astype(float),
-                    minlength=96 * 4,
-                )[0 : 4 * 96]
-                .reshape([4, 96])
-                .T
+        # Every covered position is counted (matching -> reference column,
+        # mismatch -> alt column), regardless of the read's total mismatch
+        # count. funcs/call.py's NM blacklist only drops a whole family
+        # (fractional/strand-level), not individual moderately-mismatched
+        # reads within a passing family.
+        F1R2_trinuc_alt_1Dmap = F1R2_trinuc_masked + seq_masked * 96
+        # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
+        # A passing base (qual > minBq) counts as 1; N/deletion/off-read
+        # positions (seq_masked == 4) are excluded.
+        valid = (qual_masked > 0) & (seq_masked < 4)
+        F1R2_trinuc_alt_count_mat += (
+            np.bincount(
+                F1R2_trinuc_alt_1Dmap,
+                weights=valid.astype(float),
+                minlength=96 * 4,
+            )[0 : 4 * 96]
+            .reshape([4, 96])
+            .T
+        )
+        if valid.any():
+            bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
+            flat_idx = F1R2_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
+            F1R2_trinuc_alt_bq_hist += (
+                np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
+                .reshape([4, 96, NUM_BQ])
+                .transpose(1, 0, 2)
             )
-            if valid.any():
-                bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
-                flat_idx = F1R2_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
-                F1R2_trinuc_alt_bq_hist += (
-                    np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
-                    .reshape([4, 96, NUM_BQ])
-                    .transpose(1, 0, 2)
-                )
-        # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[:32,:] + F1R2_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -326,35 +304,28 @@ def profileTriNucMismatches(
     # F1R2_alt_masked = F1R2_alt_int[F1R2_antimask]
     for mm in range(F2R1_seq_mat.shape[0]):
         seq_masked = F2R1_seq_mat[mm, F2R1_antimask]
-        ref_masked = reference_int[F2R1_antimask]
         qual_masked = F2R1_qual_mat[mm, F2R1_antimask]
-        mismatch_bool = seq_masked != ref_masked
-        n_mismatch = int(mismatch_bool.sum())
-        if n_mismatch == 0:
-            continue
-        if n_mismatch == 1:
-            F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
-            # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
-            # See the matching F1R2 comment above.
-            valid = (qual_masked > 0) & (seq_masked < 4)
-            F2R1_trinuc_alt_count_mat += (
-                np.bincount(
-                    F2R1_trinuc_alt_1Dmap,
-                    weights=valid.astype(float),
-                    minlength=96 * 4,
-                )[0 : 4 * 96]
-                .reshape([4, 96])
-                .T
+        # See the matching F1R2 loop above.
+        F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
+        # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
+        valid = (qual_masked > 0) & (seq_masked < 4)
+        F2R1_trinuc_alt_count_mat += (
+            np.bincount(
+                F2R1_trinuc_alt_1Dmap,
+                weights=valid.astype(float),
+                minlength=96 * 4,
+            )[0 : 4 * 96]
+            .reshape([4, 96])
+            .T
+        )
+        if valid.any():
+            bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
+            flat_idx = F2R1_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
+            F2R1_trinuc_alt_bq_hist += (
+                np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
+                .reshape([4, 96, NUM_BQ])
+                .transpose(1, 0, 2)
             )
-            if valid.any():
-                bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
-                flat_idx = F2R1_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
-                F2R1_trinuc_alt_bq_hist += (
-                    np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
-                    .reshape([4, 96, NUM_BQ])
-                    .transpose(1, 0, 2)
-                )
-        # n_mismatch > 1: too unreliable, excluded from SBS amp
     # F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[:32,:] + F2R1_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -409,13 +380,17 @@ def profileTriNucMismatches(
             np.zeros([5, 11]),
             sbs_alt_bq_hist,
         )
+    # Indel (HP/STR) min-reads-per-strand: separate constants from
+    # srd_min_read/ssm_min_read, which only gate the SBS antimasks above.
+    min_group_indel_amp = 3
+    min_group_indel_dmg = 3
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
-    if m_F1R2 < min_group_amp or m_F2R1 < min_group_amp:
+    if m_F1R2 < min_group_indel_amp or m_F2R1 < min_group_indel_amp:
         F1R2_antimask[:] = False
         F2R1_antimask[:] = False
     dmg_antimask = antimask.copy()
-    if m_F1R2 < min_group_dmg or m_F2R1 < min_group_dmg:
+    if m_F1R2 < min_group_indel_dmg or m_F2R1 < min_group_indel_dmg:
         dmg_antimask[:] = False
 
     # hp_raw (hp.h5): row0 = self-derived homopolymer run length, row1 =
@@ -718,43 +693,33 @@ def profileTriNucMismatches(
 
 def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12):
     """EM-estimate a per-trinuc-context SBS single-read-damage (SRD) rate
-    matrix from sbs_alt_bq_hist (see profileTriNucMismatches above),
-    replacing the old in-situ "row-normalize the raw amp.tn.txt counts at
-    call time" approach with a base-quality-aware mixture model fit once
-    here at learn time.
+    matrix from sbs_alt_bq_hist (see profileTriNucMismatches above).
 
     Per trinuc-context row, each read observation at base quality BQ
     (error rate e = 10**(-BQ/10)) is modeled as coming from one of two
-    causes: a true amp-error conversion to a specific alt base b (rate
-    p_b, the thing being estimated), correctly read with prob (1-e); or
-    the true reference base, correctly read as ref with prob (1-e) but
-    occasionally miscalled to some other base with prob e/3 each. p (the
-    "no conversion" rate) is always the residual 1 - sum(p_b) over the 3
-    alt bases, never estimated independently.
+    causes: a true amp-error conversion to alt base b (rate p_b, the
+    parameter being estimated), correctly read with prob (1-e); or the
+    true reference base, correctly read with prob (1-e) but occasionally
+    miscalled to another base with prob e/3 each. p, the "no conversion"
+    rate, is the residual 1 - sum(p_b) over the 3 alt bases.
 
     E step (responsibility that an observed-b read reflects a true b
-    conversion rather than a miscalled reference read), and its symmetric
-    but unnormalized counterpart for reads observed as the reference base
-    (responsibility that a ref-observed read is really a miscalled true-b
-    conversion). The competing "background" cause for an observed-b read is
-    a true-ref read miscalled to b, which occurs at rate p (not 1-p, the
-    total alt-conversion rate -- those are near-complements of each other
-    since p is close to 1):
+    conversion vs. a miscalled reference read; the competing cause is a
+    true-ref read miscalled to b, at rate p):
         w_b(BQ) = p_b*(1-e) / (p_b*(1-e) + p*e/3)
         w_r(BQ) = p_b*e/3
         N_b = sum_BQ(hist_b[BQ]*w_b(BQ)) + sum_BQ(hist_r[BQ]*w_r(BQ))
-    M step (Dirichlet-pseudocount-smoothed MLE, `a`=pseudocount, N=total
-    raw observation count for the row across all 4 bases -- fixed across
-    iterations, unlike N_b):
-        p_b = (N_b + a) / (N + 3*a)
-        p = 1 - sum(p_b)
+    M step (Dirichlet-pseudocount-smoothed MLE over all 4 categories --
+    p and the 3 p_b's -- sharing one denominator; a=pseudocount, N=total
+    row observation count, fixed across iterations unlike N_b):
+        p_b = (N_b + a) / (N + 4*a)
+        p = 1 - sum(p_b)   [ == (N_ref + a) / (N + 4*a) ]
 
-    Returns a (64, 4) matrix in the same row (num2trinuc/build_trinuc64_
-    order) / column (A, T, C, G) convention as the old row-normalized
-    amp.tn matrix: each row's reference-base column holds p, its 3 alt
-    columns hold p_b1/p_b2/p_b3. A context with zero total observations
-    is left as an all-zero row (regularizeErrorMat, funcs/misc.py, patches
-    it downstream the same way it always has).
+    Returns a (64, 4) matrix in the num2trinuc/build_trinuc64_order row
+    convention and (A, T, C, G) column convention: each row's reference-
+    base column holds p, its 3 alt columns hold p_b1/p_b2/p_b3. A context
+    with zero total observations is assigned the uniform 1/4-per-column
+    prior directly.
     """
     from .misc import build_trinuc64_order
 
@@ -774,6 +739,9 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
         hist_alt = {c: sbs_alt_bq_hist[row, c, :] for c in alt_cols}
         N = float(sbs_alt_bq_hist[row, :, :].sum())
         if N == 0:
+            # Guard against 0/0 in the init below; the M-step formula would
+            # evaluate to 1/4 for every column here anyway.
+            srd[row, :] = 0.25
             continue
 
         # Init from the naive (unweighted) empirical fraction.
@@ -792,7 +760,7 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
                 )
                 w_r = p_b[c] * e_over_3
                 N_c = float(np.dot(hist_alt[c], w_b)) + float(np.dot(hist_r, w_r))
-                new_p_b[c] = (N_c + pseudocount) / (N + 3 * pseudocount)
+                new_p_b[c] = (N_c + pseudocount) / (N + 4 * pseudocount)
             delta = max(abs(new_p_b[c] - p_b[c]) for c in alt_cols)
             p_b = new_p_b
             if delta < tol:

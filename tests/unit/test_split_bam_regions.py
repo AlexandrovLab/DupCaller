@@ -10,6 +10,7 @@ cut_inds one past the end of that array, raising IndexError before the
 existing clamp ever gets a chance to run.
 """
 import pysam
+import pytest
 
 from DupCaller_sub.funcs.misc import splitBamRegions
 
@@ -57,7 +58,11 @@ def test_oversaturated_thread_count_does_not_crash_and_stays_in_bounds(tmp_path)
     _build_bam(bam_path)
 
     cutSite, chunkSize, contigs_sorted = splitBamRegions(
-        [str(bam_path)], num=20, contigs=[CHROM1, CHROM2], step=50
+        [str(bam_path)],
+        num=20,
+        contigs=[CHROM1, CHROM2],
+        step=50,
+        min_chunk_length=1,
     )
 
     contig_lens = {0: CHROM1_LEN, 1: CHROM2_LEN}
@@ -68,3 +73,41 @@ def test_oversaturated_thread_count_does_not_crash_and_stays_in_bounds(tmp_path)
     # in contig order downstream).
     contig_indices = [c for c, _ in cutSite]
     assert contig_indices == sorted(contig_indices)
+
+
+@pytest.mark.parametrize("minimum", [None, 15000, 100000])
+def test_minimum_chunk_length_includes_contig_heads_and_tails(tmp_path, minimum):
+    lengths = [65000, 23000]
+    path = tmp_path / "balanced.bam"
+    header = {
+        "SQ": [{"SN": f"chr{i}", "LN": length} for i, length in enumerate(lengths)]
+    }
+    with pysam.AlignmentFile(str(path), "wb", header=header) as bam:
+        for tid, length in enumerate(lengths):
+            for pos in range(100, length - 20, 1000):
+                bam.write(_read(bam.header, f"read_{tid}_{pos}", tid, pos))
+    pysam.index(str(path))
+    kwargs = {} if minimum is None else {"min_chunk_length": minimum}
+    cuts, _, _ = splitBamRegions(
+        [str(path)], num=16, contigs=["chr0", "chr1"], step=1000, **kwargs
+    )
+    effective_minimum = 10000 if minimum is None else minimum
+    for tid, length in enumerate(lengths):
+        boundaries = sorted({0, length} | {pos for chrom, pos in cuts if chrom == tid})
+        if length < effective_minimum:
+            assert boundaries == [0, length]
+        else:
+            assert all(
+                b - a >= effective_minimum for a, b in zip(boundaries, boundaries[1:])
+            )
+    if minimum == 100000:
+        assert cuts == [(0, 0)]
+    else:
+        assert 1 < len(cuts) < 16
+
+
+def test_short_contigs_remain_unsplit_by_default(tmp_path):
+    path = tmp_path / "short.bam"
+    _build_bam(path)
+    cuts, _, _ = splitBamRegions([str(path)], num=4, contigs=[CHROM1, CHROM2], step=50)
+    assert cuts == [(0, 0)]

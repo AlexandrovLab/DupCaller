@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import sys
 import time
 from multiprocessing import Pool
 import numpy as np
@@ -1168,7 +1169,16 @@ def drop_empty_regions(regionSequence, bamObject):
     return filtered
 
 
-def splitBamRegions(bams, num, contigs, step, ref=None, regionFile=None):
+def splitBamRegions(
+    bams, num, contigs, step, ref=None, regionFile=None, min_chunk_length=10000
+):
+    """Balance read counts without creating chromosome pieces below the minimum.
+
+    Short contigs remain whole. Reject cuts too close to a previous cut or
+    either contig end, so the actual worker count can be less than requested.
+    """
+    if min_chunk_length < 1:
+        raise ValueError("min_chunk_length must be a positive integer")
     bamObject = getAlignmentObject(bams[0], "rb", ref)
     contigs_set = set(contigs)
     contigs_sorted = [_ for _ in bamObject.references if _ in contigs]
@@ -1269,6 +1279,13 @@ def splitBamRegions(bams, num, contigs, step, ref=None, regionFile=None):
     cut_pos = np.minimum(cut_pos, contig_lens[cut_contigs])
     for nn in range(cut_inds.size):
         candidate = (int(cut_contigs[nn]), int(cut_pos[nn]))
+        chrom_idx, pos = candidate
+        previous_pos = cutSite[-1][1] if cutSite[-1][0] == chrom_idx else 0
+        if (
+            pos - previous_pos < min_chunk_length
+            or contig_lens[chrom_idx] - pos < min_chunk_length
+        ):
+            continue
         # At high thread counts (small chunkSize) a single window whose
         # read count exceeds chunkSize can have more than one of the
         # np.arange(1, num) * chunkSize thresholds land inside it, so
@@ -1398,12 +1415,7 @@ def determineTrimLength(seq, params, processed_flag):
     else:
         ### Mask overlap of reverse read
         if processed_flag:
-            mate_cigar = seq.get_tag("MC")
-            cigar_m = re.findall(r"(\d+)M", mate_cigar)
-            cigar_d = re.findall(r"(\d+)D", mate_cigar)
-            mate_reference_length = sum([int(_) for _ in cigar_m]) + sum(
-                [int(_) for _ in cigar_d]
-            )
+            mate_reference_length = _cigar_ref_consumed(seq.get_tag("MC"))
             overlap = max(
                 0,
                 seq.reference_length
@@ -1445,7 +1457,7 @@ def get_bed_file_for_position(
     """
     if chrom == regions_start_chrom and pos < regions_start_pos:
         return locus_bed_prev
-    elif chrom == regions_end_chrom and pos > regions_end_pos:
+    elif chrom == regions_end_chrom and pos >= regions_end_pos:
         return locus_bed_next
     else:
         return locus_bed
@@ -1558,6 +1570,69 @@ def _drain_rugged_pool(chrom, position, rugged_reads_pool, params, currentReadDi
 _REF_CONSUMING_CIGAR_OPS = set("MDN=X")
 
 
+def _cigar_ref_consumed(cigar_str):
+    """Reference length consumed by a CIGAR string (M/D/N/=/X ops)."""
+    consumed = 0
+    for length_str, op in re.findall(r"(\d+)([MIDNSHPX=])", cigar_str):
+        if op in _REF_CONSUMING_CIGAR_OPS:
+            consumed += int(length_str)
+    return consumed
+
+
+def _eligible_overflow_read(rec):
+    return (
+        rec.is_proper_pair
+        and not rec.is_supplementary
+        and not rec.is_secondary
+        and not rec.is_qcfail
+    )
+
+
+def check_mate_cigar_tags(bam_path, reference=None, sample_size=100_000):
+    """Verify reads the MC-tag chunk-boundary overflow machinery relies on
+    (see _eligible_overflow_read) actually carry an MC tag.
+
+    Checks only the first `sample_size` fetched records (default
+    100,000), not the whole file -- a missing-MC-tag pipeline shows up
+    immediately in the first eligible reads, so a bounded sample is
+    enough; it can only miss MC tags absent deep in a later lane/
+    read-group of a merged BAM.
+    """
+    print(
+        f"Checking MC (mate CIGAR) tags on proper pairs in {bam_path} "
+        f"(sampling up to {sample_size} reads)...",
+        flush=True,
+    )
+    with getAlignmentObject(bam_path, "rb", reference) as bam:
+        for n_checked, rec in enumerate(bam.fetch(until_eof=True)):
+            if n_checked >= sample_size:
+                break
+            if _eligible_overflow_read(rec) and not rec.has_tag("MC"):
+                print(
+                    f"ERROR: Proper-pair read {rec.query_name!r} in {bam_path} is missing "
+                    "the required MC (mate CIGAR) tag. DupCaller cannot safely "
+                    "process chunk boundaries without MC tags. Add MC tags "
+                    "to proper-pair reads in the tumor alignment file before rerunning.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+
+def previous_region_coverage_start(bam, previous_regions, ref=None, region_file=None):
+    """Return (chrom, exclusive end) of the preceding worker's coverage,
+    scanning its last region with the same MC-based overflow iterator
+    used for calling.
+    """
+    if not previous_regions or len(previous_regions[-1]) != 3:
+        return None
+    region = previous_regions[-1]
+    end = region[2]
+    for rec, _ in bamIterateMultipleRegionWithOverflow(bam, [region], ref, region_file):
+        if _eligible_overflow_read(rec) and rec.reference_end is not None:
+            end = max(end, rec.reference_end)
+    return region[0], end
+
+
 def _mate_reference_end(rec):
     """Mate's reference_end, computed from rec's own MC tag (mate CIGAR)
     plus rec.next_reference_start -- without a random-access mate()
@@ -1565,11 +1640,7 @@ def _mate_reference_end(rec):
     aligner/pipeline stage that doesn't write one)."""
     if not rec.has_tag("MC"):
         return None
-    consumed = 0
-    for length_str, op in re.findall(r"(\d+)([MIDNSHPX=])", rec.get_tag("MC")):
-        if op in _REF_CONSUMING_CIGAR_OPS:
-            consumed += int(length_str)
-    return rec.next_reference_start + consumed
+    return rec.next_reference_start + _cigar_ref_consumed(rec.get_tag("MC"))
 
 
 def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
@@ -1580,20 +1651,6 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
     mate crosses the boundary (computed from the MC tag, not a fixed
     buffer), so a duplex family split across a chunk boundary can still
     be fully reconstructed by the worker that saw its upstream anchor.
-
-    This fixes a real undercount: _index_rugged_mates/_drain_rugged_pool
-    (above) reconcile a family whose PCR-duplicate copies disagree
-    slightly on their downstream mate's position (alignment noise) by
-    redirecting the minority copy into the majority position's batch --
-    but that redirect only completes if THIS SAME worker's scan later
-    reaches the majority position. If a chunk boundary falls between the
-    minority and majority positions, the worker holding the upstream
-    anchor queues the redirect but exits before ever draining it, and the
-    other worker (owning the majority position) never saw the upstream
-    anchor at all -- the family's evidence silently drops from 2 copies
-    to 1. This is exact-integer thread-count-dependent drift, not
-    floating-point noise (confirmed against real amp.tn.txt/dmg.tn.txt
-    differences between -p 32 and -p 64 reruns of the same BAM).
 
     Kept exactly-once (no double-count) by a matching check on the
     RECEIVING side: callBam's main loop skips any read whose mate starts
@@ -1612,10 +1669,7 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
         if (
             boundary_chrom is not None
             and rec.reference_name == boundary_chrom
-            and not rec.is_supplementary
-            and not rec.is_secondary
-            and not rec.is_qcfail
-            and rec.is_proper_pair
+            and _eligible_overflow_read(rec)
         ):
             mate_end = _mate_reference_end(rec)
             if mate_end is not None and mate_end > last_end:
@@ -1623,7 +1677,9 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
         yield rec, region
 
     if boundary_chrom is not None and last_end > boundary_pos:
-        overflow_region = (boundary_chrom, boundary_pos + 1, int(last_end) + 1)
+        # Fetch ends are exclusive: a mate starting exactly at the boundary
+        # belongs to this continuation, not to the preceding normal fetch.
+        overflow_region = (boundary_chrom, boundary_pos, int(last_end) + 1)
         for rec, region in bamIterateMultipleRegion(
             bam, [overflow_region], ref, region_file
         ):
@@ -1640,25 +1696,21 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
 # ======================================================================
 # Error-matrix normalization and loading
 # ======================================================================
-def _normalize_indel_hp_mat(mat):
+def _normalize_indel_hp_mat(mat, pseudocount):
     """Normalize a raw (10, 12) hp.txt count matrix (rows hp run length
     1-10+, columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}) into
     per-context probabilities: within each base's own 3-column group
-    (ref/del/ins counts for that base), each row is divided by its own
-    sum so the three probabilities for a given (hp_len, base) add to 1.
-    Then enforce monotonic non-decrease across increasing hp_len within
-    each group (row n >= row n-1 elementwise) --
-    a regularization against noisy per-row estimates at the sparser,
-    longer-homopolymer rows, done independently per base group since
-    they're otherwise unrelated contexts.
+    (ref/del/ins counts for that base), each row is Dirichlet-smoothed by
+    `pseudocount` on the counts and divided by its own (smoothed) sum, so
+    the three probabilities for a given (hp_len, base) add to 1. Then
+    enforce monotonic non-decrease across increasing hp_len within each
+    group (row n >= row n-1 elementwise), independently per base group.
     """
     mat_new = np.zeros_like(mat, dtype=float)
     for g in range(4):
         block = mat[:, g * 3 : g * 3 + 3]
         row_sum = block.sum(axis=1, keepdims=True)
-        row_nonzero = (row_sum != 0).flatten()
-        block_new = np.zeros_like(block, dtype=float)
-        block_new[row_nonzero, :] = block[row_nonzero, :] / row_sum[row_nonzero, :]
+        block_new = (block + pseudocount) / (row_sum + 3 * pseudocount)
         for nn in range(1, block_new.shape[0]):
             current_row = block_new[nn, :]
             smaller_entries = current_row <= block_new[nn - 1, :]
@@ -1668,20 +1720,18 @@ def _normalize_indel_hp_mat(mat):
     return mat_new
 
 
-def _normalize_indel_str_mat(mat):
+def _normalize_indel_str_mat(mat, pseudocount):
     """Normalize a raw (5, 11) str.txt count matrix (rows STR-length bin
     0="0-1"/not a real repeat through 4="40+", columns idLen+5 for idLen
-    in -5..5) into per-context probabilities: each row divided by its own
-    sum across all 11 columns. Real-STR rows (1-4) that end up entirely
-    zero (no observations at that length bin) fall back to the pooled
-    distribution across whichever real-STR rows do have data. Row 0 is a
-    different population (not a real repeat at all) and is never pooled
-    into or from.
+    in -5..5) into per-context probabilities: each row is Dirichlet-
+    smoothed by `pseudocount` on the counts and divided by its own
+    (smoothed) sum across all 11 columns. Real-STR rows (1-4) with zero
+    observations at that length bin fall back to the pooled distribution
+    across whichever real-STR rows do have data. Row 0 (not a real
+    repeat) is never pooled into or from.
     """
     row_sum = mat.sum(axis=1, keepdims=True)
-    row_nonzero = (row_sum != 0).flatten()
-    mat_new = np.zeros_like(mat, dtype=float)
-    mat_new[row_nonzero, :] = mat[row_nonzero, :] / row_sum[row_nonzero, :]
+    mat_new = (mat + pseudocount) / (row_sum + 11 * pseudocount)
     str_rows_total = mat[1:5, :].sum(axis=0)
     if str_rows_total.sum() > 0:
         pooled = str_rows_total / str_rows_total.sum()
@@ -1689,20 +1739,6 @@ def _normalize_indel_str_mat(mat):
             if row_sum[r, 0] == 0:
                 mat_new[r, :] = pooled
     return mat_new
-
-
-def regularizeErrorMat(mat, pseudocount):
-    """Add `pseudocount` to every entry of mat, so no cell is ever exactly
-    zero and a real observation can never be assigned zero likelihood
-    downstream. NaN entries (from a 0/0 row-sum division upstream -- a
-    trinuc/indel context with zero observed counts) are treated as 0
-    before the pseudocount is added. Replaces the old scheme of patching
-    only invalid (zero/NaN) cells with the matrix's own smallest valid
-    value (or a last-resort `minerr` fallback if the whole matrix was
-    invalid) -- a uniform additive pseudocount makes that special-casing,
-    and the fallback, unnecessary."""
-    mat = np.nan_to_num(mat, nan=0.0)
-    return mat + pseudocount
 
 
 def load_error_matrices(params):
@@ -1757,9 +1793,10 @@ def load_error_matrices(params):
             .astype(float)
         )
     # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
+    # No further regularization here -- estimate_sbs_srd_rates already
+    # returns the fully pseudocount-smoothed rate.
     ampmat_min_error = ampmat.min(axis=1, keepdims=True)
     ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)
-    ampmat = regularizeErrorMat(ampmat, 1e-6)
     params["ampmat"] = ampmat
 
     ampmat_rev = np.zeros([64, 4])
@@ -1788,12 +1825,11 @@ def load_error_matrices(params):
         ampmat_str = pd.read_csv(amperri_str_file, sep="\t", index_col=0).to_numpy(
             dtype=float
         )
-        ampmat_hp = _normalize_indel_hp_mat(ampmat_hp)
-        ampmat_hp = regularizeErrorMat(ampmat_hp, 1e-6)
+        pseudocount = params.get("pseudocount", 0.5)
+        ampmat_hp = _normalize_indel_hp_mat(ampmat_hp, pseudocount)
         params["ampmat_hp"] = ampmat_hp
 
-        ampmat_str = _normalize_indel_str_mat(ampmat_str)
-        ampmat_str = regularizeErrorMat(ampmat_str, 1e-6)
+        ampmat_str = _normalize_indel_str_mat(ampmat_str, pseudocount)
         params["ampmat_str"] = ampmat_str
 
     # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
@@ -1811,20 +1847,14 @@ def load_error_matrices(params):
         # dmgmat += 1
 
     # dmgmat += 0.5
-    # Same zero-row guard as ampmat above: a trinuc context with zero
-    # observed counts must stay exact zero here, not become NaN via 0/0,
-    # so regularizeErrorMat below can patch it correctly.
+    # Dirichlet-smoothed on the counts: a zero-observation context lands
+    # at the uniform 1/4.
+    pseudocount = params.get("pseudocount", 0.5)
     dmgmat_row_sum = dmgmat.sum(axis=1, keepdims=True)
-    dmgmat_row_nonzero = (dmgmat_row_sum != 0).flatten()
-    dmgmat_normalized = np.zeros_like(dmgmat)
-    dmgmat_normalized[dmgmat_row_nonzero, :] = (
-        dmgmat[dmgmat_row_nonzero, :] / dmgmat_row_sum[dmgmat_row_nonzero, :]
-    )
-    dmgmat = dmgmat_normalized
+    dmgmat = (dmgmat + pseudocount) / (dmgmat_row_sum + 4 * pseudocount)
     # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
     dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
-    dmgmat = regularizeErrorMat(dmgmat, 1e-8)
 
     params["dmgmat_top"] = dmgmat
     params["trinuc2num_dict"] = trinuc2num
@@ -1866,12 +1896,10 @@ def load_error_matrices(params):
         dmgmat_str = pd.read_csv(dmgerri_str_file, sep="\t", index_col=0).to_numpy(
             dtype=float
         )
-        dmgmat_hp = _normalize_indel_hp_mat(dmgmat_hp)
-        dmgmat_hp = regularizeErrorMat(dmgmat_hp, 1e-8)
+        dmgmat_hp = _normalize_indel_hp_mat(dmgmat_hp, pseudocount)
         params["dmgmat_hp"] = dmgmat_hp
 
-        dmgmat_str = _normalize_indel_str_mat(dmgmat_str)
-        dmgmat_str = regularizeErrorMat(dmgmat_str, 1e-8)
+        dmgmat_str = _normalize_indel_str_mat(dmgmat_str, pseudocount)
         params["dmgmat_str"] = dmgmat_str
 
 

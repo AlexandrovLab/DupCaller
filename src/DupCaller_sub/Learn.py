@@ -17,6 +17,7 @@ from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import drop_empty_regions
 from .funcs.misc import getAlignmentObject as BAM
+from .funcs.misc import check_mate_cigar_tags
 
 
 # if __name__ == "__main__":
@@ -90,6 +91,12 @@ def do_learn(args):
     """
     Execulte variant calling
     """
+    # Only the multi-thread path hands reads off across chunk boundaries
+    # via MC tags (see funcs/misc.py's bamIterateMultipleRegionWithOverflow),
+    # same as do_call in Caller.py -- a single-threaded run has no
+    # boundaries to reconcile.
+    if args.threads > 2:
+        check_mate_cigar_tags(args.bam, args.reference)
     if args.threads <= 2:
         """
         Single-thread execution
@@ -112,6 +119,14 @@ def do_learn(args):
             str_dmg_profile,
             sbs_alt_bq_hist,
         ) = callBam(paramsNow, 0)
+        # Match the multi-thread branch's dtype below.
+        mismatch_profile = mismatch_profile.astype(int)
+        hp_alt_profile = hp_alt_profile.astype(int)
+        str_alt_profile = str_alt_profile.astype(int)
+        mismatch_dmg_profile = mismatch_dmg_profile.astype(int)
+        hp_dmg_profile = hp_dmg_profile.astype(int)
+        str_dmg_profile = str_dmg_profile.astype(int)
+        sbs_alt_bq_hist = sbs_alt_bq_hist.astype(int)
     else:
         """
         Multi-thread execution
@@ -126,7 +141,11 @@ def do_learn(args):
         # print(args.threads)
         # if args.normalBam:
         cutSites, chunkSize, contigs = splitBamRegions(
-            [args.bam], args.threads, contigs, args.windowSize
+            [args.bam],
+            args.threads,
+            contigs,
+            args.windowSize,
+            min_chunk_length=getattr(args, "minChunkLength", 10000),
         )
         # else:
         # cutSites, chunkSize, contigs = splitBamRegions(
@@ -153,6 +172,7 @@ def do_learn(args):
                 for ii in range(pSite[0] + 1, site[0]):
                     regionSequence.append((contigs[ii],))
                 regionSequence.append((contigs[site[0]], 0, site[1]))
+        site = cutSites[-1]
         regionSequence.append((contigs[site[0]], site[1]))
         for ii in range(site[0] + 1, len(contigs)):
             regionSequence.append((contigs[ii],))

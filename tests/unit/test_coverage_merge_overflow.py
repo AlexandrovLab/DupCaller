@@ -125,3 +125,52 @@ def test_no_overflow_matches_prior_plain_concatenation_behavior(tmp_path):
     rows = _read_bed(final)
     assert [r[1] for r in rows] == [100, 200, 300, 400]
     assert [r[3][0] for r in rows] == [5.0, 3.0, 4.0, 9.0]
+
+
+def test_overflow_merge_preserves_next_chromosome_order(tmp_path):
+    """A worker spanning chromosomes must not peel low positions on the next one."""
+    sample = "MULTI"
+    files = {
+        "0_coverage.bed.gz": [("chr1", 100, 101, [5])],
+        "0_coverage_next_region.tmp.bed.gz": [("chr1", 350, 351, [2])],
+        "1_coverage_prev_region.tmp.bed.gz": [],
+        "1_coverage.bed.gz": [
+            ("chr1", 350, 351, [4]),
+            ("chr1", 400, 401, [7]),
+            ("chr2", 100, 101, [3]),
+            ("chr2", 400, 401, [9]),
+        ],
+    }
+    for suffix, rows in files.items():
+        _write_bed(str(tmp_path / f"{sample}_{suffix}"), rows)
+    merge_and_combine_coverage_files(sample, str(tmp_path), nprocess=2)
+    final = str(tmp_path / f"{sample}_coverage.bed.gz")
+    assert os.path.exists(final + ".tbi")
+    assert _read_bed(final) == [
+        ("chr1", 100, 101, [5]),
+        ("chr1", 350, 351, [6]),
+        ("chr1", 400, 401, [7]),
+        ("chr2", 100, 101, [3]),
+        ("chr2", 400, 401, [9]),
+    ]
+
+
+def test_compressed_concatenation_preserves_blocks_and_supports_tabix(tmp_path):
+    from DupCaller_sub.Caller import _concatenate_bgzf_files
+    import pysam
+
+    first, second, empty = (
+        tmp_path / f"{name}.gz" for name in ("first", "second", "empty")
+    )
+    _write_bed(str(first), [("chr1", i, i + 1, [i % 7]) for i in range(10000)])
+    _write_bed(str(second), [("chr2", i, i + 1, [i % 11]) for i in range(10000)])
+    _write_bed(str(empty), [])
+    output = tmp_path / "merged.bed.gz"
+    _concatenate_bgzf_files([str(first), str(empty), str(second)], str(output))
+    # All input compressed blocks survive byte-for-byte; only intermediate
+    # 28-byte BGZF EOF markers are removed.
+    assert output.read_bytes() == first.read_bytes()[:-28] + second.read_bytes()
+    pysam.tabix_index(str(output), preset="bed", force=True)
+    with pysam.TabixFile(str(output)) as indexed:
+        assert len(list(indexed.fetch("chr1"))) == 10000
+        assert len(list(indexed.fetch("chr2"))) == 10000

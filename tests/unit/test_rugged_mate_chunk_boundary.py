@@ -234,7 +234,10 @@ def test_rugged_mate_merges_into_one_closure_without_boundary(tmp_path):
     )
 
 
-def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(tmp_path):
+@pytest.mark.parametrize("boundary", [(C + B) // 2, B])
+def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(
+    tmp_path, boundary
+):
     """A chunk boundary strictly between C (rugged) and B (majority) used
     to drop copy2's downstream mate entirely (see this test's previous
     version / the module docstring for the bug). With
@@ -250,8 +253,7 @@ def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(tmp_path):
     bam_path = tmp_path / "family.bam"
     _build_bam(bam_path)
 
-    boundary = (C + B) // 2
-    assert C < boundary < B
+    assert C < boundary <= B
 
     worker1 = _run_family_batching(str(bam_path), [(CHROM, 0, boundary)])
     worker2 = _run_family_batching(str(bam_path), [(CHROM, boundary, CONTIG_LEN)])
@@ -316,3 +318,83 @@ def test_unrelated_read_in_overflow_zone_is_not_dropped_or_double_counted(tmp_pa
     # sitting nearby.
     all_downstream = [c for c in worker1 + worker2 if c[0] == DOWNSTREAM_LABEL]
     assert all_downstream == [(DOWNSTREAM_LABEL, 2, 0)]
+
+
+@pytest.mark.parametrize("boundary", [1100, (C + B) // 2, B])
+def test_previous_coverage_extent_includes_mates_across_a_gap(tmp_path, boundary):
+    from DupCaller_sub.funcs.misc import previous_region_coverage_start
+
+    path = tmp_path / "extent.bam"
+    _build_bam(path)
+    assert previous_region_coverage_start(str(path), [(CHROM, 0, boundary)]) == (
+        CHROM,
+        B + READLEN,
+    )
+
+
+def test_prerouted_coverage_merges_without_rewriting_main_files(tmp_path, monkeypatch):
+    from collections import Counter
+    from Bio import bgzf
+    from DupCaller_sub import Caller
+    from DupCaller_sub.funcs.misc import (
+        get_bed_file_for_position,
+        previous_region_coverage_start,
+    )
+
+    path = tmp_path / "routing.bam"
+    boundary = 1100  # no alignment overlaps the boundary; mates are farther away
+    _build_bam(path, extra_pairs=[("other", 1320, 1500, 230, "CCC-GGG")])
+    regions = [[(CHROM, 0, boundary)], [(CHROM, boundary, CONTIG_LEN)]]
+    extent = previous_region_coverage_start(str(path), regions[0])
+    assert extent == (CHROM, B + READLEN)
+    expected = Counter()
+    for worker in range(2):
+        counts = Counter()
+        for rec, _ in bamIterateMultipleRegionWithOverflow(
+            str(path), regions[worker], None
+        ):
+            if worker and rec.next_reference_start < boundary:
+                continue
+            counts.update(range(rec.reference_start, rec.reference_end))
+        expected.update(counts)
+        prefix = str(tmp_path / f"ROUTE_{worker}_coverage")
+        with bgzf.open(prefix + ".bed.gz", "wt") as main, bgzf.open(
+            prefix + "_prev_region.tmp.bed.gz", "wt"
+        ) as prev, bgzf.open(prefix + "_next_region.tmp.bed.gz", "wt") as next_file:
+            for pos, depth in sorted(counts.items()):
+                target = get_bed_file_for_position(
+                    pos,
+                    CHROM,
+                    CHROM,
+                    extent[1] if worker else 0,
+                    CHROM,
+                    CONTIG_LEN if worker else boundary,
+                    main,
+                    prev,
+                    next_file,
+                )
+                target.write(f"{CHROM}\t{pos}\t{pos + 1}\t{depth}\n")
+
+    def unexpected_split(*args):
+        raise AssertionError("Pre-routed coverage must not rewrite main BED files")
+
+    monkeypatch.setattr(Caller, "_split_bed_by_start", unexpected_split)
+    Caller.merge_and_combine_coverage_files("ROUTE", str(tmp_path), 2)
+    with bgzf.open(str(tmp_path / "ROUTE_coverage.bed.gz"), "rt") as merged:
+        rows = [line.strip().split("\t") for line in merged]
+    assert [int(row[1]) for row in rows] == sorted(expected)
+    assert [float(row[3]) for row in rows] == [
+        expected[pos] for pos in sorted(expected)
+    ]
+    assert (tmp_path / "ROUTE_coverage.bed.gz.tbi").exists()
+
+
+def test_coverage_boundary_position_goes_to_next_file():
+    from DupCaller_sub.funcs.misc import get_bed_file_for_position
+
+    assert (
+        get_bed_file_for_position(
+            1100, CHROM, CHROM, 0, CHROM, 1100, "main", "prev", "next"
+        )
+        == "next"
+    )

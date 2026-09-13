@@ -28,6 +28,8 @@ from .funcs.prob import indelErrorProbs, indelMaxLR
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import drop_empty_regions
+from .funcs.misc import previous_region_coverage_start
+from .funcs.misc import check_mate_cigar_tags
 from .funcs.misc import getAlignmentObject as BAM
 from .funcs.misc import check_h5_usable
 from .funcs.misc import build_trinuc64_order, build_trinuc192_labels
@@ -195,8 +197,19 @@ def check_input_files_exist(args):
 
 # if __name__ == "__main__":
 def do_call(args):
+    # Defensive defaults for a bare/older args namespace.
+    if not hasattr(args, "minChunkLength"):
+        args.minChunkLength = 10000
+    if not hasattr(args, "srdMinRead"):
+        args.srdMinRead = 3
+    if not hasattr(args, "ssmMinRead"):
+        args.ssmMinRead = 3
     # Check if all input files exist before proceeding
     check_input_files_exist(args)
+    # -p 1 has no chunk boundaries to reconcile via MC tags.
+    if args.threads != 1:
+        check_mate_cigar_tags(args.bam, args.reference)
+    coverage_starts = [None]
     # Resolve the Monte Carlo base seed once, up front: if the user didn't
     # pass --seed, generate one now and write it back onto args so it (a)
     # gets threaded through params below and (b) shows up in the
@@ -254,6 +267,7 @@ def do_call(args):
         "step": args.windowSize,
         "minMeanASXS": args.minMeanASXS,
         "isLearn": None,
+        "pseudocount": args.pseudocount,
         "normalVAF": args.naf,
         "rescue": args.rescue,
         "maxZeroQualFrac": args.maxZeroQualFrac,
@@ -317,6 +331,8 @@ def do_call(args):
         "step": args.windowSize,
         "minRef": args.minRef,
         "minAlt": args.minAlt,
+        "srdMinRead": args.srdMinRead,
+        "ssmMinRead": args.ssmMinRead,
         "isLearn": True,
         "rescue": False,
         # Round 0 (error-rate learning) shares callBam with rounds 1/2,
@@ -407,6 +423,15 @@ def do_call(args):
                 str_dmg_profile,
                 sbs_alt_bq_hist,
             ) = callBam(paramsNow, 0)
+            # Match Learn.py's single-thread branch and this file's own
+            # multi-thread branch dtype.
+            mismatch_profile = mismatch_profile.astype(int)
+            hp_alt_profile = hp_alt_profile.astype(int)
+            str_alt_profile = str_alt_profile.astype(int)
+            mismatch_dmg_profile = mismatch_dmg_profile.astype(int)
+            hp_dmg_profile = hp_dmg_profile.astype(int)
+            str_dmg_profile = str_dmg_profile.astype(int)
+            sbs_alt_bq_hist = sbs_alt_bq_hist.astype(int)
 
         else:
             """
@@ -428,6 +453,7 @@ def do_call(args):
                 args.windowSize,
                 args.reference,
                 params_learn["region_file"],
+                min_chunk_length=args.minChunkLength,
             )
             # else:
             # cutSites, chunkSize, contigs = splitBamRegions(
@@ -454,6 +480,7 @@ def do_call(args):
                     for ii in range(pSite[0] + 1, site[0]):
                         regionSequence.append((contigs[ii],))
                     regionSequence.append((contigs[site[0]], 0, site[1]))
+            site = cutSites[-1]
             regionSequence.append((contigs[site[0]], site[1]))
             for ii in range(site[0] + 1, len(contigs)):
                 regionSequence.append((contigs[ii],))
@@ -506,7 +533,7 @@ def do_call(args):
             pool.terminate()
             pool.join()
 
-            mismatch_profile = sum([_[0] for _ in results])
+            mismatch_profile = sum([_[0] for _ in results]).astype(int)
             hp_alt_profile = sum([_[1] for _ in results]).astype(int)
             str_alt_profile = sum([_[2] for _ in results]).astype(int)
             mismatch_dmg_profile = sum([_[3] for _ in results]).astype(int)
@@ -593,6 +620,14 @@ def do_call(args):
             + str((time.time() - startTime) / 60)
             + " minutes..............."
         )
+
+    # Older installed launchers may not yet expose this option.
+    if getattr(args, "learnOnly", False):
+        print(
+            "..............--learnOnly set: stopping after error-rate estimation, "
+            f"skipping variant calling (error files in {error_dir}/)................."
+        )
+        return
 
     if args.threads == 1:
         """
@@ -688,6 +723,7 @@ def do_call(args):
                     args.windowSize,
                     args.reference,
                     regionfile,
+                    min_chunk_length=args.minChunkLength,
                 )
             else:
                 cutSites, chunkSize, contigs = splitBamRegions(
@@ -697,6 +733,7 @@ def do_call(args):
                     args.windowSize,
                     args.reference,
                     regionfile,
+                    min_chunk_length=args.minChunkLength,
                 )
             currentContigIndex = 0
             usedTime = (time.time() - startTime) / 60
@@ -717,6 +754,7 @@ def do_call(args):
                 for ii in range(pSite[0] + 1, site[0]):
                     regionSequence.append((contigs[ii],))
                 regionSequence.append((contigs[site[0]], 0, site[1]))
+        site = cutSites[-1]
         regionSequence.append((contigs[site[0]], site[1]))
         for ii in range(site[0] + 1, len(contigs)):
             regionSequence.append((contigs[ii],))
@@ -759,6 +797,21 @@ def do_call(args):
             paramsNow["regions"] = regions
             callArgument = (paramsNow, nn)
             callArguments.append(callArgument)
+        print("Calculating coverage boundary extents from preceding regions...")
+        coverage_starts = pool.starmap(
+            previous_region_coverage_start,
+            [
+                (
+                    args.bam,
+                    regions_list[nn - 1] if nn else None,
+                    args.reference,
+                    params.get("region_file"),
+                )
+                for nn in range(len(regions_list))
+            ],
+        )
+        for (worker_params, nn), coverage_start in zip(callArguments, coverage_starts):
+            worker_params["coverage_start"] = coverage_start
         results = pool.starmap(callBam, callArguments)
 
         muts = [_[0] for _ in results]
@@ -1500,6 +1553,7 @@ def do_call(args):
         for nn, r2_regions in enumerate(regions_list):
             paramsNow2 = params.copy()
             paramsNow2["regions"] = r2_regions
+            paramsNow2["coverage_start"] = coverage_starts[nn]
             paramsNow2["isLearn"] = False
             paramsNow2["coverage_only"] = True
             paramsNow2["pcutoff_sbs_override"] = pcutoff_sbs_override
@@ -1950,96 +2004,122 @@ def do_call(args):
     )
 
 
-def _max_bed_start_position(path):
-    """Largest integer `start` coordinate in a coverage bed file, or None if
-    the file doesn't exist or has no data rows. Used to detect how far an
-    overflow-extended `next_region` file (bamIterateMultipleRegionWithOverflow,
-    funcs/misc.py, can push a worker's flush arbitrarily far past its own
-    nominal region_end to correctly attribute a boundary-crossing duplex
-    family) reaches into the following worker's own main coverage file, so
-    that file's leading rows within that reach can be folded into the
-    boundary merge below instead of assuming a plain concatenation is
-    already sorted.
+def _boundary_bed_extent(path):
+    """Return (chromosome, largest start) for a next_region boundary
+    coverage file, or None if it doesn't exist or has no data rows.
     """
     if not os.path.exists(path):
         return None
     max_pos = None
+    boundary_chrom = None
     with bgzf.open(path, "rt") as f:
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) < 3:
                 continue
-            start = int(parts[1])
+            chrom, start = parts[0], int(parts[1])
+            if boundary_chrom is not None and chrom != boundary_chrom:
+                raise ValueError(
+                    f"Boundary coverage spans multiple chromosomes: {path}"
+                )
+            boundary_chrom = chrom
             if max_pos is None or start > max_pos:
                 max_pos = start
-    return max_pos
+    return (boundary_chrom, max_pos) if max_pos is not None else None
 
 
 def _split_bed_by_start(path, cutoff, below_path, above_path):
-    """Stream-split a start-ascending coverage bed file (guaranteed by
-    callBam's max_flushed_pos watermark) into rows with start <= cutoff
-    (below_path) and start > cutoff (above_path)."""
+    """Peel rows on cutoff's chromosome at or below its start coordinate.
+
+    All other chromosomes and later positions remain in above_path.
+    """
+    boundary_chrom, max_pos = cutoff
     with bgzf.open(path, "rt") as fin, bgzf.open(below_path, "wt") as fbelow, bgzf.open(
         above_path, "wt"
     ) as fabove:
         for line in fin:
             if not line.strip():
                 continue
-            start = int(line.split("\t", 2)[1])
-            (fbelow if start <= cutoff else fabove).write(line)
+            chrom, start, _ = line.split("\t", 2)
+            in_overlap = chrom == boundary_chrom and int(start) <= max_pos
+            (fbelow if in_overlap else fabove).write(line)
+
+
+def _main_bed_overlaps(path, extent):
+    """New workers route this prefix to prev_region; inspect only the first row.
+
+    Older worker files may still need the compatibility split below.
+    """
+    with bgzf.open(path, "rt") as source:
+        for line in source:
+            if line.strip():
+                chrom, start, _ = line.split("\t", 2)
+                return chrom == extent[0] and int(start) <= extent[1]
+    return False
 
 
 def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
     """
-    1. Merge adjacent next_region/prev_region files -- plus, whenever an
-       overflow-extended next_region file reaches past the following
-       worker's own region_start, that worker's own leading main-coverage
-       rows within that reach -- by summing all numeric columns for
-       matching positions.
-    2. Combine all files (each worker's main file now peeled down to only
-       the rows past any such reach, so already correctly ordered by
-       construction) and bgzip.
+    1. Sum adjacent next_region/prev_region files at matching positions.
+       New workers route the overlap there before writing. Older files
+       with overlap still in main coverage use the compatibility split.
+    2. Concatenate compressed BGZF blocks. This preserves order when overflow stays in
+       the following worker's chunk; minimum chunk lengths reduce the
+       chance of overflow reaching beyond that worker.
     """
     print("Merging adjacent region files and combining coverage files...")
 
-    # Step 1: Create overlap files by merging adjacent regions. Track, per
-    # worker whose main file got peeled, the path to its remainder (the
-    # rows NOT folded into the overlap merge) to use in step 2 instead of
-    # its original (untouched) main file.
+    # Step 1: Merge the boundary files. Track, per worker whose main file
+    # got peeled, the path to its remainder (rows not folded into the
+    # overlap merge) to use in step 2 instead of the original main file.
     remainder_files = {}
-    for n in range(nprocess - 1):
-        next_file = os.path.join(
-            sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz"
-        )
-        prev_file = os.path.join(
-            sample_dir, f"{sample_name}_{n+1}_coverage_prev_region.tmp.bed.gz"
-        )
-        overlap_file = os.path.join(
-            sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"
-        )
-        main_next_file = os.path.join(
-            sample_dir, f"{sample_name}_{n+1}_coverage.bed.gz"
-        )
-
-        overlap_max_pos = _max_bed_start_position(next_file)
-        extra_files = []
-        if overlap_max_pos is not None and os.path.exists(main_next_file):
-            peeled_file = os.path.join(
-                sample_dir, f"{sample_name}_{n+1}_coverage_peeled.tmp.bed.gz"
+    try:
+        for n in range(nprocess - 1):
+            next_file = os.path.join(
+                sample_dir, f"{sample_name}_{n}_coverage_next_region.tmp.bed.gz"
             )
-            remainder_file = os.path.join(
-                sample_dir, f"{sample_name}_{n+1}_coverage_remainder.tmp.bed.gz"
+            prev_file = os.path.join(
+                sample_dir, f"{sample_name}_{n+1}_coverage_prev_region.tmp.bed.gz"
             )
-            _split_bed_by_start(
-                main_next_file, overlap_max_pos, peeled_file, remainder_file
+            overlap_file = os.path.join(
+                sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"
             )
-            extra_files.append(peeled_file)
-            remainder_files[n + 1] = remainder_file
+            main_next_file = os.path.join(
+                sample_dir, f"{sample_name}_{n+1}_coverage.bed.gz"
+            )
 
-        merge_adjacent_bed_files(next_file, prev_file, overlap_file, extra_files)
+            overlap_extent = _boundary_bed_extent(next_file)
+            extra_files = []
+            if (
+                overlap_extent is not None
+                and os.path.exists(main_next_file)
+                and _main_bed_overlaps(main_next_file, overlap_extent)
+            ):
+                peeled_file = os.path.join(
+                    sample_dir, f"{sample_name}_{n+1}_coverage_peeled.tmp.bed.gz"
+                )
+                remainder_file = os.path.join(
+                    sample_dir, f"{sample_name}_{n+1}_coverage_remainder.tmp.bed.gz"
+                )
+                _split_bed_by_start(
+                    main_next_file, overlap_extent, peeled_file, remainder_file
+                )
+                extra_files.append(peeled_file)
+                remainder_files[n + 1] = remainder_file
 
-        for f in extra_files:
-            os.remove(f)
+            merge_adjacent_bed_files(next_file, prev_file, overlap_file, extra_files)
+
+            for f in extra_files:
+                os.remove(f)
+    except Exception as e:
+        # Same shield as the combine/tabix steps below.
+        print(
+            f"Warning: could not merge boundary coverage files (worker pair "
+            f"{n}/{n+1}): {e}. Per-worker coverage files were left in place "
+            "for diagnosis/retry.",
+            file=sys.stderr,
+        )
+        return
 
     # Step 2: Create list of files in the correct order
     files_to_combine = []
@@ -2065,39 +2145,55 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
                 )
             files_to_combine.append(overlap_file)
 
-    # Step 3: Combine files (order is now correct by construction; sort
-    # anyway as cheap defense-in-depth) then bgzip. `pipefail` via bash so a
-    # zcat/sort failure isn't masked by bgzip's own exit code.
-    if files_to_combine:
-        final_output = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
-        cmd = (
-            f"set -o pipefail; zcat {' '.join(files_to_combine)} | "
-            f"LC_ALL=C sort -k1,1 -k2,2n -T {sample_dir} | "
-            f"bgzip > {final_output}"
+    # BGZF blocks can be concatenated directly; no decompression or recompression.
+    final_output = os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz")
+    try:
+        _concatenate_bgzf_files(files_to_combine, final_output)
+        print(f"Combined coverage file created: {final_output}")
+    except Exception as e:
+        print(
+            f"Warning: could not combine coverage files into {final_output}: {e}. "
+            "Per-worker coverage files were left in place for diagnosis/retry.",
+            file=sys.stderr,
         )
+        return
+    # Keep worker files if indexing fails, so the output can be diagnosed/retried.
+    try:
+        subprocess.run(["tabix", "-f", "-p", "bed", final_output], check=True)
+        print(f"Tabix index created for: {final_output}")
+    except subprocess.CalledProcessError as e:
+        print(
+            f"Warning: could not create tabix index for {final_output}: {e}. "
+            "The combined coverage file exists but is not indexed; per-worker "
+            "files were left in place for diagnosis/retry.",
+            file=sys.stderr,
+        )
+        return
+    cleanup_temp_files(sample_name, sample_dir, nprocess)
+    for remainder_file in remainder_files.values():
+        if os.path.exists(remainder_file):
+            os.remove(remainder_file)
 
-        try:
-            subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
-            print(f"Combined coverage file created: {final_output}")
 
-            # Index the combined bed file with tabix
-            index_cmd = f"tabix -f -p bed {final_output}"
-            try:
-                subprocess.run(index_cmd, shell=True, check=True)
-                print(f"Tabix index created for: {final_output}")
-            except subprocess.CalledProcessError as e:
-                print(f"Warning: Could not create tabix index: {e}")
-
-        except subprocess.CalledProcessError as e:
-            print(f"Error combining files: {e}")
-
-        # Clean up temporary files (including any peeled remainders)
-        cleanup_temp_files(sample_name, sample_dir, nprocess)
-        for remainder_file in remainder_files.values():
-            if os.path.exists(remainder_file):
-                os.remove(remainder_file)
-    else:
-        print("No coverage files found to combine")
+def _concatenate_bgzf_files(paths, output):
+    """Copy compressed blocks, retaining just one terminal BGZF EOF marker."""
+    eof = bgzf._bgzf_eof
+    with open(output, "wb") as dest:
+        for path in paths:
+            with open(path, "rb") as source:
+                size = os.fstat(source.fileno()).st_size
+                if size >= len(eof):
+                    source.seek(-len(eof), os.SEEK_END)
+                    if source.read() == eof:
+                        size -= len(eof)
+                source.seek(0)
+                while size:
+                    block = source.read(min(size, 1024 * 1024))
+                    if not block:
+                        raise EOFError(f"Truncated BGZF file: {path}")
+                    dest.write(block)
+                    size -= len(block)
+        dest.write(eof)
 
 
 def merge_adjacent_bed_files(next_file, prev_file, output_file, extra_files=None):
