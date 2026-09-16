@@ -21,6 +21,42 @@ def _is_float(tok):
         return False
 
 
+def _floats_close(exp_val, act_val):
+    if np.isnan(exp_val) and np.isnan(act_val):
+        return True
+    return abs(exp_val - act_val) <= ATOL + RTOL * abs(exp_val)
+
+
+def _compare_info_like(exp_tok, act_tok):
+    """Treats a token as a VCF-style ';'-joined 'key=value' list (e.g. the
+    INFO column) and compares each value with float tolerance. Returns True/
+    False if both tokens have this shape with matching keys, None if either
+    doesn't -- callers fall back to plain equality in that case. Needed
+    because a whole INFO string is otherwise one opaque token: a single
+    sub-value differing by float noise in its last ~ULP (observed between
+    different machines/libm builds, not a real numeric difference) would
+    otherwise fail the entire token on an exact string compare.
+    """
+    if ";" not in exp_tok and "=" not in exp_tok:
+        return None
+    exp_parts, act_parts = exp_tok.split(";"), act_tok.split(";")
+    if len(exp_parts) != len(act_parts):
+        return None
+    for ep, ap in zip(exp_parts, act_parts):
+        if "=" not in ep or "=" not in ap:
+            return None
+        ek, ev = ep.split("=", 1)
+        ak, av = ap.split("=", 1)
+        if ek != ak:
+            return None
+        if ev == av:
+            continue
+        if _is_float(ev) and _is_float(av) and _floats_close(float(ev), float(av)):
+            continue
+        return False
+    return True
+
+
 def compare_text(expected_path, actual_path):
     """Returns a list of human-readable diff messages (empty if equal)."""
     with open(expected_path) as f:
@@ -50,11 +86,11 @@ def compare_text(expected_path, actual_path):
             if exp_tok == act_tok:
                 continue
             if _is_float(exp_tok) and _is_float(act_tok):
-                exp_val, act_val = float(exp_tok), float(act_tok)
-                if np.isnan(exp_val) and np.isnan(act_val):
+                if _floats_close(float(exp_tok), float(act_tok)):
                     continue
-                if abs(exp_val - act_val) <= ATOL + RTOL * abs(exp_val):
-                    continue
+            info_result = _compare_info_like(exp_tok, act_tok)
+            if info_result is True:
+                continue
             diffs.append(
                 f"line {lineno} col {col}: expected {exp_tok!r}, got {act_tok!r}"
             )
