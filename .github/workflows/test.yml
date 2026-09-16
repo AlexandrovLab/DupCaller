@@ -44,6 +44,9 @@ jobs:
       - name: Install dependencies
         run: pip install .[test]
 
+      - name: Install tabix
+        run: sudo apt-get update && sudo apt-get install -y tabix
+
       - name: Run unit tests
         run: pytest tests/unit/ -v
 
@@ -63,8 +66,15 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
+      # samtools>=1.21 requires libzlib>=1.3.1, but bwa=0.7.17's only
+      # available builds all require libzlib<1.3.0a0 -- no single zlib
+      # satisfies both, so the solver either hangs (classic) or reports
+      # LibMambaUnsatisfiableError (libmamba) if paired with samtools
+      # 1.21+. samtools=1.20 is the newest release still built against
+      # the older libzlib range bwa 0.7.17 needs; verified installable
+      # together with gatk4=4.6.2.0 (libmamba solve, ~1m40s).
       - name: Install bwa, samtools, gatk4
-        run: conda install -y bwa=0.7.17 samtools=1.22.1 gatk4=4.6.2.0
+        run: conda install -y bwa=0.7.17 samtools=1.20 gatk4=4.6.2.0
 
       - name: Install DupCaller
         run: pip install .[test]

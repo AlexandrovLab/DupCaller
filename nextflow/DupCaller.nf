@@ -9,7 +9,7 @@ if (!params.reference)  error "params.reference is required"
 // Step 1: Index reference genome
 // ─────────────────────────────────────────────────────────────────────────────
 process INDEX_REFERENCE {
-    container 'yuhecheng62/dupcaller:1.2.0-dev'
+    container 'yuhecheng62/dupcaller:1.2.1-dev'
 
     input:
     path reference
@@ -33,7 +33,7 @@ process INDEX_REFERENCE {
 // ─────────────────────────────────────────────────────────────────────────────
 process TRIM_BARCODES {
     tag "${sample_id}:${type}"
-    container 'yuhecheng62/dupcaller:1.2.0-dev'
+    container 'yuhecheng62/dupcaller:1.2.1-dev'
 
     input:
     tuple val(sample_id), val(type), path(read1), path(read2)
@@ -82,7 +82,7 @@ process BWA_MEM {
 // Step 3b: sort + index (samtools lives in the GATK image)
 process SAMTOOLS_SORT {
     tag "${sample_id}:${type}"
-    container 'broadinstitute/gatk:4.2.6.0'
+    container 'broadinstitute/gatk:4.3.0.0'
     cpus params.threads
 
     input:
@@ -105,7 +105,7 @@ process SAMTOOLS_SORT {
 // ─────────────────────────────────────────────────────────────────────────────
 process MARK_DUPLICATES {
     tag "${sample_id}:${type}"
-    container 'broadinstitute/gatk:4.2.6.0'
+    container 'broadinstitute/gatk:4.3.0.0'
 
     input:
     tuple val(sample_id), val(type), path(bam), path(bai)
@@ -144,7 +144,7 @@ process MARK_DUPLICATES {
 // ─────────────────────────────────────────────────────────────────────────────
 process CALL_VARIANTS {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.0-dev'
+    container 'yuhecheng62/dupcaller:1.2.1-dev'
     cpus params.threads
     publishDir "${params.outdir}", mode: 'copy'
 
@@ -166,7 +166,7 @@ process CALL_VARIANTS {
     def ref_name     = file(params.reference).name
     def normal_arg   = (normal_bam.name   != 'NO_FILE')        ? "-n ${normal_bam}"    : ""
     def germline_arg = (germline_vcf.name != 'NO_GERMLINE_VCF') ? "-g ${germline_vcf}" : ""
-    def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.join(' ')          : ""
+    def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.collect { "'${it}'" }.join(' ') : ""
     def target_arg   = (target_bed.name   != 'NO_TARGET_BED')   ? "-R ${target_bed}"   : ""
     def indel_arg    = (indel_bed.name    != 'NO_INDEL_BED')    ? "-id ${indel_bed}"   : ""
     // Omitted by default (DupCaller.py call itself then generates a fresh
@@ -200,7 +200,7 @@ process CALL_VARIANTS {
 // ─────────────────────────────────────────────────────────────────────────────
 process ESTIMATE_BURDEN {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.0-dev'
+    container 'yuhecheng62/dupcaller:1.2.1-dev'
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
@@ -294,10 +294,15 @@ workflow {
     noise_mask_list = params.noise_mask
         ? (params.noise_mask instanceof List ? params.noise_mask : [params.noise_mask])
         : []
+    // A path input bound to an empty list has no file to stage; always
+    // stage at least one placeholder so CALL_VARIANTS' `path
+    // noise_mask_files` input is never given a genuinely empty list.
     noise_files_ch = Channel.value(
-        noise_mask_list.collectMany { m ->
-            [file(m, checkIfExists: true), file("${m}.tbi", checkIfExists: true)]
-        }
+        noise_mask_list
+            ? noise_mask_list.collectMany { m ->
+                [file(m, checkIfExists: true), file("${m}.tbi", checkIfExists: true)]
+              }
+            : [file('NO_NOISE_MASK')]
     )
     noise_names_ch = Channel.value(noise_mask_list.collect { file(it).name })
 
@@ -314,23 +319,28 @@ workflow {
         : Channel.value(file('NO_GENE_BED'))
 
     // ── Parse sample map ─────────────────────────────────────────────────────
-    // Emits (sample_id, type, fq1, fq2) for both tumor and normal per row
+    // Emits (sample_id, type, fq1, fq2). Normal rows are only emitted (and
+    // only need normal_fastq_1/2 columns) when params.normal_bam is unset --
+    // see the shared-normal branch below.
 
     Channel.fromPath(params.sample_map, checkIfExists: true)
         .splitCsv(header: true, sep: '\t', strip: true)
         .flatMap { row ->
-            [
+            def rows = [
                 [row.sample_id, 'tumor',
                  file(row.tumor_fastq_1,  checkIfExists: true),
-                 file(row.tumor_fastq_2,  checkIfExists: true)],
-                [row.sample_id, 'normal',
-                 file(row.normal_fastq_1, checkIfExists: true),
-                 file(row.normal_fastq_2, checkIfExists: true)]
+                 file(row.tumor_fastq_2,  checkIfExists: true)]
             ]
+            if (!params.normal_bam) {
+                rows << [row.sample_id, 'normal',
+                          file(row.normal_fastq_1, checkIfExists: true),
+                          file(row.normal_fastq_2, checkIfExists: true)]
+            }
+            rows
         }
         .set { reads_ch }
 
-    // ── Steps 2–4: trim → align → mark-dup (tumor and normal in parallel) ───
+    // ── Steps 2–4: trim → align → mark-dup (tumor, and normal unless shared) ─
 
     trimmed_ch = TRIM_BARCODES(reads_ch)
     sam_ch     = BWA_MEM(trimmed_ch, bwa_ref_ch)
@@ -343,12 +353,24 @@ workflow {
         .filter { it[1] == 'tumor' }
         .map    { sid, _type, bam, bai -> [sid, bam, bai] }
 
-    normal_md = markdup_ch
-        .filter { it[1] == 'normal' }
-        .map    { sid, _type, bam, bai -> [sid, bam, bai] }
-
-    // join emits: [sample_id, tumor_bam, tumor_bai, normal_bam, normal_bai]
-    call_input_ch = tumor_md.join(normal_md)
+    if (params.normal_bam) {
+        // A single already-aligned, already-indexed normal BAM shared across
+        // every sample_id in the map (e.g. one matched normal reused across
+        // many tumor-only mock/benchmark samples) -- skip trim/align/markdup
+        // for it entirely rather than reprocessing the same normal reads
+        // once per tumor sample.
+        normal_bam_file = file(params.normal_bam, checkIfExists: true)
+        normal_bai_file = file("${params.normal_bam}.bai", checkIfExists: true)
+        call_input_ch = tumor_md.map { sid, bam, bai ->
+            [sid, bam, bai, normal_bam_file, normal_bai_file]
+        }
+    } else {
+        normal_md = markdup_ch
+            .filter { it[1] == 'normal' }
+            .map    { sid, _type, bam, bai -> [sid, bam, bai] }
+        // join emits: [sample_id, tumor_bam, tumor_bai, normal_bam, normal_bai]
+        call_input_ch = tumor_md.join(normal_md)
+    }
 
     // ── Step 5: Call variants ────────────────────────────────────────────────
 

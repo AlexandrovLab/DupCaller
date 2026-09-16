@@ -21,14 +21,31 @@
 #       [-m MASK1.bed.gz[,MASK2.bed.gz,...]] \
 #       [-g GERMLINE_VCF] \
 #       [-r "chr1 chr2 ..."] \
+#       [-b BARCODE_PATTERN] \
+#       [-B NORMAL_BAM] \
 #       [-p THREADS] \
 #       [-o OUTDIR] \
 #       [-P PROFILE] \
 #       [-R REPO_ROOT]
 #
-# Required:  -s -1 -2 -3 -4 -f
+# Required:  -s -1 -2 -f, plus either (-3 and -4) or -B
+# -B NORMAL_BAM: reuse an already-aligned, already-indexed (.bai) normal
+#   BAM instead of aligning -3/-4 -- e.g. one matched normal shared across
+#   many tumor-only benchmark/mock samples. Skips trim/align/markdup for
+#   the normal entirely. -3/-4 are ignored (and not required) when set.
 # Defaults:  -p $(nproc), -o ./results/SAMPLE_ID, -P docker,local,
 #            -r (DupCaller.py's own default: chr1-22,chrX),
+#            -b pipeline.config's default (NNNXXXX) -- CHECK THIS MATCHES
+#               YOUR ACTUAL BARCODE SCHEME (N=barcode base, X=skipped
+#               constant base) before trusting results; a mismatch here
+#               corrupts barcode extraction and every read's sequence
+#               offset, silently collapsing duplex family formation
+#               without erroring. Verify by comparing a raw fastq read's
+#               length to its aligned length in an existing BAM from the
+#               same data (the difference is the true total pattern
+#               length) -- a barcode tag's own length (e.g. DB:Z:xxx-yyy)
+#               only reveals the N-count, not any trailing skipped bases,
+#               and checking that alone is NOT sufficient,
 #            -R this script's own repo checkout
 set -euo pipefail
 
@@ -40,10 +57,12 @@ THREADS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 REGIONS=""
 NOISE_MASKS=""
 GERMLINE_VCF=""
+BARCODE_PATTERN=""
+NORMAL_BAM=""
 OUTDIR=""
 SAMPLE_ID=""
 
-while getopts "s:1:2:3:4:f:m:g:r:p:o:P:R:h" opt; do
+while getopts "s:1:2:3:4:f:m:g:r:b:B:p:o:P:R:h" opt; do
     case "$opt" in
         s) SAMPLE_ID="$OPTARG" ;;
         1) TUMOR_FASTQ_1="$OPTARG" ;;
@@ -54,6 +73,8 @@ while getopts "s:1:2:3:4:f:m:g:r:p:o:P:R:h" opt; do
         m) NOISE_MASKS="$OPTARG" ;;
         g) GERMLINE_VCF="$OPTARG" ;;
         r) REGIONS="$OPTARG" ;;
+        b) BARCODE_PATTERN="$OPTARG" ;;
+        B) NORMAL_BAM="$OPTARG" ;;
         p) THREADS="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         P) PROFILE="$OPTARG" ;;
@@ -66,9 +87,11 @@ done
 : "${SAMPLE_ID:?-s SAMPLE_ID is required}"
 : "${TUMOR_FASTQ_1:?-1 TUMOR_FASTQ_R1 is required}"
 : "${TUMOR_FASTQ_2:?-2 TUMOR_FASTQ_R2 is required}"
-: "${NORMAL_FASTQ_1:?-3 NORMAL_FASTQ_R1 is required}"
-: "${NORMAL_FASTQ_2:?-4 NORMAL_FASTQ_R2 is required}"
 : "${REFERENCE:?-f REFERENCE_FASTA is required}"
+if [ -z "$NORMAL_BAM" ]; then
+    : "${NORMAL_FASTQ_1:?-3 NORMAL_FASTQ_R1 is required (or pass -B NORMAL_BAM)}"
+    : "${NORMAL_FASTQ_2:?-4 NORMAL_FASTQ_R2 is required (or pass -B NORMAL_BAM)}"
+fi
 
 OUTDIR="${OUTDIR:-$(pwd)/results/${SAMPLE_ID}}"
 mkdir -p "$OUTDIR"
@@ -95,16 +118,38 @@ else
     germline_literal="null"
 fi
 
-WORKDIR="$(mktemp -d)"
+# nextflow's -resume history (.nextflow/cache, .nextflow.log) is keyed to
+# the launch directory, not to -w's work dir -- a fresh mktemp dir here
+# would give every invocation a clean launch dir with no prior session to
+# resume from, silently turning -resume into a full rerun. Reuse a stable,
+# per-sample launch dir under OUTDIR instead so a retry after a failure
+# actually resumes.
+WORKDIR="${OUTDIR}/.nextflow_launch"
+mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
-printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\tnormal_fastq_1\tnormal_fastq_2\n%s\t%s\t%s\t%s\t%s\n' \
-    "$SAMPLE_ID" "$TUMOR_FASTQ_1" "$TUMOR_FASTQ_2" "$NORMAL_FASTQ_1" "$NORMAL_FASTQ_2" > sample.map
+if [ -n "$NORMAL_BAM" ]; then
+    printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\n%s\t%s\t%s\n' \
+        "$SAMPLE_ID" "$TUMOR_FASTQ_1" "$TUMOR_FASTQ_2" > sample.map
+else
+    printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\tnormal_fastq_1\tnormal_fastq_2\n%s\t%s\t%s\t%s\t%s\n' \
+        "$SAMPLE_ID" "$TUMOR_FASTQ_1" "$TUMOR_FASTQ_2" "$NORMAL_FASTQ_1" "$NORMAL_FASTQ_2" > sample.map
+fi
 
 # Only overrides pipeline.config's placeholders that must be per-run --
 # every calling-parameter default already in pipeline.config (-maf, -gaf,
 # -d, -tt, -tr, -mq) matches DupCaller.py's own CLI defaults, so it's
-# inherited unchanged from there.
+# inherited unchanged from there. barcode_pattern is only written here if
+# -b was actually passed, so omitting -b still falls through to
+# pipeline.config's own default rather than an empty string.
+barcode_config_line=""
+if [ -n "$BARCODE_PATTERN" ]; then
+    barcode_config_line="    barcode_pattern = \"${BARCODE_PATTERN}\""
+fi
+normal_bam_config_line=""
+if [ -n "$NORMAL_BAM" ]; then
+    normal_bam_config_line="    normal_bam = \"${NORMAL_BAM}\""
+fi
 cat > run.config <<EOF
 params {
     sample_map   = "sample.map"
@@ -116,6 +161,8 @@ params {
     regions      = "${REGIONS}"
     threads      = ${THREADS}
     max_cpus     = ${THREADS}
+${barcode_config_line}
+${normal_bam_config_line}
 }
 EOF
 
