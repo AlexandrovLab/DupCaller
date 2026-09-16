@@ -66,15 +66,20 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
-      # samtools>=1.21 requires libzlib>=1.3.1, but bwa=0.7.17's only
-      # available builds all require libzlib<1.3.0a0 -- no single zlib
-      # satisfies both, so the solver either hangs (classic) or reports
-      # LibMambaUnsatisfiableError (libmamba) if paired with samtools
-      # 1.21+. samtools=1.20 is the newest release still built against
-      # the older libzlib range bwa 0.7.17 needs; verified installable
-      # together with gatk4=4.6.2.0 (libmamba solve, ~1m40s).
+      # bwa=0.7.17 and samtools/gatk4 keep landing on mutually
+      # unsatisfiable pins when solved together (bwa needs an old
+      # libzlib range; samtools needs an htslib/libdeflate combo that
+      # keeps shifting as bioconda adds new builds, so a version pair
+      # "verified" against today's channel snapshot can stop solving a
+      # week later with no change on our end). Solve bwa in its own env,
+      # isolated from samtools/gatk4's htslib chain entirely, and put
+      # both envs' bin dirs on PATH.
       - name: Install bwa, samtools, gatk4
-        run: conda install -y bwa=0.7.17 samtools=1.20 gatk4=4.6.2.0
+        run: |
+          conda create -y -n bwa_env bwa=0.7.17
+          conda create -y -n pipeline_env samtools gatk4=4.6.2.0
+          echo "$(conda info --base)/envs/bwa_env/bin" >> "$GITHUB_PATH"
+          echo "$(conda info --base)/envs/pipeline_env/bin" >> "$GITHUB_PATH"
 
       - name: Install DupCaller
         run: pip install .[test]
