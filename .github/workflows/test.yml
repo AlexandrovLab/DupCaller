@@ -11,7 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"]
+        # README.md claims python>=3.10 support; keep this matrix in sync
+        # with that claim rather than testing 3.12 alone.
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +33,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12"]
+        # README.md claims python>=3.10 support; keep this matrix in sync
+        # with that claim rather than testing 3.12 alone.
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -84,5 +88,71 @@ jobs:
       - name: Install DupCaller
         run: pip install .[test]
 
-      - name: Run mock end-to-end pipeline test
-        run: pytest tests/mock_pipeline/ -v
+      # test_mock_pipeline_nextflow.py runs in the dedicated
+      # mock-pipeline-nextflow job below, which installs nextflow and a
+      # container runtime; it would otherwise silently skip here.
+      - name: Run mock end-to-end pipeline test (direct CLI)
+        run: |
+          pytest tests/mock_pipeline/ -v \
+            --ignore=tests/mock_pipeline/test_mock_pipeline_nextflow.py
+
+  mock-pipeline-nextflow:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment with pipeline dependencies
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.12"
+          channels: bioconda,conda-forge
+          channel-priority: strict
+
+      # See the mock-pipeline job above for why bwa is solved in its own
+      # env, isolated from samtools/gatk4.
+      - name: Install bwa, samtools, gatk4
+        run: |
+          conda create -y -n bwa_env bwa=0.7.17
+          conda create -y -n pipeline_env samtools gatk4=4.6.2.0
+          echo "$(conda info --base)/envs/bwa_env/bin" >> "$GITHUB_PATH"
+          echo "$(conda info --base)/envs/pipeline_env/bin" >> "$GITHUB_PATH"
+
+      - name: Install Nextflow
+        env:
+          # Pinned so a Nextflow release change can't silently alter what
+          # this job validates; nextflow/nextflow.config only requires
+          # >=21.10.0, so bump this deliberately rather than floating it.
+          NXF_VER: "24.10.4"
+        run: |
+          curl -s https://get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/
+          nextflow -version
+
+      # ubuntu-latest runners ship Docker with a running daemon already;
+      # this only verifies it, it doesn't install anything.
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Install DupCaller
+        run: pip install .[test]
+
+      # The test itself skips (rather than fails) when nextflow/bwa/
+      # samtools/a container runtime aren't on PATH, so that a laptop
+      # without those tools doesn't get a spurious failure. In CI all of
+      # them are guaranteed present by the steps above, so a skip here
+      # means the job's own setup is broken, not an expected outcome --
+      # treat it as a failure rather than letting the run go green on a
+      # skip.
+      - name: Run nextflow mock end-to-end pipeline test
+        run: |
+          set -o pipefail
+          pytest tests/mock_pipeline/test_mock_pipeline_nextflow.py -v -rs \
+            | tee pytest_nextflow.log
+          if grep -q "SKIPPED" pytest_nextflow.log; then
+            echo "::error::test_mock_pipeline_nextflow.py was skipped even though this job installs nextflow/bwa/samtools/docker -- fix the job setup rather than letting this pass on a skip."
+            exit 1
+          fi
