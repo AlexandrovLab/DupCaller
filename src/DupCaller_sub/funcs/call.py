@@ -164,19 +164,15 @@ def prepare_reference_mats(
         if nbams:
             depth = np.zeros(end - start)
             for nbam in nbams:
-                depth_now, indel_mask_out = extractDepthRegion(
-                    nbam, chrom, start, end, params
-                )
-                indel_mask[indel_mask_out] = True
+                depth_now = extractDepthRegion(nbam, chrom, start, end, params)
                 depth += depth_now
             n_cov_mask = depth < params["minNdepth"]
 
         if params["maxAF"] < 1:
-            depth, indel_mask_out = extractDepthRegion(tbam, chrom, start, end, params)
+            depth = extractDepthRegion(tbam, chrom, start, end, params)
             ma = params["maxAF"]
             min_depth = math.ceil(1 / ma)
             n_cov_mask = depth < min_depth
-            indel_mask[indel_mask_out] = True
 
         nm_mask = prepareAlignMask(tbam, chrom, start, end, params)
         # nm_mask = nm_avg >= params["maxNM"]/2

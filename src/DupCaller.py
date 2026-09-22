@@ -312,7 +312,7 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "--maxPileupDepth",
         "-pd",
-        type=float,
+        type=int,
         help="Maximum depth for samtools mpileup",
         default=1000000,
     )

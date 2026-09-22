@@ -584,6 +584,15 @@ def _parse_mpileup_bases(ref_base, bases_str):
     return counts
 
 
+# Regional depth/coverage counting (n_cov_mask, tumor maxAF<1 min-depth
+# check) intentionally uses its own fixed base-quality floor rather than
+# the user-configurable --minBq: --minBq gates which bases count as
+# variant-supporting evidence for a candidate, while this is a coarser
+# "is this position covered at all" depth tally that should stay stable
+# across --minBq settings.
+_REGIONAL_DEPTH_MIN_BQ = 30
+
+
 def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
     """count_alleles=True additionally tallies, from the exact same
     mpileup scan (no second pass), a per-position (end-start, 4) A/T/C/G
@@ -591,17 +600,22 @@ def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
     position in this region be read directly out of the matrix instead
     of needing its own separate extractDepthBatchSnv/Indel re-scan of
     the same bam region. Only the caller that actually needs it pays for
-    the extra per-line parsing; existing callers (indelmask/coverage-
-    threshold-only, e.g. the tumor maxAF<1 branch) are unaffected."""
+    the extra per-line parsing; existing callers (coverage-threshold-only,
+    e.g. the tumor maxAF<1 branch) are unaffected."""
     depth = np.zeros(end - start)
-    indelmask = np.zeros(end - start, dtype=bool)
-    # processed_read_names = {}
     mapq = params["mapq"]
-    max_depth = params["minNdepth"]
+    max_depth = int(params["maxDepth"])
     acgt = np.zeros((end - start, 4)) if count_alleles else None
-    # for line in pysam.depth("-q","30","-Q",f"{mapq}","-J","-r",f"{chrom}:{start}-{end}",bam).split("\n"):
     for line in pysam.mpileup(
-        "-Q", "30", "-q", f"{mapq}", "-r", f"{chrom}:{start}-{end}", bam
+        "-Q",
+        f"{_REGIONAL_DEPTH_MIN_BQ}",
+        "-q",
+        f"{mapq}",
+        "-d",
+        f"{max_depth}",
+        "-r",
+        f"{chrom}:{start}-{end}",
+        bam,
     ).split("\n"):
         if line:
             try:
@@ -613,8 +627,8 @@ def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
             except (IndexError, ValueError):
                 pass
     if count_alleles:
-        return depth, indelmask, acgt
-    return depth, indelmask
+        return depth, acgt
+    return depth
 
 
 def prepareAlignMask(bam, chrom, start, end, params):
