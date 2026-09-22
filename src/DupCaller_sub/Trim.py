@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from gzip import open as gzopen
+from itertools import zip_longest
 import os
+
+_EOF = object()
 
 
 # from itertools import izip
@@ -81,7 +84,25 @@ def do_trim(args):
     fq1Out = open(args.output + "_1.fastq", "a")
     fq2Out = open(args.output + "_2.fastq", "a")
     lineIndex = 0
-    for line1, line2 in zip(fq1, fq2):
+    record_no = 0
+    for line1, line2 in zip_longest(fq1, fq2, fillvalue=_EOF):
+        if line1 is _EOF or line2 is _EOF:
+            if lineIndex != 0:
+                raise ValueError(
+                    f"{args.fq} and {args.fq2} both ended mid-FASTQ-record "
+                    f"(read pair {record_no}, incomplete record); at least "
+                    "one file is truncated or corrupt."
+                )
+            if line1 is not line2:
+                shorter, longer = (
+                    (args.fq, args.fq2) if line1 is _EOF else (args.fq2, args.fq)
+                )
+                raise ValueError(
+                    f"{shorter} has fewer reads than {longer} "
+                    f"({record_no} complete read pairs processed before "
+                    "mismatch)."
+                )
+            break
         # print(lineIndex)
         # print(line1,line2)
         if lineIndex == 0:
@@ -102,6 +123,7 @@ def do_trim(args):
             # print(barcodeIndex)
             read1, read2 = trim(readPair, args.pattern)
             lineIndex = 0
+            record_no += 1
             # print(read1,read2)
             fq1Out.write(read1[0] + read1[1] + "+\n" + read1[2])
             fq2Out.write(read2[0] + read2[1] + "+\n" + read2[2])
