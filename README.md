@@ -29,7 +29,7 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
 
 ## Prerequisites
 
-DupCaller requires python>=3.10 to run. Earlier versions may be sufficient to run DupCaller but have not been tested.
+DupCaller requires python>=3.11 to run (setup.py pins numpy==2.3.4/scipy==1.16.2, both of which require >=3.11). Earlier versions are not supported.
 The complete DupCaller pipeline also requires the following tools for data preprocessing. The versions are used by the developer and other versions may or may not work.
 
 - BWA version 0.7.17 (https://bio-bwa.sourceforge.net)

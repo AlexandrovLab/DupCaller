@@ -11,9 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # README.md claims python>=3.10 support; keep this matrix in sync
-        # with that claim rather than testing 3.12 alone.
-        python-version: ["3.10", "3.11", "3.12"]
+        # README.md claims python>=3.11 support (numpy==2.3.4/scipy==1.16.2
+        # in setup.py both require >=3.11 -- 3.10 has no matching wheels and
+        # pip install fails outright there); keep this matrix in sync with
+        # that claim rather than testing 3.12 alone.
+        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -33,9 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # README.md claims python>=3.10 support; keep this matrix in sync
-        # with that claim rather than testing 3.12 alone.
-        python-version: ["3.10", "3.11", "3.12"]
+        # README.md claims python>=3.11 support (numpy==2.3.4/scipy==1.16.2
+        # in setup.py both require >=3.11 -- 3.10 has no matching wheels and
+        # pip install fails outright there); keep this matrix in sync with
+        # that claim rather than testing 3.12 alone.
+        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
