@@ -132,6 +132,12 @@ jobs:
           # >=21.10.0, so bump this deliberately rather than floating it.
           NXF_VER: "24.10.4"
         run: |
+          # get.nextflow.io writes a file named "nextflow" into the
+          # current directory, which collides with this repo's own
+          # nextflow/ directory when run from the checkout root -- do
+          # the install in a scratch dir instead.
+          mkdir -p "$RUNNER_TEMP/nextflow-install"
+          cd "$RUNNER_TEMP/nextflow-install"
           curl -s https://get.nextflow.io | bash
           sudo mv nextflow /usr/local/bin/
           nextflow -version
