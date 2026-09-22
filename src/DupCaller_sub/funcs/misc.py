@@ -1702,9 +1702,15 @@ def _normalize_indel_hp_mat(mat, pseudocount):
     per-context probabilities: within each base's own 3-column group
     (ref/del/ins counts for that base), each row is Dirichlet-smoothed by
     `pseudocount` on the counts and divided by its own (smoothed) sum, so
-    the three probabilities for a given (hp_len, base) add to 1. Then
-    enforce monotonic non-decrease across increasing hp_len within each
-    group (row n >= row n-1 elementwise), independently per base group.
+    the three probabilities for a given (hp_len, base) add to 1. A row
+    with zero raw observations (row_sum == 0) is instead set equal to the
+    previous hp_len row's (already-normalized) rate, since a flat
+    pseudocount prior is a worse estimate than the nearest observed
+    hp_len once any data exists in the group; the first row (hp_len 1)
+    has no previous row to fall back to and keeps its pseudocount-
+    smoothed value if it is itself all-zero. Then enforce monotonic
+    non-decrease across increasing hp_len within each group (row n >=
+    row n-1 elementwise), independently per base group.
     """
     mat_new = np.zeros_like(mat, dtype=float)
     for g in range(4):
@@ -1712,6 +1718,9 @@ def _normalize_indel_hp_mat(mat, pseudocount):
         row_sum = block.sum(axis=1, keepdims=True)
         block_new = (block + pseudocount) / (row_sum + 3 * pseudocount)
         for nn in range(1, block_new.shape[0]):
+            if row_sum[nn, 0] == 0:
+                block_new[nn, :] = block_new[nn - 1, :]
+                continue
             current_row = block_new[nn, :]
             smaller_entries = current_row <= block_new[nn - 1, :]
             current_row[smaller_entries] = block_new[nn - 1, :][smaller_entries]
@@ -1725,19 +1734,18 @@ def _normalize_indel_str_mat(mat, pseudocount):
     0="0-1"/not a real repeat through 4="40+", columns idLen+5 for idLen
     in -5..5) into per-context probabilities: each row is Dirichlet-
     smoothed by `pseudocount` on the counts and divided by its own
-    (smoothed) sum across all 11 columns. Real-STR rows (1-4) with zero
-    observations at that length bin fall back to the pooled distribution
-    across whichever real-STR rows do have data. Row 0 (not a real
-    repeat) is never pooled into or from.
+    (smoothed) sum across all 11 columns. Real-STR rows (2-4) with zero
+    raw observations at that length bin are instead set equal to the
+    previous (shorter) real-STR row's rate. Row 1, the shortest real-STR
+    bin, has no prior real-STR row to fall back to and keeps its
+    pseudocount-smoothed value if it is itself all-zero. Row 0 (not a
+    real repeat) is never involved in this fallback.
     """
     row_sum = mat.sum(axis=1, keepdims=True)
     mat_new = (mat + pseudocount) / (row_sum + 11 * pseudocount)
-    str_rows_total = mat[1:5, :].sum(axis=0)
-    if str_rows_total.sum() > 0:
-        pooled = str_rows_total / str_rows_total.sum()
-        for r in range(1, 5):
-            if row_sum[r, 0] == 0:
-                mat_new[r, :] = pooled
+    for r in range(2, 5):
+        if row_sum[r, 0] == 0:
+            mat_new[r, :] = mat_new[r - 1, :]
     return mat_new
 
 
