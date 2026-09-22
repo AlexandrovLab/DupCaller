@@ -157,7 +157,7 @@ if __name__ == "__main__":
         "-a",
         "--pseudocount",
         type=float,
-        help="regularization pseudocount added to each channel's per-channel mixture-weight MLE solve (mu), guaranteeing a root strictly between 0 and 1 without needing a channel-exclusion fallback",
+        help="regularization pseudocount added to each channel's per-channel mixture-weight MLE solve (mu), making an interior root between 0 and 1 more likely; a channel where the solve still can't bracket a root falls back to mu=0 rather than being excluded",
         default=0.5,
     )
     call_parser.add_argument(
@@ -254,7 +254,7 @@ if __name__ == "__main__":
         "-bq",
         "--minBq",
         type=int,
-        help="bases with quality less than this number will be set to 6",
+        help="bases with quality at or below this number are zeroed out and excluded from variant calling",
         default=18,
     )
     call_parser.add_argument(

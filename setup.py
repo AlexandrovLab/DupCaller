@@ -4,7 +4,7 @@ setup(
     name="DupCaller",
     version="1.2.1-dev",
     description="A variant caller for barcoded DNA sequencing",
-    url="https://github.com/yuhecheng62/DupCaller",
+    url="https://github.com/AlexandrovLab/DupCaller",
     author="Yuhe Cheng",
     author_email="yuc211@ucsd.edu",
     scripts=["src/DupCaller.py"],
