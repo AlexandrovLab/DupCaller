@@ -135,7 +135,7 @@ if __name__ == "__main__":
         "-lfdr",
         "--lfdrThreshold",
         type=float,
-        help="target per-channel lFDR (max of (1-mutation_rate)/(LR*mutation_rate+1-mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised and mutation rate re-estimated iteratively",
+        help="target per-channel lFDR (max of (1-mutation_rate)/(LR*mutation_rate+1-mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised via a single closed-form solve using the round-1 mutation-rate estimate (non-iterative)",
         default=0.05,
     )
     call_parser.add_argument(
@@ -144,7 +144,8 @@ if __name__ == "__main__":
         type=str,
         help="prefix for a previously-computed per-channel mutation-rate table pair "
         "({prefix}_sbs96_rate_n1.txt, {prefix}_indel_rate_by_hp_str.txt) -- the exact "
-        "files this same command writes out itself every run. Overrides this run's own "
+        "files this same command writes out itself every run, as {out}/tmp/{sample}_*; "
+        "pass {out}/tmp/{sample} here. Overrides this run's own "
         "round-1 per-channel mutation-rate (mu0) estimate with the supplied one instead "
         "of re-deriving it from just this run's own candidates/coverage, so a call over "
         "a small region (e.g. --rescue debugging of a single locus) can reuse a full "
@@ -515,13 +516,14 @@ if __name__ == "__main__":
         "-ft",
         "--refTrinuc",
         type=str,
-        help="Currently unused -- -f/--reference is always required regardless of this option.",
+        help="Precomputed trinucleotide composition (from -ot/--outTrinuc) to load instead of "
+        "rescanning the reference's .tn.h5. -f/--reference is still required.",
     )
     estimate_parser.add_argument(
         "-ot",
         "--outTrinuc",
         type=str,
-        help="If ref is set, output the computed trinucleotide composition file for future use",
+        help="Write the reference trinucleotide composition used by this run to this file, for reuse via -ft/--refTrinuc",
     )
     estimate_parser.add_argument(
         "-r",
@@ -530,13 +532,6 @@ if __name__ == "__main__":
         type=str,
         help="contigs to consider for trinucleotide calculation",
         default=["chr" + str(_) for _ in range(1, 23, 1)] + ["chrX"],
-    )
-    estimate_parser.add_argument(
-        "-c",
-        "--clonal",
-        action="store_true",
-        help="If set, mutations detected in more than one molecule will be considered as clonal mutations",
-        default=False,
     )
     estimate_parser.add_argument(
         "-d",
@@ -587,7 +582,7 @@ if __name__ == "__main__":
         "--repeatTsv",
         type=str,
         required=True,
-        help="PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference, e.g. produced by `PERF.core -m 1 -M <N> -u 2 -i reference.fa`. Repeat unit length and repeat count are read directly from the motif and num_units columns. Entries with unit length 1 (homopolymers) are ignored -- those are self-derived from the reference sequence instead.",
+        help="PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference, e.g. produced by `PERF -m 2 -M 10 -u 2 -i reference.fa`. Repeat unit length and repeat count are read directly from the motif and num_units columns. Entries with unit length 1 (homopolymers) are ignored -- those are self-derived from the reference sequence instead.",
     )
 
     index_dbs_parser = subparsers.add_parser(

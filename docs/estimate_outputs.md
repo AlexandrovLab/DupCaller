@@ -10,6 +10,7 @@ All files are written under the sample directory specified by `-i / --prefix` (c
 ├── {sample}_stats.txt                  (three lines appended by this step — see call_outputs.md)
 ├── SBS/   _sbs_burden.txt, _sbs_96_corrected.txt, SBS_96_plots_{sample}.pdf,
 │          _sbs_burden_by_group_size.txt/.pdf,
+│          _sbs_flt.vcf   (conditional, -d)
 │          _sbs_burden_re_estimate.txt, _sbs_96_corrected_re_estimate.txt,
 │          SBS_96_plots_{sample}_re_estimate.pdf   (conditional, -rb)
 ├── INDEL/ _indel_burden.txt, _indel_83_corrected.txt, ID_83_plots_{sample}.pdf,
@@ -234,3 +235,11 @@ A separate, shorter field set (note the field *names* differ slightly from the m
 | `Corrected indel number` | Correction-ratio-weighted indel count. |
 | `Mutation number per genome`, `..95% lower/upper` | Genome-wide extrapolation (`Corrected indel burden × Reference base number`, CI scaled the same way), matching the main `_sbs_burden.txt` convention. |
 | `Indel coverage` | Total ID83-resolution opportunity coverage within the region (not rescaled by `indel_locus_multiplier` — unlike the main `_indel_burden.txt`, this file's burden values are already computed directly against this same raw denominator, so no rescaling is needed here). |
+
+---
+
+## `SBS/{sample}_sbs_flt.vcf`
+
+**Condition:** only written when `-d/--dilute` is set.
+
+A filtered subset of `_sbs.vcf`: SNVs with a tumor alt allele count (`AC`) above 1 are dropped if their tumor and matched-normal allele counts differ significantly (Barnard's exact test, p ≤ 0.05). Intended for the case where the sample and matched normal come from the same starting DNA material.

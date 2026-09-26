@@ -18,6 +18,7 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
   - [Step 5: Call Variants](#step-5-call-variants)
   - [Step 6: Estimate Mutational Burden](#step-6-estimate-mutational-burden)
   - [Step 7: Summarize Across Samples](#step-7-summarize-across-samples)
+  - [Optional: Aggregate Error Profiles Across Samples](#optional-aggregate-error-profiles-across-samples)
 - [Results](#results)
 - [End-to-End Examples](#end-to-end-examples)
 - [Resources](#resources)
@@ -90,13 +91,13 @@ singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.0.sif DupCaller.py {your com
 
 DupCaller uses a numpyrized reference genome to perform memory-efficient reference fetching, trinucleotide context lookup, and repeat (homopolymer/short tandem repeat, STR) annotation used to improve indel calling near repetitive regions.
 
-Repeat annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder). First, run PERF against the reference FASTA:
+STR annotation comes from a single tsv produced by [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder). First, run PERF against the reference FASTA:
 
 ```bash
-PERF -m 1 -M 10 -u 2 -i reference.fa -o repeats.tsv
+PERF -m 2 -M 10 -u 2 -i reference.fa -o repeats.tsv
 ```
 
-- `-m`/`-M` — min/max repeat unit (motif) size to search for. `-M 10` covers homopolymers through 10bp-unit STRs; going much higher increases PERF's runtime and memory non-trivially.
+- `-m`/`-M` — min/max repeat unit (motif) size to search for. `-m 2 -M 10` covers 2–10bp-unit STRs; going much higher increases PERF's runtime and memory non-trivially. Homopolymers (unit length 1) are not taken from this tsv: `index` derives them directly from the reference sequence and ignores any unit-length-1 rows, so `-m 1` only adds runtime.
 - `-u 2` (`--min-units`) — minimum number of repeat copies to report.
 
 Then index the reference, passing PERF's tsv directly:
@@ -105,7 +106,9 @@ Then index the reference, passing PERF's tsv directly:
 DupCaller.py index -f reference.fa -rt repeats.tsv
 ```
 
-The command will generate five h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5`, `{reference}.hp.h5`, `{reference}.str.h5`, and `{reference}.dbs.h5` — numpyrized reference sequences, trinucleotide contexts, homopolymer annotations, STR (unit length >=2) annotations, and per-position dinucleotide (DBS) classes, respectively. Make sure that when running other DupCaller utilities, all five files are within the same folder as the reference genome.
+The command will generate five h5 files in the same folder as the reference: `{reference}.ref.h5`, `{reference}.tn.h5`, `{reference}.hp.h5`, `{reference}.str.h5`, and `{reference}.dbs.h5` — numpyrized reference sequences, trinucleotide contexts, homopolymer annotations, STR (unit length >=2) annotations, and per-position dinucleotide (DBS) classes, respectively. `call` and `estimate` require the first four to be in the same folder as the reference genome; `.dbs.h5` is not currently read by `call` or `estimate`.
+
+To add only the `.dbs.h5` file to a reference that was already indexed, run `DupCaller.py index-dbs -f reference.fa`. It reads only the existing `.ref.h5`, so it is safe to run while other jobs are using the reference.
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
@@ -114,7 +117,7 @@ For human reference genome hg38 and mouse reference genome mm39, we provided pre
 | Short | Long        | Description                                                                                                                                                                                                          |
 | ----- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | -f    | --reference | Reference genome fasta file (required)                                                                                                                                                                               |
-| -rt   | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns. |
+| -rt   | --repeatTsv | PERF-format repeat tsv (chrom, start, end, motif, length, strand, num_units, motif_repeat) for the reference (required). Repeat unit length and repeat count are read directly from the motif and num_units columns; rows with unit length 1 are ignored. |
 
 ### Step 2: Trim Barcodes
 
@@ -204,7 +207,7 @@ See the [Results](#results) section for descriptions of all output files.
 | ----- | ----------- | --------------------------- |
 | -b    | --bam       | BAM file of ecNGS data      |
 | -f    | --reference | Reference genome FASTA file |
-| -o    | --output    | Prefix of the output files  |
+| -o    | --output    | Output directory; created if needed. Files inside are named `{sample}_*`, where `{sample}` is the directory's basename |
 
 ##### Recommended
 
@@ -231,8 +234,8 @@ The effect of changing these parameters should be evaluated before implementatio
 | Short    | Long               | Description                                                                                                                                                                                                                                                                                                                                                                                 | Default |
 | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | --naf    |                    | Maximum VAF in matched normal for a mutation to be called                                                                                                                                                                                                                                                                                                                                   | 0.01    |
-| --rescue |                    | Output discarded variants with reason in the FILTER field                                                                                                                                                                                                                                                                                                                                   | False   |
-| -nm      | --nmflt            | Filter reads with edit distance larger than this value                                                                                                                                                                                                                                                                                                                                      | 5       |
+| --rescue | -res               | Output discarded variants with reason in the FILTER field                                                                                                                                                                                                                                                                                                                                   | False   |
+| -nm      | --nmflt            | Drop a read family when at least half of its reads have an edit distance (NM) above this value                                                                                                                                                                                                                                                                                              | 5       |
 | -ax      | --minMeanASXS      | Minimum mean AS-XS alignment score difference for a read group to be considered                                                                                                                                                                                                                                                                                                             | 50      |
 | -gaf     | --germlineAfCutoff | Skip positions with germline AF above this threshold                                                                                                                                                                                                                                                                                                                                        | 0.001   |
 | -d       | --minNdepth        | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                                              | 10      |
@@ -260,16 +263,22 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 | -id      | --indelbed        | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                               | None                 |
 | -rt      | --regionst        | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                                  | same as`--regions` |
 | -pd      | --maxPileupDepth  | Maximum depth for samtools mpileup                                                                                                                                                                                                                     | 1000000              |
+| -mr      | --muterateprefix  | Reuse per-channel mutation-rate tables from an earlier run instead of estimating them from this run's own candidates (useful when calling a small region). Pass `{out}/tmp/{sample}` from that run, which holds `{sample}_sbs96_rate_n1.txt` and `{sample}_indel_rate_by_hp_str.txt`. LR thresholds are still solved against this run's `-lfdr` | None                 |
+|          | --seed            | RNG seed for the Monte Carlo detection-power simulation, for reproducible results across runs and `-p` values. If unset, a random seed is generated and recorded in `{sample}_call_params.log` | random               |
 
 #### Germline and Noise Masks
 
 The `-m` option accepts BED files and will ignore any mutations overlapping an excluded locus. Any custom BED file can be used as input.
 
+#### Low-Coverage Error-Profile Fallback
+
+DupCaller ships a set of reference error profiles (`src/ERROR/fallback_latest.*.txt`, installed with the package). When a context in the sample's own learned error profile has fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin), any error type in that context with zero observed counts takes its rate from the bundled profile instead of the flat pseudocount prior. Error types that were observed, and well-sampled contexts, always use the sample's own rates. This applies to the SBS amplification (SRD) and damage matrices and to the homopolymer/STR indel matrices.
+
 ---
 
 ### Step 6: Estimate Mutational Burden
 
-After mutation calling, run burden estimation from the output folder:
+After mutation calling, run burden estimation on the `call` output directory (`-i` is the same path that was passed to `call -o`):
 
 ```bash
 DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX
@@ -285,15 +294,17 @@ For dNdScv coverage correction, DupCaller can output mean duplex depth per gene 
 DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -gb {target}.bed
 ```
 
-The gene BED should have the fourth column formatted as `{gene_name}_{exon_number}` (e.g. `tp53_1`).
+The gene BED should have the fourth column formatted as `{gene_name}_{exon_number}` (e.g. `tp53_1`). It must be bgzip-compressed and tabix-indexed (`bgzip {target}.bed && tabix -p bed {target}.bed.gz`).
 
 #### Re-estimation for Specific Regions
 
 To re-estimate trinucleotide-corrected mutational burden in specific regions without re-running variant calling, use `-rb`:
 
 ```bash
-DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estimate}.bed
+DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estimate}.bed.gz
 ```
+
+As with `-gb`, the BED file must be bgzip-compressed and tabix-indexed.
 
 #### Parameters
 
@@ -301,24 +312,19 @@ DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estim
 
 | Short | Long     | Description                                  |
 | ----- | -------- | -------------------------------------------- |
-| -i    | --prefix | Input prefix of results from`call` command |
-
-##### Reference (choose one)
-
-| Short | Long        | Description                                               | Default |
-| ----- | ----------- | --------------------------------------------------------- | ------- |
-| -f    | --reference | FASTA file of reference genome                            | None    |
-| -ft   | --refTrinuc | Precomputed trinucleotide composition of reference genome | None    |
+| -i    | --prefix | Output directory of the `call` command (the `-o` value) |
+| -f    | --reference | FASTA file of reference genome (its h5 index files must sit next to it) |
 
 ##### Optional
 
 | Short | Long            | Description                                                        | Default         |
 | ----- | --------------- | ------------------------------------------------------------------ | --------------- |
 | -r    | --regions       | Contigs to consider for trinucleotide calculation                  | chr{1..22} chrX |
-| -ot   | --outTrinuc     | Output the computed trinucleotide composition file for future use  | None            |
-| -c    | --clonal        | Treat mutations detected in more than one molecule as one mutation | False           |
-| -gb   | --genebed       | Gene BED file for per-gene coverage calculation                    | None            |
-| -rb   | --reestimatebed | BED file for burden re-estimation in specific regions              | None            |
+| -ot   | --outTrinuc     | Write the reference trinucleotide composition to this file, for reuse with `-ft` | None |
+| -ft   | --refTrinuc     | Load a trinucleotide composition written by `-ot` instead of rescanning the reference (`-f` is still required) | None |
+| -d    | --dilute        | Set when sample and matched normal come from the same starting DNA material: SNVs with a tumor alt allele count (`AC`) above 1 are dropped when their tumor and normal allele counts differ significantly (Barnard's exact test, p <= 0.05), and kept calls are written to `SBS/{sample}_sbs_flt.vcf` | False |
+| -gb   | --genebed       | bgzipped, tabix-indexed gene BED file for per-gene coverage calculation | None |
+| -rb   | --reestimatebed | bgzipped, tabix-indexed BED file for burden re-estimation in specific regions | None |
 
 ---
 
@@ -330,11 +336,11 @@ After running `estimate` on all samples, use `DupCaller.py summarize` to collate
 DupCaller.py summarize -i sample1 sample2 sample3 -o cohort_summary.txt
 ```
 
-This reads `{sample}_stats.txt`, `{sample}/SBS/{sample}_sbs_burden.txt`, `{sample}/INDEL/{sample}_indel_burden.txt`, and `{sample}/SBS/{sample}_sbs_96_corrected.txt` from each sample folder and writes four output files:
+This reads `{sample}/{sample}_stats.txt`, `{sample}/SBS/{sample}_sbs_burden.txt`, `{sample}/INDEL/{sample}_indel_burden.txt`, `{sample}/DBS/{sample}_dbs_burden.txt`, and `{sample}/SBS/{sample}_sbs_96_corrected.txt` from each sample folder (all five are required) and writes four output files:
 
 | File                                     | Description                                                                       |
 | ---------------------------------------- | --------------------------------------------------------------------------------- |
-| `cohort_summary.txt`                   | One row per sample with burden metrics and library statistics                     |
+| `cohort_summary.txt`                   | One row per sample with SBS, indel, and DBS burden metrics and library statistics |
 | `cohort_summary_SBS96_uncorrected.txt` | 96-context raw mutation counts across all samples (SigProfiler-compatible format) |
 | `cohort_summary_SBS96_corrected.txt`   | 96-context trinucleotide-corrected counts across all samples                      |
 | `cohort_summary_SBS96_genome.txt`      | 96-context estimated mutations per genome across all samples                      |
@@ -347,6 +353,24 @@ All SBS96 file can be directly input into [SigProfilerPlotting](https://github.c
 | ----- | -------- | ------------------------------------------------------------------ |
 | -i    | --input  | One or more sample folders (space-separated)                       |
 | -o    | --output | Output filename for the summary table (e.g.`cohort_summary.txt`) |
+
+### Optional: Aggregate Error Profiles Across Samples
+
+`DupCaller.py aggregate` pools the learned error profiles of several `call` runs into one set, which can then be passed to `call -E` (for example, for a low-coverage sample from the same library prep):
+
+```bash
+DupCaller.py aggregate -i sample1 sample2 sample3 -o pooled
+DupCaller.py call ... -E pooled
+```
+
+It sums each sample's `ERROR/{sample}.*.txt` count tables and re-fits the SRD amplification matrix from the summed base-quality histograms in each sample's `tmp/{sample}.amp.tn.bqhist.npz`, so the `tmp/` folder of each input run must still exist. It writes `pooled.amp.tn.txt`, `pooled.amp.tn.srd.txt`, `pooled.dmg.tn.txt`, and the four `pooled.{amp,dmg}.{hp,str}.txt` files.
+
+| Short | Long         | Description                                                                 | Default |
+| ----- | ------------ | --------------------------------------------------------------------------- | ------- |
+| -i    | --input      | One or more `call` output directories                                       | None    |
+| -f    | --input-file | File with one error-file prefix per line (e.g. `sample1/ERROR/sample1`), as an alternative or addition to `-i` | None |
+| -o    | --output     | Output prefix for the aggregated error files (required)                     | None    |
+| -a    | --pseudocount | Pseudocount for the SRD matrix re-fit (same as `call -a`)                  | 0.5     |
 
 ---
 
@@ -369,9 +393,9 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 | `DBS/{sample}_dbs.vcf`                                  | VCF of detected dinucleotide substitution (DBS) mutations                                                                                           |
 | `{sample}_coverage.bed.gz`                              | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
 | `{sample}_coverage.bed.gz.tbi`                          | Tabix index for the coverage BED file                                                                                                               |
-| `{sample}_trinuc_by_duplex_group.txt`                   | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation                                                          |
-| `{sample}_indel_by_duplex_group.txt`                    | Indel context counts grouped by duplex read number, used for indel burden estimation                                                                |
-| `{sample}_dbs_by_duplex_group.txt`                      | 144-class dinucleotide context counts grouped by duplex read number, used for DBS burden estimation                                                 |
+| `SBS/{sample}_trinuc_by_duplex_group.txt`               | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation                                                          |
+| `INDEL/{sample}_indel_by_duplex_group.txt`              | Indel context counts grouped by duplex read number, used for indel burden estimation                                                                |
+| `DBS/{sample}_dbs_by_duplex_group.txt`                  | 144-class dinucleotide context counts grouped by duplex read number, used for DBS burden estimation                                                 |
 | `{sample}_duplex_family_strand_composition.txt`         | Strand composition statistics for duplex read families                                                                                              |
 | `{sample}_duplex_family_strand_composition_heatmap.pdf` | Heatmap visualization of duplex family strand composition                                                                                           |
 | `{sample}_call_params.log`                              | Full record of all resolved parameters used for the`call` run                                                                                     |
@@ -379,15 +403,17 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 
 ### Error Profile Files
 
-| File                        | Description                                                                       |
-| --------------------------- | --------------------------------------------------------------------------------- |
-| `{sample}.amp.tn.txt`     | Raw amplification SBS mismatch profile by trinucleotide context (diagnostic only) |
-| `{sample}.amp.tn.srd.txt` | SRD-EM-fitted amplification SBS error rate matrix actually used for calling       |
-| `{sample}.dmg.tn.txt`     | Damage SBS error profile by trinucleotide context                                 |
-| `{sample}.amp.hp.txt`     | Amplification indel error rates for homopolymer contexts                          |
-| `{sample}.amp.str.txt`    | Amplification indel error rates for short-tandem-repeat contexts                  |
-| `{sample}.dmg.hp.txt`     | Damage indel error rates for homopolymer contexts                                 |
-| `{sample}.dmg.str.txt`    | Damage indel error rates for short-tandem-repeat contexts                         |
+Written to the `ERROR/` subfolder of the `call` output directory. If a complete set of the six files used for calling already exists there, learning is skipped and they are reused.
+
+| File                              | Description                                                                       |
+| --------------------------------- | --------------------------------------------------------------------------------- |
+| `ERROR/{sample}.amp.tn.txt`     | Raw amplification SBS mismatch profile by trinucleotide context (diagnostic only) |
+| `ERROR/{sample}.amp.tn.srd.txt` | SRD-EM-fitted amplification SBS error rate matrix actually used for calling       |
+| `ERROR/{sample}.dmg.tn.txt`     | Damage SBS error profile by trinucleotide context                                 |
+| `ERROR/{sample}.amp.hp.txt`     | Amplification indel error rates for homopolymer contexts                          |
+| `ERROR/{sample}.amp.str.txt`    | Amplification indel error rates for short-tandem-repeat contexts                  |
+| `ERROR/{sample}.dmg.hp.txt`     | Damage indel error rates for homopolymer contexts                                 |
+| `ERROR/{sample}.dmg.str.txt`    | Damage indel error rates for short-tandem-repeat contexts                         |
 
 ### Burden Estimation Files
 
@@ -403,6 +429,7 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 | `INDEL/{sample}_indel_burden_by_group_size.txt` | Same stratification as above, for indels                                                                                                                  |
 | `DBS/{sample}_dbs_burden_by_group_size.txt`     | Same stratification as above, for DBS                                                                                                                     |
 | `{sample}_duplex_allele_counts.txt`             | Duplex depths and allele counts for each unique mutation                                                                                                  |
+| `{sample}_estimate_params.log`                  | Full record of all resolved parameters used for the `estimate` run                                                                                        |
 
 ### Visualization Files
 
@@ -424,6 +451,7 @@ Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific output
 | `INDEL/{sample}_indel_burden_re_estimate.txt`   | `-rb` option | Re-estimated indel burden for specific regions          |
 | `SBS/{sample}_sbs_96_corrected_re_estimate.txt` | `-rb` option | Re-estimated 96-context SBS counts for specific regions |
 | `SBS/SBS_96_plots_{sample}_re_estimate.pdf`     | `-rb` option | Signature plots for re-estimated regions                |
+| `SBS/{sample}_sbs_flt.vcf`                      | `-d` option  | SNV calls kept after the `--dilute` normal-comparison filter |
 
 ---
 

@@ -1,16 +1,16 @@
-Uncorrected burden	0.001858160421183029
-Uncorrected burden 95% lower	0.00022503184751684576
-Uncorrected burden 95% upper	0.006712314339786894
+Uncorrected burden	0.0015822784810126582
+Uncorrected burden 95% lower	0.00019162126467085836
+Uncorrected burden 95% upper	0.005715733914338576
 Uncorrected mutation number	2
-Corrected burden	0.0013602251407129457
-Corrected burden 95% lower	0.0001647295749947229
-Corrected burden 95% upper	0.006143368389172838
-Corrected mutation number	1.464055659787367
-Mutation number per genome	4.3500000000000005
-Mutation number per genome 95% lower	0.5268051808331239
+Corrected burden	0.0013602251407129455
+Corrected burden 95% lower	0.00016472957499472288
+Corrected burden 95% upper	0.006143368389172839
+Corrected mutation number	1.7193245778611632
+Mutation number per genome	4.35
+Mutation number per genome 95% lower	0.5268051808331238
 Mutation number per genome 95% upper	19.646492108574737
-Duplex coverage	1076.3333333333333
-Unmasked burden	0.001858160421183029
-Unmasked burden 95% lower	0.00022503184751684576
-Unmasked burden 95% upper	0.006712314339786894
+Duplex coverage	1264.0
+Unmasked burden	0.0015822784810126582
+Unmasked burden 95% lower	0.00019162126467085836
+Unmasked burden 95% upper	0.005715733914338576
 Reference base number	3198.0

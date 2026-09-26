@@ -305,7 +305,9 @@ def do_learn(args):
     # params["amperr_file"] now points at and load_error_matrices
     # (funcs/misc.py) reads directly for calling, replacing the old
     # in-situ row-normalization of raw counts.
-    srd_mat = estimate_sbs_srd_rates(sbs_alt_bq_hist, params["pseudocount"])
+    srd_mat = estimate_sbs_srd_rates(
+        sbs_alt_bq_hist, params["pseudocount"], fallback=True
+    )
     srd_pd = pd.DataFrame(srd_mat, columns=["A", "T", "C", "G"], index=num2trinuc)
     srd_pd.to_csv(error_prefix + ".amp.tn.srd.txt", sep="\t")
 

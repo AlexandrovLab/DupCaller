@@ -22,10 +22,6 @@ def log(mat):
     return np.log(np.where(mat > 0, mat, np.finfo(float).eps))
 
 
-def exp(mat):
-    return np.exp(np.where(mat >= np.log10(np.finfo(float).eps), mat, -np.inf))
-
-
 def _logsumexp4(terms):
     """Numerically stable log(sum(exp(terms), axis=0)) for a fixed 4-row
     stack — equivalent to scipy.special.logsumexp(terms, axis=0), but

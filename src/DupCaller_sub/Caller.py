@@ -138,7 +138,7 @@ def check_input_files_exist(args):
             print(f"  - {msg}")
         print(
             "\nPlease re-index the reference genome with the current version of DupCaller:\n"
-            f"  DupCaller.py index -f {args.reference} -s <str_regions.bed.gz>"
+            f"  DupCaller.py index -f {args.reference} -rt <repeats.tsv>"
         )
         sys.exit(1)
 
@@ -612,7 +612,9 @@ def do_call(args):
         # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
         # histogram above; this is what params["amperr_file"] points at and
         # load_error_matrices (funcs/misc.py) reads directly for calling.
-        srd_mat = estimate_sbs_srd_rates(sbs_alt_bq_hist, args.pseudocount)
+        srd_mat = estimate_sbs_srd_rates(
+            sbs_alt_bq_hist, args.pseudocount, fallback=True
+        )
         srd_pd = pd.DataFrame(srd_mat, columns=["A", "T", "C", "G"], index=num2trinuc)
         srd_pd.to_csv(error_prefix + ".amp.tn.srd.txt", sep="\t")
         print(

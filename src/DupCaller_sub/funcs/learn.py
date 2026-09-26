@@ -384,10 +384,17 @@ def profileTriNucMismatches(
     # srd_min_read/ssm_min_read, which only gate the SBS antimasks above.
     min_group_indel_amp = 3
     min_group_indel_dmg = 3
+    # Amp opportunity: each strand gated on its own read count, matching
+    # the per-strand gate on amp events below (F1R2_antimask/F2R1_antimask
+    # are reassigned per-indel there). Gating opportunity on both strands
+    # while events are gated per-strand credited events from families that
+    # contributed no opportunity -- inflating amp HP/STR rates ~1.5-2x and
+    # driving idLen=0 negative in shallow samples.
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
-    if m_F1R2 < min_group_indel_amp or m_F2R1 < min_group_indel_amp:
+    if m_F1R2 < min_group_indel_amp:
         F1R2_antimask[:] = False
+    if m_F2R1 < min_group_indel_amp:
         F2R1_antimask[:] = False
     dmg_antimask = antimask.copy()
     if m_F1R2 < min_group_indel_dmg or m_F2R1 < min_group_indel_dmg:
@@ -691,7 +698,9 @@ def profileTriNucMismatches(
     )
 
 
-def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12):
+def estimate_sbs_srd_rates(
+    sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12, fallback=False
+):
     """EM-estimate a per-trinuc-context SBS single-read-damage (SRD) rate
     matrix from sbs_alt_bq_hist (see profileTriNucMismatches above).
 
@@ -720,6 +729,12 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
     base column holds p, its 3 alt columns hold p_b1/p_b2/p_b3. A context
     with zero total observations is assigned the uniform 1/4-per-column
     prior directly.
+
+    fallback=True then gives each alt entry with zero raw observations, in a
+    row with fewer than FALLBACK_MIN_SITES, the bundled
+    fallback_latest.amp.tn.srd.txt rate instead (see funcs/misc.py's
+    apply_sbs_low_coverage_fallback). Off by default so AggregateProfile --
+    which builds those fallback profiles -- fits purely from data.
     """
     from .misc import build_trinuc64_order
 
@@ -769,4 +784,12 @@ def estimate_sbs_srd_rates(sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12
         srd[row, ref_col] = 1 - sum(p_b.values())
         for c in alt_cols:
             srd[row, c] = p_b[c]
+    if fallback:
+        from .misc import _read_fallback_counts, apply_sbs_low_coverage_fallback
+
+        srd = apply_sbs_low_coverage_fallback(
+            srd,
+            sbs_alt_bq_hist.sum(axis=2),
+            _read_fallback_counts(".amp.tn.srd.txt"),
+        )
     return srd

@@ -2,9 +2,14 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
-## [1.2.1-dev] - Unreleased
+## [1.2.1] - 2026-09-26
 
 ### Fixed
+- `Estimate.py`: removed `-c/--clonal`; burden and profile estimates count each detected molecule. `-ot/--outTrinuc` and `-ft/--refTrinuc` were previously no-ops; `-ot` now writes the reference trinucleotide composition and `-ft` loads it instead of rescanning `.tn.h5`.
+- `learn.py`: amplification indel opportunity is now gated per strand, matching the per-strand gate on amp indel events; gating opportunity on both strands inflated amp HP/STR rates ~1.5-2x.
+- `Caller.py`: the "re-index" hint for a bad h5 index referred to a removed `-s` flag; it now shows `-rt <repeats.tsv>`.
+- CLI help: `-lfdr` no longer claims an iterative re-estimation (the solve is closed-form); `-mr` now says where its input tables are written (`{out}/tmp/`).
+- README/docs: corrected output locations (`ERROR/`, per-type `*_by_duplex_group.txt`), `-o`/`-i` as directories, PERF homopolymer handling, `summarize`'s DBS-burden requirement, tabix requirement for `-gb`/`-rb`, and `_sbs_flt.vcf` as an `estimate -d` output; documented `aggregate`, `index-dbs`, `--seed`, `-mr`, `-d/--dilute`.
 - `learn.py`: `estimate_sbs_srd_rates`'s EM M-step denominator changed from `N + 3*pseudocount` to `N + 4*pseudocount`, matching a proper symmetric Dirichlet(a,a,a,a) prior over all 4 categories (reference + 3 alt bases) instead of smoothing only the 3 alt categories and leaving the residual reference-rate unsmoothed (it could drift toward exactly 0 for a high-base-quality/near-zero-error context). With the corrected denominator, a zero-observation trinuc context now yields the uniform 1/4 directly from the general formula.
 - `misc.py`/`Caller.py`: Removed `regularizeErrorMat`, a flat post-hoc additive floor (`+1e-6`/`+1e-8`) applied to every cell of the SBS/indel error matrices after normalization. It was silently dominating/overriding genuinely small EM-fitted rates. Replaced everywhere by Dirichlet pseudocount regularization applied at the count level (`(count + a) / (total + n*a)`), consistent with how `estimate_sbs_srd_rates` already regularizes internally. `-a`/`--pseudocount` now also controls this smoothing (previously hardcoded `1e-6`/`1e-8`).
 - `learn.py`: `profileTriNucMismatches`'s SRD (single-read-damage) site-inclusion antimask now uses BQ-qualifying counts (`F1R2_hq_count_mat`/`F1R2_hq_ref_count`) consistently across every check, instead of mixing them with the raw, BQ-blind `F1R2_count_mat` in the "≥2 distinct alleles, else exclude if ref_count==0" fallback. A low-base-quality base is now invisible to every step of the antimask, not just some.
@@ -17,6 +22,7 @@ All notable changes to DupCaller are recorded here, most recent first.
 - `misc.py`: `splitBamRegions` gained a `min_chunk_length` parameter (default 10000) rejecting a candidate chunk-boundary cut too close to the previous cut or either contig end, bounding how small a worker's chunk (and therefore its risk of MC-tag overflow reaching past the next worker) can get.
 
 ### Added
+- Low-coverage error-profile fallback: in a context with fewer than 1000 observations, a zero-count error type takes its rate from the bundled `fallback_latest.*` profiles (`src/ERROR/`, now installed as package data) instead of the flat pseudocount prior. Applies to the SRD, damage SBS, and HP/STR indel matrices.
 - `-lo`/`--learnOnly`: stop after estimating/writing the error-rate files, skipping variant calling entirely.
 - `--minChunkLength`/`--min-chunk-length` (default 10000): minimum chunk length in bases for BAM-splitting across worker processes.
 - `--srdMinRead` (default 3, non-negative): minimum reads on a single strand (F1R2 or F2R1) for that strand to be included in SBS single-read-damage (SRD) rate learning, evaluated independently per strand.

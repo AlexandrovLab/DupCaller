@@ -21,7 +21,6 @@ Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `
 | `SBS/{sample}_sbs.vcf`, `_sbs_fail.vcf` | Called SNVs/MNVs, PASS-only and everything-else |
 | `INDEL/{sample}_indel.vcf`, `_indel_fail.vcf` | Called short indels, PASS-only and everything-else |
 | `DBS/{sample}_dbs.vcf`, `_dbs_fail.vcf` | Called dinucleotide substitutions, PASS-only and everything-else |
-| `SBS/{sample}_sbs_flt.vcf` | Dilute-mode filtered SNVs (conditional, `--dilute`) |
 | `{sample}_coverage.bed.gz` | Per-position, per-alt-base/indel-category duplex coverage (23 columns) |
 | `{sample}_stats.txt` | Library and calling quality metrics (three lines appended later by `estimate`) |
 | `{sample}_call_params.log` | Resolved `call` parameters and error-file paths for this run |
@@ -50,6 +49,7 @@ Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `
 | `{sample}_duplex_allele_counts.txt` | Duplex depth and allele counts per unique mutation |
 | `{sample}_gene_coverage.txt` | Mean per-base SBS and indel duplex depth per gene (conditional, `-gb`) |
 | `{sample}_estimate_params.log` | Resolved `estimate` parameters for this run |
+| `SBS/{sample}_sbs_flt.vcf` | Dilute-mode filtered SNVs (conditional, `-d/--dilute`) |
 | `SBS/{sample}_sbs_burden_re_estimate.txt` | Re-estimated SNV burden for a sub-region (conditional, `-rb`) |
 | `INDEL/{sample}_indel_burden_re_estimate.txt` | Re-estimated indel burden for a sub-region (conditional, `-rb`) |
 | `SBS/{sample}_sbs_96_corrected_re_estimate.txt`, `SBS_96_plots_{sample}_re_estimate.pdf` | Re-estimated SBS96 counts and profile plot (conditional, `-rb`) |

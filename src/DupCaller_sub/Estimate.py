@@ -42,7 +42,40 @@ def calculate_ref_trinuc(args):
     """Reference-genome trinucleotide composition at full 64-context
     resolution (un-folded by reverse complement). Reverse-complement pairs
     are only combined at estimation time, inside estimate_96.
+
+    -ft/--refTrinuc loads a table previously written by -ot/--outTrinuc
+    instead of rescanning .tn.h5; -ot/--outTrinuc writes the table used.
     """
+    _, num2trinuc = build_trinuc64_order()
+    if getattr(args, "refTrinuc", None):
+        table = pd.read_csv(args.refTrinuc, sep="\t", index_col=0, comment="#")
+        if list(table.index) != num2trinuc:
+            raise ValueError(
+                f"-ft/--refTrinuc file {args.refTrinuc} does not hold the 64 "
+                "trinucleotide contexts written by -ot/--outTrinuc"
+            )
+        with open(args.refTrinuc) as f:
+            header = f.readline().strip()
+        if header.startswith("# regions:"):
+            file_regions = header.split(":", 1)[1].split()
+            if file_regions != list(args.regions):
+                print(
+                    f"WARNING: -ft/--refTrinuc was computed over {file_regions}, "
+                    f"but -r/--regions is {list(args.regions)}"
+                )
+        trinuc_count = table["count"].to_numpy(dtype=float)
+    else:
+        trinuc_count = _scan_ref_trinuc(args)
+    if getattr(args, "outTrinuc", None):
+        with open(args.outTrinuc, "w") as f:
+            f.write("# regions: " + " ".join(args.regions) + "\n")
+            pd.DataFrame(
+                {"count": trinuc_count}, index=pd.Index(num2trinuc, name="trinuc")
+            ).to_csv(f, sep="\t")
+    return trinuc_count
+
+
+def _scan_ref_trinuc(args):
     tn_int = h5py.File(args.reference + ".tn.h5", "r")
     trinuc_count = np.zeros(97)
     n_chroms = len(args.regions)
@@ -1728,7 +1761,6 @@ def do_estimate(args):
                 i,
                 extra=f"{rec.chrom}:{rec.pos}",
             )
-            count_flag = 0
             if "PASS" not in rec.filter:
                 continue
             chrom = rec.chrom
@@ -1740,12 +1772,7 @@ def do_estimate(args):
             mutation_key = (rec.chrom, rec.pos, rec.ref, rec.alts[0])
             if not unique_mutations.get(mutation_key):
                 unique_mutations[mutation_key] = [0, TAC, TDP]
-                count_flag = 1
             unique_mutations[mutation_key][0] += 1
-            """
-            if count_flag == 0:
-                continue
-            """
             F1R2 = rec.info["F1R2"]
             F2R1 = rec.info["F2R1"]
             if TAC > 1 and args.dilute:
@@ -1955,8 +1982,8 @@ def do_estimate(args):
                 i,
                 extra=f"{rec.chrom}:{rec.pos}",
             )
-            indel_count += 1
             mutation_key = (rec.chrom, rec.pos, rec.ref, rec.alts[0])
+            indel_count += 1
             TAC = rec.samples["TUMOR"]["AC"]
             TDP = rec.samples["TUMOR"]["DP"]
 

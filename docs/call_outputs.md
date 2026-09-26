@@ -9,12 +9,14 @@ All files are written under the directory specified by `-o / --output` (call it 
 ├── {sample}_duplex_family_strand_composition.txt
 ├── {sample}_duplex_family_strand_composition_heatmap.pdf
 ├── {sample}_stats.txt
-├── SBS/{sample}_sbs.vcf, _sbs_fail.vcf, _sbs_flt.vcf, _trinuc_by_duplex_group.txt
+├── SBS/{sample}_sbs.vcf, _sbs_fail.vcf, _trinuc_by_duplex_group.txt
 ├── INDEL/{sample}_indel.vcf, _indel_fail.vcf, _indel_by_duplex_group.txt
 ├── DBS/{sample}_dbs.vcf, _dbs_fail.vcf, _dbs_by_duplex_group.txt
 ├── ERROR/{sample}.amp.tn.txt, .amp.tn.srd.txt, .amp.hp.txt, .amp.str.txt,
 │         .dmg.tn.txt, .dmg.hp.txt, .dmg.str.txt
-└── tmp/  (per-worker intermediate files, safe to delete after a successful run)
+└── tmp/  (per-worker intermediate files, plus {sample}_sbs96_rate_n1.txt / _indel_rate_by_hp_str.txt
+          for `call -mr` and {sample}.amp.tn.bqhist.npz for `aggregate`; delete only if you
+          won't need either)
 ```
 
 `{sample}_duplex_allele_counts.txt` is documented in [`estimate_outputs.md`](estimate_outputs.md#sampleduplex_allele_countstxt) — it requires `_coverage.bed.gz` and is actually written by `estimate`, not `call`.
@@ -102,11 +104,7 @@ Two samples are always written, `TUMOR` then `NORMAL` (matching the VCF header's
 
 ---
 
-## `SBS/{sample}_sbs_flt.vcf`
-
-**Condition:** only written when `--dilute` is set.
-
-A filtered subset of `_sbs.vcf` that excludes variants with a statistically significant allele-fraction difference between the tumor and matched normal (Barnard's exact test, p ≤ 0.05). Intended for the case where the sample and matched normal come from the same starting DNA material, so real somatic variants should look the same in both.
+`SBS/{sample}_sbs_flt.vcf` is written by `estimate -d/--dilute`, not `call`; see [`estimate_outputs.md`](estimate_outputs.md#sbssample_sbs_fltvcf).
 
 ---
 
@@ -203,13 +201,15 @@ These seven files capture the sample-specific error model learned automatically 
 
 | File | Description |
 | --- | --- |
-| `{sample}.amp.tn.txt` | Raw amplification (PCR) SBS mismatch profile: rows are the 32 pyrimidine-folded trinucleotide contexts, columns are the four alt bases A/T/C/G. A diagnostic/intermediate byproduct of learning — not itself used for calling. |
+| `{sample}.amp.tn.txt` | Raw amplification (PCR) SBS mismatch profile: rows are all 64 trinucleotide contexts (not strand-folded; C/T-centred first, then their G/A-centred reverse complements), columns are the four bases A/T/C/G. A diagnostic/intermediate byproduct of learning — not itself used for calling. |
 | `{sample}.amp.tn.srd.txt` | The single-read-damage (SRD) EM-fitted SBS amplification-error rate matrix actually used for calling (`amperr_file`). Same row/column shape as `.amp.tn.txt`. |
 | `{sample}.dmg.tn.txt` | Damage SBS error rate matrix (`dmgerr_file`) — errors from DNA damage (e.g. oxidative damage producing C→A artefacts), symmetric on both strands. Same shape as `.amp.tn.txt`. |
 | `{sample}.amp.hp.txt` | Amplification indel error rates for homopolymer contexts. |
 | `{sample}.dmg.hp.txt` | Damage indel error rates for homopolymer contexts. |
 | `{sample}.amp.str.txt` | Amplification indel error rates for short-tandem-repeat (STR) contexts. |
 | `{sample}.dmg.str.txt` | Damage indel error rates for short-tandem-repeat (STR) contexts. |
+
+These files hold the sample's own learned values. At calling time, any context with fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin) takes the rate for each zero-count error type from the bundled `fallback_latest.*` profiles shipped with DupCaller (`src/ERROR/`). Observed error types and well-sampled contexts keep the sample's own rates. For `.amp.tn.srd.txt` the fallback is already applied in the written file; for the other five it is applied when the file is loaded for calling.
 
 ---
 

@@ -1696,29 +1696,49 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
 # ======================================================================
 # Error-matrix normalization and loading
 # ======================================================================
-def _normalize_indel_hp_mat(mat, pseudocount):
+def _normalize_indel_hp_mat(mat, pseudocount, fallback=None):
     """Normalize a raw (10, 12) hp.txt count matrix (rows hp run length
     1-10+, columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}) into
     per-context probabilities: within each base's own 3-column group
     (ref/del/ins counts for that base), each row is Dirichlet-smoothed by
     `pseudocount` on the counts and divided by its own (smoothed) sum, so
-    the three probabilities for a given (hp_len, base) add to 1. A row
-    with zero raw observations (row_sum == 0) is instead set equal to the
-    previous hp_len row's (already-normalized) rate, since a flat
-    pseudocount prior is a worse estimate than the nearest observed
-    hp_len once any data exists in the group; the first row (hp_len 1)
-    has no previous row to fall back to and keeps its pseudocount-
-    smoothed value if it is itself all-zero. Then enforce monotonic
-    non-decrease across increasing hp_len within each group (row n >=
-    row n-1 elementwise), independently per base group.
+    the three probabilities for a given (hp_len, base) add to 1.
+
+    `fallback` (the bundled fallback_latest hp.txt counts, same shape and
+    smoothing) covers unobserved error categories: in an (hp_len, base)
+    context with fewer than FALLBACK_MIN_SITES raw observations (that
+    base's own 3-column group only), a del/ins entry whose own count is 0
+    takes the fallback rate, raised to the
+    previous hp_len row's rate if that is higher -- the rate actually used
+    for that previous row (itself possibly fallback-derived or floored),
+    not its observed rate. The first row (hp_len 1) has no previous row and
+    takes the fallback as-is. Every other entry keeps the monotonic
+    non-decrease rule (row n >= row n-1 elementwise, against the previous
+    row's used rate), independently per base group. Without `fallback`, an
+    all-zero row copies the previous row's rate instead.
     """
     mat_new = np.zeros_like(mat, dtype=float)
     for g in range(4):
         block = mat[:, g * 3 : g * 3 + 3]
         row_sum = block.sum(axis=1, keepdims=True)
         block_new = (block + pseudocount) / (row_sum + 3 * pseudocount)
-        for nn in range(1, block_new.shape[0]):
-            if row_sum[nn, 0] == 0:
+        if fallback is not None:
+            fb_block = fallback[:, g * 3 : g * 3 + 3]
+            fb_new = (fb_block + pseudocount) / (
+                fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
+            )
+            # Site total for the fallback gate: this (hp_len, base) context
+            # alone, so a zero-count base group is never left at the flat
+            # pseudocount rate just because other bases are well sampled.
+            use_fb = (block == 0) & (row_sum < FALLBACK_MIN_SITES)
+            # del (col 0) / ins (col 2) only; col 1 is the opportunity.
+            use_fb[:, 1] = False
+        for nn in range(block_new.shape[0]):
+            if fallback is not None and use_fb[nn].any():
+                block_new[nn, use_fb[nn]] = fb_new[nn, use_fb[nn]]
+            if nn == 0:
+                continue
+            if fallback is None and row_sum[nn, 0] == 0:
                 block_new[nn, :] = block_new[nn - 1, :]
                 continue
             current_row = block_new[nn, :]
@@ -1729,24 +1749,105 @@ def _normalize_indel_hp_mat(mat, pseudocount):
     return mat_new
 
 
-def _normalize_indel_str_mat(mat, pseudocount):
+def _normalize_indel_str_mat(mat, pseudocount, fallback=None):
     """Normalize a raw (5, 11) str.txt count matrix (rows STR-length bin
     0="0-1"/not a real repeat through 4="40+", columns idLen+5 for idLen
     in -5..5) into per-context probabilities: each row is Dirichlet-
     smoothed by `pseudocount` on the counts and divided by its own
-    (smoothed) sum across all 11 columns. Real-STR rows (2-4) with zero
-    raw observations at that length bin are instead set equal to the
-    previous (shorter) real-STR row's rate. Row 1, the shortest real-STR
-    bin, has no prior real-STR row to fall back to and keeps its
-    pseudocount-smoothed value if it is itself all-zero. Row 0 (not a
-    real repeat) is never involved in this fallback.
+    (smoothed) sum across all 11 columns.
+
+    `fallback` (the bundled fallback_latest str.txt counts, same shape and
+    smoothing) covers unobserved error categories: in a row with fewer
+    than FALLBACK_MIN_SITES raw observations, an indel-length entry (any
+    column but idLen=0, the opportunity) whose own count is 0 takes the
+    fallback rate. For real-STR rows 2-4 it is then raised to the previous
+    (shorter) real-STR row's rate if higher -- the rate actually used for
+    that row (itself possibly fallback-derived), not its observed rate.
+    Rows 0 (not a real repeat) and 1 (shortest real-STR bin) have no
+    previous real-STR row and take the fallback as-is. Without `fallback`,
+    an all-zero real-STR row 2-4 copies the previous row's rate instead.
     """
     row_sum = mat.sum(axis=1, keepdims=True)
     mat_new = (mat + pseudocount) / (row_sum + 11 * pseudocount)
+    if fallback is not None:
+        fb_new = (fallback + pseudocount) / (
+            fallback.sum(axis=1, keepdims=True) + 11 * pseudocount
+        )
+        use_fb = (mat == 0) & (row_sum < FALLBACK_MIN_SITES)
+        use_fb[:, 5] = False
+        for r in range(5):
+            cols = use_fb[r]
+            if not cols.any():
+                continue
+            if r >= 2:
+                mat_new[r, cols] = np.maximum(fb_new[r, cols], mat_new[r - 1, cols])
+            else:
+                mat_new[r, cols] = fb_new[r, cols]
+        return mat_new
     for r in range(2, 5):
         if row_sum[r, 0] == 0:
             mat_new[r, :] = mat_new[r - 1, :]
     return mat_new
+
+
+# In a context (trinuc row, hp_len x base group, or STR row) with fewer
+# total observations than this, a zero-count error category is treated as
+# under-sampled rather than a true zero rate; its rate comes from the
+# bundled fallback_latest.* profile instead (see
+# apply_sbs_low_coverage_fallback and the indel normalizers above).
+FALLBACK_MIN_SITES = 1000
+
+
+def fallback_error_file(suffix):
+    """Path of the bundled fallback_latest{suffix} error profile. Looked up
+    in DupCaller_sub/ERROR (where setup.py installs src/ERROR) first, then
+    src/ERROR itself (source checkout / editable install)."""
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.path.join(pkg_dir, "ERROR", "fallback_latest" + suffix),
+        os.path.join(os.path.dirname(pkg_dir), "ERROR", "fallback_latest" + suffix),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        f"Fallback error profile fallback_latest{suffix} not found in: "
+        + ", ".join(candidates)
+    )
+
+
+def _read_fallback_counts(suffix):
+    return (
+        pd.read_csv(fallback_error_file(suffix), sep="\t", index_col=0)
+        .to_numpy()
+        .astype(float)
+    )
+
+
+def apply_sbs_low_coverage_fallback(
+    rate_mat, counts, fallback_rate_mat, min_sites=FALLBACK_MIN_SITES
+):
+    """In a (64, 4) SBS rate matrix (SRD or SSM/damage), replace each alt
+    (error) entry whose own count is 0 in a row with fewer than min_sites
+    total observations by the bundled fallback profile's rate. Observed
+    (non-zero) alt entries and well-sampled rows are left alone; a touched
+    row's reference column is reset to 1 - sum(alt rates)."""
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    _, num2trinuc = build_trinuc64_order()
+    counts = np.asarray(counts)
+    out = np.array(rate_mat, dtype=float)
+    site_totals = counts.sum(axis=1)
+    for row, trinuc in enumerate(num2trinuc):
+        if site_totals[row] >= min_sites:
+            continue
+        ref_col = base2num[trinuc[1]]
+        zero = counts[row] == 0
+        zero[ref_col] = False
+        if not zero.any():
+            continue
+        out[row, zero] = fallback_rate_mat[row, zero]
+        out[row, ref_col] = 1 - (out[row].sum() - out[row, ref_col])
+    return out
 
 
 def load_error_matrices(params):
@@ -1834,10 +1935,14 @@ def load_error_matrices(params):
             dtype=float
         )
         pseudocount = params.get("pseudocount", 0.5)
-        ampmat_hp = _normalize_indel_hp_mat(ampmat_hp, pseudocount)
+        ampmat_hp = _normalize_indel_hp_mat(
+            ampmat_hp, pseudocount, _read_fallback_counts(".amp.hp.txt")
+        )
         params["ampmat_hp"] = ampmat_hp
 
-        ampmat_str = _normalize_indel_str_mat(ampmat_str, pseudocount)
+        ampmat_str = _normalize_indel_str_mat(
+            ampmat_str, pseudocount, _read_fallback_counts(".amp.str.txt")
+        )
         params["ampmat_str"] = ampmat_str
 
     # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
@@ -1858,8 +1963,18 @@ def load_error_matrices(params):
     # Dirichlet-smoothed on the counts: a zero-observation context lands
     # at the uniform 1/4.
     pseudocount = params.get("pseudocount", 0.5)
+    dmgmat_counts = dmgmat
     dmgmat_row_sum = dmgmat.sum(axis=1, keepdims=True)
     dmgmat = (dmgmat + pseudocount) / (dmgmat_row_sum + 4 * pseudocount)
+    if not isLearn:
+        # Unobserved error categories in under-sampled rows take the
+        # fallback profile's rates, smoothed the same way as the sample's
+        # own counts.
+        fallback_counts = _read_fallback_counts(".dmg.tn.txt")
+        fallback_rates = (fallback_counts + pseudocount) / (
+            fallback_counts.sum(axis=1, keepdims=True) + 4 * pseudocount
+        )
+        dmgmat = apply_sbs_low_coverage_fallback(dmgmat, dmgmat_counts, fallback_rates)
     # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
     dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
@@ -1904,10 +2019,14 @@ def load_error_matrices(params):
         dmgmat_str = pd.read_csv(dmgerri_str_file, sep="\t", index_col=0).to_numpy(
             dtype=float
         )
-        dmgmat_hp = _normalize_indel_hp_mat(dmgmat_hp, pseudocount)
+        dmgmat_hp = _normalize_indel_hp_mat(
+            dmgmat_hp, pseudocount, _read_fallback_counts(".dmg.hp.txt")
+        )
         params["dmgmat_hp"] = dmgmat_hp
 
-        dmgmat_str = _normalize_indel_str_mat(dmgmat_str, pseudocount)
+        dmgmat_str = _normalize_indel_str_mat(
+            dmgmat_str, pseudocount, _read_fallback_counts(".dmg.str.txt")
+        )
         params["dmgmat_str"] = dmgmat_str
 
 
