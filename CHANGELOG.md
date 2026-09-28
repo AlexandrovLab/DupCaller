@@ -2,6 +2,11 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [Unreleased]
+
+### Added
+- Bundled PERF v0.4.6 (https://github.com/rkmlab/perf, MIT license) as `DupCaller_sub.PERF`, installed with DupCaller as the `PERF` command. Sources are unmodified; only upstream's `biopython==1.69` pin is dropped in favor of DupCaller's biopython. Adds `tqdm` as a dependency.
+
 ## [1.2.1] - 2026-09-26
 
 ### Fixed

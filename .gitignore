@@ -16,6 +16,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!src/DupCaller_sub/PERF/lib/
 lib64/
 parts/
 sdist/

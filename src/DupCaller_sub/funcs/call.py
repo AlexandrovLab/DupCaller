@@ -172,7 +172,9 @@ def prepare_reference_mats(
             depth = extractDepthRegion(tbam, chrom, start, end, params)
             ma = params["maxAF"]
             min_depth = math.ceil(1 / ma)
-            n_cov_mask = depth < min_depth
+            # OR, not overwrite: a position failing minNdepth in the
+            # normal must stay masked when --maxAF also applies.
+            n_cov_mask = n_cov_mask | (depth < min_depth)
 
         nm_mask = prepareAlignMask(tbam, chrom, start, end, params)
         # nm_mask = nm_avg >= params["maxNM"]/2
@@ -382,7 +384,9 @@ def _process_duplex_family(
             # treated as a candidate mutation, capped per-call by
             # that call's own theoretical LR ceiling (LR_max/"LM",
             # already context-specific -- see indelMaxLR).
-            LR_pass_bool = LR_raw > np.minimum(params["pcutoffi"], LR_max)
+            # >=, matching simulate_power_grid and Caller.py's final
+            # threshold check.
+            LR_pass_bool = LR_raw >= np.minimum(params["pcutoffi"], LR_max)
         indels_pass = [indels[_] for _ in pass_inds]
         for nn in range(len(indels_pass)):
             indel = indels_pass[nn]
@@ -945,7 +949,9 @@ def _process_duplex_family(
         ]
         # ts removed: any candidate with a positive LR is treated
         # as a candidate mutation.
-        LR_pass_bool[mut_mask] = LR_raw_mut > mut_thresholds
+        # >=, matching simulate_power_grid and Caller.py's final
+        # threshold check.
+        LR_pass_bool[mut_mask] = LR_raw_mut >= mut_thresholds
         alt_int = b1_int
         unmasked_pass_bool = np.full(n_win, False, dtype=bool)
         unmasked_pass_bool[refs_ind] = True
@@ -1712,7 +1718,8 @@ def callBam(params, processNo):
     currentReadDict = {}
     # rugged_reads_index/rugged_reads_pool: reroute a downstream mate whose
     # own alignment start disagrees with the rest of its anchor family's
-    # next_reference_start into that family's majority-position group.
+    # next_reference_start into that family's largest-mate-position group
+    # (see _index_rugged_mates for why largest, not majority).
     rugged_reads_index = {}
     rugged_reads_pool = {}
     # Chromosome of the entries currently held in rugged_reads_index/
@@ -2860,9 +2867,13 @@ def callBam(params, processNo):
             ref = mut["ref"]
             alt = mut["alt"]
             ta, tr, ti, tdp, na, nr, ni, ndp = muts_dbs_dict[(chrom, pos, ref, alt)]
-            if tdp > 0 and ta / tdp > params["maxAF"]:
+            if ta == 0:
+                # Same no_good_alt_read gate as SNV/indel: kept with real
+                # depth, pruned by Caller.py unless --rescue.
+                mut["filter"] = "no_good_alt_read"
+            elif ta / tdp > params["maxAF"]:
                 continue
-            if normalBams:
+            elif normalBams:
                 if ndp < params["minNdepth"]:
                     continue
                 if na / ndp > params["normalVAF"]:

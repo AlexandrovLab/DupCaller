@@ -1,5 +1,11 @@
 import numpy as np
-from .indels import findIndels, getIndelArr, left_align_indel
+from .indels import (
+    findIndels,
+    getIndelArr,
+    indel_context_index,
+    indel_passes_mask,
+    left_align_indel,
+)
 
 # BQ axis for the amp-error BQ histograms below: covers SAM/BAM's full
 # Phred range (0-93); bin index == literal BQ value.
@@ -16,7 +22,6 @@ def profileTriNucMismatches(
     num2base = "ATCG"
     base_changes = ["C>A", "C>G", "C>T", "T>A", "T>C", "T>G"]
     chrom = seqs[0].reference_name
-    start = seqs[0].reference_start
     trinuc2num = params["trinuc2num_dict"]
     # hp_alt_count/hp_dmg_count: (10, 12) -- rows hp run length 1-10+
     # (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}
@@ -357,17 +362,19 @@ def profileTriNucMismatches(
         indels.update(
             left_align_indel(i, reference_int, reference_start) for i in current_indels
         )
-    start = seqs[0].reference_start
+    # antimask/hp_raw/str_raw/reference_int all start at reference_start
+    # (the family's minimum read start), which seqs[0] need not be.
+    start = reference_start
     indels = list(indels)
     indels_masked = list()
     for indel in indels:
-        refPos = int(indel.split(":")[0]) - 1
+        refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
-        if antimask[refPos - start]:
-            # if indelLen < 0:
-            # if antimask[refPos - start : refPos - start- indelLen].all():
+        # Same locus mask as genotypeDSIndel at call time.
+        if indel_passes_mask(antimask, refPos - start, indelLen) and (
+            indel_context_index(refPos - start) < len(reference_int)
+        ):
             indels_masked.append(indel)
-        # else: indels_masked.append(indel)
 
     m = len(indels_masked)
     if m >= 2:
@@ -572,11 +579,9 @@ def profileTriNucMismatches(
         parts = indel.split(":")
         pos = int(parts[0]) - start
         indelLen = int(parts[1])
-        # anchor is the reference base immediately after the insertion
-        # point / the deleted base itself -- same position for both
-        # directions, matching funcs/prob.py's genotypeDSIndel exactly, so
-        # learn-time and call-time always agree.
-        anchor = pos + 1
+        # Shared with funcs/prob.py's genotypeDSIndel so learn-time and
+        # call-time classify the event in the same HP/STR bin.
+        anchor = indel_context_index(pos)
         hp = int(hp_raw[0, anchor])
         hp_capped = min(hp, 10)
         unit_len_here = int(str_raw[0, anchor])

@@ -12,7 +12,21 @@ setup(
     # data-only DupCaller_sub.ERROR package.
     package_dir={"": "src", "DupCaller_sub.ERROR": "src/ERROR"},
     packages=find_packages(where="src") + ["DupCaller_sub.ERROR"],
-    package_data={"DupCaller_sub.ERROR": ["fallback_latest.*.txt"]},
+    # DupCaller_sub.PERF is a vendored copy of PERF (https://github.com/rkmlab/perf,
+    # MIT license, see src/DupCaller_sub/PERF/LICENSE); its lib/ assets are
+    # needed for PERF's HTML report (-a).
+    package_data={
+        "DupCaller_sub.ERROR": ["fallback_latest.*.txt"],
+        "DupCaller_sub.PERF": [
+            "LICENSE",
+            "README.md",
+            "all_repeats_1-6nt.txt",
+            "lib/*.html",
+            "lib/src/*.js",
+            "lib/styles/*.css",
+        ],
+    },
+    entry_points={"console_scripts": ["PERF=DupCaller_sub.PERF.core:main"]},
     install_requires=[
         "biopython==1.85",
         "pysam==0.23.3",
@@ -22,6 +36,7 @@ setup(
         "pandas==2.3.3",
         "h5py==3.15.0",
         "sigProfilerPlotting==1.4.3",
+        "tqdm>=4",
     ],
     extras_require={
         "test": ["pytest"],

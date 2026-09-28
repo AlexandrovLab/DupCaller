@@ -584,15 +584,6 @@ def _parse_mpileup_bases(ref_base, bases_str):
     return counts
 
 
-# Regional depth/coverage counting (n_cov_mask, tumor maxAF<1 min-depth
-# check) intentionally uses its own fixed base-quality floor rather than
-# the user-configurable --minBq: --minBq gates which bases count as
-# variant-supporting evidence for a candidate, while this is a coarser
-# "is this position covered at all" depth tally that should stay stable
-# across --minBq settings.
-_REGIONAL_DEPTH_MIN_BQ = 30
-
-
 def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
     """count_alleles=True additionally tallies, from the exact same
     mpileup scan (no second pass), a per-position (end-start, 4) A/T/C/G
@@ -607,23 +598,28 @@ def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
     max_depth = int(params["maxDepth"])
     acgt = np.zeros((end - start, 4)) if count_alleles else None
     for line in pysam.mpileup(
+        # Same BQ floor as the per-candidate depth pileups (BQ >= minBq).
         "-Q",
-        f"{_REGIONAL_DEPTH_MIN_BQ}",
+        f"{int(params['minBq'])}",
         "-q",
         f"{mapq}",
         "-d",
         f"{max_depth}",
         "-r",
-        f"{chrom}:{start}-{end}",
+        # samtools regions are 1-based inclusive: [start, end) -> start+1..end
+        f"{chrom}:{start + 1}-{end}",
         bam,
     ).split("\n"):
         if line:
             try:
                 parts = line.split("\t")
                 pos = int(parts[1]) - 1  # 0-based position
-                depth[pos - start] = int(parts[3])
+                idx = pos - start
+                if not 0 <= idx < end - start:
+                    continue
+                depth[idx] = int(parts[3])
                 if count_alleles:
-                    acgt[pos - start] = _parse_mpileup_bases(parts[2].upper(), parts[4])
+                    acgt[idx] = _parse_mpileup_bases(parts[2].upper(), parts[4])
             except (IndexError, ValueError):
                 pass
     if count_alleles:

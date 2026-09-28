@@ -37,8 +37,9 @@ def left_align_indel(indel, reference_int, reference_start):
         containing this indel, starting at reference_start.
     reference_start: genomic position reference_int[0] corresponds to.
 
-    Shifting simply stops early if it would run past the left edge of
-    reference_int, or (for a deletion) past the right edge when reading
+    Shifting simply stops early if it would move the anchor past the left
+    edge of reference_int (the returned anchor is never < reference_start),
+    or (for a deletion) past the right edge when reading
     reference_int[anchor + del_len] -- identical in spirit to how repeat-context
     computations elsewhere in this codebase (e.g. call.py's
     last_cut_valid) already accept degraded results right at a
@@ -52,7 +53,7 @@ def left_align_indel(indel, reference_int, reference_start):
         del_len = -length
         anchor = pos - reference_start
         while (
-            anchor >= 0
+            anchor > 0
             and anchor + del_len < len(reference_int)
             and 0 <= reference_int[anchor] <= 3
             and 0 <= reference_int[anchor + del_len] <= 3
@@ -64,7 +65,8 @@ def left_align_indel(indel, reference_int, reference_start):
         seq_nums = [_BASE2NUM.get(b, -1) for b in parts[2]]
         anchor = pos - reference_start
         while (
-            anchor >= 0
+            anchor > 0
+            and anchor < len(reference_int)
             and seq_nums[-1] != -1
             and 0 <= reference_int[anchor] <= 3
             and reference_int[anchor] == seq_nums[-1]
@@ -73,6 +75,34 @@ def left_align_indel(indel, reference_int, reference_start):
             anchor -= 1
         new_seq = "".join(_NUM2BASE[n] if 0 <= n <= 3 else "N" for n in seq_nums)
         return f"{anchor + reference_start}:{length}:{new_seq}"
+
+
+def indel_mask_span(local_pos, indel_len):
+    """[lo, hi) local interval that must be unmasked for an indel anchored
+    at local_pos (0-based, relative to the window's antimask): the anchor
+    itself, plus every deleted base for a deletion. Shared by learning
+    (funcs/learn.py) and calling (funcs/prob.py, funcs/call.py) so both
+    apply the identical locus mask."""
+    return local_pos, local_pos + max(-indel_len, 0) + 1
+
+
+def indel_passes_mask(antimask, local_pos, indel_len):
+    """True iff the whole indel_mask_span lies inside antimask and is
+    unmasked. A span reaching outside the window fails rather than
+    wrapping (negative index) or silently truncating (empty slice)."""
+    lo, hi = indel_mask_span(local_pos, indel_len)
+    if lo < 0 or hi > len(antimask):
+        return False
+    return bool(antimask[lo:hi].all())
+
+
+def indel_context_index(local_pos):
+    """Local index whose hp_raw/str_raw/reference_int value classifies an
+    indel's sequence context: the base right after the anchor, i.e. the
+    first deleted base for a deletion, the first reference base after
+    the insertion point for an insertion. Shared by learning and calling
+    so an event is learned and scored in the same HP/STR bin."""
+    return local_pos + 1
 
 
 def findIndels(seq):

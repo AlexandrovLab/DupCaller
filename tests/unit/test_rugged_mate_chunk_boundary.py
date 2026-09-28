@@ -398,3 +398,71 @@ def test_coverage_boundary_position_goes_to_next_file():
         )
         == "next"
     )
+
+
+# ------------------------------------------- 3+ copy families / ties
+#
+# _index_rugged_mates pools at the LARGEST mate position, not the mode: the
+# pool bucket is popped when the scan reaches it, so it must sit at or after
+# every member's arrival. These pin that behavior and show no copy is lost.
+
+
+def _family_dict(mate_starts):
+    header = pysam.AlignmentHeader.from_dict(
+        {"HD": {"VN": "1.6"}, "SQ": [{"SN": CHROM, "LN": CONTIG_LEN}]}
+    )
+    tlen = (max(mate_starts) + READLEN) - U
+    currentReadDict = {}
+    for i, ms in enumerate(mate_starts):
+        rec = _read(header, f"copy{i}", True, U, ms, tlen)
+        _place_read_in_dict(
+            rec, _compute_read_label(rec, BARCODE_PARAMS), currentReadDict
+        )
+    return currentReadDict
+
+
+@pytest.mark.parametrize(
+    "mate_starts, redirected",
+    [
+        ([B, B, B + 10], {"copy0", "copy1"}),
+        ([B, B, B, B + 10], {"copy0", "copy1", "copy2"}),
+        ([B, B, B + 10, B + 10], {"copy0", "copy1"}),
+        ([B + 10, B, B], {"copy1", "copy2"}),
+    ],
+)
+def test_index_rugged_mates_targets_largest_mate_position(mate_starts, redirected):
+    index, pool = {}, {}
+    _index_rugged_mates(_family_dict(mate_starts), index, pool)
+    target = (CHROM, max(mate_starts))
+    assert set(index) == redirected
+    assert set(index.values()) == {target}
+    assert list(pool) == [target]
+
+
+def _build_multi_copy_bam(path, mate_starts):
+    header = {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": CHROM, "LN": CONTIG_LEN}],
+    }
+    unsorted_path = str(path) + ".unsorted.bam"
+    tlen = (max(mate_starts) + READLEN) - U
+    with pysam.AlignmentFile(unsorted_path, "wb", header=header) as bam:
+        for i, ms in enumerate(mate_starts):
+            bam.write(_read(bam.header, f"copy{i}", True, U, ms, tlen))
+            bam.write(_read(bam.header, f"copy{i}", False, ms, U, -tlen))
+        bam.write(_read(bam.header, "filler", True, FILLER_POS, FILLER_POS + 200, 250))
+    pysam.sort("-o", str(path), unsorted_path)
+    pysam.index(str(path))
+
+
+@pytest.mark.parametrize(
+    "mate_starts",
+    [[B, B, B + 10], [B, B, B, B + 10], [B, B, B + 10, B + 10]],
+)
+def test_multi_copy_family_closes_once_with_every_copy(tmp_path, mate_starts):
+    bam_path = tmp_path / "family.bam"
+    _build_multi_copy_bam(bam_path, mate_starts)
+    closures = _run_family_batching(str(bam_path), [(CHROM, 0, CONTIG_LEN)])
+    tlen = (max(mate_starts) + READLEN) - U
+    label = f"AAA+TTT+{-tlen}"
+    assert [c for c in closures if c[0] == label] == [(label, len(mate_starts), 0)]

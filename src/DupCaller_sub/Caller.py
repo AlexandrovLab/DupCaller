@@ -1518,14 +1518,20 @@ def do_call(args):
         for mut in mutsAll
         if mut.get("filter", "PASS") == "PASS"
     }
+    no_alt_positions = {
+        (mut["chrom"], mut["pos"])
+        for mut in mutsAll
+        if mut.get("filter") == "no_good_alt_read"
+    }
     for dbs in dbsAll:
         if dbs.get("filter", "PASS") != "PASS":
             continue
-        new_pass = (dbs["chrom"], dbs["pos"]) in pass_positions and (
-            dbs["chrom"],
-            dbs["pos"] + 1,
-        ) in pass_positions
-        if not new_pass:
+        sites = [(dbs["chrom"], dbs["pos"]), (dbs["chrom"], dbs["pos"] + 1)]
+        if any(site in no_alt_positions for site in sites):
+            # Inherit the constituent SNV's rescue-only reason instead of
+            # "underpowered", so it's pruned below unless --rescue.
+            dbs["filter"] = "no_good_alt_read"
+        elif not all(site in pass_positions for site in sites):
             dbs["filter"] = "underpowered"
 
     efficiency = duplex_num / rec_num if rec_num > 0 else 0.0
@@ -1793,6 +1799,7 @@ def do_call(args):
         indelsAll = [
             m for m in indelsAll if m.get("filter", "PASS") not in _reject_reasons
         ]
+        dbsAll = [m for m in dbsAll if m.get("filter", "PASS") not in _reject_reasons]
 
     # "masked" (SNPM/NOISEM-blocked) records that never went through
     # round 2's deferred depth-extraction -- raw LR below the channel's

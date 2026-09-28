@@ -1,5 +1,11 @@
 import numpy as np
-from .indels import findIndels, getIndelArr, left_align_indel
+from .indels import (
+    findIndels,
+    getIndelArr,
+    indel_context_index,
+    indel_passes_mask,
+    left_align_indel,
+)
 
 
 def log10(mat):
@@ -536,11 +542,8 @@ def genotypeDSIndel(
     for indel in indels:
         refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
-        if indelLen < 0:
-            indelLen_abs = -indelLen
-        else:
-            indelLen_abs = 0
-        if antimask[refPos - start : refPos - start + indelLen_abs + 1].all():
+        # Same locus mask as profileTriNucMismatches at learn time.
+        if indel_passes_mask(antimask, refPos - start, indelLen):
             indels_masked.append(indel)
             pos_masked.append(refPos)
             indelLen_masked.append(indelLen)
@@ -592,8 +595,6 @@ def genotypeDSIndel(
     f1r2_prob = -f1r2_prob / 10
     f2r1_prob = -f2r1_prob / 10
 
-    offset = -indelLen_masked
-    offset[offset < 0] = 0
     hps = np.zeros(pos_masked.size, dtype=int)
     strs = np.zeros(pos_masked.size, dtype=int)
     Pamp = np.zeros(pos_masked.size)
@@ -611,25 +612,14 @@ def genotypeDSIndel(
     # approximating every +-1bp call as HP-matched.
     hp_match_arr = np.ones(pos_masked.size, dtype=bool)
     for nn in range(pos_masked.size):
-        # hps is always the self-derived homopolymer run length (hp_raw
-        # row0), taken as the max over the indel's reference span so an
-        # anchor landing just outside the repeat still picks up the run
-        # it abuts — matches main's `hps[nn] = np.max(hp_int[0, ...])`.
-        # strs is a separate, independent lookup against the BED-derived
-        # STR annotation (str_raw), not a fallback gated by unit_len — an
-        # embedded homopolymer inside an STR unit (e.g. the "AA" in a
-        # (AAT)n repeat) still gets its true run length here, and is
-        # never mutually exclusive with the STR classification.
-        anchor = pos_masked[nn] - start + offset[nn] + 1
-        hps[nn] = np.max(
-            hp_raw[
-                0,
-                max(0, pos_masked[nn] - start) : pos_masked[nn]
-                + offset[nn]
-                - start
-                + 2,
-            ]
-        )
+        # HP and STR context are both read at the shared context index
+        # (first deleted base / first base after the insertion point), the
+        # same position funcs/learn.py learns them at. hps is the
+        # self-derived homopolymer run length (hp_raw row0); strs is an
+        # independent lookup against the BED-derived STR annotation
+        # (str_raw), never mutually exclusive with it.
+        anchor = indel_context_index(pos_masked[nn] - start)
+        hps[nn] = hp_raw[0, anchor]
         unit_len_here = int(str_raw[0, anchor])
         repeat_count_here = int(str_raw[1, anchor])
         # 5 STR-length bins now (0="0-1"/not a real repeat, 1="2-9",
@@ -661,7 +651,7 @@ def genotypeDSIndel(
         # old learn-time code used a different, inconsistent anchor for
         # deletions; this rewrite aligns the two).
         if idLen == 1 or idLen == -1:
-            ref_allele = int(reference_int[pos - start + 1])
+            ref_allele = int(reference_int[anchor])
         else:
             ref_allele = 0
         # inserted_base: the actual base being inserted, read off the

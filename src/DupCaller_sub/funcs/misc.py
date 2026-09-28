@@ -1526,9 +1526,18 @@ def _place_read_in_dict(rec, label, currentReadDict):
 
 def _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool):
     """For each upstream-anchor family (template_length > 0) whose members
-    disagree on next_reference_start, point every minority read's mate at
-    the majority (largest) mate position via rugged_reads_index, and
-    pre-open its rugged_reads_pool bucket.
+    disagree on next_reference_start, point every read whose mate is not
+    at the LARGEST mate position there via rugged_reads_index, and pre-open
+    its rugged_reads_pool bucket.
+
+    This is deliberately the largest coordinate, not the most common one:
+    the BAM is streamed in coordinate order and a pool bucket is drained
+    (popped) as soon as the scan reaches its position, so the bucket must
+    sit at or after every member's own arrival. With mates at
+    [1300, 1300, 1310] a bucket at the mode (1300) would already be gone
+    when the 1310 mate arrives. Which position is chosen affects only when
+    the family is processed, not its coordinates: callBam derives
+    rs_reference_start/rs_reference_end from the reads themselves.
 
     Pool/index keys are (chrom, position), not bare position: a redirect
     queued here isn't guaranteed to ever be drained (e.g. the downstream
