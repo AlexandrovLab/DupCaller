@@ -31,12 +31,13 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
 ## Prerequisites
 
 DupCaller requires python>=3.11 to run (setup.py pins numpy==2.3.4/scipy==1.16.2, both of which require >=3.11). Earlier versions are not supported.
-The complete DupCaller pipeline also requires the following tools for data preprocessing. The versions are used by the developer and other versions may or may not work.
+The complete DupCaller pipeline also requires the following tools for data preprocessing. The versions listed are the ones used for the published analyses, and the Nextflow pipeline (`nextflow/`) runs the same versions and commands. Other versions may work but have not been validated.
 
-- BWA version 0.7.17 (https://bio-bwa.sourceforge.net)
-- GATK version 4.2.6 (https://github.com/broadinstitute/gatk/releases)
-- Tabix for indexing compressed genomic files (recommended installation: `conda install bioconda::tabix`)
-- [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder). A copy of PERF (v0.4.6, MIT license) with modified dependency is bundled with DupCaller and installed as the `PERF` command, so no separate installation is needed.
+- BWA 0.7.17 (https://bio-bwa.sourceforge.net), run as `bwa mem -C -T 0` (Step 3)
+- GATK 4.3.0.0 (https://github.com/broadinstitute/gatk/releases), for MarkDuplicates (Step 4)
+- samtools, for sorting and indexing BAMs
+- htslib, which provides `tabix` and `bgzip` for compressed, indexed genomic files (recommended installation: `conda install bioconda::htslib`)
+- [PERF](https://github.com/rkmlab/perf) (Pattern-based Exhaustive Repeat Finder) v0.4.6 (MIT license) is bundled with DupCaller, runs on the same Python, and is installed as the `PERF` command, so it needs no separate installation.
 
 ## Installation
 
@@ -45,7 +46,7 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 The tool uses pip for installing scripts and prerequisites. We recommend creating a new environment to install DupCaller:
 
 ```bash
-conda create -n DupCaller python=3.12 bioconda::tabix
+conda create -n DupCaller python=3.12 bioconda::htslib
 ```
 
 To install DupCaller, simply clone this repository and install via pip:
@@ -133,10 +134,10 @@ If the matched normal is prepared in the same way as the sample, apply trimming 
 
 ### Step 3: Align Reads
 
-Use a DNA NGS aligner such as BWA-MEM to align the trimmed FASTQs of both sample and matched normal. GATK requires read group fields `ID`, `SM`, and `PL`, so adding those tags during BWA alignment is recommended. **FASTQ tags must be kept — for `bwa mem` this requires the `-C` option.**
+Use a DNA NGS aligner such as BWA-MEM to align the trimmed FASTQs of both sample and matched normal. GATK requires read group fields `ID`, `SM`, and `PL`, so adding those tags during BWA alignment is recommended. **FASTQ tags must be kept — for `bwa mem` this requires the `-C` option.** The published analyses (and the Nextflow pipeline) also use `-T 0`, which outputs every alignment regardless of its score, so low-scoring alignments are filtered by DupCaller (MAPQ/AS-XS) rather than dropped by BWA.
 
 ```bash
-bwa mem -C -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" \
+bwa mem -C -T 0 -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" \
     reference.fa {sample_name}_1.fastq {sample_name}_2.fastq \
     | samtools sort -@ {threads} > {sample_name}.bam
 samtools index -@ {threads} {sample_name}.bam
@@ -156,7 +157,7 @@ Run GATK MarkDuplicates on sample and matched-normal BAMs. Optical and PCR dupli
 - Set `--DUPLEX_UMI true` for duplex UMI handling.
 - Set `--READ_NAME_REGEX` as shown below, because the read names were modified in Step 2.
 
-> **Note:** Outdated versions of GATK do not have the `--DUPLEX_UMI` flag. Please update GATK to the latest version if this occurs.
+> **Note:** The published analyses used GATK 4.3.0.0. Older GATK releases do not have the `--DUPLEX_UMI` flag.
 
 ```bash
 gatk MarkDuplicates \
@@ -249,7 +250,7 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 | -a           | --pseudocount     | Regularization pseudocount added to each channel's per-channel mixture-weight MLE solve, making an interior root between 0 and 1 more likely; channels where the solve still can't bracket a root (insufficient coverage relative to candidate count) fall back to mutation rate 0 rather than solving                                                 | 0.5                  |
 | -mq          | --mapq            | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                                                                                                                         | 40                   |
 | -w           | --windowSize      | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                                                                                                                      | 100000               |
-| -bq          | --minBq           | Bases with quality at or below this value are zeroed out and excluded from variant calling/learning                                                                                                                                                                                                                                                    | 18                   |
+| -bq          | --minBq           | Bases with quality below this value are zeroed out and excluded from variant calling/learning (usable iff BQ >= minBq)                                                                                                                                                                                                                                                    | 18                   |
 | -aq          | --minAltQual      | Minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it                                                                                                                                                                                                                                                  | 90                   |
 | --minRef     |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                              | 3                    |
 | --minAlt     |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                              | 3                    |
@@ -278,7 +279,7 @@ The SBS and indel likelihoods compare alt reads against non-alt reads on each st
 For every PASS SBS and indel call, DupCaller tests each strand (F1R2, F2R1) separately. Under the null hypothesis the strand is a clean mutant and every non-alt read is an error:
 
 - **SBS:** each covering read shows a non-alt base with probability `10^(-BQ/10)` plus the amplification error rate for that trinucleotide context. Every read covering the position is used at its actual base quality (no `--minBq` cut), and the p-value is Poisson-binomial over the reads.
-- **Indel:** the reads are the informative ones (showing the indel or spanning the reference allele, with base quality above `--minBq`). Each shows the reference with the learned amplification error rate that undoes the indel in the mutant molecule's own context: for example, a 1 bp deletion from a run of 7 reverts by a +1 error in a run of 6, and a base inserted next to an unrelated run reverts by losing an isolated base. The learned indel rates already include sequencing error, so there is no separate base-quality term; the p-value is binomial.
+- **Indel:** the reads are the informative ones (showing the indel or spanning the reference allele, with base quality at or above `--minBq`). Each shows the reference with the learned amplification error rate that undoes the indel in the mutant molecule's own context: for example, a 1 bp deletion from a run of 7 reverts by a +1 error in a run of 6, and a base inserted next to an unrelated run reverts by losing an isolated base. The learned indel rates already include sequencing error, so there is no separate base-quality term; the p-value is binomial.
 
 The p-value is the probability of seeing at least the observed number of non-alt reads. Both strand p-values are written to INFO `MSP` (F1R2,F2R1) on every SBS and indel call that was PASS going into the filter (so PASS and `strand_independence` records); every other record gets `.`. If either strand's p-value is <= `--p_threshold` (default 0.05), the call gets FILTER `strand_independence`, is written to the fail VCF, and is not counted by `estimate`. A DBS whose own read family has a failed SBS gets the same FILTER, and so does that DBS's other SBS, so neither base is counted as a standalone SBS.
 
@@ -484,11 +485,11 @@ DupCaller.py trim -i ${SAMPLE}_R1.fq.gz -i2 ${SAMPLE}_R2.fq.gz -p NNNXXXX -o ${S
 DupCaller.py trim -i ${NORMAL}_R1.fq.gz -i2 ${NORMAL}_R2.fq.gz -p NNNXXXX -o ${NORMAL}
 
 # 2. Align
-bwa mem -C -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
+bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
     ${REF} ${SAMPLE}_1.fastq ${SAMPLE}_2.fastq | samtools sort -@ ${THREADS} > ${SAMPLE}.bam
 samtools index -@ ${THREADS} ${SAMPLE}.bam
 
-bwa mem -C -t ${THREADS} -R "@RG\tID:${NORMAL}\tSM:${NORMAL}\tPL:ILLUMINA" \
+bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${NORMAL}\tSM:${NORMAL}\tPL:ILLUMINA" \
     ${REF} ${NORMAL}_1.fastq ${NORMAL}_2.fastq | samtools sort -@ ${THREADS} > ${NORMAL}.bam
 samtools index -@ ${THREADS} ${NORMAL}.bam
 
@@ -526,7 +527,7 @@ THREADS=16
 DupCaller.py trim -i ${SAMPLE}_R1.fq.gz -i2 ${SAMPLE}_R2.fq.gz -p NNNXXXX -o ${SAMPLE}
 
 # 2. Align
-bwa mem -C -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
+bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
     ${REF} ${SAMPLE}_1.fastq ${SAMPLE}_2.fastq | samtools sort -@ ${THREADS} > ${SAMPLE}.bam
 samtools index -@ ${THREADS} ${SAMPLE}.bam
 

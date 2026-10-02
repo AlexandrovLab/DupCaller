@@ -24,7 +24,7 @@ def _sbs_strand_counts(seq_mat, qual_mat, antimask, trinuc_int):
     """One strand's SBS amp-error tallies over all its reads at once: the
     (96, 4) trinuc x base count matrix and the (96, 4, NUM_BQ) base-quality
     histogram. A read's base counts where antimask is set and it is a
-    passing base (qual > minBq; the caller zeroes the rest) that isn't an
+    passing base (qual >= minBq; the caller zeroes the rest) that isn't an
     N/deletion/off-read position (seq == 4)."""
     seq_masked = seq_mat[:, antimask]
     qual_masked = qual_mat[:, antimask]
@@ -51,7 +51,7 @@ def _sbs_strand_counts(seq_mat, qual_mat, antimask, trinuc_int):
 def _indel_informative_reads(covered, hq, span_ends, active=True):
     """reads x positions, per table in span_ends: True where a read could
     show the reference allele of an indel whose context base
-    (indel_context_index) is position p -- its base at p is above minBq
+    (indel_context_index) is position p -- its base at p is at or above minBq
     (hq) and it aligns contiguously from the anchor p - 1 through
     span_end[p] (the base after the run/tract), as getIndelArr requires
     for REF. False for p < 2 (anchor at the window's first base, see
@@ -215,8 +215,8 @@ def profileTriNucMismatches(
         F2R1_seq_mat[mm, current_mat_ind:n] = 4
         F2R1_qual_mat[mm, current_mat_ind:n] = 0
 
-    F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 0
-    F2R1_qual_mat[F2R1_qual_mat <= params["minBq"]] = 0
+    F1R2_qual_mat[F1R2_qual_mat < params["minBq"]] = 0
+    F2R1_qual_mat[F2R1_qual_mat < params["minBq"]] = 0
 
     F1R2_antimask = antimask.copy()
     F2R1_antimask = antimask.copy()
@@ -458,7 +458,7 @@ def profileTriNucMismatches(
     hp_rc4 = [1, 0, 3, 2]  # base-complement permutation, 4-wide axis
 
     # Amp opportunity weight per position: that strand's reads that could
-    # show REF for an event there (_indel_informative_reads: base above
+    # show REF for an event there (_indel_informative_reads: base at or above
     # minBq, aligned through the run/tract plus one base), per table: HP
     # (run), STR rows 1-4 (tract), STR row 0 (the base itself).
     pos_idx = np.arange(n)

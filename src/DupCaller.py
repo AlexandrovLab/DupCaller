@@ -276,7 +276,7 @@ if __name__ == "__main__":
         "-bq",
         "--minBq",
         type=int,
-        help="bases with quality at or below this number are zeroed out and excluded from variant calling",
+        help="bases with quality below this number are zeroed out and excluded from variant calling (a base is usable iff BQ >= minBq)",
         default=18,
     )
     call_parser.add_argument(
@@ -302,7 +302,7 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "--srdMinRead",
         type=nonnegative_int,
-        help="minimum reads on a single strand (F1R2 or F2R1) for that strand's reads to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand -- a family can contribute its F1R2 reads even if F2R1 doesn't meet this, or vice versa. Also gates, per site within a qualifying strand, the minimum number of BQ>minBq bases required for that site to be counted",
+        help="minimum reads on a single strand (F1R2 or F2R1) for that strand's reads to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand -- a family can contribute its F1R2 reads even if F2R1 doesn't meet this, or vice versa. Also gates, per site within a qualifying strand, the minimum number of BQ>=minBq bases required for that site to be counted",
         default=3,
     )
     call_parser.add_argument(

@@ -2,23 +2,66 @@
 from gzip import open as gzopen
 from itertools import zip_longest
 import os
+import re
 
 _EOF = object()
+_MATE_SUFFIX = re.compile(r"/[12]$")
 
 
-# from itertools import izip
+def _open_fastq(path):
+    """Open a FASTQ as text, detecting gzip from the file's own magic bytes
+    (so each mate is detected independently, whatever its extension)."""
+    with open(path, "rb") as fh:
+        magic = fh.read(2)
+    if magic == b"\x1f\x8b":
+        return gzopen(path, "rt")
+    return open(path)
+
+
+def _validate_pattern(pattern):
+    if not pattern or set(pattern) - {"N", "X"}:
+        raise ValueError(
+            f"Invalid barcode pattern '{pattern}': it must be non-empty and use "
+            "only N (barcode base) and X (skipped base)."
+        )
+
+
+def _read_base_name(header, path, record_no):
+    """Read name without the leading '@', any comment, or a trailing /1 or /2."""
+    header = header.rstrip("\r\n")
+    if not header.startswith("@") or len(header) < 2:
+        raise ValueError(
+            f"{path}: record {record_no + 1} header is not a FASTQ header: {header!r}"
+        )
+    return _MATE_SUFFIX.sub("", header[1:].split(None, 1)[0])
+
+
+def _check_read(name, seq, qual, pattern_len, path, record_no):
+    if len(seq) != len(qual):
+        raise ValueError(
+            f"{path}: read {name} (pair {record_no + 1}) has sequence length "
+            f"{len(seq)} but quality length {len(qual)}."
+        )
+    if len(seq) < pattern_len:
+        raise ValueError(
+            f"{path}: read {name} (pair {record_no + 1}) is {len(seq)} bp, shorter "
+            f"than the {pattern_len} bp barcode pattern."
+        )
+
+
 def trim(readPair, pattern):
+    """Move each mate's barcode bases (pattern N positions) into the read
+    name and DB tag and clip the pattern off the read. Records are
+    [header, seq, qual] with or without trailing newlines; mate headers must
+    name the same fragment (a trailing /1 or /2 is dropped) and both mates
+    get the same rewritten name."""
     adapterLen = len(pattern)
-    read1 = readPair[0]
-    read2 = readPair[1]
-    name1 = read1[0]
-    name2 = read2[0]
-    seq1 = read1[1]
-    seq2 = read2[1]
-    qual1 = read1[2]
-    qual2 = read2[2]
-    # bc1 = ''.join([a for a,b in zip(seq1[0:adapterLen],pattern) if b == 'N'])
-    # bc2 = ''.join([a for a,b in zip(seq2[0:adapterLen],pattern) if b == 'N'])
+    (name1, seq1, qual1), (name2, seq2, qual2) = readPair
+    seq1, seq2 = seq1.rstrip("\r\n"), seq2.rstrip("\r\n")
+    qual1, qual2 = qual1.rstrip("\r\n"), qual2.rstrip("\r\n")
+    base_name = _read_base_name(name1, "read 1", 0)
+    if _read_base_name(name2, "read 2", 0) != base_name:
+        raise ValueError(f"Mate names differ: {name1.strip()!r} vs {name2.strip()!r}")
     bc1 = "".join(
         [base for nn, base in enumerate(seq1[0:adapterLen]) if pattern[nn] == "N"]
     )
@@ -26,42 +69,14 @@ def trim(readPair, pattern):
         [base for nn, base in enumerate(seq2[0:adapterLen]) if pattern[nn] == "N"]
     )
     if len(bc1) > 0:
-        namenew1 = (
-            name1.strip("\n").split(" ")[0]
-            + "_"
-            + bc1
-            + "+"
-            + bc2
-            + " "
-            # + " ".join(name1.strip("\n").split(" ")[1:])
-            + "DB:Z:"
-            + bc1
-            + "-"
-            + bc2
-            + "\n"
-        )
-        namenew2 = (
-            name2.strip("\n").split(" ")[0]
-            + "_"
-            + bc1
-            + "+"
-            + bc2
-            + " "
-            # + " ".join(name2.strip("\n").split(" ")[1:])
-            + "DB:Z:"
-            + bc1
-            + "-"
-            + bc2
-            + "\n"
-        )
+        namenew = f"@{base_name}_{bc1}+{bc2} DB:Z:{bc1}-{bc2}\n"
     else:
-        namenew1 = name1
-        namenew2 = name2
-    seqnew1 = seq1[adapterLen:]
-    seqnew2 = seq2[adapterLen:]
-    qualnew1 = qual1[adapterLen:]
-    qualnew2 = qual2[adapterLen:]
-    return [namenew1, seqnew1, qualnew1], [namenew2, seqnew2, qualnew2]
+        namenew = f"@{base_name}\n"
+    seqnew1 = seq1[adapterLen:] + "\n"
+    seqnew2 = seq2[adapterLen:] + "\n"
+    qualnew1 = qual1[adapterLen:] + "\n"
+    qualnew2 = qual2[adapterLen:] + "\n"
+    return [namenew, seqnew1, qualnew1], [namenew, seqnew2, qualnew2]
 
 
 def do_trim(args):
@@ -70,13 +85,11 @@ def do_trim(args):
         raise FileNotFoundError(f"Input fastq file not found: {args.fq}")
     if not os.path.exists(args.fq2):
         raise FileNotFoundError(f"Input fastq file not found: {args.fq2}")
+    _validate_pattern(args.pattern)
+    pattern_len = len(args.pattern)
 
-    if args.fq[-3:] == ".gz":
-        fq1 = gzopen(args.fq, "rt")
-        fq2 = gzopen(args.fq2, "rt")
-    else:
-        fq1 = open(args.fq)
-        fq2 = open(args.fq2)
+    fq1 = _open_fastq(args.fq)
+    fq2 = _open_fastq(args.fq2)
     with open(args.output + "_1.fastq", "w") as out1:
         out1.write("")
     with open(args.output + "_2.fastq", "w") as out2:
@@ -103,28 +116,33 @@ def do_trim(args):
                     "mismatch)."
                 )
             break
-        # print(lineIndex)
-        # print(line1,line2)
         if lineIndex == 0:
             name1 = line1
             name2 = line2
             lineIndex = 1
         elif lineIndex == 1:
-            seq1 = line1
-            seq2 = line2
+            seq1 = line1.rstrip("\r\n")
+            seq2 = line2.rstrip("\r\n")
             lineIndex = 2
         elif lineIndex == 2:
             lineIndex = 3
         else:
-            qual1 = line1
-            qual2 = line2
+            qual1 = line1.rstrip("\r\n")
+            qual2 = line2.rstrip("\r\n")
+            base1 = _read_base_name(name1, args.fq, record_no)
+            base2 = _read_base_name(name2, args.fq2, record_no)
+            if base1 != base2:
+                raise ValueError(
+                    f"Mate names differ at read pair {record_no + 1}: "
+                    f"{base1!r} ({args.fq}) vs {base2!r} ({args.fq2}); the "
+                    "FASTQs are not in the same order."
+                )
+            _check_read(base1, seq1, qual1, pattern_len, args.fq, record_no)
+            _check_read(base2, seq2, qual2, pattern_len, args.fq2, record_no)
             readPair = [[name1, seq1, qual1], [name2, seq2, qual2]]
-            # barcodeIndex = [nn for nn,a in enumerate(args.pattern) if a == 'N']
-            # print(barcodeIndex)
             read1, read2 = trim(readPair, args.pattern)
             lineIndex = 0
             record_no += 1
-            # print(read1,read2)
             fq1Out.write(read1[0] + read1[1] + "+\n" + read1[2])
             fq2Out.write(read2[0] + read2[1] + "+\n" + read2[2])
     fq1Out.close()

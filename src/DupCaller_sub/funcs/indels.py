@@ -288,7 +288,8 @@ def getIndelArr(seq, indels, min_bq, reference_int, reference_start):
     def _median_bq(anchor, window_len):
         idx = np.nonzero(ref_pos == anchor)[0]
         if idx.size == 0:
-            return 0.0
+            # Anchor not in the read: below any min_bq, so always INDEL_LOW_BQ.
+            return -1.0
         i = idx[0]
         return float(np.median(quals[i + 1 : i + 1 + window_len]))
 
@@ -336,7 +337,7 @@ def getIndelArr(seq, indels, min_bq, reference_int, reference_start):
         # inserted bases, or the bases after the deletion point), for ALT
         # and REF alike.
         median_bq = _median_bq(bq_anchor, abs(indel_len))
-        if median_bq <= min_bq:
+        if median_bq < min_bq:
             seqArr[nn] = INDEL_LOW_BQ
             continue
         seqArr[nn] = state

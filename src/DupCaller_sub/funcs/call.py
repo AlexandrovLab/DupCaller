@@ -13,7 +13,6 @@ import pysam
 import os
 import h5py
 import errno
-import copy
 from array import array
 from scipy.optimize import brentq
 
@@ -1301,6 +1300,53 @@ def _collect_call_barcode(call_barcodes, key, mut):
     )
 
 
+COVERAGE_WINDOW_ROWS = 1000000
+
+
+def _cut_coverage_leftover(arrays, old_start, new_start, same_chrom):
+    """Split a window's per-locus coverage arrays at the next window's start.
+
+    arrays are row-aligned (row i = genomic old_start + i). Returns
+    (flush_rows, leftovers, leftover_gstart): rows [0, flush_rows) lie
+    before new_start and are final; leftovers are copies of the rows from
+    genomic leftover_gstart onward (trailing all-zero rows trimmed), to be
+    added back into the next window with _carry_in_coverage. On a
+    chromosome change everything is flushed and leftovers is None. When
+    new_start < old_start nothing is flushed and the whole window is
+    carried.
+    """
+    rows = arrays[0].shape[0]
+    if not same_chrom:
+        return rows, None, None
+    cut = min(max(new_start - old_start, 0), rows)
+    tail = np.zeros(rows - cut)
+    for arr in arrays:
+        tail += arr[cut:].sum(axis=1)
+    nz = np.flatnonzero(tail)
+    if nz.size == 0:
+        return cut, None, None
+    n = int(nz[-1]) + 1
+    return cut, [arr[cut : cut + n].copy() for arr in arrays], old_start + cut
+
+
+def _carry_in_coverage(arrays, leftovers, leftover_gstart, window_start):
+    """Add carried rows back at their genomic position in the current window."""
+    off = leftover_gstart - window_start
+    for arr, rows in zip(arrays, leftovers):
+        arr[off : off + rows.shape[0]] += rows
+
+
+def _coverage_window_rows(leftovers, leftover_gstart, window_start):
+    """Rows for a new window's coverage arrays: the usual 1 Mb, or more if
+    the carried rows (which start at or after window_start) reach past it."""
+    if leftovers is None:
+        return COVERAGE_WINDOW_ROWS
+    return max(
+        COVERAGE_WINDOW_ROWS,
+        leftover_gstart - window_start + leftovers[0].shape[0],
+    )
+
+
 def callBam(params, processNo):
     # Get parameters
     bam = params["tumorBam"]
@@ -1484,6 +1530,10 @@ def callBam(params, processNo):
     # so any flush only ever emits strictly-increasing positions and
     # silently drops the (already-accounted-for) rest.
     max_flushed_pos = -1
+    # Coverage rows carried from one window to the next (see
+    # _cut_coverage_leftover) and the genomic position of their first row.
+    coverage_leftovers = None
+    coverage_leftover_gstart = None
     locus_bed = bgzf.open(output + "_coverage.bed.gz", "wt")
     locus_bed_prev = bgzf.open(output + "_coverage_prev_region.tmp.bed.gz", "wt")
     locus_bed_next = bgzf.open(output + "_coverage_next_region.tmp.bed.gz", "wt")
@@ -1556,7 +1606,7 @@ def callBam(params, processNo):
             for read in tumorBam.fetch(*region):
                 if not read.is_unmapped and read.query_alignment_qualities is not None:
                     quals = np.array(read.query_alignment_qualities, dtype=float)
-                    valid_quals = quals[quals > params["minBq"]]
+                    valid_quals = quals[quals >= params["minBq"]]
                     all_quals.extend(valid_quals.tolist())
                     reads_sampled += 1
                     if reads_sampled >= max_qual_reads:
@@ -2059,80 +2109,41 @@ def callBam(params, processNo):
                         # (per-subprocess only -- Caller.py does not merge
                         # these across process boundaries yet).
                         if "coverage" in locals():
-                            if "coverage_leftover" in locals():
-                                coverage[
-                                    0 : coverage_leftover.shape[0]
-                                ] += coverage_leftover
-                                coverage_indel_cat[
-                                    0 : coverage_leftover.shape[0]
-                                ] += coverage_indel_cat_leftover
-                                unmasked_coverage[
-                                    0 : coverage_leftover.shape[0]
-                                ] += unmasked_coverage_leftover
-                                unmasked_coverage_indel_cat[
-                                    0 : coverage_leftover.shape[0]
-                                ] += unmasked_coverage_indel_cat_leftover
-                                unmasked_coverage_leftover = np.zeros((1, 4))
-                                unmasked_coverage_indel_cat_leftover = np.zeros((1, 16))
-                                coverage_leftover = np.zeros((1, 4))
-                                coverage_indel_cat_leftover = np.zeros((1, 16))
-                            if (
-                                chromNow == reference_mat_chrom
-                                and rs_reference_start >= reference_mat_start
-                            ):
-                                # Forward progress within the same
-                                # chromosome: the new window starts inside
-                                # the old window's range, so the old
-                                # window's tail is still relevant and gets
-                                # carried forward as "leftover" rather than
-                                # flushed immediately. A *backward* trigger
-                                # (rs_reference_start < reference_mat_start)
-                                # can't reuse this -- the new window's
-                                # positions aren't a re-based slice of the
-                                # old coverage array -- so it falls through
-                                # to the full-flush branch below instead,
-                                # same as a chromosome change.
-                                coverage_leftover = copy.deepcopy(
-                                    coverage[
-                                        (rs_reference_start - reference_mat_start) : (
-                                            reference_mat_end - reference_mat_start
-                                        )
-                                    ]
+                            if coverage_leftovers is not None:
+                                _carry_in_coverage(
+                                    (
+                                        coverage,
+                                        coverage_indel_cat,
+                                        unmasked_coverage,
+                                        unmasked_coverage_indel_cat,
+                                    ),
+                                    coverage_leftovers,
+                                    coverage_leftover_gstart,
+                                    reference_mat_start,
                                 )
-                                coverage_indel_cat_leftover = copy.deepcopy(
-                                    coverage_indel_cat[
-                                        (rs_reference_start - reference_mat_start) : (
-                                            reference_mat_end - reference_mat_start
-                                        )
-                                    ]
-                                )
-                                unmasked_coverage_leftover = copy.deepcopy(
-                                    unmasked_coverage[
-                                        (rs_reference_start - reference_mat_start) : (
-                                            reference_mat_end - reference_mat_start
-                                        )
-                                    ]
-                                )
-                                unmasked_coverage_indel_cat_leftover = copy.deepcopy(
-                                    unmasked_coverage_indel_cat[
-                                        (rs_reference_start - reference_mat_start) : (
-                                            reference_mat_end - reference_mat_start
-                                        )
-                                    ]
-                                )
-                                non_zero_positions = np.nonzero(
-                                    coverage[
-                                        0 : (rs_reference_start - reference_mat_start)
-                                    ].sum(axis=1)
-                                    + coverage_indel_cat[
-                                        0 : (rs_reference_start - reference_mat_start)
-                                    ].sum(axis=1)
-                                )
-                            else:
-                                non_zero_positions = np.nonzero(
-                                    coverage.sum(axis=1)
-                                    + coverage_indel_cat.sum(axis=1)
-                                )
+                            # Split at the next window's actual start (batch_min_start, which
+                            # can sit upstream of this key's rs_reference_start when the batch
+                            # holds a rerouted rugged mate): positions before it are final and
+                            # flushed now, the rest is carried by genomic coordinate.
+                            (
+                                flush_rows,
+                                coverage_leftovers,
+                                coverage_leftover_gstart,
+                            ) = _cut_coverage_leftover(
+                                (
+                                    coverage,
+                                    coverage_indel_cat,
+                                    unmasked_coverage,
+                                    unmasked_coverage_indel_cat,
+                                ),
+                                reference_mat_start,
+                                batch_min_start,
+                                chromNow == reference_mat_chrom,
+                            )
+                            non_zero_positions = np.nonzero(
+                                coverage[0:flush_rows].sum(axis=1)
+                                + coverage_indel_cat[0:flush_rows].sum(axis=1)
+                            )
                             for pos in non_zero_positions[0].tolist():
                                 current_pos = pos + reference_mat_start
                                 if current_pos <= max_flushed_pos:
@@ -2267,10 +2278,15 @@ def callBam(params, processNo):
                             params,
                         )
                         # print(ref_np,reference_mat_start)
-                        coverage = np.zeros((1000000, 4))
-                        coverage_indel_cat = np.zeros((1000000, 16))
-                        unmasked_coverage = np.zeros((1000000, 4))
-                        unmasked_coverage_indel_cat = np.zeros((1000000, 16))
+                        cov_rows = _coverage_window_rows(
+                            coverage_leftovers,
+                            coverage_leftover_gstart,
+                            reference_mat_start,
+                        )
+                        coverage = np.zeros((cov_rows, 4))
+                        coverage_indel_cat = np.zeros((cov_rows, 16))
+                        unmasked_coverage = np.zeros((cov_rows, 4))
+                        unmasked_coverage_indel_cat = np.zeros((cov_rows, 16))
                     if _process_duplex_family(
                         F1R2,
                         F2R1,
@@ -2453,67 +2469,41 @@ def callBam(params, processNo):
                 # (per-subprocess only -- see the matching block earlier in
                 # this function).
                 if "coverage" in locals():
-                    if "coverage_leftover" in locals():
-                        coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
-                        coverage_indel_cat[
-                            0 : coverage_leftover.shape[0]
-                        ] += coverage_indel_cat_leftover
-                        unmasked_coverage[
-                            0 : coverage_leftover.shape[0]
-                        ] += unmasked_coverage_leftover
-                        unmasked_coverage_indel_cat[
-                            0 : coverage_leftover.shape[0]
-                        ] += unmasked_coverage_indel_cat_leftover
-                        unmasked_coverage_leftover = np.zeros((1, 4))
-                        unmasked_coverage_indel_cat_leftover = np.zeros((1, 16))
-                        coverage_leftover = np.zeros((1, 4))
-                        coverage_indel_cat_leftover = np.zeros((1, 16))
-                    if (
-                        chromNow == reference_mat_chrom
-                        and rs_reference_start >= reference_mat_start
-                    ):
-                        # See the matching comment on the equivalent block
-                        # earlier in this function.
-                        coverage_leftover = copy.deepcopy(
-                            coverage[
-                                (rs_reference_start - reference_mat_start) : (
-                                    reference_mat_end - reference_mat_start
-                                )
-                            ]
+                    if coverage_leftovers is not None:
+                        _carry_in_coverage(
+                            (
+                                coverage,
+                                coverage_indel_cat,
+                                unmasked_coverage,
+                                unmasked_coverage_indel_cat,
+                            ),
+                            coverage_leftovers,
+                            coverage_leftover_gstart,
+                            reference_mat_start,
                         )
-                        coverage_indel_cat_leftover = copy.deepcopy(
-                            coverage_indel_cat[
-                                (rs_reference_start - reference_mat_start) : (
-                                    reference_mat_end - reference_mat_start
-                                )
-                            ]
-                        )
-                        unmasked_coverage_leftover = copy.deepcopy(
-                            unmasked_coverage[
-                                (rs_reference_start - reference_mat_start) : (
-                                    reference_mat_end - reference_mat_start
-                                )
-                            ]
-                        )
-                        unmasked_coverage_indel_cat_leftover = copy.deepcopy(
-                            unmasked_coverage_indel_cat[
-                                (rs_reference_start - reference_mat_start) : (
-                                    reference_mat_end - reference_mat_start
-                                )
-                            ]
-                        )
-                        non_zero_positions = np.nonzero(
-                            coverage[
-                                0 : (rs_reference_start - reference_mat_start)
-                            ].sum(axis=1)
-                            + coverage_indel_cat[
-                                0 : (rs_reference_start - reference_mat_start)
-                            ].sum(axis=1)
-                        )
-                    else:
-                        non_zero_positions = np.nonzero(
-                            coverage.sum(axis=1) + coverage_indel_cat.sum(axis=1)
-                        )
+                    # Split at the next window's actual start (batch_min_start, which
+                    # can sit upstream of this key's rs_reference_start when the batch
+                    # holds a rerouted rugged mate): positions before it are final and
+                    # flushed now, the rest is carried by genomic coordinate.
+                    (
+                        flush_rows,
+                        coverage_leftovers,
+                        coverage_leftover_gstart,
+                    ) = _cut_coverage_leftover(
+                        (
+                            coverage,
+                            coverage_indel_cat,
+                            unmasked_coverage,
+                            unmasked_coverage_indel_cat,
+                        ),
+                        reference_mat_start,
+                        batch_min_start,
+                        chromNow == reference_mat_chrom,
+                    )
+                    non_zero_positions = np.nonzero(
+                        coverage[0:flush_rows].sum(axis=1)
+                        + coverage_indel_cat[0:flush_rows].sum(axis=1)
+                    )
                     for pos in non_zero_positions[0].tolist():
                         current_pos = pos + reference_mat_start
                         if current_pos <= max_flushed_pos:
@@ -2627,10 +2617,13 @@ def callBam(params, processNo):
                     params,
                 )
                 # print(ref_np,reference_mat_start)
-                coverage = np.zeros((1000000, 4))
-                coverage_indel_cat = np.zeros((1000000, 16))
-                unmasked_coverage = np.zeros((1000000, 4))
-                unmasked_coverage_indel_cat = np.zeros((1000000, 16))
+                cov_rows = _coverage_window_rows(
+                    coverage_leftovers, coverage_leftover_gstart, reference_mat_start
+                )
+                coverage = np.zeros((cov_rows, 4))
+                coverage_indel_cat = np.zeros((cov_rows, 16))
+                unmasked_coverage = np.zeros((cov_rows, 4))
+                unmasked_coverage_indel_cat = np.zeros((cov_rows, 16))
             if _process_duplex_family(
                 F1R2,
                 F2R1,
@@ -3038,17 +3031,18 @@ def callBam(params, processNo):
     # only -- see the matching blocks earlier in this function).
     _final_flush_t0 = time.time()
     if "coverage" in locals():
-        if "coverage_leftover" in locals():
-            coverage[0 : coverage_leftover.shape[0]] += coverage_leftover
-            coverage_indel_cat[
-                0 : coverage_leftover.shape[0]
-            ] += coverage_indel_cat_leftover
-            unmasked_coverage[
-                0 : coverage_leftover.shape[0]
-            ] += unmasked_coverage_leftover
-            unmasked_coverage_indel_cat[
-                0 : coverage_leftover.shape[0]
-            ] += unmasked_coverage_indel_cat_leftover
+        if coverage_leftovers is not None:
+            _carry_in_coverage(
+                (
+                    coverage,
+                    coverage_indel_cat,
+                    unmasked_coverage,
+                    unmasked_coverage_indel_cat,
+                ),
+                coverage_leftovers,
+                coverage_leftover_gstart,
+                reference_mat_start,
+            )
         non_zero_positions = np.nonzero(
             coverage.sum(axis=1) + coverage_indel_cat.sum(axis=1)
         )

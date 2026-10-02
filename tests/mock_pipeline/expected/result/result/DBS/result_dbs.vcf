@@ -15,6 +15,7 @@
 ##FILTER=<ID=duplex_vaf,Description="The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue">
 ##FILTER=<ID=normal_vaf,Description="The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue">
 ##FILTER=<ID=n_cov_mask,Description="Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue">
+##FILTER=<ID=dbs_member,Description="SBS that is one of the two bases of a PASS DBS from the same read family; reported once, as the DBS, so SBS and DBS calls (and their burdens/spectra) are mutually exclusive">
 ##FILTER=<ID=strand_independence,Description="SBS or indel call with a strand whose strand independence hypothesis p-value (INFO MSP) is <= --p_threshold: more non-alt reads than read error explains, i.e. a mixed read family. A DBS containing such an SBS (same read family) fails too, and so does that DBS's other SBS">
 ##INFO=<ID=F1R2,Number=1,Type=Integer,Description="Number of F1R2 read(s) in the read bundle">
 ##INFO=<ID=F2R1,Number=1,Type=Integer,Description="Number of F2R1 read(s) in the read bundle">

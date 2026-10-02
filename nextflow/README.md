@@ -4,6 +4,10 @@ Runs the full DupCaller workflow end-to-end, one or more tumor/normal
 samples at a time: barcode trimming → BWA-MEM alignment → GATK duplicate
 marking → `DupCaller.py call` → `DupCaller.py estimate`.
 
+Preprocessing uses the same tools and commands as the published analyses
+and the main README: BWA 0.7.17 (`bwa mem -C -T 0`) and GATK 4.3.0.0
+MarkDuplicates.
+
 ## Prerequisites
 
 - Nextflow >= 21.10.0

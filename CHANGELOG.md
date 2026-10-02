@@ -2,6 +2,18 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.4] - 2026-10-02
+
+### Changed
+- A base is now usable iff its quality is >= `--minBq`, in every path: genotyping, learning, the indel median-BQ gate and the detection-power BQ sampling used to require BQ > `--minBq` while the depth re-checks (pysam/samtools) kept BQ >= `--minBq`. With 1.2.3's MAPQ fix, calling and the depth re-checks now use the same convention for both MAPQ and BQ, so a family at exactly the thresholds can no longer pass calling and then vanish from the depth re-check.
+- SBS and DBS are mutually exclusive event classes: the two bases of a PASS DBS from the same read family get the new FILTER `dbs_member` and are written to `_sbs_fail.vcf` instead of `_sbs.vcf`; "Total SBS FDR" excludes them. Estimate's previous position-based exclusion (which also dropped other families' SBS at a DBS position) is removed, and the re-estimate path, `_duplex_allele_counts.txt` and `_sbs_flt.vcf` no longer count DBS bases as SBS. The per-channel mu solve still uses them, so calling thresholds are unchanged.
+- README and Nextflow README list the tool versions used for the published analyses: BWA 0.7.17 run as `bwa mem -C -T 0`, GATK 4.3.0.0, samtools, and htslib (`bioconda::htslib` instead of `bioconda::tabix`); PERF v0.4.6 is bundled.
+
+### Fixed
+- The reference indel opportunity no longer credits N positions (flat channels used every position; homopolymer/STR/1bp-insertion channels could credit N too), matching the coverage side and `reference_base_number`. Corrected indel burden, mutations per genome and per-channel correction ratios were biased up by about the N fraction of the analysed regions, mostly in the flat channels.
+- Per-locus coverage carried between 1 Mb windows is cut at the next window's actual start and re-added at its own genomic position. When a batch held a rerouted mate starting upstream of the triggering read set, carried coverage was shifted by a few bases and some positions were dropped from `_coverage.bed.gz` and the coverage totals.
+- `trim` detects gzip per mate from the file contents, strips trailing `/1` `/2` and gives both mates the same name, and fails with a clear error (naming the read) on reads shorter than the barcode pattern, sequence/quality length mismatches, mismatched mate names, or a pattern that isn't only N/X, instead of writing malformed FASTQ.
+
 ## [1.2.3] - 2026-10-02
 
 ### Fixed

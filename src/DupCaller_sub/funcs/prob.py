@@ -283,8 +283,8 @@ def genotypeDSSnv(
     # BQs for the strand independence test: no minBq cut, N/uncovered = 0.
     F1R2_strand_qual_mat = np.where(F1R2_seq_mat == 4, 0, F1R2_qual_mat)
     F2R1_strand_qual_mat = np.where(F2R1_seq_mat == 4, 0, F2R1_qual_mat)
-    F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 0
-    F2R1_qual_mat[F2R1_qual_mat <= params["minBq"]] = 0
+    F1R2_qual_mat[F1R2_qual_mat < params["minBq"]] = 0
+    F2R1_qual_mat[F2R1_qual_mat < params["minBq"]] = 0
 
     F1R2_qual_mat_0_count = np.count_nonzero(F1R2_qual_mat == 0, axis=0)
     F2R1_qual_mat_0_count = np.count_nonzero(F2R1_qual_mat == 0, axis=0)
@@ -311,7 +311,7 @@ def genotypeDSSnv(
         ).sum(axis=0)
     total_count_mat = F1R2_count_mat + F2R1_count_mat
     # Positions where too many of the family's reads have no usable base
-    # (deleted, N, off the read, or BQ <= minBq) are masked.
+    # (deleted, N, off the read, or BQ < minBq) are masked.
     zero_qual_frac_fail = (
         (F1R2_qual_mat_0_count + F2R1_qual_mat_0_count) / (m_F1R2 + m_F2R1)
     ) >= params.get("maxZeroQualFrac", 0.9)

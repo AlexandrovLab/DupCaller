@@ -702,14 +702,21 @@ def indel100_reference_bucket_indices(
     reference-genome indel composition (see calculate_ref_indel100).
     """
     n = hp_run_arr.shape[0]
-    ref_base_safe = np.where((ref_base_arr < 0) | (ref_base_arr > 3), 0, ref_base_arr)
-    real_str = str_unit_len_arr >= 2
+    # N (or other non-ACGT) reference positions are never opportunity: the
+    # coverage side drops them via noise_mask (call.py), and
+    # reference_base_number (Estimate.py) excludes them too, so every
+    # column below is restricted to valid_base and the flat credits use
+    # n_valid instead of n.
+    valid_base = (ref_base_arr >= 0) & (ref_base_arr <= 3)
+    n_valid = int(np.count_nonzero(valid_base))
+    ref_base_safe = np.where(valid_base, ref_base_arr, 0)
+    real_str = (str_unit_len_arr >= 2) & valid_base
     base_cgta = _INDEL_BASE2NUM_TO_CGTA[ref_base_safe]
     hp_cut = (
         np.asarray(hp_cut_arr, dtype=bool)
         if hp_cut_arr is not None
         else np.ones(n, dtype=bool)
-    )
+    ) & valid_base
     str_cut = (
         np.asarray(str_cut_arr, dtype=bool)
         if str_cut_arr is not None
@@ -774,7 +781,7 @@ def indel100_reference_bucket_indices(
     # flat credit is for every *other* hypothetical unit size,
     # independently, at every position (including real_str ones).
     for u_idx in range(4):
-        out[44 + u_idx * 6] += n
+        out[44 + u_idx * 6] += n_valid
 
     # 10: STR insertion opportunity (cols 68-91) — real part: one credit
     # per annotated tract (real_str & str_cut), with the same rep-count
@@ -793,13 +800,13 @@ def indel100_reference_bucket_indices(
     # gated by ~real_str, same reasoning as the deletion case above.
     for u_idx in range(4):
         base_col = 68 + u_idx * 6
-        out[base_col] += n
-        out[base_col + 1] += n
+        out[base_col] += n_valid
+        out[base_col + 1] += n_valid
 
-    # 11: microhomology deletion opportunity (cols 92-95) — every position,
-    # fixed context, independent of actual repeat annotation.
+    # 11: microhomology deletion opportunity (cols 92-95) — every non-N
+    # position, fixed context, independent of actual repeat annotation.
     for k in range(4):
-        out[92 + k] += n
+        out[92 + k] += n_valid
 
     # 12: 1bp-insertion "next base" opportunity (cols 96-99) — a position
     # is opportunity for "insert base N here, rep0" purely if its own
@@ -809,7 +816,7 @@ def indel100_reference_bucket_indices(
     if next_ref_base_arr is not None:
         next_base_valid = (next_ref_base_arr >= 0) & (next_ref_base_arr <= 3)
         for b in range(4):
-            add_uniform(96 + b, next_base_valid & (next_ref_base_arr != b))
+            add_uniform(96 + b, valid_base & next_base_valid & (next_ref_base_arr != b))
 
     return out
 

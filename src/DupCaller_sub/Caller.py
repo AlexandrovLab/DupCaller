@@ -142,6 +142,24 @@ def _dbs_family_keys(dbs):
     ]
 
 
+def _relabel_dbs_members(sbs_records, dbsAll):
+    """Set FILTER dbs_member on each PASS SBS that is one of the two bases
+    of a PASS DBS from the same read family, so SBS and DBS are mutually
+    exclusive event classes. Returns the number relabelled."""
+    member_keys = {
+        site
+        for dbs in dbsAll
+        if dbs.get("filter", "PASS") == "PASS"
+        for site in _dbs_family_keys(dbs)
+    }
+    n = 0
+    for mut in sbs_records:
+        if mut.get("filter", "PASS") == "PASS" and _sbs_family_key(mut) in member_keys:
+            mut["filter"] = "dbs_member"
+            n += 1
+    return n
+
+
 def _apply_strand_filter(records, pvalue_fn, p_threshold):
     """Strand independence filter for PASS records: stamp INFO MSP from each
     record's _strand inputs (pvalue_fn(*inputs) per strand) and, when
@@ -1074,6 +1092,7 @@ def do_call(args):
         "duplex_vaf": "The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue",
         "normal_vaf": "The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue",
         "n_cov_mask": "Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue",
+        "dbs_member": "SBS that is one of the two bases of a PASS DBS from the same read family; reported once, as the DBS, so SBS and DBS calls (and their burdens/spectra) are mutually exclusive",
         "strand_independence": "SBS or indel call with a strand whose strand independence hypothesis p-value (INFO MSP) is <= --p_threshold: more non-alt reads than read error explains, i.e. a mixed read family. A DBS containing such an SBS (same read family) fails too, and so does that DBS's other SBS",
     }
 
@@ -2039,6 +2058,22 @@ def do_call(args):
         ):
             dbs_local_fdrs.append(local_fdr)
     total_dbs_fdr = float(np.mean(dbs_local_fdrs)) if dbs_local_fdrs else float("nan")
+
+    # SBS and DBS are mutually exclusive event classes: a PASS DBS's two
+    # bases (same read family) leave the SBS set as dbs_member. Done after
+    # the strand filter (which needs PASS members to propagate failures) and
+    # after the DBS FDR (built from the members' local FDRs).
+    n_dbs_member = _relabel_dbs_members(mutsAll, dbsAll)
+    if n_dbs_member:
+        print(f"{n_dbs_member} SBS reported as part of a PASS DBS (dbs_member)")
+    sbs_local_fdrs = [
+        mut["infos"]["FDR"]
+        for mut in mutsAll
+        if mut.get("filter", "PASS") == "PASS"
+        and channel_final_mu.get(_sbs_channel_name(mut["infos"]["TN"], mut["alt"]))
+        is not None
+    ]
+    total_sbs_fdr = float(np.mean(sbs_local_fdrs)) if sbs_local_fdrs else float("nan")
 
     with open(args.output + "_stats.txt", "w") as f:
         f.write(f"Number of Read Families\t{unique_read_num}\n")

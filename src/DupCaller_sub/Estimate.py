@@ -1682,11 +1682,9 @@ def do_estimate(args):
         ###Read DBS events up front: classify each PASS event into its
         ### DBS78 channel (used later, in the DBS burden section), and
         ### record its two constituent genomic positions so the SBS96
-        ### counting below can skip them. Every PASS DBS event's two
-        ### positions are, by construction (call.py's _detect_dbs_pairs),
-        ### ALSO individually PASS-called SNVs in _sbs.vcf — counting both
-        ### would double-count the same physical mutation as 1 DBS event
-        ### AND 2 separate SBS mutations.
+        ### counting below. A PASS DBS's two bases are not in _sbs.vcf:
+        ### call relabels them dbs_member (same read family), so SBS and
+        ### DBS counts are already mutually exclusive.
         vcf_dbs = VCF(dbs_dir + "/" + sample + "_dbs.vcf", "r")
         dbs_mut_78 = np.zeros(78, dtype=int)
         # Per-duplex-group counterpart of dbs_mut_78, same duplex_no_dict
@@ -1695,12 +1693,9 @@ def do_estimate(args):
         # and indel already do, using the per-group opportunity resolution
         # _dbs_by_duplex_group.txt provides.
         dbs_mut_by_rf = np.zeros([78, len(trinuc_by_rf.columns)], dtype=int)
-        dbs_snv_positions = set()
         for rec in vcf_dbs.fetch():
             if "PASS" not in rec.filter:
                 continue
-            dbs_snv_positions.add((rec.chrom, rec.pos))
-            dbs_snv_positions.add((rec.chrom, rec.pos + 1))
             label = dbs_raw_event_to_label(rec.ref, rec.alts[0])
             dbs_mut_78[DBS78_LABEL2NUM[label]] += 1
             duplex_no = f"{rec.info['F1R2']}+{rec.info['F2R1']}"
@@ -1725,8 +1720,6 @@ def do_estimate(args):
                 i,
                 extra=f"{rec.chrom}:{rec.pos}",
             )
-            if (rec.chrom, rec.pos) in dbs_snv_positions:
-                continue
             unmasked_mut_count += 1
         for i, rec in enumerate(vcf_fail.fetch()):
             log_progress(
@@ -1740,8 +1733,6 @@ def do_estimate(args):
                 and (rec.info.get("SNPM") or rec.info.get("NOISEM"))
                 and rec.samples["TUMOR"]["DP"] > 0
             ):
-                continue
-            if (rec.chrom, rec.pos) in dbs_snv_positions:
                 continue
             unmasked_mut_count += 1
         vcf_fail.close()
@@ -1800,10 +1791,8 @@ def do_estimate(args):
                 )
                 alt = revcomp[raw_alt]
             trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
-            # Skip the SBS96 numerator for a DBS-forming position (already
-            # counted once in dbs_mut_78 above) -- avoids double-reporting
-            # the same physical event as both 1 DBS event and 1 SBS
-            # mutation. Its coverage cell is deliberately left untouched:
+            # DBS bases never reach here (call writes them as dbs_member,
+            # not PASS). A mutant locus's coverage cell is left untouched:
             # per-locus coverage (trinuc_by_rf_np, from cov_mat in
             # funcs/prob.py) is a fixed examined-opportunity value -- a
             # function of read depth/orientation and the reference
@@ -1814,10 +1803,7 @@ def do_estimate(args):
             # other examined locus: burden = mutations / all examined loci
             # for that channel, not mutations / (examined loci minus the
             # mutations themselves).
-            if (chrom, pos) not in dbs_snv_positions:
-                trinuc_mut_np[
-                    TRINUCSBS2NUM_96[trinucSbs], duplex_no_dict[duplex_no]
-                ] += 1
+            trinuc_mut_np[TRINUCSBS2NUM_96[trinucSbs], duplex_no_dict[duplex_no]] += 1
 
         print("......Estimating mutational burden and SBS96 profile........")
         trinuc_cov_96_by_rf = combine_raw192_to_sbs96(trinuc_by_rf_np, label2num_192)
@@ -1848,8 +1834,8 @@ def do_estimate(args):
             ref_trinuc,
             trinuc_by_rf.columns,
         )
-        # Total reference bases actually considered (non-N, non-noise-
-        # masked) across args.regions -- ref_trinuc.sum() (all 64 raw,
+        # Total reference bases actually considered (non-N, ACGT-flanked;
+        # no noise BED applied) across args.regions -- ref_trinuc.sum() (all 64 raw,
         # un-folded classes) is exactly this count, since every considered
         # position is credited to exactly one of those 64 classes by its
         # own literal ref base. Reused as the shared denominator for a
