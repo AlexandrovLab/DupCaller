@@ -2,6 +2,11 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.3] - 2026-10-02
+
+### Fixed
+- `--mapq/-mq` is now applied the same way to normal and tumor reads: a read is kept when its MAPQ is >= `--mapq`, as the help text says. The per-candidate normal depth and allele counts (SNV, indel, DBS, and the overlap-discordance check) used to drop normal reads at exactly `--mapq`, while tumor families were kept at a mean MAPQ of exactly `--mapq`. With the default `-mq 40`, normal reads at MAPQ 40 were left out, which lowered normal depth (extra `n_cov_mask`) and could hide normal alt reads from `normal_vaf`, mostly in paralogous regions (#7).
+
 ## [1.2.2] - 2026-10-01
 
 ### Changed

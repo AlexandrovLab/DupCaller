@@ -127,7 +127,7 @@ def extractDepthBatchSnv(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality <= params["mapq"]
+                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
                     processed_read_names[aln.query_name] = 1
@@ -234,7 +234,7 @@ def extractDepthBatchIndel(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality <= params["mapq"]
+                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
                     processed_read_names[aln.query_name] = 1
@@ -362,7 +362,7 @@ def extractDepthBatchDbs(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality <= params["mapq"]
+                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
                     processed_read_names[aln.query_name] = 1
@@ -467,7 +467,7 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):
                     or pileupread.alignment.is_supplementary
                     or processed_read_names.get(pileupread.alignment.query_name)
                     or pileupread.alignment.has_tag("DT")
-                    or pileupread.alignment.mapping_quality <= params["mapq"]
+                    or pileupread.alignment.mapping_quality < params["mapq"]
                 ):
                     continue
                 processed_read_names[pileupread.alignment.query_name] = 1
@@ -519,7 +519,7 @@ def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=18):
                     # or pileupread.alignment.is_duplicate
                     or processed_read_names.get(pileupread.alignment.query_name)
                     or pileupread.alignment.has_tag("DT")
-                    or pileupread.alignment.mapping_quality <= params["mapq"]
+                    or pileupread.alignment.mapping_quality < params["mapq"]
                 ):
                     continue
                 processed_read_names[pileupread.alignment.query_name] = 1
@@ -843,7 +843,7 @@ def detectOverlapDiscord(
                     or pileupread.alignment.is_supplementary
                     or pileupread.alignment.is_duplicate
                     or pileupread.alignment.has_tag("DT")
-                    or pileupread.alignment.mapping_quality <= params["mapq"]
+                    or pileupread.alignment.mapping_quality < params["mapq"]
                     or pileupread.is_del
                 ):
                     continue
