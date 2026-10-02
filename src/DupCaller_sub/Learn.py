@@ -108,7 +108,7 @@ def do_learn(args):
         paramsNow["isLearn"] = True
         regions = params["regions"]
         paramsNow["regions"] = [
-            (chrom, 0, bamObject.get_reference_length(chrom) - 1) for chrom in regions
+            (chrom, 0, bamObject.get_reference_length(chrom)) for chrom in regions
         ]
         (
             mismatch_profile,

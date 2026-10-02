@@ -122,6 +122,7 @@ table below is a quick reference.
 | `trim_read` | Ignore mutations within N bp of read ends (`-tr`) | `7` |
 | `mapq` | Minimum alignment MAPQ (`-mq`) | `40` |
 | `seed` | Pin the Monte Carlo seed (omit to let `DupCaller.py call` pick a fresh one every run) | unset |
+| `p_threshold` | Strand independence hypothesis SBS/indel filter (`-pt`/`--p_threshold`): per-strand p threshold, not corrected for the number of calls (strand p <= this); failed calls get FILTER `strand_independence`; `0` disables. Unset uses `DupCaller.py call`'s default (`0.05`) | unset |
 | `estimate_clonal` | Treat multi-molecule mutations as one in burden estimation | `false` |
 | `estimate_dilute` | Set when sample and matched normal share starting DNA material | `false` |
 

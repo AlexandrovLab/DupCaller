@@ -71,8 +71,9 @@ def test_left_align_interior_unchanged():
 
 
 def test_mask_span_insertion_and_deletions():
-    assert indel_mask_span(5, 1) == (5, 6)
-    assert indel_mask_span(5, 3) == (5, 6)
+    # An insertion needs its context base (the first base after it) too.
+    assert indel_mask_span(5, 1) == (5, 7)
+    assert indel_mask_span(5, 3) == (5, 7)
     assert indel_mask_span(5, -1) == (5, 7)
     assert indel_mask_span(5, -5) == (5, 11)
 

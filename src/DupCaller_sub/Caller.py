@@ -24,7 +24,8 @@ from .funcs.call import callBam  # , output_masked_mutations
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
 from .funcs.misc import init_refine_worker, refine_channel_task
-from .funcs.prob import indelErrorProbs, indelMaxLR
+from .funcs.misc import indel_mu_channel
+from .funcs.prob import indelErrorProbs, indelMaxLR, indel_strand_pvalue, strand_pvalue
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
 from .funcs.misc import drop_empty_regions
@@ -47,6 +48,15 @@ import pysam
 # refine_channel_task/init_refine_worker (the per-channel FDR-refinement
 # Pool it and _refine_channel run inside of) live in funcs/call.py -- see
 # below in do_call.
+
+
+# Written to every row of _indel_rate_by_hp_str.txt ("eeff_sites" column):
+# what the HP/STR Eeff counts, so -mr refuses a table whose mu is on another
+# scale. "per_run": one site per homopolymer run / STR tract (2026-09-30);
+# older tables (no column) counted every base of a run, about 1/L the mu.
+# "per_run_signed" (2026-10-01): deletion/insertion sites counted
+# separately, STR slips by str_slip_tract, str.h5 schema 3.
+INDEL_EEFF_SITE_SET = "per_run_signed"
 
 
 def _load_mutation_rate_override(prefix):
@@ -73,6 +83,17 @@ def _load_mutation_rate_override(prefix):
     """
     sbs_table = pd.read_csv(prefix + "_sbs96_rate_n1.txt", sep="\t")
     indel_table = pd.read_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t")
+    if (
+        "eeff_sites" not in indel_table.columns
+        or (indel_table["eeff_sites"] != INDEL_EEFF_SITE_SET).any()
+    ):
+        raise ValueError(
+            f"-mr/--muterateprefix table {prefix}_indel_rate_by_hp_str.txt was "
+            "written by a DupCaller version whose HP/STR Eeff counted a different "
+            f"site set (expected eeff_sites={INDEL_EEFF_SITE_SET!r}); its indel "
+            "mutation rates are on a different scale. Regenerate it from a full "
+            "run with the current DupCaller version."
+        )
     override = dict(zip(sbs_table["context"], sbs_table["mutation_rate_mle"]))
     for context, indel_length, mu0 in zip(
         indel_table["context"],
@@ -93,6 +114,86 @@ def _load_mutation_rate_override(prefix):
             )
         override[name] = mu0
     return override
+
+
+def _sbs_family_key(mut):
+    """(chrom, pos, TAG1, TAG2, SP, TL): one read family's call at one
+    position. Several families (molecules) can call the same position. TL
+    (template length) is part of the family label: a fragment no longer
+    than the read makes two families with the same barcodes and start."""
+    infos = mut["infos"]
+    return (
+        mut["chrom"],
+        mut["pos"],
+        infos["TAG1"],
+        infos["TAG2"],
+        infos["SP"],
+        infos["TL"],
+    )
+
+
+def _dbs_family_keys(dbs):
+    """_sbs_family_key of a DBS record's two constituent SBS (same family)."""
+    return [
+        _sbs_family_key(
+            {"chrom": dbs["chrom"], "pos": dbs["pos"] + k, "infos": dbs["infos"]}
+        )
+        for k in (0, 1)
+    ]
+
+
+def _apply_strand_filter(records, pvalue_fn, p_threshold):
+    """Strand independence filter for PASS records: stamp INFO MSP from each
+    record's _strand inputs (pvalue_fn(*inputs) per strand) and, when
+    p_threshold > 0, set FILTER strand_independence on records with a
+    strand p <= p_threshold, comparing the unrounded p-values. Records
+    without _strand inputs, or with a non-finite p, keep MSP "." and are
+    not tested. Returns the failed records."""
+    failed = []
+    for rec in records:
+        strand_inputs = rec["infos"].get("_strand")
+        if strand_inputs is None:
+            continue
+        ps = [pvalue_fn(*ev) for ev in strand_inputs]
+        if not all(np.isfinite(ps)):
+            continue
+        rec["infos"]["MSP"] = ",".join(f"{p:.4g}" for p in ps)
+        if p_threshold > 0 and min(ps) <= p_threshold:
+            rec["filter"] = "strand_independence"
+            failed.append(rec)
+    return failed
+
+
+def _fail_dbs_of_failed_sbs(dbsAll, sbs_records, failed_sbs):
+    """Propagate strand_independence from SBS to DBS within a read family:
+    a PASS DBS with a failed SBS of its own family fails, and so does its
+    other SBS. Repeats until stable (three adjacent SBS make two DBS that
+    share the middle one). Returns (failed DBS, partner SBS failed)."""
+    failed_keys = {_sbs_family_key(m) for m in failed_sbs}
+    pass_by_key = {
+        _sbs_family_key(m): m for m in sbs_records if m.get("filter", "PASS") == "PASS"
+    }
+    n_dbs = 0
+    n_partner = 0
+    changed = True
+    while changed:
+        changed = False
+        for dbs in dbsAll:
+            if dbs.get("filter", "PASS") != "PASS":
+                continue
+            sites = _dbs_family_keys(dbs)
+            if not any(site in failed_keys for site in sites):
+                continue
+            dbs["filter"] = "strand_independence"
+            n_dbs += 1
+            changed = True
+            for site in sites:
+                partner = pass_by_key.pop(site, None)
+                if partner is not None:
+                    partner["filter"] = "strand_independence"
+                    failed_keys.add(site)
+                    n_partner += 1
+    return n_dbs, n_partner
 
 
 def check_input_files_exist(args):
@@ -411,8 +512,7 @@ def do_call(args):
             # paramsNow["isLearn"] = True
             regions = params_learn["regions"]
             paramsNow["regions"] = [
-                (chrom, 0, bamObject.get_reference_length(chrom) - 1)
-                for chrom in regions
+                (chrom, 0, bamObject.get_reference_length(chrom)) for chrom in regions
             ]
             (
                 mismatch_profile,
@@ -640,7 +740,7 @@ def do_call(args):
         # paramsNow["reference"] = fasta
         regions = params["regions"]
         paramsNow["regions"] = [
-            (chrom, 0, bamObject.get_reference_length(chrom) - 1) for chrom in regions
+            (chrom, 0, bamObject.get_reference_length(chrom)) for chrom in regions
         ]
         # Single "worker" region list, so round 2 below (always dispatched
         # via Pool.starmap over regions_list) works the same way regardless
@@ -671,6 +771,8 @@ def do_call(args):
             L_power,
             L_indel_1bp,
             L_indel_len,
+            neg_lr_sbs,
+            neg_lr_indel,
         ) = callBam(paramsNow, 0)
         muts_positions = [
             mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
@@ -842,6 +944,11 @@ def do_call(args):
         L_power = np.mean(np.stack([_[19] for _ in results]), axis=0)
         L_indel_1bp = np.mean(np.stack([_[20] for _ in results]), axis=0)
         L_indel_len = np.mean(np.stack([_[21] for _ in results]), axis=0)
+        neg_lr_sbs = [np.concatenate([_[22][k] for _ in results]) for k in range(256)]
+        neg_lr_indel = {
+            name: np.concatenate([_[23][name] for _ in results if name in _[23]])
+            for name in set().union(*(_[23].keys() for _ in results))
+        }
         dbsAll = sum(dbs_muts, [])
         print(
             "..............Completed bam calling in "
@@ -891,11 +998,20 @@ def do_call(args):
         "F2R1": [1, "Integer", "Number of F2R1 read(s) in the read bundle"],
         # "TLR": [1, "Float", "Alt/Ref log likelihood ratio of top strand"],
         # "BLR": [1, "Float", "Alt/Ref log likelihood ratio of bottom strand"],
-        "LR": [1, "Float", "Log-Likelihood ratio of major base over minor base"],
+        "LR": [
+            1,
+            "Float",
+            "log10 likelihood ratio of the alt allele (SBS: the position's non-reference base; indel: the indel) over the reference allele",
+        ],
         "LM": [
             1,
             "Float",
-            "maximum log-Likelihood ratio of major base over minor base",
+            "maximum log10 likelihood ratio the context's damage rates allow (the LR ceiling)",
+        ],
+        "MSP": [
+            2,
+            "String",
+            "Strand independence hypothesis p-values (F1R2,F2R1): P(>= observed non-alt reads on that strand | clean mutant strand). SBS: Poisson-binomial over every read covering the position (actual BQ, no minBq cut) with per-read non-alt probability 10^(-BQ/10) + amplification error. Indel: binomial over the informative (ALT+REF) reads with per-read probability of the learned amplification error that reverts the indel. Small = more discordant reads than read error explains (mixed read family). Computed only for calls that are PASS going into the strand independence filter; '.' on every other record. See --p_threshold",
         ],
         "TC": [4, "Integer", "Top strand base count"],
         "BC": [4, "Float", "Bottom strand base count"],
@@ -909,7 +1025,7 @@ def do_call(args):
         "STR": [
             1,
             "Integer",
-            "reference allele length bin of short tandem repeats. 0: no STR or less than 10bp. 1: 10-24bp. 2: 25-39bp. 3: 40bp+. Always 0 for SBS",
+            "STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that is not a whole number of the tract's repeat units; 1 = 2-9bp; 2 = 10-24bp; 3 = 25-39bp; 4 = 40bp+. Always 0 for SBS",
         ],
         "SNPM": [
             1,
@@ -944,7 +1060,8 @@ def do_call(args):
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
         "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
-        "underpowered": "Passed the default calling threshold but failed the FDR-refined per-channel threshold",
+        "underpowered": "Candidate with LR > 0 that failed the FDR-refined per-channel threshold",
+        "zero_LR": "Candidate with no evidence for the alt over the ref (log10 LR == 0, e.g. alt and non-alt reads cancelling); reported for completeness, never PASS. A DBS inherits it from either of its own read family's SNVs",
         "high_nm": "Read family failed the NM/blacklist filter -- only reported under --rescue",
         "low_mapq": "Read family failed the mapq filter -- only reported under --rescue",
         "low_ASXS": "Read family failed the AS-XS filter -- only reported under --rescue",
@@ -957,6 +1074,7 @@ def do_call(args):
         "duplex_vaf": "The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue",
         "normal_vaf": "The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue",
         "n_cov_mask": "Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue",
+        "strand_independence": "SBS or indel call with a strand whose strand independence hypothesis p-value (INFO MSP) is <= --p_threshold: more non-alt reads than read error explains, i.e. a mixed read family. A DBS containing such an SBS (same read family) fails too, and so does that DBS's other SBS",
     }
 
     # Each mutation type gets its own SBS/INDEL/DBS subfolder (matching
@@ -1061,11 +1179,16 @@ def do_call(args):
     def _mu0_for(name):
         return mu0_override_table.get(name) if mu0_override_table is not None else None
 
-    # SBS-96 mutation rate per channel (mutnum/Eeff/mutation_rate_mle),
+    # SBS-96 mutation rate per channel (n_sites/Eeff/mutation_rate_mle),
     # written out below alongside indel_rate_by_hp_str once sbs_results is
     # available -- same columns/source (the per-channel brentq/pseudocount
     # solve in refine_channel_task) as the indel table, for consistency.
     startTime_refine = time.time()
+    # The mu solve uses every unmasked site that passes all other filters,
+    # whatever the sign of its LR: round-1 PASS records (raw LRs) plus the
+    # LR < 0 sites in neg_lr_sbs (float32 log10 LRs, kept apart and only
+    # exponentiated inside refine_channel_task). Eeff excludes the same
+    # masked positions.
     raw_lr_192_n1 = [[] for _ in range(192)]
     for mut in mutsAll:
         if mut.get("filter", "PASS") != "PASS":
@@ -1074,6 +1197,12 @@ def do_call(args):
             continue
         idx_192 = label2num_192[f"{mut['infos']['TN']}>{mut['alt']}"]
         raw_lr_192_n1[idx_192].append(10 ** mut["infos"]["LR"])
+    raw_lr_192_n1 = [np.asarray(lrs, dtype=float) for lrs in raw_lr_192_n1]
+    neg_lr_192_n1 = [np.empty(0, dtype=np.float32)] * 192
+    for k, lrs in enumerate(neg_lr_sbs):
+        if lrs.size:
+            label = f"{num2trinuc_64[k // 4]}>{'ATCG'[k % 4]}"
+            neg_lr_192_n1[label2num_192[label]] = lrs
     # Same raw-192 -> canonical-96 reverse-complement pairing as
     # combine_raw192_to_sbs96 (misc.py), applied here to lists of raw LR
     # values instead of scalar counts, so each of the 96 canonical classes
@@ -1084,6 +1213,7 @@ def do_call(args):
     # do inline.
     _, sbs96_labels_for_rc = _build_sbs96_labels()
     raw_lr_96_n1 = []
+    neg_lr_96_n1 = []
     sbs_jobs = []
     for k, label in enumerate(sbs96_labels_for_rc):
         trinuc = label[0] + label[2] + label[6]
@@ -1091,8 +1221,20 @@ def do_call(args):
         rc_trinuc = "".join(_REVCOMP[b] for b in reversed(trinuc))
         rc_alt = _REVCOMP[alt]
         raw_lr_96_n1.append(
-            raw_lr_192_n1[label2num_192[f"{trinuc}>{alt}"]]
-            + raw_lr_192_n1[label2num_192[f"{rc_trinuc}>{rc_alt}"]]
+            np.concatenate(
+                [
+                    raw_lr_192_n1[label2num_192[f"{trinuc}>{alt}"]],
+                    raw_lr_192_n1[label2num_192[f"{rc_trinuc}>{rc_alt}"]],
+                ]
+            )
+        )
+        neg_lr_96_n1.append(
+            np.concatenate(
+                [
+                    neg_lr_192_n1[label2num_192[f"{trinuc}>{alt}"]],
+                    neg_lr_192_n1[label2num_192[f"{rc_trinuc}>{rc_alt}"]],
+                ]
+            )
         )
         t_fwd, b_fwd = trinuc2num_64[trinuc], base2num[alt]
         t_rc = trinuc2num_64[rc_trinuc]
@@ -1106,22 +1248,17 @@ def do_call(args):
                 args.lfdrThreshold,
                 args.pseudocount,
                 _mu0_for(f"SBS96:{label}"),
+                neg_lr_96_n1[k],
             )
         )
 
-    # HP/STR indel mutation rate, analogous to the SBS-96 block above but
-    # for indels and unrestricted by strand-depth stratum (Eeff below is
-    # already an exact detection-power-weighted opportunity count, not an
-    # n1-only approximation). rawLR list per (hp length 1-10 capped, indel
-    # length) and (STR bin 1-3, indel length) context comes from PASS
-    # indel calls; Eeff (effective opportunity) for the same context is
-    # computed directly from depth_by_hpstr (read-family depth-composition
-    # counts, base-aware for hp -- 40 buckets: base A/T/C/G x length 1-10,
-    # then 3 STR buckets -- see funcs/call.py's _accumulate_depth_matrix)
-    # weighted by the matching L_indel_1bp/L_indel_len detection-power
-    # table cell, exactly the same power tables genotypeDSIndel itself
-    # uses to classify these calls (real hp length, not the fixed hps=1
-    # context indel100/cov_mat_indel fall back to for length>=2 opportunity).
+    # HP/STR indel mutation rate, analogous to the SBS-96 block above. The
+    # rawLR list per (hp length 1-10+, indel length) and (STR bin 0-4,
+    # indel length) channel comes from PASS candidates plus the LR < 0
+    # ones in neg_lr_indel; Eeff for the same channel is a raw depth sum from
+    # depth_by_hpstr (one site per homopolymer run / STR tract start, every
+    # position for STR0, both strands required; see funcs/misc.py's
+    # indel_eeff_site_masks and _channel_eeff_at_threshold).
     # Summing a context's Eeff/rawLR over all 4 hp bases is what "pools
     # reverse complementary bases" (A<->T, C<->G) amounts to here: the
     # output grid has no base axis, so forward and RC-partner base
@@ -1147,57 +1284,51 @@ def do_call(args):
     # ...) rather than pooled.
     _HP_POOL_BASES = {"C": (2, 3), "T": (0, 1)}  # base2num order A,T,C,G
 
-    def _hp_pool(base_char):
-        return "C" if base_char in ("C", "G") else "T"
+    def _indel_channel(indel):
+        # The mu-solve/threshold channel of an indel record (None if it has
+        # none), routed by indel_mu_channel exactly as call.py routes LR < 0
+        # candidates. id_len < 0 (deletion): ref is anchor+deleted bases, so
+        # the deleted base is ref[1]; otherwise alt[1] is the inserted base.
+        id_len = len(indel["alt"]) - len(indel["ref"])
+        if id_len == 0:
+            return None
+        return indel_mu_channel(
+            id_len,
+            int(indel["infos"]["HP"]),
+            int(indel["infos"]["STR"]),
+            indel["infos"].get("HM", 1),
+            indel["ref"][1] if id_len < 0 else indel["alt"][1],
+        )
 
-    def _cap_id_len(id_len):
-        # STR-length channels only exist for |id_len|<=5 (matching
-        # ampmat_str/dmgmat_str's 11 columns, idLen+5 for idLen -5..5 --
-        # funcs/learn.py clamps to this same range when building those
-        # matrices, so an indel longer than 5bp was already folded into
-        # the id_len=+-5 column at learning time).
-        if id_len > 5:
-            return 5
-        if id_len < -5:
-            return -5
-        return id_len
-
-    raw_lr_hp = {
-        (hp, idl, pool): []
-        for hp in range(1, 11)
-        for idl in hp_indel_lengths
-        for pool in ("C", "T")
-    }
-    raw_lr_str = {(sb, idl): [] for sb in range(0, 5) for idl in str_indel_lengths}
-    raw_lr_str0 = []
+    # Raw LRs of the PASS candidates per channel; LR < 0 candidates arrive
+    # pre-routed (by the same indel_mu_channel) as float32 log10 LRs in
+    # neg_lr_indel and never as records.
+    indel_channel_names = (
+        ["STR0_len1"]
+        + [
+            f"HP{hp_len}_len{id_len}_{pool}"
+            for hp_len in range(1, 11)
+            for id_len in hp_indel_lengths
+            for pool in ("C", "T")
+        ]
+        + [
+            f"STR{str_bin}_len{id_len}"
+            for str_bin in range(0, 5)
+            for id_len in str_indel_lengths
+        ]
+    )
+    raw_lr_indel = {name: [] for name in indel_channel_names}
+    _no_neg_lr = np.empty(0, dtype=np.float32)
     for indel in indelsAll:
         if indel.get("filter", "PASS") != "PASS":
             continue
-        id_len = len(indel["alt"]) - len(indel["ref"])
-        if id_len == 0:
-            continue
-        hp_len = int(indel["infos"]["HP"])
-        str_bin = int(indel["infos"]["STR"])
-        raw_lr = 10 ** indel["infos"]["LR"]
-        # Matches genotypeDSIndel/indelErrorProbs's own branch selection
-        # exactly: the STR branch applies at |id_len|>=2 regardless of
-        # str_bin (0 is "not a real repeat," same as row 0 elsewhere in
-        # str.txt -- see learn.py's str_alt_count/str_dmg_count routing,
-        # which accumulates these events the same way); a +-1bp event
-        # routes to the HP channel unless it's a mismatched insertion
-        # (HM==0), which goes to the row-0 channel instead.
-        if abs(id_len) >= 2:
-            raw_lr_str[(str_bin, _cap_id_len(id_len))].append(raw_lr)
-        elif abs(id_len) == 1 and indel["infos"].get("HM", 1) == 0:
-            raw_lr_str0.append(raw_lr)
-        elif hp_len >= 1:
-            # id_len==-1 (deletion): ref is anchor+deleted-base, so the
-            # deleted base is ref[1]. id_len==1 reaching this branch
-            # (HM!=0) means the inserted base matches the flanking run,
-            # so alt[1] (the inserted base) is that same run's base.
-            base_char = indel["ref"][1] if id_len == -1 else indel["alt"][1]
-            pool = _hp_pool(base_char)
-            raw_lr_hp[(hp_len, id_len, pool)].append(raw_lr)
+        name = _indel_channel(indel)
+        if name is not None:
+            raw_lr_indel[name].append(10 ** indel["infos"]["LR"])
+
+    # Nothing with LR < 0 is ever written to a VCF (PASS or _fail).
+    indelsAll = [m for m in indelsAll if m["infos"]["LR"] >= 0]
+    mutsAll = [m for m in mutsAll if m["infos"]["LR"] >= 0]
 
     # threshold0 is cheap (indelErrorProbs + indelMaxLR, no Monte Carlo) --
     # computed here in the main process, same as always. Only the Eeff
@@ -1208,11 +1339,12 @@ def do_call(args):
             "STR0_len1",
             "str",
             (0, 1),
-            raw_lr_str0,
+            raw_lr_indel["STR0_len1"],
             _indel_ctx_threshold(0, 0, 1),
             args.lfdrThreshold,
             args.pseudocount,
             _mu0_for("STR0_len1"),
+            neg_lr_indel.get("STR0_len1", _no_neg_lr),
         )
     ]
     for hp_len in range(1, 11):
@@ -1224,11 +1356,12 @@ def do_call(args):
                         f"HP{hp_len}_len{id_len}_{pool}",
                         "hp",
                         (hp_len, id_len, pool),
-                        raw_lr_hp[(hp_len, id_len, pool)],
+                        raw_lr_indel[f"HP{hp_len}_len{id_len}_{pool}"],
                         threshold0,
                         args.lfdrThreshold,
                         args.pseudocount,
                         _mu0_for(f"HP{hp_len}_len{id_len}_{pool}"),
+                        neg_lr_indel.get(f"HP{hp_len}_len{id_len}_{pool}", _no_neg_lr),
                     )
                 )
     for str_bin in range(0, 5):
@@ -1239,11 +1372,12 @@ def do_call(args):
                     f"STR{str_bin}_len{id_len}",
                     "str",
                     (str_bin, id_len),
-                    raw_lr_str[(str_bin, id_len)],
+                    raw_lr_indel[f"STR{str_bin}_len{id_len}"],
                     threshold0,
                     args.lfdrThreshold,
                     args.pseudocount,
                     _mu0_for(f"STR{str_bin}_len{id_len}"),
+                    neg_lr_indel.get(f"STR{str_bin}_len{id_len}", _no_neg_lr),
                 )
             )
 
@@ -1304,7 +1438,7 @@ def do_call(args):
         sbs96_rate_rows.append(
             {
                 "context": name,
-                "mutnum": len(raw_lr_96_n1[k]),
+                "n_sites": len(raw_lr_96_n1[k]) + len(neg_lr_96_n1[k]),
                 "Eeff": Eeff0,
                 "mutation_rate_mle": mu0,
             }
@@ -1328,7 +1462,8 @@ def do_call(args):
         {
             "context": "STR0",
             "indel_length": 1,
-            "mutnum": len(raw_lr_str0),
+            "n_sites": len(raw_lr_indel["STR0_len1"])
+            + len(neg_lr_indel.get("STR0_len1", _no_neg_lr)),
             "Eeff": Eeff0,
             "mutation_rate_mle": mu0,
         }
@@ -1338,7 +1473,6 @@ def do_call(args):
     for hp_len in range(1, 11):
         for id_len in hp_indel_lengths:
             for pool in ("C", "T"):
-                raw_lr_list = raw_lr_hp[(hp_len, id_len, pool)]
                 name, kind, ctx_key, Eeff0, mu0, new_threshold = next(
                     indel_results_iter
                 )
@@ -1347,7 +1481,8 @@ def do_call(args):
                     {
                         "context": f"HP{hp_len}_{pool}",
                         "indel_length": id_len,
-                        "mutnum": len(raw_lr_list),
+                        "n_sites": len(raw_lr_indel[name])
+                        + len(neg_lr_indel.get(name, _no_neg_lr)),
                         "Eeff": Eeff0,
                         "mutation_rate_mle": mu0,
                     }
@@ -1355,20 +1490,21 @@ def do_call(args):
                 channel_thresholds[name] = new_threshold
     for str_bin in range(0, 5):
         for id_len in str_indel_lengths:
-            raw_lr_list = raw_lr_str[(str_bin, id_len)]
             name, kind, ctx_key, Eeff0, mu0, new_threshold = next(indel_results_iter)
             channel_final_mu[name] = mu0
             indel_rate_rows.append(
                 {
                     "context": f"STR{str_bin}",
                     "indel_length": id_len,
-                    "mutnum": len(raw_lr_list),
+                    "n_sites": len(raw_lr_indel[name])
+                    + len(neg_lr_indel.get(name, _no_neg_lr)),
                     "Eeff": Eeff0,
                     "mutation_rate_mle": mu0,
                 }
             )
             channel_thresholds[name] = new_threshold
     indel_rate_by_hp_str = pd.DataFrame(indel_rate_rows)
+    indel_rate_by_hp_str["eeff_sites"] = INDEL_EEFF_SITE_SET
     indel_rate_by_hp_str.to_csv(
         os.path.join(
             params["tmp_dir"],
@@ -1467,7 +1603,10 @@ def do_call(args):
         ctx_key = (trinuc2num_64.get(mut["infos"]["TN"]), base2num.get(mut["alt"]))
         threshold = pcutoff_sbs_override.get(ctx_key, params["pcutoff"])
         if old_filter == "PASS":
-            if mut["infos"]["LR"] < threshold:
+            # LR == 0: no evidence either way.
+            if mut["infos"]["LR"] <= 0:
+                mut["filter"] = "zero_LR"
+            elif mut["infos"]["LR"] < threshold:
                 mut["filter"] = "underpowered"
         elif mut["infos"]["LR"] >= threshold and (
             mut["infos"].get("SNPM") or mut["infos"].get("NOISEM")
@@ -1478,32 +1617,13 @@ def do_call(args):
         old_filter = indel.get("filter", "PASS")
         if old_filter not in ("PASS", "masked"):
             continue
-        id_len = len(indel["alt"]) - len(indel["ref"])
-        hp_len = int(indel["infos"]["HP"])
-        str_bin = int(indel["infos"]["STR"])
-        # Multi-bp indels are always STR-context now (row = str_bin, 0-4
-        # -- 0 is "not a real repeat"), independent of hp_len. +-1bp
-        # indels route by hp_len, UNLESS this specific call is a
-        # mismatched insertion (HM==0, set by genotypeDSIndel at call
-        # time), in which case it uses the STR0_len1 override instead --
-        # same channel indelErrorProbs itself scored it against.
-        if abs(id_len) >= 2:
-            threshold = indel_len_threshold_override.get(
-                (str_bin, _cap_id_len(id_len)), params["pcutoffi"]
-            )
-        elif abs(id_len) == 1 and indel["infos"].get("HM", 1) == 0:
-            threshold = indel_len_threshold_override.get((0, 1), params["pcutoffi"])
-        elif hp_len >= 1:
-            sign_idx = 1 if id_len == 1 else 0
-            base_char = indel["ref"][1] if id_len == -1 else indel["alt"][1]
-            pool = _hp_pool(base_char)
-            threshold = indel_1bp_threshold_override.get(
-                (hp_len, sign_idx, pool), params["pcutoffi"]
-            )
-        else:
-            threshold = params["pcutoffi"]
+        # The channel indelErrorProbs scored this call against (multi-bp:
+        # STR bin; 1bp: HP, or STR0_len1 for a mismatched insertion).
+        threshold = channel_thresholds.get(_indel_channel(indel), params["pcutoffi"])
         if old_filter == "PASS":
-            if indel["infos"]["LR"] < threshold:
+            if indel["infos"]["LR"] <= 0:
+                indel["filter"] = "zero_LR"
+            elif indel["infos"]["LR"] < threshold:
                 indel["filter"] = "underpowered"
         elif indel["infos"]["LR"] >= threshold and indel["infos"].get("NOISEM"):
             deferred_depth_keys.add(_mut_key(indel))
@@ -1513,25 +1633,31 @@ def do_call(args):
     # needs re-validating too. DBS is never "masked" by construction (only
     # ever "PASS" or dropped entirely), so only the downgrade path applies
     # -- no deferred set for DBS.
-    pass_positions = {
-        (mut["chrom"], mut["pos"])
-        for mut in mutsAll
-        if mut.get("filter", "PASS") == "PASS"
+    # Keyed by read family (_sbs_family_key), so a DBS only ever looks at
+    # its own family's two SBS records, not another molecule's call at the
+    # same position.
+    pass_keys = {
+        _sbs_family_key(mut) for mut in mutsAll if mut.get("filter", "PASS") == "PASS"
     }
-    no_alt_positions = {
-        (mut["chrom"], mut["pos"])
+    no_alt_keys = {
+        _sbs_family_key(mut)
         for mut in mutsAll
         if mut.get("filter") == "no_good_alt_read"
+    }
+    zero_lr_keys = {
+        _sbs_family_key(mut) for mut in mutsAll if mut.get("filter") == "zero_LR"
     }
     for dbs in dbsAll:
         if dbs.get("filter", "PASS") != "PASS":
             continue
-        sites = [(dbs["chrom"], dbs["pos"]), (dbs["chrom"], dbs["pos"] + 1)]
-        if any(site in no_alt_positions for site in sites):
+        sites = _dbs_family_keys(dbs)
+        if any(site in no_alt_keys for site in sites):
             # Inherit the constituent SNV's rescue-only reason instead of
             # "underpowered", so it's pruned below unless --rescue.
             dbs["filter"] = "no_good_alt_read"
-        elif not all(site in pass_positions for site in sites):
+        elif any(site in zero_lr_keys for site in sites):
+            dbs["filter"] = "zero_LR"
+        elif not all(site in pass_keys for site in sites):
             dbs["filter"] = "underpowered"
 
     efficiency = duplex_num / rec_num if rec_num > 0 else 0.0
@@ -1823,6 +1949,26 @@ def do_call(args):
         mutsAll = [m for m in mutsAll if not _masked_no_depth(m)]
         indelsAll = [m for m in indelsAll if not _masked_no_depth(m)]
 
+    # Strand independence filter: MSP for the final PASS SBS and indel calls
+    # from their _strand inputs (every other record keeps "."); calls with a
+    # strand p <= --p_threshold fail. A DBS fails with either of its own
+    # family's SBS, and takes the other SBS down with it.
+    pass_sbs = [m for m in mutsAll if m.get("filter", "PASS") == "PASS"]
+    failed_sbs = _apply_strand_filter(pass_sbs, strand_pvalue, args.p_threshold)
+    pass_indels = [m for m in indelsAll if m.get("filter", "PASS") == "PASS"]
+    failed_indels = _apply_strand_filter(
+        pass_indels, indel_strand_pvalue, args.p_threshold
+    )
+    if args.p_threshold > 0:
+        n_si_dbs, n_si_partner = _fail_dbs_of_failed_sbs(dbsAll, pass_sbs, failed_sbs)
+        print(
+            f"..............Strand independence hypothesis filter (--p_threshold "
+            f"{args.p_threshold}): {len(failed_sbs)} of {len(pass_sbs)} PASS SBS "
+            f"calls failed ({n_si_partner} more as the other SBS of {n_si_dbs} "
+            f"failed DBS), {len(failed_indels)} of {len(pass_indels)} PASS indel "
+            f"calls failed..............."
+        )
+
     # Per-call FDR: the same local-fdr formula every channel already uses
     # internally ((1-mu0)/(rawLR*mu0+1-mu0), mu0 being that call's own
     # channel's round-1 MLE mutation rate -- see _refine_channel). Computed and
@@ -1855,32 +2001,20 @@ def do_call(args):
         return (1.0 - mu) / ((10**log10_lr) * mu + (1.0 - mu))
 
     sbs_local_fdrs = []
-    pos_to_local_fdr = {}
+    key_to_local_fdr = {}
     for mut in mutsAll:
         name = _sbs_channel_name(mut["infos"]["TN"], mut["alt"])
         mu = channel_final_mu.get(name)
         local_fdr = _local_fdr(mut["infos"]["LR"], mu) if mu is not None else 1.0
         mut["infos"]["FDR"] = local_fdr
-        pos_to_local_fdr[(mut["chrom"], mut["pos"])] = local_fdr
+        key_to_local_fdr[_sbs_family_key(mut)] = local_fdr
         if mu is not None and mut.get("filter", "PASS") == "PASS":
             sbs_local_fdrs.append(local_fdr)
     total_sbs_fdr = float(np.mean(sbs_local_fdrs)) if sbs_local_fdrs else float("nan")
 
     indel_local_fdrs = []
     for indel in indelsAll:
-        id_len = len(indel["alt"]) - len(indel["ref"])
-        hp_len = int(indel["infos"]["HP"])
-        str_bin = int(indel["infos"]["STR"])
-        if abs(id_len) >= 2:
-            name = f"STR{str_bin}_len{_cap_id_len(id_len)}"
-        elif abs(id_len) == 1 and indel["infos"].get("HM", 1) == 0:
-            name = "STR0_len1"
-        elif hp_len >= 1:
-            base_char = indel["ref"][1] if id_len == -1 else indel["alt"][1]
-            name = f"HP{hp_len}_len{id_len}_{_hp_pool(base_char)}"
-        else:
-            name = None
-        mu = channel_final_mu.get(name)
+        mu = channel_final_mu.get(_indel_channel(indel))
         local_fdr = _local_fdr(indel["infos"]["LR"], mu) if mu is not None else 1.0
         indel["infos"]["FDR"] = local_fdr
         if mu is not None and indel.get("filter", "PASS") == "PASS":
@@ -1891,8 +2025,7 @@ def do_call(args):
 
     dbs_local_fdrs = []
     for dbs in dbsAll:
-        fdr1 = pos_to_local_fdr.get((dbs["chrom"], dbs["pos"]))
-        fdr2 = pos_to_local_fdr.get((dbs["chrom"], dbs["pos"] + 1))
+        fdr1, fdr2 = (key_to_local_fdr.get(site) for site in _dbs_family_keys(dbs))
         local_fdr = (
             1.0 - (1.0 - fdr1) * (1.0 - fdr2)
             if fdr1 is not None and fdr2 is not None

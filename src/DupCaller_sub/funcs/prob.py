@@ -1,11 +1,24 @@
 import numpy as np
+from scipy.stats import poisson_binom
 from .indels import (
+    base_codes,
+    str_length_bin,
+    str_slip_tract,
+    INDEL_ALT,
+    INDEL_CONFLICT,
+    INDEL_REF,
     findIndels,
     getIndelArr,
+    indel_context_fits_window,
     indel_context_index,
+    indel_has_context,
     indel_passes_mask,
     left_align_indel,
 )
+
+
+# |log10 LR| below this is rounding noise around a tie and is snapped to 0.
+LR_ZERO_TOL = 1e-9
 
 
 def log10(mat):
@@ -69,20 +82,14 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
 
 
 def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2):
-    # Pseq is ln(base-call error rate implied by BQ): exp(Pseq) is the
-    # probability of ANY miscall, but the mixture below treats it as the
-    # probability of specifically miscalling to the ONE alternate allele
-    # under test here, so it's divided by 3 (the number of possible wrong
-    # bases) -- skipped for the "no real quality info" sentinel (Pseq
-    # coming in as exactly 0, e.g. a >2bp indel insertion, see
-    # funcs/indels.py's getIndelArr) so that case stays exactly the
-    # uninformative 50/50 log(0.5) below, not further scaled by it.
-    zero_mask = Pseq == 0
-    Pseq[zero_mask] = log(0.5)
-    Pseq[~zero_mask] -= log(3)
+    # Pseq is ln(e), e = 10^(-BQ/10). The read emission is conditioned on
+    # the read showing one of the two modelled alleles: P(the other
+    # allele) = (e/3) / (1 - 2e/3), P(the true allele) = 1 minus that.
+    # Pseq == 0 (no BQ for this read) stays uninformative at 0.5.
     bin_seq = bin_seq.astype(bool, copy=False)
-
-    expP = np.exp(Pseq)
+    e = np.exp(Pseq)
+    expP = (e / 3) / (1 - 2 * e / 3)
+    expP = np.where(Pseq == 0, 0.5, expP)
 
     # precompute the two mixture terms
     A = (1 - P) * (1 - expP) + P * expP
@@ -111,6 +118,60 @@ def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2
     return prob1, prob2
 
 
+def strand_evidence(qual_mat, alt_mat, p_extra):
+    """Per-position strand-test inputs for one strand: (BQs of the counted
+    reads, k = number of them that are non-alt, p_extra). A read counts
+    where qual > 0. qual_mat and alt_mat are reads x positions; p_extra
+    is per position (Pamp)."""
+    counted = qual_mat > 0
+    k = np.logical_and(counted, ~alt_mat).sum(axis=0)
+    return [
+        (qual_mat[counted[:, j], j], int(k[j]), float(p_extra[j]))
+        for j in range(qual_mat.shape[1])
+    ]
+
+
+def _nonalt_upper_tail(probs, k):
+    """P(X >= k), X Poisson-binomial over per-read non-alt probabilities
+    `probs`. Computed as 1 - cdf(k - 1), so tails below ~1e-16 round to 0."""
+    if k == 0:
+        return 1.0
+    return min(max(1.0 - poisson_binom(probs).cdf(k - 1), 0.0), 1.0)
+
+
+def strand_pvalue(quals, k, p_extra):
+    """SBS strand p-value: P(X >= k) under H0 "clean mutant strand", each
+    counted read showing a non-alt base independently with probability
+    10^(-BQ/10) + p_extra."""
+    probs = np.minimum(10 ** (-np.asarray(quals, dtype=float) / 10) + p_extra, 1.0)
+    return _nonalt_upper_tail(probs, k)
+
+
+def indel_strand_evidence(n_alt, n_ref, rev_rate):
+    """Indel strand-test inputs for one strand: (informative reads, REF
+    reads, per-read reversion rate). Informative = ALT or REF in
+    getIndelArr, which already applies the minBq gate."""
+    return (int(n_alt) + int(n_ref), int(n_ref), float(rev_rate))
+
+
+def indel_strand_pvalue(n, k, rev_rate):
+    """Indel strand p-value: P(X >= k REF reads among n informative reads)
+    under H0 "clean mutant strand", each read showing the reference
+    independently with the learned reversion rate (indelReversionRate),
+    which already includes sequencing error. NaN if the rate is
+    unavailable."""
+    if not np.isfinite(rev_rate):
+        return float("nan")
+    return _nonalt_upper_tail(np.full(n, min(rev_rate, 1.0)), k)
+
+
+def strand_nonalt_pvalues(qual_mat, alt_mat, p_extra):
+    """strand_pvalue for every column of a reads x positions matrix."""
+    return np.array(
+        [strand_pvalue(*ev) for ev in strand_evidence(qual_mat, alt_mat, p_extra)]
+    )
+
+
 def genotypeDSSnv(
     seqs,
     reference_start,
@@ -121,18 +182,14 @@ def genotypeDSSnv(
     params,
     L=None,
 ):
-    """antimask and mut_antimask_scope both start as boolean masks over
-    the same window, refined identically by the structural/quality checks
-    below (trinuc validity, zero-qual fraction, 3+-allele ambiguity) --
-    but antimask is the narrow one (still respects n_cov_mask/nm_mask/
-    trim, whatever the caller passed in) used only to gate cov_mat, while
-    mut_antimask_scope is the wide one (only include_mask ever blocks it)
-    used to gate mut_antimask/candidate detection. They're deliberately
-    decoupled so a --rescue-eligible candidate blocked only by a
-    rescuable mask (n_cov/nm/trim/indel_mask) can still get a real LR
-    score without also making low-reliability positions contribute to
-    cov_mat's coverage/opportunity accounting -- see call.py's rescue
-    branch for how the resulting LR gets used.
+    """Genotype every position of one duplex family's window.
+
+    antimask and mut_antimask_scope get the same checks below (trinuc
+    validity, zero-quality fraction >= maxZeroQualFrac, more than one
+    non-reference base). antimask (all of the
+    caller's masks) gates cov_mat; mut_antimask_scope (include_mask only)
+    gates candidate detection, so a candidate blocked only by a rescuable
+    mask still gets an LR for --rescue.
     """
     prob_amp_mat = params["ampmat"]
     prob_amp_mat_rev = params["ampmat_rev"]
@@ -158,14 +215,13 @@ def genotypeDSSnv(
     ### Prepare sequence matrix and quality matrix for each strand
     n = len(reference_int)
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3, "N": 4}
-    base2num_npfunc = np.vectorize(lambda b: base2num[b])
     F1R2_seq_mat = np.zeros([m_F1R2, n], dtype=int)  # Base(ATCG) x reads x pos
     F1R2_qual_mat = np.zeros([m_F1R2, n])
     F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # Base(ATCG) x reads x pos
     F2R1_qual_mat = np.zeros([m_F2R1, n])
     for mm, seq in enumerate(F1R2):
         qualities = seq.query_alignment_qualities
-        sequence = np.array(list(seq.query_alignment_sequence))
+        sequence = base_codes(seq.query_alignment_sequence)
         cigartuples = seq.cigartuples
         current_seq_ind = 0
         current_mat_ind = seq.reference_start - reference_start
@@ -173,9 +229,9 @@ def genotypeDSSnv(
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                F1R2_seq_mat[
-                    mm, current_mat_ind : current_mat_ind + ct[1]
-                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
+                F1R2_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = sequence[
+                    current_seq_ind : current_seq_ind + ct[1]
+                ]
                 F1R2_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
@@ -195,7 +251,7 @@ def genotypeDSSnv(
         F1R2_qual_mat[mm, current_mat_ind:n] = 0
     for mm, seq in enumerate(F2R1):
         qualities = seq.query_alignment_qualities
-        sequence = np.array(list(seq.query_alignment_sequence))
+        sequence = base_codes(seq.query_alignment_sequence)
         cigartuples = seq.cigartuples
         current_seq_ind = 0
         current_mat_ind = seq.reference_start - reference_start
@@ -203,9 +259,9 @@ def genotypeDSSnv(
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                F2R1_seq_mat[
-                    mm, current_mat_ind : current_mat_ind + ct[1]
-                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
+                F2R1_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = sequence[
+                    current_seq_ind : current_seq_ind + ct[1]
+                ]
                 F2R1_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
@@ -224,6 +280,9 @@ def genotypeDSSnv(
         F2R1_seq_mat[mm, current_mat_ind:n] = 4
         F2R1_qual_mat[mm, current_mat_ind:n] = 0
 
+    # BQs for the strand independence test: no minBq cut, N/uncovered = 0.
+    F1R2_strand_qual_mat = np.where(F1R2_seq_mat == 4, 0, F1R2_qual_mat)
+    F2R1_strand_qual_mat = np.where(F2R1_seq_mat == 4, 0, F2R1_qual_mat)
     F1R2_qual_mat[F1R2_qual_mat <= params["minBq"]] = 0
     F2R1_qual_mat[F2R1_qual_mat <= params["minBq"]] = 0
 
@@ -251,19 +310,27 @@ def genotypeDSSnv(
             np.logical_and(F2R1_seq_mat == nn, F2R1_qual_mat != 0)
         ).sum(axis=0)
     total_count_mat = F1R2_count_mat + F2R1_count_mat
+    # Positions where too many of the family's reads have no usable base
+    # (deleted, N, off the read, or BQ <= minBq) are masked.
     zero_qual_frac_fail = (
         (F1R2_qual_mat_0_count + F2R1_qual_mat_0_count) / (m_F1R2 + m_F2R1)
-    ) >= params["maxZeroQualFrac"]
-    ambiguous_allele_fail = (total_count_mat >= 1).sum(axis=0) > 2
+    ) >= params.get("maxZeroQualFrac", 0.9)
     antimask[zero_qual_frac_fail] = False
-    antimask[ambiguous_allele_fail] = False
     mut_antimask_scope[zero_qual_frac_fail] = False
+    # base1 is the position's non-reference base, base2 the reference. A
+    # position with more than one distinct non-reference base (counted
+    # reads only) is masked.
+    ref_valid = reference_int < 4
+    alt_count_mat = total_count_mat.copy()
+    alt_count_mat[reference_int[ref_valid], np.nonzero(ref_valid)[0]] = 0
+    n_alt_alleles = (alt_count_mat >= 1).sum(axis=0)
+    ambiguous_allele_fail = n_alt_alleles > 1
+    antimask[ambiguous_allele_fail] = False
     mut_antimask_scope[ambiguous_allele_fail] = False
-    base1_int = np.argmax(total_count_mat, axis=0)
-    total_count_without_base1 = total_count_mat.copy()
-    total_count_without_base1[base1_int, np.ogrid[:n]] = -1
-    base2_int = np.argmax(total_count_without_base1, axis=0)
-    base2_int[base1_int != reference_int] = reference_int[base1_int != reference_int]
+    base1_int = np.where(
+        n_alt_alleles >= 1, np.argmax(alt_count_mat, axis=0), reference_int
+    )
+    base2_int = reference_int.copy()
     # Empirical duplex coverage matrix [n, 4]: L lookup per unmasked position per alt base
     cov_mat = np.zeros([n, 4])
     if L is not None:
@@ -276,6 +343,8 @@ def genotypeDSSnv(
             ]
 
     mut_antimask = np.logical_and(mut_antimask_scope, base1_int != reference_int)
+    # Non-candidates are reported as reference.
+    base1_int[~mut_antimask] = reference_int[~mut_antimask]
     if not mut_antimask.any():
         return (
             cov_mat,
@@ -286,6 +355,11 @@ def genotypeDSSnv(
             antimask,
             F1R2_count_mat,
             F2R1_count_mat,
+            [],
+            [],
+            np.zeros(0, dtype=int),
+            np.zeros(0, dtype=int),
+            np.zeros(0),
         )
 
     F1R2_masked_qual_mat = F1R2_qual_mat[:, mut_antimask]
@@ -301,16 +375,6 @@ def genotypeDSSnv(
     trinuc_converted_masked = trinuc_convert_np[
         trinuc_int[mut_antimask], base1_int_masked
     ]
-    ref_int_masked = reference_int[mut_antimask]
-    base2_int_masked[
-        np.logical_and(
-            base1_int_masked == ref_int_masked,
-            total_count_mat[:, mut_antimask][
-                base2_int_masked, np.ogrid[: base2_int_masked.size]
-            ]
-            == 0,
-        )
-    ] = 4
     Pamp = prob_amp_mat[trinuc_converted_masked, base2_int_masked]
     Pamp_rev = prob_amp_mat_rev[trinuc_converted_masked, base2_int_masked]
     Pdmg_t = prob_dmg_mat_top[trinuc_converted_masked, base2_int_masked]
@@ -367,12 +431,27 @@ def genotypeDSSnv(
     LR_max = (
         log10(1 - Pdmg_t) + log10(1 - Pdmg_b) - log10(Pdmg_rev_t) - log10(Pdmg_rev_b)
     )
-    # A negative LR_masked means the evidence actually favors base2 over
-    # the majority-vote base1 -- not a real mutation candidate, just noise
-    # in the vote. genotypeDSIndel has always excluded these via its own
-    # `take = LR_masked >= 0` gate, independent of CS; mirror that here so
-    # SNVs get the same non-CS-based sanity filter.
+    # LR < 0: the reads favor the reference over the mismatch base.
+    LR_masked[np.abs(LR_masked) < LR_ZERO_TOL] = 0.0
     keep = LR_masked >= 0
+    # Strand independence test inputs for the LR >= 0 candidates; Caller.py
+    # computes the p-values (strand_pvalue) for PASS calls only.
+    ev_F1R2 = strand_evidence(
+        F1R2_strand_qual_mat[:, mut_antimask][:, keep],
+        F1R2_bin_seq_mat[:, keep],
+        Pamp[keep],
+    )
+    ev_F2R1 = strand_evidence(
+        F2R1_strand_qual_mat[:, mut_antimask][:, keep],
+        F2R1_bin_seq_mat[:, keep],
+        Pamp[keep],
+    )
+    # LR < 0 positions count as reference coverage; their position,
+    # mismatch base and LR are returned for the per-channel mu solve.
+    rejected = np.nonzero(mut_antimask)[0][~keep]
+    neg_alt = base1_int[rejected].copy()
+    neg_LR = LR_masked[~keep]
+    base1_int[rejected] = reference_int[rejected]
     mut_antimask[mut_antimask] = keep
     LR_masked = LR_masked[keep]
     LR_max = LR_max[keep]
@@ -385,7 +464,76 @@ def genotypeDSSnv(
         antimask,
         F1R2_count_mat,
         F2R1_count_mat,
+        ev_F1R2,
+        ev_F2R1,
+        rejected,
+        neg_alt,
+        neg_LR,
     )
+
+
+_RC = [1, 0, 3, 2]
+
+
+def _indel_error_cells(hps, strs, idLen, ref_allele, inserted_base, strs_mut=None):
+    """Matrix cells of the two amplification/damage events that matter for
+    a candidate indel, each as (matrix, row, col, col_bot) with matrix
+    "hp" or "str" and col_bot the bottom-strand (base-complemented) column:
+
+    reversion: alt->ref, the event that undoes the indel in the mutant
+        molecule's own context.
+    forward: ref->alt, the indel itself in the reference context.
+
+    hp rows are run length 1-10+ (rows cap at 10; hps is the uncapped run
+    length, so the mutant run of a deletion from an 11+ run is still
+    10+), columns base*3 + (idLen + 1); str rows are STR bins, columns
+    idLen + 5.
+      1bp deletion from a run of L: forward = -1 in a run of L; reversion
+        = +1 in a run of L-1, or str row 0 +1 when L == 1 (no run left).
+      Run-extending 1bp insertion into a run of L: forward = +1 in a run
+        of L; reversion = -1 in a run of L+1.
+      Mismatched 1bp insertion of base x: forward = str row 0 +1;
+        reversion = -1 of x as a run of 1 (str row 0 -1 if x is not ACGT).
+      Longer indels: forward = idLen in the reference tract's bin (strs);
+        reversion = -idLen in the mutant tract's bin (strs_mut, default
+        strs when the tract length isn't known, e.g. per-context tables).
+    """
+    if abs(idLen) >= 2:
+        if strs_mut is None:
+            strs_mut = strs
+        return ("str", strs_mut, -idLen + 5, -idLen + 5), (
+            "str",
+            strs,
+            idLen + 5,
+            idLen + 5,
+        )
+    L_raw = max(1, int(hps))
+    L = min(L_raw, 10)
+    if idLen == -1:
+        b = ref_allele
+        forward = ("hp", L - 1, b * 3 + 0, _RC[b] * 3 + 0)
+        if L_raw >= 2:
+            reversion = ("hp", min(L_raw - 1, 10) - 1, b * 3 + 2, _RC[b] * 3 + 2)
+        else:
+            reversion = ("str", 0, 6, 6)
+    elif inserted_base == ref_allele:
+        b = ref_allele
+        forward = ("hp", L - 1, b * 3 + 2, _RC[b] * 3 + 2)
+        reversion = ("hp", min(L_raw + 1, 10) - 1, b * 3 + 0, _RC[b] * 3 + 0)
+    else:
+        forward = ("str", 0, 6, 6)
+        x = inserted_base
+        if 0 <= x <= 3:
+            reversion = ("hp", 0, x * 3 + 0, _RC[x] * 3 + 0)
+        else:
+            reversion = ("str", 0, 4, 4)
+    return reversion, forward
+
+
+def _cell_value(cell, mat_hp, mat_str, bottom=False):
+    kind, row, col, col_bot = cell
+    mat = mat_hp if kind == "hp" else mat_str
+    return mat[row, col_bot if bottom else col]
 
 
 def indelErrorProbs(
@@ -398,94 +546,54 @@ def indelErrorProbs(
     prob_dmg_hp,
     prob_amp_str,
     prob_dmg_str,
+    strs_mut=None,
 ):
-    """Select Pamp/Pdmg values for a candidate indel from the new split
-    error matrices: prob_*_hp is (10, 12) -- rows hp run length 1-10+
-    (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1} (the
-    idLen=0 column is the reference/opportunity count); prob_*_str is
-    (5, 11) -- rows STR-length bin 0="0-1" (i.e. not a real repeat) / 1=
-    "2-9" / 2="10-24" / 3="25-39" / 4="40+", columns idLen+5 for idLen in
-    -5..5 (idLen=0 again the opportunity column). See Index.py-style
-    write-out in Caller.py/Learn.py and funcs/learn.py's accumulation for
-    how these are built.
+    """Amplification and damage rates for a candidate indel, in the slots
+    calculateSSPosterior/calculateDSPosterior expect (same convention as
+    genotypeDSSnv): Pamp/Pdmg/Pdmg_bot are alt->ref (the reversion in the
+    mutant context), Pamp_rev/Pdmg_rev/Pdmg_rev_bot are ref->alt (the
+    indel in the reference context). See _indel_error_cells.
 
-    Routing rule for +-1bp indels: a deletion always removes a base that
-    was actually there, so it trivially belongs to that base's own
-    homopolymer (hp matrix) regardless of hp length (even hp_len==1, an
-    "isolated" base, counts). An insertion only belongs to the hp matrix
-    if `inserted_base` (the base actually being inserted -- for real
-    candidates, read off the event itself; for context/coverage
-    enumeration where every base is by construction the position's own,
-    pass inserted_base == ref_allele) matches `ref_allele` (the reference
-    base immediately after the insertion point, i.e. the base whose run
-    would be extended); otherwise it isn't a real homopolymer-slippage
-    event and falls to str.txt's row 0 ("not a repeat") at the +-1
-    column. Indels of length >=2 are always STR-context (no hp.txt
-    column exists for them), keyed directly by `strs` (the STR-length
-    bin already computed by the caller) regardless of any hp annotation
-    -- a length>=2 indel not inside an annotated STR has no hp-length
-    fallback here; it still routes through str.txt (row 0, "not a
-    repeat").
-
-    No separate "_rev" matrices, unlike the SBS side: Pamp_rev/Pdmg_rev
-    are the same hp/str matrix as Pamp/Pdmg, just indexed at the column
-    for -idLen instead of idLen (the opposite-direction column).
+    ref_allele is the reference base at indel_context_index; for 1bp
+    insertions, inserted_base == ref_allele selects the run-extending
+    (hp) case, anything else the mismatched (str row 0) case.
     """
     if idLen == 0:
         raise ValueError("idLen must be nonzero")
-    if abs(idLen) >= 2:
-        row = strs
-        col = -idLen + 5
-        col_rev = idLen + 5
-        Pamp = prob_amp_str[row, col]
-        Pamp_rev = prob_amp_str[row, col_rev]
-        Pdmg = prob_dmg_str[row, col]
-        Pdmg_rev = prob_dmg_str[row, col_rev]
-        Pdmg_bot = Pdmg
-        Pdmg_rev_bot = Pdmg_rev
-    elif idLen == -1:
-        # Deletion: always matches its own homopolymer.
-        rc = [1, 0, 3, 2]
-        ref_allele_rc = rc[ref_allele]
-        row = min(hps, 10) - 1
-        col = ref_allele * 3 + 0
-        col_rev = ref_allele * 3 + 2
-        col_bot = ref_allele_rc * 3 + 0
-        col_rev_bot = ref_allele_rc * 3 + 2
-        Pamp = prob_amp_hp[row, col]
-        Pamp_rev = prob_amp_hp[row, col_rev]
-        Pdmg = prob_dmg_hp[row, col]
-        Pdmg_rev = prob_dmg_hp[row, col_rev]
-        Pdmg_bot = prob_dmg_hp[row, col_bot]
-        Pdmg_rev_bot = prob_dmg_hp[row, col_rev_bot]
-    else:  # idLen == 1
-        if inserted_base == ref_allele:
-            rc = [1, 0, 3, 2]
-            ref_allele_rc = rc[ref_allele]
-            row = min(hps, 10) - 1
-            col = ref_allele * 3 + 2
-            col_rev = ref_allele * 3 + 0
-            col_bot = ref_allele_rc * 3 + 2
-            col_rev_bot = ref_allele_rc * 3 + 0
-            Pamp = prob_amp_hp[row, col]
-            Pamp_rev = prob_amp_hp[row, col_rev]
-            Pdmg = prob_dmg_hp[row, col]
-            Pdmg_rev = prob_dmg_hp[row, col_rev]
-            Pdmg_bot = prob_dmg_hp[row, col_bot]
-            Pdmg_rev_bot = prob_dmg_hp[row, col_rev_bot]
-        else:
-            row = 0
-            col = 1 + 5
-            col_rev = -1 + 5
-            Pamp = prob_amp_str[row, col]
-            Pamp_rev = prob_amp_str[row, col_rev]
-            Pdmg = prob_dmg_str[row, col]
-            Pdmg_rev = prob_dmg_str[row, col_rev]
-            Pdmg_bot = Pdmg
-            Pdmg_rev_bot = Pdmg_rev
+    reversion, forward = _indel_error_cells(
+        hps, strs, idLen, ref_allele, inserted_base, strs_mut
+    )
+    Pamp = _cell_value(reversion, prob_amp_hp, prob_amp_str)
+    Pamp_rev = _cell_value(forward, prob_amp_hp, prob_amp_str)
+    Pdmg = _cell_value(reversion, prob_dmg_hp, prob_dmg_str)
+    Pdmg_rev = _cell_value(forward, prob_dmg_hp, prob_dmg_str)
+    Pdmg_bot = _cell_value(reversion, prob_dmg_hp, prob_dmg_str, bottom=True)
+    Pdmg_rev_bot = _cell_value(forward, prob_dmg_hp, prob_dmg_str, bottom=True)
     if Pamp == 0:
         Pamp = 1e-9
     return Pamp, Pamp_rev, Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot
+
+
+def indelReversionRate(
+    hps,
+    strs,
+    idLen,
+    ref_allele,
+    inserted_base,
+    prob_amp_hp,
+    prob_amp_str,
+    strs_mut=None,
+):
+    """Per-read probability that a read from a molecule carrying this indel
+    shows the reference: the amplification reversion of _indel_error_cells
+    (indelErrorProbs' Pamp without its zero floor). NaN when the matrices
+    aren't loaded."""
+    if prob_amp_hp is None or prob_amp_str is None:
+        return np.nan
+    reversion, _ = _indel_error_cells(
+        hps, strs, idLen, ref_allele, inserted_base, strs_mut
+    )
+    return float(_cell_value(reversion, prob_amp_hp, prob_amp_str))
 
 
 def indelMaxLR(Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot):
@@ -542,8 +650,14 @@ def genotypeDSIndel(
     for indel in indels:
         refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
-        # Same locus mask as profileTriNucMismatches at learn time.
-        if indel_passes_mask(antimask, refPos - start, indelLen):
+        # Same filter as profileTriNucMismatches at learn time.
+        if (
+            indel_passes_mask(antimask, refPos - start, indelLen)
+            and indel_has_context(refPos - start, len(reference_int))
+            and indel_context_fits_window(
+                indel, refPos - start, reference_int, hp_raw, str_raw
+            )
+        ):
             indels_masked.append(indel)
             pos_masked.append(refPos)
             indelLen_masked.append(indelLen)
@@ -564,7 +678,7 @@ def genotypeDSIndel(
 
     m = len(indels_masked)
     if m == 0:  # or m >= 2:
-        return [np.zeros(0)] * 10
+        return [np.zeros(0)] * 11
     n_f1r2 = len(F1R2)
     n_f2r1 = len(F2R1)
     mask_multiallele = np.ones(m, dtype=bool)
@@ -579,19 +693,23 @@ def genotypeDSIndel(
     f2r1_ref_count = np.zeros(m)
 
     for nn, seq in enumerate(F1R2):
-        seqArr, qualArr = getIndelArr(seq, indels_masked, params["minBq"])
-        mask_multiallele[seqArr == -1] = 0
-        f1r2_seq[nn, :] = seqArr > 0
+        seqArr, qualArr = getIndelArr(
+            seq, indels_masked, params["minBq"], reference_int, reference_start
+        )
+        mask_multiallele[seqArr == INDEL_CONFLICT] = 0
+        f1r2_seq[nn, :] = seqArr == INDEL_ALT
         f1r2_prob[nn, :] = qualArr
-        f1r2_alt_count += (seqArr == 1).astype(int)
-        f1r2_ref_count += (seqArr == 0).astype(int)
+        f1r2_alt_count += (seqArr == INDEL_ALT).astype(int)
+        f1r2_ref_count += (seqArr == INDEL_REF).astype(int)
     for nn, seq in enumerate(F2R1):
-        seqArr, qualArr = getIndelArr(seq, indels_masked, params["minBq"])
-        mask_multiallele[seqArr == -1] = 0
-        f2r1_seq[nn, :] = seqArr > 0
+        seqArr, qualArr = getIndelArr(
+            seq, indels_masked, params["minBq"], reference_int, reference_start
+        )
+        mask_multiallele[seqArr == INDEL_CONFLICT] = 0
+        f2r1_seq[nn, :] = seqArr == INDEL_ALT
         f2r1_prob[nn, :] = qualArr
-        f2r1_alt_count += (seqArr == 1).astype(int)
-        f2r1_ref_count += (seqArr == 0).astype(int)
+        f2r1_alt_count += (seqArr == INDEL_ALT).astype(int)
+        f2r1_ref_count += (seqArr == INDEL_REF).astype(int)
     f1r2_prob = -f1r2_prob / 10
     f2r1_prob = -f2r1_prob / 10
 
@@ -603,63 +721,52 @@ def genotypeDSIndel(
     Pdmg_rev = np.zeros(pos_masked.size)
     Pdmg_bot = np.zeros(pos_masked.size)
     Pdmg_rev_bot = np.zeros(pos_masked.size)
-    # True for every deletion (always matches its own homopolymer) and
-    # for a homopolymer-matching insertion; False only for an insertion
-    # that indelErrorProbs routed to str.txt row 0. Saved per-candidate
-    # (unlike Pamp/Pdmg, which only need the aggregate probability) so
-    # Caller.py's channel/rate-table classification can route a real
-    # PASS call the same way indelErrorProbs itself did, instead of
-    # approximating every +-1bp call as HP-matched.
+    # Per-read reversion rate for the strand independence test.
+    rev_rate = np.zeros(pos_masked.size)
+    # False only for a 1bp insertion whose base differs from the next
+    # reference base (routed to str.txt row 0); Caller.py uses it to pick
+    # the call's channel.
     hp_match_arr = np.ones(pos_masked.size, dtype=bool)
     for nn in range(pos_masked.size):
-        # HP and STR context are both read at the shared context index
-        # (first deleted base / first base after the insertion point), the
-        # same position funcs/learn.py learns them at. hps is the
-        # self-derived homopolymer run length (hp_raw row0); strs is an
-        # independent lookup against the BED-derived STR annotation
-        # (str_raw), never mutually exclusive with it.
+        # HP and STR context, read independently at indel_context_index
+        # (same position as learning).
         anchor = indel_context_index(pos_masked[nn] - start)
-        hps[nn] = hp_raw[0, anchor]
-        unit_len_here = int(str_raw[0, anchor])
-        repeat_count_here = int(str_raw[1, anchor])
-        # 5 STR-length bins now (0="0-1"/not a real repeat, 1="2-9",
-        # 2="10-24", 3="25-39", 4="40+"), matching str.txt's 5 rows --
-        # was 4 bins (0-3, with 0 meaning "<10" rather than "not a real
-        # repeat") before this rewrite.
-        if unit_len_here >= 2:
-            total_len = unit_len_here * repeat_count_here
-            if total_len >= 40:
-                strs[nn] = 4
-            elif total_len >= 25:
-                strs[nn] = 3
-            elif total_len >= 10:
-                strs[nn] = 2
-            else:
-                strs[nn] = 1
-        else:
-            strs[nn] = 0
+        # Uncapped run length for the error cells (a deletion from an 11+
+        # run leaves a 10+ run); hps (the HP INFO field / channel) caps at 10.
+        hp_run = int(hp_raw[0, anchor])
+        hps[nn] = min(hp_run, 10)
+        # STR bins (str.txt rows): 0 = not a repeat, 1 = 2-9bp,
+        # 2 = 10-24bp, 3 = 25-39bp, 4 = 40+bp.
         idLen = indelLen_masked[nn]
         pos = pos_masked[nn]
-        if hps[nn] > 10:
-            hps[nn] = 10
-        # Only evaluated lazily for +-1bp indels, matching the original
-        # inline code, so this never indexes reference_int out of bounds for
-        # longer indels near the edge of the window. ref_allele is the
-        # reference base immediately after the insertion point / the
-        # deleted base itself -- same anchor (pos-start+1) for both
-        # directions, matching funcs/learn.py's accumulation exactly (the
-        # old learn-time code used a different, inconsistent anchor for
-        # deletions; this rewrite aligns the two).
+        indel_parts = indels_masked[nn].split(":")
+        raw_len = int(indel_parts[1])
+        # A >=2bp indel that isn't a slip of the tract at its context base
+        # (str_slip_tract) is STR0 ("not a repeat").
+        slip = str_slip_tract(
+            raw_len,
+            indel_parts[2] if raw_len > 0 else "",
+            anchor,
+            reference_int,
+            str_raw,
+        )
+        if slip is not None:
+            unit_len_here, total_len = slip
+            strs[nn] = str_length_bin(unit_len_here, total_len)
+            # Mutant tract (reference tract plus the uncapped indel
+            # length): its bin holds the reversion rate.
+            strs_mut = str_length_bin(unit_len_here, total_len + raw_len)
+        else:
+            strs[nn] = 0
+            strs_mut = 0
+        # ref_allele (1bp indels only): the deleted base, or the reference
+        # base right after the insertion point.
         if idLen == 1 or idLen == -1:
             ref_allele = int(reference_int[anchor])
         else:
             ref_allele = 0
-        # inserted_base: the actual base being inserted, read off the
-        # event's own sequence (indels_masked entries are "pos:len:seq"
-        # for insertions) -- only meaningful/used when idLen==1, where
-        # indelErrorProbs compares it against ref_allele to decide
-        # whether this is a real homopolymer-extending insertion (hp.txt)
-        # or an unrelated single-base insertion (str.txt row 0).
+        # inserted_base (1bp insertions): compared with ref_allele to pick
+        # hp.txt (run-extending) or str.txt row 0 (mismatched).
         if idLen == 1:
             inserted_seq = indels_masked[nn].split(":")[2]
             inserted_base = base2num.get(inserted_seq[0], -1) if inserted_seq else -1
@@ -674,7 +781,7 @@ def genotypeDSIndel(
             Pdmg_bot[nn],
             Pdmg_rev_bot[nn],
         ) = indelErrorProbs(
-            hps[nn],
+            hp_run,
             strs[nn],
             idLen,
             ref_allele,
@@ -683,6 +790,17 @@ def genotypeDSIndel(
             prob_dmg_hp,
             prob_amp_str,
             prob_dmg_str,
+            strs_mut,
+        )
+        rev_rate[nn] = indelReversionRate(
+            hp_run,
+            strs[nn],
+            idLen,
+            ref_allele,
+            inserted_base,
+            prob_amp_hp,
+            prob_amp_str,
+            strs_mut,
         )
     ln10 = np.log(10)
     F1R2_alt_prob, F1R2_ref_prob = calculateSSPosterior(
@@ -714,8 +832,9 @@ def genotypeDSIndel(
     )
     LR_masked = LL_B1 - LL_B2
     LR_max = indelMaxLR(Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot)
-    take = LR_masked >= 0
-    take[mask_multiallele == 0] = 0
+    LR_masked[np.abs(LR_masked) < LR_ZERO_TOL] = 0.0
+    # Negative-LR candidates are returned too, for the per-channel mu solve.
+    take = mask_multiallele != 0
     return (
         LR_masked[take],
         LR_max[take],
@@ -727,4 +846,5 @@ def genotypeDSIndel(
         f2r1_ref_count[take].astype("int"),
         f2r1_alt_count[take].astype("int"),
         hp_match_arr[take],
+        rev_rate[take],
     )

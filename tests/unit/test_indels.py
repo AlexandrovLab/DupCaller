@@ -7,16 +7,14 @@ Two bugs fixed together:
    not query bases. Any indel downstream of an N in the same read was
    reported at the wrong genomic position.
 
-2. getIndelArr's deletion branch scored an unaligned base immediately
-   after a deletion candidate's anchor as -1 (prob.py's multiallele-
-   conflict sentinel) unconditionally -- including when the read simply
-   ends there (a soft clip), which has nothing to do with the candidate.
-   Since -1 from a single read drops the whole candidate via
-   mask_multiallele, an unrelated trailing soft clip on one read could
-   silently kill a real deletion call for the whole family. The
-   insertion branch already special-cased this; the deletion branch now
-   does too, scoring 0 (uninformative) when the unaligned base is
-   outside the read's aligned span.
+2. getIndelArr guessed an allele for reads that can't show one: soft
+   clips matching an inserted sequence counted as ALT, reads ending right
+   after the anchor or partway through a deletion counted as REF, and a
+   read not overlapping the candidate at all counted as a conflict
+   (dropping the candidate). It now returns ALT only for the read's own
+   anchored CIGAR indel, REF only for a read aligned through the whole
+   locus, CONFLICT for a different indel inside the locus, and
+   UNINFORMATIVE otherwise.
 """
 import pysam
 
@@ -70,50 +68,99 @@ def test_soft_clip_still_advances_query_only():
 
 
 # -------------------------------------------------------------- getIndelArr
+import numpy as np
+
+from DupCaller_sub.funcs.indels import (
+    INDEL_ALT,
+    INDEL_CONFLICT,
+    INDEL_REF,
+    INDEL_UNINFORMATIVE,
+)
+
+# Non-repetitive around 104-107, so the deletion "104:-2" (removes GC at
+# 105-106) has one placement and needs REF reads through 107.
+REF = "ACGTTGCAAGCTTACGGATCCATGCAGTCA"
+REF_INT = np.array(["ATCG".index(b) for b in REF])
 
 
-def test_deletion_soft_clipped_right_after_anchor_is_uninformative():
-    """A read that ends (soft clip) immediately after a deletion
-    candidate's anchor must not be flagged as a competing allele (-1) --
-    that sentinel would drop the whole candidate for every read via
-    prob.py's mask_multiallele, even though this read simply doesn't
-    extend far enough to say anything about the candidate."""
-    read = _read([(0, 5), (4, 10)], seq="A" * 15, ref_start=100)
-    seqArr, _ = getIndelArr(read, ["104:-2"], min_bq=0)
-    assert seqArr[0] == 0
+def _arr(read, indel):
+    return getIndelArr(read, [indel], 0, REF_INT, 100)
 
 
-def test_deletion_real_competing_insertion_after_anchor_is_conflict():
-    """Sanity check the fix isn't over-broad: a genuine competing indel
-    (an insertion right where the candidate deletion would start) is
-    still a real multiallele conflict and must stay -1."""
-    read = _read([(0, 5), (1, 3), (0, 7)], seq="A" * 15, ref_start=100)
-    seqArr, _ = getIndelArr(read, ["104:-2"], min_bq=0)
-    assert seqArr[0] == -1
+def _ref_read(n, start=100, soft=0):
+    cigar = [(0, n)] + ([(4, soft)] if soft else [])
+    return _read(
+        cigar, seq=REF[start - 100 : start - 100 + n] + "T" * soft, ref_start=start
+    )
 
 
-def test_deletion_matching_read_scores_alt():
-    read = _read([(0, 5), (2, 2), (0, 8)], seq="A" * 13, ref_start=100)
-    seqArr, qualArr = getIndelArr(read, ["104:-2"], min_bq=0)
-    assert seqArr[0] == 1
-    assert qualArr[0] > 0
+def test_deletion_alt_and_ref():
+    alt = _read([(0, 5), (2, 2), (0, 8)], seq=REF[:5] + REF[7:15])
+    seqArr, qualArr = _arr(alt, "104:-2")
+    assert seqArr[0] == INDEL_ALT and qualArr[0] > 0
+    seqArr, qualArr = _arr(_ref_read(15), "104:-2")
+    assert seqArr[0] == INDEL_REF and qualArr[0] > 0
 
 
-def test_deletion_ref_read_scores_ref():
-    read = _read([(0, 15)], seq="A" * 15, ref_start=100)
-    seqArr, _ = getIndelArr(read, ["104:-2"], min_bq=0)
-    assert seqArr[0] == 0
+def test_read_ending_at_anchor_is_uninformative():
+    assert _arr(_ref_read(5, soft=10), "104:-2")[0][0] == INDEL_UNINFORMATIVE
+    assert _arr(_ref_read(5), "104:-2")[0][0] == INDEL_UNINFORMATIVE
 
 
-def test_insertion_soft_clip_window_checked_against_inserted_seq():
-    """Pre-existing behavior this change mirrors: an insertion candidate
-    whose inserted bases fall in a trailing soft clip is scored by
-    whether the clipped bases actually match the candidate sequence, not
-    unconditionally treated as a conflict."""
-    read_match = _read([(0, 5), (4, 2)], seq="AAAAA" + "CC", ref_start=100)
-    seqArr, _ = getIndelArr(read_match, ["104:2:CC"], min_bq=0)
-    assert seqArr[0] == 1
+def test_deletion_not_fully_spanned_is_uninformative():
+    # Must align 104..107 (deleted bases plus the next base) to be REF.
+    assert _arr(_ref_read(6), "104:-2")[0][0] == INDEL_UNINFORMATIVE
+    assert _arr(_ref_read(7, soft=3), "104:-2")[0][0] == INDEL_UNINFORMATIVE
+    assert _arr(_ref_read(8), "104:-2")[0][0] == INDEL_REF
 
-    read_mismatch = _read([(0, 5), (4, 2)], seq="AAAAA" + "GG", ref_start=100)
-    seqArr, _ = getIndelArr(read_mismatch, ["104:2:CC"], min_bq=0)
-    assert seqArr[0] == 0
+
+def test_non_overlapping_read_is_uninformative_not_conflict():
+    assert _arr(_ref_read(10, start=110), "104:-2")[0][0] == INDEL_UNINFORMATIVE
+
+
+def test_other_indel_in_locus_is_conflict():
+    ins = _read([(0, 5), (1, 3), (0, 7)], seq=REF[:5] + "GGG" + REF[5:12])
+    assert _arr(ins, "104:-2")[0][0] == INDEL_CONFLICT
+    longer_del = _read([(0, 5), (2, 3), (0, 7)], seq=REF[:5] + REF[8:15])
+    assert _arr(longer_del, "104:-2")[0][0] == INDEL_CONFLICT
+
+
+def test_indel_outside_locus_is_not_conflict():
+    far = _read([(0, 12), (2, 2), (0, 5)], seq=REF[:12] + REF[14:19])
+    assert _arr(far, "104:-2")[0][0] == INDEL_REF
+
+
+def test_insertion_soft_clips_are_uninformative_either_way():
+    match = _read([(0, 5), (4, 2)], seq=REF[:5] + "CC")
+    mismatch = _read([(0, 5), (4, 2)], seq=REF[:5] + "GG")
+    assert _arr(match, "104:2:CC")[0][0] == INDEL_UNINFORMATIVE
+    assert _arr(mismatch, "104:2:CC")[0][0] == INDEL_UNINFORMATIVE
+
+
+def test_insertion_at_read_end_needs_anchor():
+    trailing = _read([(0, 5), (1, 2)], seq=REF[:5] + "CC")
+    assert _arr(trailing, "104:2:CC")[0][0] == INDEL_UNINFORMATIVE
+    anchored = _read([(0, 5), (1, 2), (0, 8)], seq=REF[:5] + "CC" + REF[5:13])
+    assert _arr(anchored, "104:2:CC")[0][0] == INDEL_ALT
+    assert _arr(_ref_read(15), "104:2:CC")[0][0] == INDEL_REF
+
+
+def test_repeat_ref_needs_whole_run_and_left_aligned_alt():
+    # 100 CAAAAT...: +A anywhere in the A run left-aligns to anchor 100.
+    ref = "CAAAATGCGT"
+    ref_int = np.array(["ATCG".index(b) for b in ref])
+    inside = _read([(0, 4)], seq=ref[:4])
+    assert (
+        getIndelArr(inside, ["100:1:A"], 0, ref_int, 100)[0][0] == INDEL_UNINFORMATIVE
+    )
+    spans = _read([(0, 6)], seq=ref[:6])
+    assert getIndelArr(spans, ["100:1:A"], 0, ref_int, 100)[0][0] == INDEL_REF
+    shifted = _read([(0, 3), (1, 1), (0, 5)], seq=ref[:3] + "A" + ref[3:8])
+    assert getIndelArr(shifted, ["100:1:A"], 0, ref_int, 100)[0][0] == INDEL_ALT
+
+
+def test_reference_position_zero_is_aligned():
+    # Reference position 0 is a real aligned position, not "unaligned".
+    ref_int = np.array(["ATCG".index(b) for b in "ACGTACGTAC"])
+    read = _read([(0, 10)], seq="ACGTACGTAC", ref_start=0)
+    assert getIndelArr(read, ["0:-1"], 0, ref_int, 0)[0][0] == INDEL_REF

@@ -173,6 +173,8 @@ process CALL_VARIANTS {
     // random seed every run) -- set params.seed to pin it, e.g. to
     // reproduce/compare against a specific prior run's exact seed.
     def seed_arg     = params.seed != null                      ? "--seed ${params.seed}" : ""
+    // Omitted by default (DupCaller.py call's own default, 0.05, applies).
+    def pt_arg       = params.p_threshold != null               ? "-pt ${params.p_threshold}" : ""
     """
     DupCaller.py call \
         -b  ${tumor_bam} \
@@ -186,6 +188,7 @@ process CALL_VARIANTS {
         ${target_arg} \
         ${indel_arg} \
         ${seed_arg} \
+        ${pt_arg} \
         -maf ${params.max_af} \
         -gaf ${params.germline_af_cutoff} \
         -d   ${params.min_n_depth} \

@@ -1987,21 +1987,10 @@ def do_estimate(args):
             TAC = rec.samples["TUMOR"]["AC"]
             TDP = rec.samples["TUMOR"]["DP"]
 
-            # Classify by actual sequence content (classify_indel_channel,
-            # funcs/misc.py) as the ground truth for category (repeat-unit
-            # vs microhomology), with repeat-count read straight from
-            # hp.h5 (homopolymer events) or str.h5 (STR events, wherever
-            # its unit_len agrees with what was actually observed) — see
-            # classify_indel_channel's `anno` docstring for why that's
-            # safe, and why it isn't trusted for the category call itself.
-            # rec.pos is pysam's 1-based
-            # VCF POS (the anchor base), which numerically equals the
-            # 0-based index of the first affected base in ref.h5 — see
-            # funcs/misc.py's classify_indel_record docstring for why. That
-            # anchor is always left-aligned (funcs/indels.py's
-            # left_align_indel, applied at call time before this VCF was
-            # ever written), which is also why only ref_after is needed
-            # here — see the same docstring.
+            # ID83 channel from the event's sequence and the reference after
+            # it (classify_indel_channel), with the repeat count from
+            # hp.h5/str.h5. rec.pos (1-based anchor) is the 0-based index
+            # of the base after the anchor.
             F1R2 = rec.info["F1R2"]
             F2R1 = rec.info["F2R1"]
             duplex_no = str(F1R2) + "+" + str(F2R1)
@@ -2018,17 +2007,9 @@ def do_estimate(args):
                 after_start = rec.pos
             after_end = min(chrom_len, after_start + INDEL_CONTEXT_WINDOW)
             ref_after = _decode_ref_seq(ref_h5[rec.chrom][after_start:after_end])
-            # Annotation lookup at rec.pos: for a deletion that's the first
-            # deleted base (start of the deleted unit's own tract, since
-            # left-aligned); for an insertion that's the next reference
-            # base after the insertion point ("1bp next to the insertion
-            # locus") — both are exactly where the pre-existing repeat
-            # tract's own unit_len/repeat_count apply, matching the
-            # opportunity side's own convention (call.py). Read raw from
-            # hp.h5 and str.h5 independently (not load_repeat_context's
-            # STR-priority merge) since classify_indel_channel picks
-            # between them itself, keyed on the observed event's own unit
-            # length rather than on which annotation wins positionally.
+            # HP/STR annotation at the base after the anchor (first deleted
+            # base / first base after the insertion), the same position as
+            # indel_context_index; hp.h5 and str.h5 are read independently.
             anno = (
                 int(hp_h5[rec.chrom][0, rec.pos]),
                 int(str_h5[rec.chrom][0, rec.pos]),
@@ -2439,19 +2420,8 @@ def do_estimate(args):
                 # single-family site, and bias duplex_vaf's denominator low.
                 alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
                 is_snv = len(ref) == 1 and len(alt) == 1 and alt in alt_col
-                # For an indel, coverage.bed.gz's per-category columns
-                # (see indel_coverage_category_index / cov_mat_indel in
-                # funcs/call.py) are keyed one position after this
-                # record's own left-aligned VCF anchor -- POS marks the
-                # unchanged base before the event, not the event itself
-                # (a deletion's first deleted base, or an insertion's
-                # first potentially-run-extending reference base, both
-                # sit at anchor+1). Verified against real coverage.bed.gz
-                # rows for both deletions and insertions: querying at POS
-                # itself reads a column that's structurally 0 here (the
-                # hp/str "cut" flag lives on the adjacent base), while
-                # POS (used directly as the 0-based anchor+1 coordinate)
-                # reads the real, non-zero credit.
+                # coverage.bed.gz is keyed at the SNV position, or for an
+                # indel at the base after its anchor (0-based index = POS).
                 query_pos = pos - 1 if is_snv else pos
                 for row in tbx.fetch(chrom, query_pos, query_pos + 1):
                     parts = row.split("\t")
@@ -2643,14 +2613,7 @@ def do_estimate(args):
                 if rec.pos <= interval.start or rec.pos > interval.end:
                     continue
                 indel_count += 1
-                # Classify to its exact ID83 channel (funcs/misc.py's
-                # classify_indel_channel) -- same sequence-extraction logic
-                # and same hp.h5/str.h5 annotation lookup as the main
-                # indel83 pipeline above (see its own comment for why only
-                # ref_after is needed, given left-aligned VCF records), so
-                # mutation counts land at the same ID83 resolution the
-                # redistributed coverage side (indel_cov100_re, folded to
-                # ID83 below) does.
+                # Same ID83 classification as the main indel83 pipeline above.
                 indel_len = len(rec.alts[0]) - len(rec.ref)
                 chrom_len = ref_h5[rec.chrom].shape[0]
                 if indel_len < 0:

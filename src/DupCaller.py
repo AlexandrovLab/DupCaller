@@ -23,6 +23,20 @@ def nonnegative_int(value):
     return value
 
 
+def positive_float(value):
+    value = float(value)
+    if not value > 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return value
+
+
+def p_threshold_value(value):
+    value = float(value)
+    if not 0 <= value < 1:
+        raise argparse.ArgumentTypeError("must be in [0, 1); 0 disables the filter")
+    return value
+
+
 # from Estimate import do_estimate
 if __name__ == "__main__":
     """
@@ -139,6 +153,13 @@ if __name__ == "__main__":
         default=0.05,
     )
     call_parser.add_argument(
+        "-pt",
+        "--p_threshold",
+        type=p_threshold_value,
+        help="strand independence hypothesis filter: per-strand p threshold (not corrected for the number of calls). Each strand of each PASS SBS or indel call gets a p-value for its non-alt reads under per-read error (INFO MSP); calls with a strand p <= this are failed as strand_independence (a DBS with a failed SBS of its own read family fails too, along with its other SBS). Must be in [0, 1); 0 disables the filter (MSP is still reported)",
+        default=0.05,
+    )
+    call_parser.add_argument(
         "-mr",
         "--muterateprefix",
         type=str,
@@ -157,8 +178,8 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "-a",
         "--pseudocount",
-        type=float,
-        help="regularization pseudocount added to each channel's per-channel mixture-weight MLE solve (mu), making an interior root between 0 and 1 more likely; a channel where the solve still can't bracket a root falls back to mu=0 rather than being excluded",
+        type=positive_float,
+        help="regularization pseudocount (> 0) added to each channel's per-channel mixture-weight MLE solve (mu), making an interior root between 0 and 1 more likely; a channel where the solve still can't bracket a root falls back to mu=0 rather than being excluded",
         default=0.5,
     )
     call_parser.add_argument(
@@ -308,7 +329,7 @@ if __name__ == "__main__":
         "-z",
         type=float,
         help="Maximum fraction of bases in a read family that has 0 quality",
-        default=0.5,
+        default=0.9,
     )
     call_parser.add_argument(
         "--maxPileupDepth",

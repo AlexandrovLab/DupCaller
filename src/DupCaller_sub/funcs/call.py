@@ -14,6 +14,7 @@ import os
 import h5py
 import errno
 import copy
+from array import array
 from scipy.optimize import brentq
 
 from .depth import (
@@ -29,6 +30,7 @@ from .prob import (
     genotypeDSIndel,
     indelErrorProbs,
     indelMaxLR,
+    indel_strand_evidence,
     calculateSSPosterior,
     calculateDSPosterior,
 )
@@ -39,7 +41,16 @@ from .misc import load_repeat_context
 from .misc import log_progress
 from .misc import get_duplex_barcode
 from .misc import (
+    DEPTH_HPSTR_NCAT,
+    DEPTH_HPSTR_STR0_ANY,
+    STR_EEFF_LENGTHS,
+    depth_hpstr_str_bucket,
+    depth_hpstr_str0_bucket,
+    indel_eeff_site_masks,
+    indel_mu_channel,
+    str_tract_valid,
     determineTrimLength,
+    trim_mask,
     nums2str,
     get_bed_file_for_position,
     _filter_reason_label,
@@ -56,7 +67,7 @@ from .misc import (
     _index_rugged_mates,
     _drain_rugged_pool,
 )
-from .indels import findIndels
+from .indels import findIndels, indel_mask_span
 
 
 def prepare_reference_mats(
@@ -246,6 +257,8 @@ def _process_duplex_family(
     trinuc_np,
     unmasked_coverage,
     unmasked_coverage_indel_cat,
+    neg_lr_sbs=None,
+    neg_lr_indel=None,
 ):
     """Genotype and record one candidate duplex family, mutating the
     caller's per-process accumulators (coverage, indel100, VCF-record
@@ -302,8 +315,7 @@ def _process_duplex_family(
     left, right = determineTrimLength(
         readSet[max_ref_num], params=params, processed_flag=processed_flag
     )
-    masks[5, :left] = True
-    masks[5, -right:] = True
+    masks[5, :] = trim_mask(masks.shape[1], left, right)
     antimask = np.all(~masks, axis=0)
     antimask[trinuc_np[start_ind:end_ind] > 64] = False
     antimask[ref_np[start_ind:end_ind] == 4] = False
@@ -342,8 +354,7 @@ def _process_duplex_family(
         left, right = determineTrimLength(
             readSet[max_ref_num], params=params, processed_flag=processed_flag
         )
-        masks_indel[3, :left] = True
-        masks_indel[3, -right:] = True
+        masks_indel[3, :] = trim_mask(masks_indel.shape[1], left, right)
         masks_indel[4, :] = include_mask[start_ind:end_ind_max]
         masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
         antimask_indel = np.all(~masks_indel, axis=0)
@@ -363,6 +374,7 @@ def _process_duplex_family(
             F2R1_ref_count,
             F2R1_alt_count,
             hp_match,
+            rev_rate,
         ) = genotypeDSIndel(
             readSet,
             rs_reference_start,
@@ -438,17 +450,39 @@ def _process_duplex_family(
                 continue
             if F2R1_alt_count[pass_inds[nn]] + F2R1_ref_count[pass_inds[nn]] == 0:
                 continue
-            if indel_size > 0:
-                offset = 0
-            else:
-                offset = -indel_size
-            indel_slice_start = indel_pos - reference_mat_start - start_ind
-            indel_slice = slice(indel_slice_start, indel_slice_start + offset + 1)
-            # See the matching block earlier in this function for
-            # the full explanation.
-            if not LR_pass_bool[nn]:
+            # Anchor plus the deleted bases / the insertion's context base,
+            # as in learning and the Eeff site masks.
+            indel_slice = slice(
+                *indel_mask_span(
+                    indel_pos - reference_mat_start - start_ind, indel_size
+                )
+            )
+            # LR < 0: only where every other filter passes, its log10 LR
+            # goes to neg_lr_indel[channel] as a mu-solve input; no record
+            # (it skips depth extraction and is never written to a VCF).
+            if LR_raw[pass_inds[nn]] < 0:
+                if (
+                    neg_lr_indel is None
+                    or params.get("coverage_only", False)
+                    or flt_rs != "PASS"
+                    or not antimask_indel[indel_slice].all()
+                ):
+                    continue
+                channel = indel_mu_channel(
+                    indel_size,
+                    int(hps[pass_inds[nn]]),
+                    int(strs[nn]),
+                    int(hp_match[pass_inds[nn]]),
+                    indel_ref[1] if indel_size < 0 else indel_alt[1],
+                )
+                if channel is not None:
+                    neg_lr_indel.setdefault(channel, array("f")).append(
+                        LR_raw[pass_inds[nn]]
+                    )
                 continue
-            if antimask_indel[indel_slice].all():
+            elif not LR_pass_bool[nn]:
+                continue
+            elif antimask_indel[indel_slice].all():
                 flt = flt_rs
             elif unmasked_antimask_indel[indel_slice].all():
                 flt = "masked"
@@ -486,6 +520,27 @@ def _process_duplex_family(
                     # "LR": LR[pass_inds[0]],
                     "LR": LR_raw[pass_inds[nn]],
                     "LM": LR_max[pass_inds[nn]],
+                    # Filled in by Caller.py for PASS calls from _strand
+                    # (per strand: informative reads, REF reads, reversion
+                    # rate); _strand is not written to the VCF. Only a
+                    # round-1 PASS record can end up a PASS call.
+                    "MSP": ".",
+                    "_strand": (
+                        (
+                            indel_strand_evidence(
+                                F1R2_alt_count[pass_inds[nn]],
+                                F1R2_ref_count[pass_inds[nn]],
+                                rev_rate[pass_inds[nn]],
+                            ),
+                            indel_strand_evidence(
+                                F2R1_alt_count[pass_inds[nn]],
+                                F2R1_ref_count[pass_inds[nn]],
+                                rev_rate[pass_inds[nn]],
+                            ),
+                        )
+                        if flt == "PASS" and not params.get("coverage_only", False)
+                        else None
+                    ),
                     # "BLR": F2R1_LR[pass_inds[0]],
                     "TC": ",".join(
                         [
@@ -560,6 +615,11 @@ def _process_duplex_family(
             unmasked_antimask,
             F1R2_count,
             F2R1_count,
+            strand_ev_F1R2,
+            strand_ev_F2R1,
+            neg_pos,
+            neg_alt,
+            neg_LR,
         ) = genotypeDSSnv(
             readSet,
             rs_reference_start,
@@ -619,6 +679,9 @@ def _process_duplex_family(
                 hp_raw_np[0, start_ind:end_ind].astype(int), 10
             )
             hp_bucket_row = ref_allele_safe * 10 + hp_run_capped10 - 1
+            # L_indel_1bp's run axis keeps exactly-10 and 11+ apart: a
+            # deletion from an 11+ run reverts as a 10+ run.
+            hp_run_power = np.minimum(hp_raw_np[0, start_ind:end_ind].astype(int), 11)
             str_unit_row = str_raw_np[0, start_ind:end_ind].astype(int)
             str_repeat_row = str_raw_np[1, start_ind:end_ind].astype(int)
             is_real_str_row = str_unit_row >= 2
@@ -627,7 +690,6 @@ def _process_duplex_family(
             str_bin_row[is_real_str_row & (total_len_row >= 10)] = 2
             str_bin_row[is_real_str_row & (total_len_row >= 25)] = 3
             str_bin_row[is_real_str_row & (total_len_row >= 40)] = 4
-            str_bucket_row = 39 + str_bin_row
             unit_len_clamped = np.clip(unit_len_arr, 2, 5)
             n_top_indel = np.minimum(F1R2_count.sum(axis=0), 9).astype(int)
             n_bot_indel = np.minimum(F2R1_count.sum(axis=0), 9).astype(int)
@@ -656,7 +718,11 @@ def _process_duplex_family(
             hp_cut_bool = hp_raw_np[1, start_ind:end_ind].astype(bool)
             hp_repeat_valid = _run_boundary_valid(hp_cut_bool) & antimask_indel
             str_cut_bool = str_raw_np[2, start_ind:end_ind].astype(bool)
-            str_repeat_valid = _run_boundary_valid(str_cut_bool) & antimask_indel
+            # str.h5 flags only tract starts, so validity comes from each
+            # tract's own end, not from the next cut (str_tract_valid).
+            str_repeat_valid = (
+                str_tract_valid(str_cut_bool, total_len_row) & antimask_indel
+            )
             unit_len_clamped_str = np.clip(str_unit_row, 2, 5)
             # Reference base immediately following each position,
             # needed for the "Insertion A/T/C/G" columns below and
@@ -749,16 +815,12 @@ def _process_duplex_family(
             # call site earlier in this function for the full
             # explanation.
             cov_mat_indel[:, 14] = (
-                L_indel_1bp[
-                    n_top_indel, n_bot_indel, hp_run_capped10, ref_allele_safe, 0
-                ]
+                L_indel_1bp[n_top_indel, n_bot_indel, hp_run_power, ref_allele_safe, 0]
                 * hp_repeat_valid
                 * hp_cut_bool
             )
             cov_mat_indel[:, 15] = (
-                L_indel_1bp[
-                    n_top_indel, n_bot_indel, hp_run_capped10, ref_allele_safe, 1
-                ]
+                L_indel_1bp[n_top_indel, n_bot_indel, hp_run_power, ref_allele_safe, 1]
                 * hp_repeat_valid
                 * hp_cut_bool
             )
@@ -812,7 +874,7 @@ def _process_duplex_family(
             # the position's own raw hp run/cut, regardless of any
             # STR annotation there too.
             hp_del_power = L_indel_1bp[
-                n_top_indel, n_bot_indel, hp_run_capped10, ref_allele_safe, 0
+                n_top_indel, n_bot_indel, hp_run_power, ref_allele_safe, 0
             ]
             del_bucket = np.clip(hp_run_capped10, 1, 6) - 1
             _accumulate_indel100(
@@ -829,7 +891,7 @@ def _process_duplex_family(
             # (see Estimate.py's
             # override_inshp0_with_next_base_opportunity).
             hp_ins_power = L_indel_1bp[
-                n_top_indel, n_bot_indel, hp_run_capped10, ref_allele_safe, 1
+                n_top_indel, n_bot_indel, hp_run_power, ref_allele_safe, 1
             ]
             ins_bucket = np.clip(hp_run_capped10, 1, 5) - 1
             _accumulate_indel100(
@@ -958,6 +1020,26 @@ def _process_duplex_family(
         unmasked_pass_bool[muts_ind] = True
         pass_bool = np.copy(unmasked_pass_bool)
         pass_bool[~antimask] = False
+        # LR < 0 sites that pass every other filter (unmasked, family PASS,
+        # reads on both strands) go to neg_lr_sbs[trinuc * 4 + base] for
+        # the per-channel mu solve. Round 1 only.
+        if (
+            neg_lr_sbs is not None
+            and neg_pos.size
+            and flt_rs == "PASS"
+            and not params.get("coverage_only", False)
+        ):
+            neg_trinuc = trinuc_np[start_ind:end_ind][neg_pos]
+            neg_ok = (
+                pass_bool[neg_pos]
+                & (F1R2_count[:, neg_pos].sum(axis=0) > 0)
+                & (F2R1_count[:, neg_pos].sum(axis=0) > 0)
+                & (neg_trinuc < 64)
+            )
+            for k, lr in zip(
+                (neg_trinuc * 4 + neg_alt)[neg_ok].tolist(), neg_LR[neg_ok].tolist()
+            ):
+                neg_lr_sbs[k].append(lr)
         pos = [mut_ind + start_ind + reference_mat_start for mut_ind in muts_ind]
         mut_positions = [
             mut_ind + start_ind + reference_mat_start + 1 for mut_ind in muts_ind
@@ -1025,6 +1107,18 @@ def _process_duplex_family(
                     "F2R1": F2R1,
                     "LR": LR_raw_mut[muts_ind_compressed[nn]],
                     "LM": LR_max_mut[muts_ind_compressed[nn]],
+                    # Filled in by Caller.py for PASS calls from _strand
+                    # (not written to the VCF). Only a round-1 PASS record
+                    # can end up a PASS call.
+                    "MSP": ".",
+                    "_strand": (
+                        (
+                            strand_ev_F1R2[muts_ind_compressed[nn]],
+                            strand_ev_F2R1[muts_ind_compressed[nn]],
+                        )
+                        if flt == "PASS" and not params.get("coverage_only", False)
+                        else None
+                    ),
                     # "BLR": F2R1_LR[muts_ind[nn]],
                     # "LR": LR[muts_ind[nn]],
                     "TC": ",".join(
@@ -1100,30 +1194,76 @@ def _process_duplex_family(
                 # matching block earlier in this function for the
                 # full explanation).
                 trinuc_ctx = trinuc_np[start_ind:end_ind]
+                # Eeff covers the same sites as the mu solve's candidates:
+                # SBS excludes snp_mask/noise_mask (pass_bool); indels use
+                # the indel masks and one site per run/tract
+                # (indel_eeff_site_masks), with the depth bucket taken at
+                # the anchor (the base before the context base), which
+                # every read that can show the event covers -- a deletion
+                # read has no base at a deleted context base.
+                n_top_anchor = np.zeros_like(n_top_indel)
+                n_top_anchor[1:] = n_top_indel[:-1]
+                n_bot_anchor = np.zeros_like(n_bot_indel)
+                n_bot_anchor[1:] = n_bot_indel[:-1]
+                (
+                    hp_eeff_bool,
+                    str_eeff_by_len,
+                    str0_any_eeff_bool,
+                    str0_eeff_by_len,
+                ) = indel_eeff_site_masks(
+                    antimask_indel,
+                    ref_int,
+                    hp_cut_bool,
+                    hp_repeat_valid,
+                    str_unit_row,
+                    total_len_row,
+                    str_cut_bool,
+                    str_repeat_valid,
+                )
                 _accumulate_depth_matrix(
                     depth_by_trinuc,
                     n_top_indel,
                     n_bot_indel,
                     trinuc_ctx,
-                    unmasked_pass_bool & (trinuc_ctx < 64),
+                    pass_bool & (trinuc_ctx < 64),
                     64,
                 )
                 _accumulate_depth_matrix(
                     depth_by_hpstr,
-                    n_top_indel,
-                    n_bot_indel,
+                    n_top_anchor,
+                    n_bot_anchor,
                     hp_bucket_row,
-                    unmasked_pass_bool,
-                    44,
+                    hp_eeff_bool,
+                    DEPTH_HPSTR_NCAT,
                 )
                 _accumulate_depth_matrix(
                     depth_by_hpstr,
-                    n_top_indel,
-                    n_bot_indel,
-                    str_bucket_row,
-                    unmasked_pass_bool & is_real_str_row,
-                    44,
+                    n_top_anchor,
+                    n_bot_anchor,
+                    np.full(window_len, DEPTH_HPSTR_STR0_ANY),
+                    str0_any_eeff_bool,
+                    DEPTH_HPSTR_NCAT,
                 )
+                for k in STR_EEFF_LENGTHS:
+                    for signed_k in (-k, k):
+                        _accumulate_depth_matrix(
+                            depth_by_hpstr,
+                            n_top_anchor,
+                            n_bot_anchor,
+                            depth_hpstr_str_bucket(
+                                np.maximum(str_bin_row, 1), signed_k
+                            ),
+                            str_eeff_by_len[signed_k],
+                            DEPTH_HPSTR_NCAT,
+                        )
+                        _accumulate_depth_matrix(
+                            depth_by_hpstr,
+                            n_top_anchor,
+                            n_bot_anchor,
+                            np.full(window_len, depth_hpstr_str0_bucket(signed_k)),
+                            str0_eeff_by_len[signed_k],
+                            DEPTH_HPSTR_NCAT,
+                        )
                 dinuc_ctx = ref_allele_safe * 4 + np.where(
                     next_ref_arr >= 0, next_ref_arr, 0
                 )
@@ -1277,6 +1417,11 @@ def callBam(params, processNo):
     FPs = []
     RPs = []
     indel_dict = dict()
+    # log10 LRs (float32) of the LR < 0 sites for the mu solve: SBS per
+    # trinuc * 4 + base, indels per indel_mu_channel name (see
+    # _process_duplex_family); returned last as arrays, pooled by Caller.py.
+    neg_lr_sbs = [array("f") for _ in range(256)]
+    neg_lr_indel = {}
     mismatch_mat = np.zeros([64, 4])
     hp_alt_mat = np.zeros([10, 12])
     str_alt_mat = np.zeros([5, 11])
@@ -1310,9 +1455,9 @@ def callBam(params, processNo):
     # window boundaries and no cross-process boundary merging to do; see
     # _accumulate_depth_matrix.
     depth_by_trinuc = np.zeros((10, 10, 64), dtype=np.int64)  # 64 trinuc contexts
-    depth_by_hpstr = np.zeros(
-        (10, 10, 44), dtype=np.int64
-    )  # 40 hp (A/T/C/G x len 1-10, capped) + 4 str buckets
+    # 40 hp (A/T/C/G x len 1-10, capped) + 16 STR (bin x length) + 5 STR0
+    # buckets, see DEPTH_HPSTR_NCAT.
+    depth_by_hpstr = np.zeros((10, 10, DEPTH_HPSTR_NCAT), dtype=np.int64)
     depth_by_dinuc = np.zeros((10, 10, 16), dtype=np.int64)  # 16 dinuc contexts
     starttime = time.time()
     tumorBam = BAM(bam, "rb", params.get("reference"))
@@ -1514,9 +1659,9 @@ def callBam(params, processNo):
 
     # Build indel detection-power tables, analogous to L above but for indel
     # calling. genotypeDSIndel classifies each candidate indel by repeat
-    # context (hps: homopolymer run length 0-10, capped; strs: STR length
-    # bin 0-3)
-    # and indel length (idLen), then selects Pamp/Pdmg via indelErrorProbs.
+    # context (hps: homopolymer run length; strs: STR bin 0-4, 0 = not a
+    # whole-unit slip of an STR) and indel length (idLen), then selects
+    # Pamp/Pdmg via indelErrorProbs.
     # These tables simulate that same selection across every (top count,
     # bottom count) combination and precompute the fraction of simulations
     # that would clear indel calling's per-context pcutoffi threshold, so
@@ -1568,7 +1713,9 @@ def callBam(params, processNo):
             )
 
         # 1bp indels (deletion/insertion of a homopolymer's repeat unit):
-        # axes are top count, bottom count, hps (0-10, capped), ref_allele
+        # axes are top count, bottom count, hps (0-11: run length, 11 = 11+;
+        # a deletion from an 11+ run reverts as 10+, one from a run of
+        # exactly 10 as 9 -- see _indel_error_cells), ref_allele
         # (0-3), sign (0=deletion idLen=-1, 1=insertion idLen=+1).
         # inserted_base is passed equal to ref_allele_c throughout -- this
         # grid represents the true same-base homopolymer-extension
@@ -1580,10 +1727,10 @@ def callBam(params, processNo):
         # docstring and Caller.py's channel job-building for the same
         # scoping note; such candidates still get scored correctly by
         # genotypeDSIndel, they just don't get an FDR-refined threshold.
-        L_indel_1bp = np.zeros([10, 10, 11, 4, 2])
+        L_indel_1bp = np.zeros([10, 10, 12, 4, 2])
         indel_1bp_threshold_override = params.get("indel_1bp_threshold_override", {})
         if coverage_only:
-            for hps_c in range(11):
+            for hps_c in range(12):
                 for ref_allele_c in range(4):
                     for sign_idx, idLen_c in enumerate((-1, 1)):
                         (
@@ -1611,8 +1758,9 @@ def callBam(params, processNo):
                         # Caller.py's raw_lr_hp accumulation -- base2num
                         # order A,T,C,G, so ref_allele_c in (2,3) is "C".
                         pool_c = "C" if ref_allele_c in (2, 3) else "T"
+                        # Channels stop at HP10 (10+).
                         threshold = indel_1bp_threshold_override.get(
-                            (hps_c, sign_idx, pool_c),
+                            (min(hps_c, 10), sign_idx, pool_c),
                             indelContextThreshold(
                                 Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
                             ),
@@ -2180,6 +2328,8 @@ def callBam(params, processNo):
                         trinuc_np,
                         unmasked_coverage,
                         unmasked_coverage_indel_cat,
+                        neg_lr_sbs=neg_lr_sbs,
+                        neg_lr_indel=neg_lr_indel,
                     ):
                         duplex_count += 1
             """
@@ -2538,6 +2688,8 @@ def callBam(params, processNo):
                 trinuc_np,
                 unmasked_coverage,
                 unmasked_coverage_indel_cat,
+                neg_lr_sbs=neg_lr_sbs,
+                neg_lr_indel=neg_lr_indel,
             ):
                 duplex_count += 1
     """
@@ -2987,4 +3139,6 @@ def callBam(params, processNo):
         L,
         L_indel_1bp,
         L_indel_len,
+        [np.frombuffer(lrs, dtype=np.float32) for lrs in neg_lr_sbs],
+        {k: np.frombuffer(v, dtype=np.float32) for k, v in neg_lr_indel.items()},
     )

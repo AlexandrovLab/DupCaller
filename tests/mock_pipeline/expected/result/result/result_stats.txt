@@ -5,8 +5,8 @@ Unmasked Coverage	1264.0
 Per Read Family Coverage 	79.0
 Pass-filter Duplication Rate	        0.8333333333333334
 Efficiency	0.16666666666666666
-Total SBS FDR	8.103047014367311e-11
-Total Indel FDR	3.527242318463029e-08
+Total SBS FDR	8.103079150931604e-11
+Total Indel FDR	nan
 Total DBS FDR	nan
 SBS Base Coverage	1264.0
 Indel Base Coverage	1264.6138944783602

@@ -157,9 +157,11 @@ def parse_stats_file(path):
 # the reference sequence, homopolymers only) and a new str.h5 (3 rows:
 # unit_len, hp, cut — still built from --repeatBed/--strbed, restricted to
 # unit_len>=2). See Index.py's do_index and funcs/misc.py's
-# load_repeat_context. `DupCaller.py index` (Index.py) stamps this onto
+# load_repeat_context. Version 3 resolves overlapping PERF tracts in str.h5
+# (Index.py's resolve_str_overlaps), so every flagged start carries its own
+# tract's unit/count. `DupCaller.py index` (Index.py) stamps this onto
 # each h5 file's root attrs; check_h5_usable below verifies it.
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 
 
 def check_h5_usable(h5_path, expected_ndim=None):
@@ -1403,6 +1405,18 @@ def bamIterateMultipleRegion(bam, regions, ref, regionFile=None):
                     yield rec, region
 
 
+def trim_mask(n, left, right):
+    """Boolean mask over a family's n window positions marking the first
+    `left` and last `right` as trimmed. right == 0 trims nothing (a bare
+    `mask[-0:]` would select the whole row)."""
+    mask = np.zeros(n, dtype=bool)
+    if left > 0:
+        mask[:left] = True
+    if right > 0:
+        mask[-right:] = True
+    return mask
+
+
 def determineTrimLength(seq, params, processed_flag):
     if seq.template_length > 0 and not processed_flag:
         overlap = 0  # Never mask overlap of forward read
@@ -1859,6 +1873,73 @@ def apply_sbs_low_coverage_fallback(
     return out
 
 
+def ref_conditional_error_rates(rates, ref_col, fallback_rates):
+    """Turn a per-context error-rate matrix into the binary-model rates the
+    genotyper consumes: P(read shows this error | read shows this error or
+    the reference).
+
+    Per row, the reference rate is recomputed as 1 - sum(every other entry
+    in the row). A row whose reference rate comes out negative (its error
+    rates, after fallback substitution/monotonicity, sum past 1) is
+    replaced wholesale by that row of `fallback_rates` and recomputed the
+    same way. Each non-reference entry P then becomes P / (Pref + P); the
+    reference column holds Pref itself.
+
+    rates/fallback_rates: (rows, cols); ref_col: scalar or per-row column
+    index of the reference entry.
+    """
+    out = np.array(rates, dtype=float)
+    n = out.shape[0]
+    idx = np.arange(n)
+    ref_col = np.broadcast_to(np.asarray(ref_col), (n,))
+    alt_mask = np.ones_like(out, dtype=bool)
+    alt_mask[idx, ref_col] = False
+    ref = 1 - np.where(alt_mask, out, 0).sum(axis=1)
+    bad = ref < 0
+    if bad.any():
+        out[bad] = np.asarray(fallback_rates, dtype=float)[bad]
+        ref[bad] = 1 - np.where(alt_mask[bad], out[bad], 0).sum(axis=1)
+        if (ref < 0).any():
+            raise ValueError(
+                "Fallback error profile has a row whose error rates sum past 1"
+            )
+    denom = out + ref[:, None]
+    cond = np.divide(out, denom, out=np.zeros_like(out), where=denom > 0)
+    out[alt_mask] = cond[alt_mask]
+    out[idx, ref_col] = ref
+    return out
+
+
+def _sbs_ref_cols():
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    _, num2trinuc = build_trinuc64_order()
+    return np.array([base2num[trinuc[1]] for trinuc in num2trinuc])
+
+
+def _hp_ref_conditional(rates, fallback_counts, pseudocount):
+    """ref_conditional_error_rates per (hp_len, base) 3-column group of a
+    normalized (10, 12) hp matrix: ref (idLen=0, col 1) = 1 - del - ins."""
+    out = np.array(rates, dtype=float)
+    for g in range(4):
+        fb_block = fallback_counts[:, g * 3 : g * 3 + 3]
+        fb_rates = (fb_block + pseudocount) / (
+            fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
+        )
+        out[:, g * 3 : g * 3 + 3] = ref_conditional_error_rates(
+            out[:, g * 3 : g * 3 + 3], 1, fb_rates
+        )
+    return out
+
+
+def _str_ref_conditional(rates, fallback_counts, pseudocount):
+    """ref_conditional_error_rates on a normalized (5, 11) str matrix:
+    ref (idLen=0, col 5) = 1 - sum(other 10 columns)."""
+    fb_rates = (fallback_counts + pseudocount) / (
+        fallback_counts.sum(axis=1, keepdims=True) + 11 * pseudocount
+    )
+    return ref_conditional_error_rates(rates, 5, fb_rates)
+
+
 def load_error_matrices(params):
     """Load and regularize the SBS (amperr/dmgerr) and indel
     (amperri/dmgerri) error-rate matrices from the files named in params,
@@ -1912,7 +1993,12 @@ def load_error_matrices(params):
         )
     # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
     # No further regularization here -- estimate_sbs_srd_rates already
-    # returns the fully pseudocount-smoothed rate.
+    # returns the fully pseudocount-smoothed rate. Convert to the binary
+    # model's P(error | error or ref), see ref_conditional_error_rates.
+    if not isLearn:
+        ampmat = ref_conditional_error_rates(
+            ampmat, _sbs_ref_cols(), _read_fallback_counts(".amp.tn.srd.txt")
+        )
     ampmat_min_error = ampmat.min(axis=1, keepdims=True)
     ampmat = np.concatenate([ampmat, ampmat_min_error], axis=1)
     params["ampmat"] = ampmat
@@ -1944,14 +2030,14 @@ def load_error_matrices(params):
             dtype=float
         )
         pseudocount = params.get("pseudocount", 0.5)
-        ampmat_hp = _normalize_indel_hp_mat(
-            ampmat_hp, pseudocount, _read_fallback_counts(".amp.hp.txt")
-        )
+        amp_hp_fb = _read_fallback_counts(".amp.hp.txt")
+        ampmat_hp = _normalize_indel_hp_mat(ampmat_hp, pseudocount, amp_hp_fb)
+        ampmat_hp = _hp_ref_conditional(ampmat_hp, amp_hp_fb, pseudocount)
         params["ampmat_hp"] = ampmat_hp
 
-        ampmat_str = _normalize_indel_str_mat(
-            ampmat_str, pseudocount, _read_fallback_counts(".amp.str.txt")
-        )
+        amp_str_fb = _read_fallback_counts(".amp.str.txt")
+        ampmat_str = _normalize_indel_str_mat(ampmat_str, pseudocount, amp_str_fb)
+        ampmat_str = _str_ref_conditional(ampmat_str, amp_str_fb, pseudocount)
         params["ampmat_str"] = ampmat_str
 
     # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
@@ -1984,6 +2070,7 @@ def load_error_matrices(params):
             fallback_counts.sum(axis=1, keepdims=True) + 4 * pseudocount
         )
         dmgmat = apply_sbs_low_coverage_fallback(dmgmat, dmgmat_counts, fallback_rates)
+        dmgmat = ref_conditional_error_rates(dmgmat, _sbs_ref_cols(), fallback_rates)
     # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
     dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
@@ -2028,14 +2115,14 @@ def load_error_matrices(params):
         dmgmat_str = pd.read_csv(dmgerri_str_file, sep="\t", index_col=0).to_numpy(
             dtype=float
         )
-        dmgmat_hp = _normalize_indel_hp_mat(
-            dmgmat_hp, pseudocount, _read_fallback_counts(".dmg.hp.txt")
-        )
+        dmg_hp_fb = _read_fallback_counts(".dmg.hp.txt")
+        dmgmat_hp = _normalize_indel_hp_mat(dmgmat_hp, pseudocount, dmg_hp_fb)
+        dmgmat_hp = _hp_ref_conditional(dmgmat_hp, dmg_hp_fb, pseudocount)
         params["dmgmat_hp"] = dmgmat_hp
 
-        dmgmat_str = _normalize_indel_str_mat(
-            dmgmat_str, pseudocount, _read_fallback_counts(".dmg.str.txt")
-        )
+        dmg_str_fb = _read_fallback_counts(".dmg.str.txt")
+        dmgmat_str = _normalize_indel_str_mat(dmgmat_str, pseudocount, dmg_str_fb)
+        dmgmat_str = _str_ref_conditional(dmgmat_str, dmg_str_fb, pseudocount)
         params["dmgmat_str"] = dmgmat_str
 
 
@@ -2149,6 +2236,140 @@ def simulate_power_grid(
     return grid
 
 
+# depth_by_hpstr's context axis:
+#   0-39   homopolymer: base * 10 + run length (1-10+) - 1
+#   40-71  STR bin 1-4 x indel length 2-5+ x deletion/insertion: slip sites
+#          (depth_hpstr_str_bucket)
+#   72     STR0 1bp (mismatched insertion): every position
+#   73-80  STR0 indel length 2-5+ x deletion/insertion: sites of a non-slip
+#          indel of that length (depth_hpstr_str0_bucket)
+# Deletions and insertions are split because their sites and masks differ:
+# a deletion needs every deleted base unmasked and can only sit where it
+# can't left-align further; an insertion that isn't a slip can sit
+# anywhere.
+DEPTH_HPSTR_STR_BASE = 40
+DEPTH_HPSTR_STR0_ANY = 72
+DEPTH_HPSTR_STR0_LEN_BASE = 73
+DEPTH_HPSTR_NCAT = 81
+STR_EEFF_LENGTHS = (2, 3, 4, 5)
+
+
+def _signed_len_offset(indel_len):
+    """Offset of a signed indel length 2-5+ within its 8 buckets: length
+    pairs, deletion first."""
+    return (min(abs(indel_len), 5) - 2) * 2 + (1 if indel_len > 0 else 0)
+
+
+def depth_hpstr_str_bucket(str_bin, indel_len):
+    """depth_by_hpstr bucket of STR bin 1-4 and signed indel length 2-5+."""
+    return DEPTH_HPSTR_STR_BASE + (str_bin - 1) * 8 + _signed_len_offset(indel_len)
+
+
+def depth_hpstr_str0_bucket(indel_len):
+    """depth_by_hpstr bucket of an STR0 channel of this signed indel length."""
+    if abs(indel_len) == 1:
+        return DEPTH_HPSTR_STR0_ANY
+    return DEPTH_HPSTR_STR0_LEN_BASE + _signed_len_offset(indel_len)
+
+
+def str_tract_valid(str_cut_bool, total_len):
+    """STR tract starts of one family window whose tract can be scored: its
+    anchor (the base before the start) and the base after the tract
+    (start + unit * repeat count) both fall inside the window."""
+    p = np.arange(str_cut_bool.shape[0])
+    return str_cut_bool & (p >= 1) & (p + total_len < str_cut_bool.shape[0])
+
+
+def indel_eeff_site_masks(
+    antimask_indel,
+    ref_int,
+    hp_cut_bool,
+    hp_repeat_valid,
+    str_unit,
+    str_total_len,
+    str_cut_bool,
+    str_repeat_valid,
+):
+    """Positions of one family window that count toward each indel
+    channel's Eeff (depth_by_hpstr): exactly where a candidate of that
+    channel can be called. A site is the context base (anchor + 1). Every
+    site needs the anchor and the context base unmasked (antimask_indel, the
+    indel masks, no snp_mask), an ACGT context base and an anchor that isn't
+    the window's first base (indel_has_context); a deletion of k also needs
+    all k deleted bases unmasked and inside the window, and the base after
+    them to differ from the anchor (otherwise it left-aligns further), the
+    same span as indel_mask_span.
+
+    HP: one site per run, its first base, skipping runs cut by the window
+    edge (hp_repeat_valid). STR(+-k): tract starts whose unit divides k
+    (str_slip_tract), whose tract fits the window (str_repeat_valid), and
+    for a deletion k <= the tract length. STR0(+k): every site (an
+    insertion that isn't copies of the tract's unit can go anywhere).
+    STR0(-k): every deletion site that isn't an STR(-k) slip. The capped 5+
+    length pools 5, 6, 7, ...; it is approximated with k = 5's mask span,
+    every tract start for STR and no left-alignment test.
+
+    str_unit: the STR unit length at each position (0/1 outside an STR);
+    str_total_len: the tract length (unit * repeat count).
+    Returns (hp, str_by_len, str0_any, str0_by_len), str_by_len and
+    str0_by_len keyed by signed length +-STR_EEFF_LENGTHS."""
+    n = antimask_indel.shape[0]
+    site_ok = antimask_indel & (ref_int < 4)
+    site_ok[1:] &= antimask_indel[:-1]
+    site_ok[:2] = False
+    p = np.arange(n)
+    # masked_before[i]: masked positions in [0, i).
+    masked_before = np.concatenate(([0], np.cumsum(~antimask_indel)))
+    is_str = str_unit >= 2
+    unit = np.maximum(str_unit, 1)
+    # str_length_bin: a tract needs two units to be a repeat.
+    str_start = str_cut_bool & is_str & (str_total_len >= 2 * unit)
+    str_by_len = {}
+    str0_by_len = {}
+    for k in STR_EEFF_LENGTHS:
+        end = np.minimum(p + k, n)
+        del_ok = site_ok & (p + k <= n) & (masked_before[end] - masked_before[p] == 0)
+        if k == STR_EEFF_LENGTHS[-1]:
+            slip_ins = str_start
+            slip_del = str_start & (str_total_len >= k)
+            str_by_len[-k] = slip_del & str_repeat_valid & del_ok
+            str_by_len[k] = slip_ins & str_repeat_valid & site_ok
+            str0_by_len[-k] = del_ok
+            str0_by_len[k] = site_ok
+            continue
+        # The base after a k-deletion at p, compared with the anchor.
+        after = np.full(n, -1)
+        m = max(n - k, 0)
+        after[1 : 1 + m] = ref_int[k : k + m]
+        before = np.full(n, -2)
+        before[1:] = ref_int[:-1]
+        left_aligned = after != before
+        unit_divides = str_start & (k % unit == 0)
+        slip_del = unit_divides & (str_total_len >= k) & left_aligned
+        str_by_len[-k] = slip_del & str_repeat_valid & del_ok
+        str_by_len[k] = unit_divides & str_repeat_valid & site_ok
+        str0_by_len[-k] = del_ok & left_aligned & ~slip_del
+        str0_by_len[k] = site_ok
+    return site_ok & hp_repeat_valid & hp_cut_bool, str_by_len, site_ok, str0_by_len
+
+
+def indel_mu_channel(id_len, hp_len, str_bin, hm, base_char):
+    """Name of the mu-solve channel an indel candidate belongs to, or None
+    (an HP-routed 1bp event outside any homopolymer). Same branch selection
+    as genotypeDSIndel/indelErrorProbs: |id_len| >= 2 is STR-context (length
+    capped at +-5); a 1bp mismatched insertion (hm == 0) is STR0_len1;
+    any other 1bp event is HP, pooled by base_char (the deleted or inserted
+    base): "C" for C/G, "T" for A/T."""
+    if abs(id_len) >= 2:
+        return f"STR{str_bin}_len{max(-5, min(5, id_len))}"
+    if hm == 0:
+        return "STR0_len1"
+    if hp_len >= 1:
+        pool = "C" if base_char in ("C", "G") else "T"
+        return f"HP{hp_len}_len{id_len}_{pool}"
+    return None
+
+
 _REFINE_WORKER_CTX = {}
 
 
@@ -2186,39 +2407,27 @@ def _channel_eeff_at_threshold(kind, ctx_key):
         eeff = float(np.sum(c["depth_by_trinuc"][:, :, t_fwd] * n1_mask))
         eeff += float(np.sum(c["depth_by_trinuc"][:, :, t_rc] * n1_mask))
         return eeff
+    # Indel channels, like SBS, need reads on both strands (n1_mask).
     if kind == "hp":
-        # HP channels only ever exist for id_len in {-1, 1} now -- there's
-        # no hp.txt column for multi-bp lengths any more (those are always
-        # STR-context, see indelErrorProbs). Restricted to just this
-        # channel's own pool's 2 bases (base2num order A,T,C,G -- "T" pool
-        # is A/T, "C" pool is C/G, matching classify_indel_channel's own
-        # base pooling and Caller.py's raw_lr_hp accumulation) rather than
-        # all 4, now that each pool is its own channel with its own
-        # threshold.
+        # HP channels (id_len +-1) sum the depth of their pool's two bases:
+        # "T" pool = A/T, "C" pool = C/G.
         hp_len, id_len, pool = ctx_key
+        n1_mask = c["n1_mask"]
         total = 0.0
         for base in (0, 1) if pool == "T" else (2, 3):
-            total += float(np.sum(c["depth_by_hpstr"][:, :, base * 10 + hp_len - 1]))
+            total += float(
+                np.sum(c["depth_by_hpstr"][:, :, base * 10 + hp_len - 1] * n1_mask)
+            )
         return total
     if kind == "str":
-        # str_bin in {1,2,3,4} for real STR-length contexts (>=2bp
-        # events). str_bin==0 with id_len==1 is the mismatched-insertion
-        # background channel.
+        # str_bin 1-4: STR contexts (whole-unit slips); 0: the mismatched 1bp
+        # insertion channel and the >=2bp indels that aren't a slip of an STR.
         str_bin, id_len = ctx_key
         if str_bin == 0:
-            # No per-context depth bucket exists for "not a real repeat"
-            # (depth_by_hpstr's 39+strs_for_row buckets only ever populate
-            # for strs_for_row>=1 -- 39+0 would collide with the last real
-            # HP bucket, base G/hp_len=10, not a dedicated background
-            # slot). A mismatched-insertion opportunity isn't tied to any
-            # hp/str context anyway, so the correct denominator is
-            # genuinely "covered here, anywhere" -- depth_by_trinuc summed
-            # across all 64 contexts is exactly that count, already
-            # computed for the SBS side.
-            depth = c["depth_by_trinuc"].sum(axis=2)
+            bucket = depth_hpstr_str0_bucket(id_len)
         else:
-            depth = c["depth_by_hpstr"][:, :, 39 + str_bin]
-        return float(np.sum(depth))
+            bucket = depth_hpstr_str_bucket(str_bin, id_len)
+        return float(np.sum(c["depth_by_hpstr"][:, :, bucket] * c["n1_mask"]))
     raise ValueError(f"unknown channel kind {kind!r}")
 
 
@@ -2276,12 +2485,16 @@ def refine_channel_task(job):
     this run's own opportunity even when its mutation-rate estimate comes
     from elsewhere.
 
+    raw_lr_list holds the raw (10**LR) LRs of the channel's LR >= 0 sites;
+    neg_log_lr the log10 LRs (float32) of its LR < 0 sites, which callBam
+    keeps as bare numbers rather than records. Both enter raw_lr below.
+
     Without an override, mu0 solves
     g(mu) = sum(raw_lr/(1-mu+mu*raw_lr)) - Eeff0 + pseudocount/mu == 0
     directly via brentq. The pseudocount/mu term sends g(0) to literally
     +inf (np.divide(pseudocount, 0.0) rather than plain float division,
     which would raise ZeroDivisionError instead); g(1) works out to
-    n - Eeff0 + pseudocount (n = len(raw_lr_list), since each
+    n - Eeff0 + pseudocount (n = the number of sites, since each
     raw_lr/(1-1+1*raw_lr) term is exactly 1), so a bracketing sign change
     (g(0) = +inf, g(1) < 0) is only guaranteed when n - Eeff0 + pseudocount
     < 0, not for every Eeff0 > 0. In practice this always holds --
@@ -2291,13 +2504,13 @@ def refine_channel_task(job):
     Eeff0 == 0) can still violate it; this is exactly the small-region
     scenario -mr/--muterateprefix exists to sidestep.
 
-    n - Eeff0 + pseudocount >= 0 is the exact case brentq can't solve:
-    g(1) >= 0 there, so g stays non-negative on the whole (0, 1) bracket
-    (every raw_lr/(1-mu+mu*raw_lr) term is >= 0 and only grows smaller
-    than its mu=1 value as mu shrinks toward 0, while pseudocount/mu only
-    grows) and brentq raises for failing to bracket a root. Short-circuit
-    to mu0 = 0 directly -- there isn't enough coverage relative to the
-    candidate count to estimate a mutation rate from anyway.
+    When n - Eeff0 + pseudocount >= 0 (g(1) >= 0), (0, 1) doesn't bracket
+    a root, but g can still dip below 0 inside it: a term with raw_lr > 1
+    grows as mu shrinks. g is then scanned on a log grid from 1e-12 up and
+    the first sign change (the smallest-mu local maximum of the
+    likelihood) is solved with brentq. Only if g never goes negative is
+    mu0 = 0 -- too little coverage relative to the candidate count to
+    estimate a mutation rate from.
     """
     (
         name,
@@ -2308,28 +2521,42 @@ def refine_channel_task(job):
         fdr_thr,
         pseudocount,
         mu0_override,
+        neg_log_lr,
     ) = job
     Eeff0 = _channel_eeff_at_threshold(kind, ctx_key)
 
     if mu0_override is not None:
         mu0 = mu0_override
     else:
-        raw_lr = np.asarray(raw_lr_list, dtype=float)
-        n = len(raw_lr_list)
+        # g(0) must be +inf for the brentq brackets below; pseudocount 0
+        # makes it NaN.
+        assert pseudocount > 0, f"pseudocount must be > 0, got {pseudocount}"
+        raw_lr = np.concatenate(
+            [
+                np.asarray(raw_lr_list, dtype=float),
+                10.0 ** np.asarray(neg_log_lr, dtype=float),
+            ]
+        )
+        n = len(raw_lr)
 
-        if n - Eeff0 + pseudocount >= 0:
-            mu0 = 0.0
-        else:
+        def g(mu):
+            with np.errstate(divide="ignore"):
+                return (
+                    np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
+                    - Eeff0
+                    + np.divide(pseudocount, mu)
+                )
 
-            def g(mu):
-                with np.errstate(divide="ignore"):
-                    return (
-                        np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
-                        - Eeff0
-                        + np.divide(pseudocount, mu)
-                    )
-
+        if n - Eeff0 + pseudocount < 0:
             mu0 = brentq(g, 0.0, 1.0)
+        else:
+            mu0 = 0.0
+            lo = 0.0
+            for hi in np.logspace(-12, 0, 241)[:-1]:
+                if g(hi) < 0:
+                    mu0 = brentq(g, lo, hi)
+                    break
+                lo = hi
     new_threshold = _refine_channel(mu0, threshold0, fdr_thr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 
@@ -2347,7 +2574,8 @@ def _accumulate_depth_matrix(depth_mat, n_top, n_bot, category, valid, n_cat):
         already capped at 9 (matching the L-table convention used
         elsewhere in this module).
     category: (window_len,) context bucket index in [0, n_cat) -- e.g.
-        trinuc (0-63), merged hp/str bucket (0-22), or dinuc (0-15).
+        trinuc (0-63), hp/str bucket (0 to DEPTH_HPSTR_NCAT-1), or dinuc
+        (0-15).
         Entries outside [0, n_cat) are fine as long as they're excluded
         by `valid` (this function never reads them).
     valid: (window_len,) bool mask of positions to actually count.

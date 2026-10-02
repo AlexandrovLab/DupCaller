@@ -104,6 +104,40 @@ def do_index_dbs(args):
     print(f"DBS index written to {args.reference}.dbs.h5")
 
 
+def resolve_str_overlaps(rows):
+    """Non-overlapping STR tracts from one chromosome's PERF rows
+    (start, end, unit_len, repeat_count), as (start, true_end, unit_len,
+    repeat_count) sorted by start.
+
+    PERF scans each unit length separately, so its tracts can overlap
+    ((AGGA)2 and (AGG)2 in AGGAGGAGG). Painted in file order, a later tract
+    overwrote an earlier one's unit/count but both kept their start flag,
+    so a flagged start could carry another tract's values. Tracts are kept
+    longest first (ties: shorter unit, then leftmost) and one overlapping an
+    already-kept tract is dropped, so every position belongs to at most one
+    tract and every tract has exactly one start flag.
+
+    PERF's span can run past start + num_units*unit_len at the trailing
+    boundary; true_end clamps it so the extra bases aren't painted."""
+    tracts = []
+    for start, end, unit_length, count in rows:
+        true_end = min(end, start + unit_length * count)
+        if true_end > start:
+            tracts.append((start, true_end, unit_length, count))
+    if not tracts:
+        return []
+    tracts.sort(key=lambda t: (-(t[1] - t[0]), t[2], t[0]))
+    taken = np.zeros(max(t[1] for t in tracts), dtype=bool)
+    kept = []
+    for t in tracts:
+        if taken[t[0] : t[1]].any():
+            continue
+        taken[t[0] : t[1]] = True
+        kept.append(t)
+    kept.sort()
+    return kept
+
+
 def _iter_fasta_records(path):
     """Stream FASTA records one at a time instead of loading every contig
     into memory up front (SeqIO.to_dict keeps the whole genome resident for
@@ -263,21 +297,12 @@ def do_index(args):
         # _iter_repeat_tsv_by_chrom's docstring) — leave the arrays at 0
         # and don't advance the tsv stream.
         if pending_tsv_chrom is not None and pending_tsv_chrom[0] == chrom:
-            for start, end, unit_length, count in pending_tsv_chrom[1]:
-                # PERF's reported span can overextend past the tract's true
-                # length (start + num_units*unit_length) at the trailing
-                # boundary -- clamp so any such trailing bases aren't
-                # painted with the full tract's unit_len/count, which would
-                # contaminate HP/STR opportunity counting and error-rate
-                # learning at those positions.
-                true_end = min(end, start + unit_length * count)
+            for start, true_end, unit_length, count in resolve_str_overlaps(
+                pending_tsv_chrom[1]
+            ):
                 str_unit_len[start:true_end] = unit_length
                 str_cut[start] = 1
-                # Clipped to the array's uint8 range before storing — since
-                # every position is written at most once, this is
-                # identical to storing the unclipped count and clipping
-                # the whole array afterward, just without the wider dtype
-                # in between.
+                # Clipped to the array's uint8 range.
                 str_hp[start:true_end] = min(count, 127)
             pending_tsv_chrom = _next_or_none(repeat_tsv_iter)
         # str_lens rows: 0 = repeat unit length, 1 = number of times the

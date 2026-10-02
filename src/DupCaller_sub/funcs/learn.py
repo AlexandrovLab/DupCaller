@@ -1,8 +1,15 @@
 import numpy as np
 from .indels import (
+    base_codes,
+    str_length_bin,
+    str_slip_tract,
+    INDEL_ALT,
+    INDEL_REF,
     findIndels,
     getIndelArr,
+    indel_context_fits_window,
     indel_context_index,
+    indel_has_context,
     indel_passes_mask,
     left_align_indel,
 )
@@ -11,6 +18,60 @@ from .indels import (
 # Phred range (0-93); bin index == literal BQ value.
 MAX_BQ = 93
 NUM_BQ = MAX_BQ + 1
+
+
+def _sbs_strand_counts(seq_mat, qual_mat, antimask, trinuc_int):
+    """One strand's SBS amp-error tallies over all its reads at once: the
+    (96, 4) trinuc x base count matrix and the (96, 4, NUM_BQ) base-quality
+    histogram. A read's base counts where antimask is set and it is a
+    passing base (qual > minBq; the caller zeroes the rest) that isn't an
+    N/deletion/off-read position (seq == 4)."""
+    seq_masked = seq_mat[:, antimask]
+    qual_masked = qual_mat[:, antimask]
+    alt_1d = trinuc_int[antimask][None, :] + seq_masked * 96
+    valid = (qual_masked > 0) & (seq_masked < 4)
+    count_mat = (
+        np.bincount(
+            alt_1d.ravel(), weights=valid.ravel().astype(float), minlength=96 * 4
+        )[0 : 4 * 96]
+        .reshape([4, 96])
+        .T.astype(float)
+    )
+    bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
+    flat_idx = alt_1d[valid] * NUM_BQ + bq_valid
+    bq_hist = (
+        np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
+        .reshape([4, 96, NUM_BQ])
+        .transpose(1, 0, 2)
+        .astype(float)
+    )
+    return count_mat, bq_hist
+
+
+def _indel_informative_reads(covered, hq, span_ends, active=True):
+    """reads x positions, per table in span_ends: True where a read could
+    show the reference allele of an indel whose context base
+    (indel_context_index) is position p -- its base at p is above minBq
+    (hq) and it aligns contiguously from the anchor p - 1 through
+    span_end[p] (the base after the run/tract), as getIndelArr requires
+    for REF. False for p < 2 (anchor at the window's first base, see
+    indel_has_context) and where span_end[p] is outside the window.
+    active=False (a strand that fails its opportunity gate) returns all
+    False without computing."""
+    m, n = covered.shape
+    out = {table: np.zeros((m, n), dtype=bool) for table in span_ends}
+    if not active or m == 0 or n == 0:
+        return out
+    # gaps[:, j]: uncovered positions in [0, j).
+    gaps = np.zeros((m, n + 1), dtype=np.int64)
+    gaps[:, 1:] = np.cumsum(~covered, axis=1)
+    p = np.arange(n)
+    for table, span_end in span_ends.items():
+        ok = (p >= 2) & (span_end < n)
+        lo = p[ok] - 1
+        hi = span_end[ok]
+        out[table][:, ok] = (gaps[:, hi + 1] - gaps[:, lo] == 0) & hq[:, ok]
+    return out
 
 
 def profileTriNucMismatches(
@@ -63,18 +124,39 @@ def profileTriNucMismatches(
     # below.
     min_depth = max(params.get("minRef", 3), params.get("minAlt", 3))
     min_alt_qual = params.get("minAltQual", 90)
+    # Indel (HP/STR) min-reads-per-strand: separate constants from
+    # srd_min_read/ssm_min_read, which only gate the SBS antimasks below.
+    min_group_indel_amp = 3
+    min_group_indel_dmg = 3
+
+    # A family too small for every track (SRD and indel amp need one strand,
+    # SSM and indel damage both strands, at their minimum read counts)
+    # contributes nothing; skip building its matrices.
+    if max(m_F1R2, m_F2R1) < min(srd_min_read, min_group_indel_amp) and min(
+        m_F1R2, m_F2R1
+    ) < min(ssm_min_read, min_group_indel_dmg):
+        return (
+            np.zeros([64, 4]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
+            np.zeros([64, 4]),
+            np.zeros([10, 12]),
+            np.zeros([5, 11]),
+            np.zeros([64, 4, NUM_BQ]),
+        )
 
     ### Prepare sequence matrix and quality matrix for each strand
     n = len(reference_int)
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3, "N": 4}
-    base2num_npfunc = np.vectorize(lambda b: base2num[b])
-    F1R2_seq_mat = np.zeros([m_F1R2, n], dtype=int)  # Base(ATCG) x reads x pos
+    # 4 (no base) wherever a read has no aligned base: before its start,
+    # deletions, past its end. A zero would read as an "A".
+    F1R2_seq_mat = np.full([m_F1R2, n], 4, dtype=int)  # Base(ATCG) x reads x pos
     F1R2_qual_mat = np.zeros([m_F1R2, n])
-    F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # Base(ATCG) x reads x pos
+    F2R1_seq_mat = np.full([m_F2R1, n], 4, dtype=int)  # Base(ATCG) x reads x pos
     F2R1_qual_mat = np.zeros([m_F2R1, n])
     for mm, seq in enumerate(F1R2):
         qualities = seq.query_alignment_qualities
-        sequence = np.array(list(seq.query_alignment_sequence))
+        sequence = base_codes(seq.query_alignment_sequence)
         cigartuples = seq.cigartuples
         current_seq_ind = 0
         current_mat_ind = seq.reference_start - reference_start
@@ -82,9 +164,9 @@ def profileTriNucMismatches(
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                F1R2_seq_mat[
-                    mm, current_mat_ind : current_mat_ind + ct[1]
-                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
+                F1R2_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = sequence[
+                    current_seq_ind : current_seq_ind + ct[1]
+                ]
                 F1R2_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
@@ -104,7 +186,7 @@ def profileTriNucMismatches(
         F1R2_qual_mat[mm, current_mat_ind:n] = 0
     for mm, seq in enumerate(F2R1):
         qualities = seq.query_alignment_qualities
-        sequence = np.array(list(seq.query_alignment_sequence))
+        sequence = base_codes(seq.query_alignment_sequence)
         cigartuples = seq.cigartuples
         current_seq_ind = 0
         current_mat_ind = seq.reference_start - reference_start
@@ -112,9 +194,9 @@ def profileTriNucMismatches(
         ref_length_plus_del = seq.reference_length
         for ct in cigartuples:
             if ct[0] == 0:
-                F2R1_seq_mat[
-                    mm, current_mat_ind : current_mat_ind + ct[1]
-                ] = base2num_npfunc(sequence[current_seq_ind : current_seq_ind + ct[1]])
+                F2R1_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = sequence[
+                    current_seq_ind : current_seq_ind + ct[1]
+                ]
                 F2R1_qual_mat[
                     mm, current_mat_ind : current_mat_ind + ct[1]
                 ] = qualities[current_seq_ind : current_seq_ind + ct[1]]
@@ -253,41 +335,14 @@ def profileTriNucMismatches(
     ] = False
     # F2R1_antimask[(F2R1_seq_mat == 4).any(axis=0)] = False
 
-    F1R2_trinuc_masked = trinuc_int[F1R2_antimask]
-    F1R2_antimask_positions = np.nonzero(F1R2_antimask)[0]
-    F1R2_trinuc_alt_count_mat = np.zeros([96, 4])
-    F1R2_trinuc_alt_bq_hist = np.zeros([96, 4, NUM_BQ])
-    F1R2_trinuc_seq_err_count_mat = np.zeros([96, 4])
-    for mm in range(F1R2_seq_mat.shape[0]):
-        seq_masked = F1R2_seq_mat[mm, F1R2_antimask]
-        qual_masked = F1R2_qual_mat[mm, F1R2_antimask]
-        # Every covered position is counted (matching -> reference column,
-        # mismatch -> alt column), regardless of the read's total mismatch
-        # count. funcs/call.py's NM blacklist only drops a whole family
-        # (fractional/strand-level), not individual moderately-mismatched
-        # reads within a passing family.
-        F1R2_trinuc_alt_1Dmap = F1R2_trinuc_masked + seq_masked * 96
-        # F1R2_trinuc_alt_1Dmap = F1R2_trinuc_alt_1Dmap[F1R2_trinuc_alt_1Dmap < 4*96]
-        # A passing base (qual > minBq) counts as 1; N/deletion/off-read
-        # positions (seq_masked == 4) are excluded.
-        valid = (qual_masked > 0) & (seq_masked < 4)
-        F1R2_trinuc_alt_count_mat += (
-            np.bincount(
-                F1R2_trinuc_alt_1Dmap,
-                weights=valid.astype(float),
-                minlength=96 * 4,
-            )[0 : 4 * 96]
-            .reshape([4, 96])
-            .T
-        )
-        if valid.any():
-            bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
-            flat_idx = F1R2_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
-            F1R2_trinuc_alt_bq_hist += (
-                np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
-                .reshape([4, 96, NUM_BQ])
-                .transpose(1, 0, 2)
-            )
+    # Every covered position is counted (matching -> reference column,
+    # mismatch -> alt column), regardless of the read's total mismatch
+    # count. funcs/call.py's NM blacklist only drops a whole family
+    # (fractional/strand-level), not individual moderately-mismatched reads
+    # within a passing family.
+    F1R2_trinuc_alt_count_mat, F1R2_trinuc_alt_bq_hist = _sbs_strand_counts(
+        F1R2_seq_mat, F1R2_qual_mat, F1R2_antimask, trinuc_int
+    )
     # F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[:32,:] + F1R2_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F1R2_trinuc_alt_count_mat_norm = F1R2_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -302,35 +357,9 @@ def profileTriNucMismatches(
         ]
     )
 
-    F2R1_trinuc_alt_count_mat = np.zeros([96, 4])
-    F2R1_trinuc_alt_bq_hist = np.zeros([96, 4, NUM_BQ])
-    F2R1_trinuc_masked = trinuc_int[F2R1_antimask]
-    F2R1_antimask_positions = np.nonzero(F2R1_antimask)[0]
-    # F1R2_alt_masked = F1R2_alt_int[F1R2_antimask]
-    for mm in range(F2R1_seq_mat.shape[0]):
-        seq_masked = F2R1_seq_mat[mm, F2R1_antimask]
-        qual_masked = F2R1_qual_mat[mm, F2R1_antimask]
-        # See the matching F1R2 loop above.
-        F2R1_trinuc_alt_1Dmap = F2R1_trinuc_masked + seq_masked * 96
-        # F2R1_trinuc_alt_1Dmap = F2R1_trinuc_alt_1Dmap[F2R1_trinuc_alt_1Dmap < 4*96]
-        valid = (qual_masked > 0) & (seq_masked < 4)
-        F2R1_trinuc_alt_count_mat += (
-            np.bincount(
-                F2R1_trinuc_alt_1Dmap,
-                weights=valid.astype(float),
-                minlength=96 * 4,
-            )[0 : 4 * 96]
-            .reshape([4, 96])
-            .T
-        )
-        if valid.any():
-            bq_valid = np.clip(qual_masked[valid].astype(int), 0, MAX_BQ)
-            flat_idx = F2R1_trinuc_alt_1Dmap[valid] * NUM_BQ + bq_valid
-            F2R1_trinuc_alt_bq_hist += (
-                np.bincount(flat_idx, minlength=4 * 96 * NUM_BQ)
-                .reshape([4, 96, NUM_BQ])
-                .transpose(1, 0, 2)
-            )
+    F2R1_trinuc_alt_count_mat, F2R1_trinuc_alt_bq_hist = _sbs_strand_counts(
+        F2R1_seq_mat, F2R1_qual_mat, F2R1_antimask, trinuc_int
+    )
     # F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[:32,:] + F2R1_trinuc_alt_count_mat[32:64,np.array([1,0,3,2])]
     F2R1_trinuc_alt_count_mat_norm = F2R1_trinuc_alt_count_mat[0:64, :] + np.vstack(
         [
@@ -371,8 +400,12 @@ def profileTriNucMismatches(
         refPos = int(indel.split(":")[0])
         indelLen = int(indel.split(":")[1])
         # Same locus mask as genotypeDSIndel at call time.
-        if indel_passes_mask(antimask, refPos - start, indelLen) and (
-            indel_context_index(refPos - start) < len(reference_int)
+        if (
+            indel_passes_mask(antimask, refPos - start, indelLen)
+            and indel_has_context(refPos - start, len(reference_int))
+            and indel_context_fits_window(
+                indel, refPos - start, reference_int, hp_raw, str_raw
+            )
         ):
             indels_masked.append(indel)
 
@@ -387,34 +420,25 @@ def profileTriNucMismatches(
             np.zeros([5, 11]),
             sbs_alt_bq_hist,
         )
-    # Indel (HP/STR) min-reads-per-strand: separate constants from
-    # srd_min_read/ssm_min_read, which only gate the SBS antimasks above.
-    min_group_indel_amp = 3
-    min_group_indel_dmg = 3
-    # Amp opportunity: each strand gated on its own read count, matching
-    # the per-strand gate on amp events below (F1R2_antimask/F2R1_antimask
-    # are reassigned per-indel there). Gating opportunity on both strands
-    # while events are gated per-strand credited events from families that
-    # contributed no opportunity -- inflating amp HP/STR rates ~1.5-2x and
-    # driving idLen=0 negative in shallow samples.
-    F1R2_antimask = antimask.copy()
-    F2R1_antimask = antimask.copy()
+    # Amp opportunity: each strand gated on its own read count, like the
+    # per-strand amp events below.
+    F1R2_opp_antimask = antimask.copy()
+    F2R1_opp_antimask = antimask.copy()
     if m_F1R2 < min_group_indel_amp:
-        F1R2_antimask[:] = False
+        F1R2_opp_antimask[:] = False
     if m_F2R1 < min_group_indel_amp:
-        F2R1_antimask[:] = False
-    dmg_antimask = antimask.copy()
+        F2R1_opp_antimask[:] = False
+    dmg_opp_antimask = antimask.copy()
     if m_F1R2 < min_group_indel_dmg or m_F2R1 < min_group_indel_dmg:
-        dmg_antimask[:] = False
+        dmg_opp_antimask[:] = False
+    # No candidate's context base sits at the window's first two positions
+    # (indel_has_context); the amp weights are 0 there too.
+    dmg_opp_antimask[:2] = False
 
-    # hp_raw (hp.h5): row0 = self-derived homopolymer run length, row1 =
-    # start-of-run bool. str_raw (str.h5): row0 = repeat unit length,
-    # row1 = number of times the unit repeats, row2 = start-of-repeat
-    # bool. These are two independent sources — a position inside an
-    # annotated STR interval that also starts an embedded run of
-    # identical bases (e.g. the "AA" in a (AAT)n repeat) is credited to
-    # BOTH the homopolymer and the STR opportunity/error tables, never
-    # mutually exclusive (unchanged from before this rewrite).
+    # hp_raw (hp.h5): row0 = homopolymer run length, row1 = start-of-run.
+    # str_raw (str.h5): row0 = unit length, row1 = repeat count, row2 =
+    # start-of-repeat. HP and STR are credited independently: a run start
+    # inside an STR (the "AA" in (AAT)n) counts toward both tables.
     hp_len_arr = hp_raw[0].astype(int)
     hp_mask = hp_raw[1] == 1
 
@@ -422,10 +446,8 @@ def profileTriNucMismatches(
     repeat_count = str_raw[1].astype(int)
     total_len = unit_len * repeat_count
     is_str = unit_len >= 2
-    # 5 bins: 0 = not a real repeat (is_str False -- never populated by
-    # the opportunity pass below, only ever reached by an actual
-    # mismatched-insertion event; see the per-event loop), 1="2-9",
-    # 2="10-24", 3="25-39", 4="40+".
+    # STR bins: 0 = not a repeat, 1 = 2-9bp, 2 = 10-24bp, 3 = 25-39bp,
+    # 4 = 40+bp.
     str_bin_arr = np.zeros_like(total_len)
     str_bin_arr[is_str] = 1
     str_bin_arr[is_str & (total_len >= 10)] = 2
@@ -435,74 +457,80 @@ def profileTriNucMismatches(
 
     hp_rc4 = [1, 0, 3, 2]  # base-complement permutation, 4-wide axis
 
-    # HP amp opportunity: every start-of-run position (regardless of
-    # is_str) contributes its own (hp length, own reference base) as an
-    # idLen=0 (column base*3+1) observation, weighted by family size and
-    # self-RC-folded per strand -- same convention as the SBS/DBS amp
-    # matrices above (each strand's own tally symmetrized under base-
-    # complement, then the two strands summed), since amp errors have no
-    # strand-of-origin directionality. reference_int can be 4 (N/
-    # ambiguous) at a run-start position; those are excluded rather than
-    # risking an out-of-range column.
+    # Amp opportunity weight per position: that strand's reads that could
+    # show REF for an event there (_indel_informative_reads: base above
+    # minBq, aligned through the run/tract plus one base), per table: HP
+    # (run), STR rows 1-4 (tract), STR row 0 (the base itself).
+    pos_idx = np.arange(n)
+    F1R2_covered = F1R2_seq_mat < 4
+    F2R1_covered = F2R1_seq_mat < 4
+    F1R2_hq = (F1R2_qual_mat > 0) & (F1R2_seq_mat < 4)
+    F2R1_hq = (F2R1_qual_mat > 0) & (F2R1_seq_mat < 4)
+    span_ends = {
+        "hp": pos_idx + hp_len_arr,
+        "str": pos_idx + total_len,
+        "str0": pos_idx,
+    }
+    # A strand that fails its opportunity gate credits nothing anywhere.
+    F1R2_inf = _indel_informative_reads(
+        F1R2_covered, F1R2_hq, span_ends, F1R2_opp_antimask.any()
+    )
+    F2R1_inf = _indel_informative_reads(
+        F2R1_covered, F2R1_hq, span_ends, F2R1_opp_antimask.any()
+    )
+
+    # HP amp opportunity: every run start adds its (hp length, base) as an
+    # idLen=0 (column base*3+1) observation, weighted by the strand's
+    # informative reads and RC-folded per strand like the SBS/DBS amp
+    # matrices. N bases are skipped.
     def _hp_amp_opportunity(strand_antimask, weight):
-        hp_here = hp_len_arr[strand_antimask][hp_mask[strand_antimask]]
-        ref_here = reference_int[strand_antimask][hp_mask[strand_antimask]]
+        sel = strand_antimask & hp_mask
+        hp_here = hp_len_arr[sel]
+        ref_here = reference_int[sel]
+        w_here = weight[sel]
         valid = ref_here <= 3
         hp_here = np.minimum(hp_here[valid], 10)
         ref_here = ref_here[valid]
         local = np.zeros([10, 4])
-        np.add.at(local, (hp_here - 1, ref_here), 1)
-        local *= weight
+        np.add.at(local, (hp_here - 1, ref_here), w_here[valid])
         return local + local[:, hp_rc4]
 
-    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(F1R2_antimask, m_F1R2)
-    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(F2R1_antimask, m_F2R1)
+    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(
+        F1R2_opp_antimask, F1R2_inf["hp"].sum(axis=0)
+    )
+    hp_alt_count[:, [1, 4, 7, 10]] += _hp_amp_opportunity(
+        F2R1_opp_antimask, F2R1_inf["hp"].sum(axis=0)
+    )
 
-    # STR amp opportunity: only at annotated-repeat start positions,
-    # column 5 (idLen=0). No base identity/RC-fold involved (a repeat's
-    # unit length has no complement).
+    # STR amp opportunity: repeat start positions, column 5 (idLen=0).
     def _str_amp_opportunity(strand_antimask, weight):
-        bin_here = str_bin_arr[strand_antimask][str_mask[strand_antimask]]
-        return np.bincount(bin_here, minlength=5) * weight
+        sel = strand_antimask & str_mask
+        return np.bincount(str_bin_arr[sel], weights=weight[sel], minlength=5)
 
-    str_alt_count[:, 5] += _str_amp_opportunity(F1R2_antimask, m_F1R2)
-    str_alt_count[:, 5] += _str_amp_opportunity(F2R1_antimask, m_F2R1)
+    str_alt_count[:, 5] += _str_amp_opportunity(
+        F1R2_opp_antimask, F1R2_inf["str"].sum(axis=0)
+    )
+    str_alt_count[:, 5] += _str_amp_opportunity(
+        F2R1_opp_antimask, F2R1_inf["str"].sum(axis=0)
+    )
 
-    # STR amp opportunity for row 0 ("not a real repeat"): unlike rows
-    # 1-4 (one credit per real, cut-gated repeat tract via str_mask),
-    # row 0 has no tract to dedupe by -- str_mask structurally excludes
-    # every row-0 position (str_mask requires is_str), so without this,
-    # row 0's own column 5 stays permanently 0 and
-    # _normalize_indel_str_mat's row-sum normalization has no real
-    # opportunity denominator for row 0, silently normalizing its rare
-    # event counts against each other instead and producing wildly
-    # inflated "probabilities" (observed: up to 0.58, when a real
-    # damage/amp rate should be ~1e-5 or smaller). Every antimask-passing
-    # position independently counts here, INCLUDING real-STR-annotated
-    # ones -- not gated by ~is_str. A row-0-type event (a mismatched
-    # insertion/arbitrary indel unrelated to any specific repeat) is a
-    # real, independent opportunity even at a position that also has a
-    # real, different-unit STR annotation (e.g. an arbitrary "TAA"
-    # insertion inside an ATGATGATG tract isn't a repeat of the ATG unit,
-    # so it's still a genuine row-0 event there). Matches
-    # misc.py's indel100_reference_bucket_indices flat rep1/rep0 credit
-    # and call.py's L_indel_len[...,0,X] lookup, both of which likewise
-    # credit row 0 unconditionally now, not real_str-excluded.
+    # STR amp opportunity for row 0 (not a repeat): every unmasked
+    # position counts, including STR ones, since a mismatched insertion
+    # can happen anywhere.
     def _str_amp_opportunity_row0(strand_antimask, weight):
-        return np.count_nonzero(strand_antimask) * weight
+        return weight[strand_antimask].sum()
 
-    str_alt_count[0, 5] += _str_amp_opportunity_row0(F1R2_antimask, m_F1R2)
-    str_alt_count[0, 5] += _str_amp_opportunity_row0(F2R1_antimask, m_F2R1)
+    str_alt_count[0, 5] += _str_amp_opportunity_row0(
+        F1R2_opp_antimask, F1R2_inf["str0"].sum(axis=0)
+    )
+    str_alt_count[0, 5] += _str_amp_opportunity_row0(
+        F2R1_opp_antimask, F2R1_inf["str0"].sum(axis=0)
+    )
 
-    # HP dmg opportunity: a single combined pass (dmg_antimask doesn't
-    # distinguish which strand might show damage), credited to BOTH
-    # orientations from the same position data -- direct (F1R2 frame)
-    # and base-complemented (F2R1/bottom-strand frame) via the same
-    # self-fold operation as the amp case, mirroring how the per-event
-    # dmg branch below folds F2R1's contribution onto F1R2's frame
-    # instead of self-folding each independently.
-    hp_dmg_here = hp_len_arr[dmg_antimask][hp_mask[dmg_antimask]]
-    ref_dmg_here = reference_int[dmg_antimask][hp_mask[dmg_antimask]]
+    # HP dmg opportunity: one pass over dmg_opp_antimask, credited to both
+    # orientations (direct and base-complemented).
+    hp_dmg_here = hp_len_arr[dmg_opp_antimask][hp_mask[dmg_opp_antimask]]
+    ref_dmg_here = reference_int[dmg_opp_antimask][hp_mask[dmg_opp_antimask]]
     valid_dmg = ref_dmg_here <= 3
     hp_dmg_here = np.minimum(hp_dmg_here[valid_dmg], 10)
     ref_dmg_here = ref_dmg_here[valid_dmg]
@@ -510,16 +538,12 @@ def profileTriNucMismatches(
     np.add.at(hp_dmg_local, (hp_dmg_here - 1, ref_dmg_here), 1)
     hp_dmg_count[:, [1, 4, 7, 10]] += hp_dmg_local + hp_dmg_local[:, hp_rc4]
 
-    # STR dmg opportunity: same *2 (both orientations, no base identity
-    # to complement) as the two separate-weighted amp strand passes.
-    str_dmg_here = str_bin_arr[dmg_antimask][str_mask[dmg_antimask]]
+    # STR dmg opportunity: *2 for the two orientations.
+    str_dmg_here = str_bin_arr[dmg_opp_antimask][str_mask[dmg_opp_antimask]]
     str_dmg_count[:, 5] += np.bincount(str_dmg_here, minlength=5) * 2
 
-    # STR dmg opportunity for row 0 -- same reasoning as the amp case
-    # above (unconditional, not ~is_str-excluded), same *2 (both
-    # orientations, no base identity to complement) as the two
-    # separate-weighted amp strand passes.
-    str_dmg_count[0, 5] += np.count_nonzero(dmg_antimask) * 2
+    # STR dmg opportunity for row 0: every unmasked position, *2.
+    str_dmg_count[0, 5] += np.count_nonzero(dmg_opp_antimask) * 2
 
     if m == 0:
         return (
@@ -536,14 +560,34 @@ def profileTriNucMismatches(
     F1R2_ref_count = np.zeros(m)
     F2R1_alt_count = np.zeros(m)
     F2R1_ref_count = np.zeros(m)
-    for seq in F1R2:
-        seqArr, _ = getIndelArr(seq, indels_masked, params["minBq"])
-        F1R2_alt_count += np.count_nonzero(seqArr == 1)
-        F1R2_ref_count += np.count_nonzero(seqArr == 0)
-    for seq in F2R1:
-        seqArr, _ = getIndelArr(seq, indels_masked, params["minBq"])
-        F2R1_alt_count += np.count_nonzero(seqArr == 1)
-        F2R1_ref_count += np.count_nonzero(seqArr == 0)
+    ctx = indel_context_index(int(indels_masked[0].split(":")[0]) - start)
+    # Per-read ALT flags, to move out of the idLen=0 column only the ALT
+    # reads that were credited there (see _alt_in_opp below).
+    F1R2_is_alt = np.zeros(len(F1R2), dtype=bool)
+    F2R1_is_alt = np.zeros(len(F2R1), dtype=bool)
+    for mm, seq in enumerate(F1R2):
+        seqArr, _ = getIndelArr(
+            seq, indels_masked, params["minBq"], reference_int, reference_start
+        )
+        F1R2_alt_count += np.count_nonzero(seqArr == INDEL_ALT)
+        F1R2_ref_count += np.count_nonzero(seqArr == INDEL_REF)
+        F1R2_is_alt[mm] = seqArr[0] == INDEL_ALT
+    for mm, seq in enumerate(F2R1):
+        seqArr, _ = getIndelArr(
+            seq, indels_masked, params["minBq"], reference_int, reference_start
+        )
+        F2R1_alt_count += np.count_nonzero(seqArr == INDEL_ALT)
+        F2R1_ref_count += np.count_nonzero(seqArr == INDEL_REF)
+        F2R1_is_alt[mm] = seqArr[0] == INDEL_ALT
+
+    def _alt_in_opp(is_alt, inf, table):
+        """ALT reads counted in the table's opportunity weight at ctx."""
+        return int(np.count_nonzero(is_alt & inf[table][:, ctx]))
+
+    def _ref_in_opp(is_alt, inf, table):
+        """Non-ALT reads counted in the table's opportunity weight at ctx; an
+        amp event is booked only where the strand credited at least one."""
+        return int(np.count_nonzero(~is_alt & inf[table][:, ctx]))
 
     dmg_antimask = np.ones(m, dtype=bool)
     dmg_antimask[
@@ -572,32 +616,53 @@ def profileTriNucMismatches(
     F2R1_antimask[F2R1_ref_count + F2R1_alt_count < min_depth] = False
     F2R1_antimask[F2R1_alt_count > 1] = False
 
-    # m == 1 here (m>=2 and m==0 both returned above), so this loop runs
-    # exactly once -- kept as a loop (rather than indexing indels_masked[0]
-    # directly) only to mirror the surrounding code's style.
+    def _book_str_event(row, col, mm):
+        """Book an STR-table event (row 0 = not a repeat) at ctx, only where
+        the opportunity pass credited ctx: row 0 at every unmasked
+        position, rows 1-4 at a tract start. Amp moves the strand's ALT
+        reads credited there out of the idLen=0 column; damage needs the
+        damage pattern (ALT on exactly one strand)."""
+        table = "str" if row >= 1 else "str0"
+        ctx_ok = row == 0 or bool(str_mask[ctx])
+        if not ctx_ok:
+            return
+        if (
+            F1R2_antimask[mm]
+            and F1R2_opp_antimask[ctx]
+            and _ref_in_opp(F1R2_is_alt, F1R2_inf, table)
+        ):
+            str_alt_count[row, col] += F1R2_alt_count[mm]
+            str_alt_count[row, 5] -= _alt_in_opp(F1R2_is_alt, F1R2_inf, table)
+        if (
+            F2R1_antimask[mm]
+            and F2R1_opp_antimask[ctx]
+            and _ref_in_opp(F2R1_is_alt, F2R1_inf, table)
+        ):
+            str_alt_count[row, col] += F2R1_alt_count[mm]
+            str_alt_count[row, 5] -= _alt_in_opp(F2R1_is_alt, F2R1_inf, table)
+        if dmg_opp_antimask[ctx] and (F1R2_dmg_antimask[mm] or F2R1_dmg_antimask[mm]):
+            str_dmg_count[row, col] += 1
+            str_dmg_count[row, 5] -= 1
+
+    # m == 1 here (m >= 2 and m == 0 returned above).
     for mm, indel in enumerate(indels_masked):
         parts = indel.split(":")
         pos = int(parts[0]) - start
         indelLen = int(parts[1])
-        # Shared with funcs/prob.py's genotypeDSIndel so learn-time and
-        # call-time classify the event in the same HP/STR bin.
+        # Same HP/STR context position as genotypeDSIndel.
         anchor = indel_context_index(pos)
         hp = int(hp_raw[0, anchor])
         hp_capped = min(hp, 10)
-        unit_len_here = int(str_raw[0, anchor])
-        repeat_count_here = int(str_raw[1, anchor])
-        if unit_len_here >= 2:
-            total_len_here = unit_len_here * repeat_count_here
-            if total_len_here >= 40:
-                str_bin_here = 4
-            elif total_len_here >= 25:
-                str_bin_here = 3
-            elif total_len_here >= 10:
-                str_bin_here = 2
-            else:
-                str_bin_here = 1
-        else:
-            str_bin_here = 0
+        # Same STR0 rule as genotypeDSIndel: a >=2bp indel that isn't a slip
+        # of the tract at its context base goes to row 0.
+        slip = str_slip_tract(
+            indelLen,
+            parts[2] if indelLen > 0 and len(parts) > 2 else "",
+            anchor,
+            reference_int,
+            str_raw,
+        )
+        str_bin_here = 0 if slip is None else str_length_bin(*slip)
 
         if indelLen > 5:
             indelLen = 5
@@ -624,73 +689,53 @@ def profileTriNucMismatches(
                 col_rc = ref_allele_rc * 3 + (indelLen + 1)
                 opp_col = ref_allele * 3 + 1
                 opp_col_rc = ref_allele_rc * 3 + 1
+                # An event is booked only where the opportunity pass
+                # credited ctx (its strand antimask, a run start, ACGT).
+                hp_ctx = bool(hp_mask[ctx]) and ref_allele <= 3
 
-                # Amp: reconcile against the opportunity credit already
-                # given to this exact (hp_len, base) cell above (this
-                # position was covered and its hp/base context counted
-                # there without knowing an indel would land here), then
-                # self-RC-fold each strand's own delta before summing --
-                # same convention as the opportunity pass.
+                # Amp: move the ALT reads credited at ctx from the idLen=0
+                # cell to the event's cell, then RC-fold per strand.
                 F1R2_local = np.zeros(12)
                 F2R1_local = np.zeros(12)
-                if F1R2_antimask[mm]:
+                if (
+                    F1R2_antimask[mm]
+                    and hp_ctx
+                    and F1R2_opp_antimask[ctx]
+                    and _ref_in_opp(F1R2_is_alt, F1R2_inf, "hp")
+                ):
                     F1R2_local[col] += F1R2_alt_count[mm]
-                    F1R2_local[opp_col] -= F1R2_alt_count[mm]
-                if F2R1_antimask[mm]:
+                    F1R2_local[opp_col] -= _alt_in_opp(F1R2_is_alt, F1R2_inf, "hp")
+                if (
+                    F2R1_antimask[mm]
+                    and hp_ctx
+                    and F2R1_opp_antimask[ctx]
+                    and _ref_in_opp(F2R1_is_alt, F2R1_inf, "hp")
+                ):
                     F2R1_local[col_rc] += F2R1_alt_count[mm]
-                    F2R1_local[opp_col_rc] -= F2R1_alt_count[mm]
+                    F2R1_local[opp_col_rc] -= _alt_in_opp(F2R1_is_alt, F2R1_inf, "hp")
                 F1R2_local = F1R2_local.reshape(4, 3)
                 F1R2_local = F1R2_local + F1R2_local[hp_rc4, :]
                 F2R1_local = F2R1_local.reshape(4, 3)
                 F2R1_local = F2R1_local + F2R1_local[hp_rc4, :]
                 hp_alt_count[row, :] += (F1R2_local + F2R1_local).reshape(12)
 
-                # Dmg: both strands fold directly into the same cell
-                # (F2R1 via the complemented base), same as the dmg
-                # opportunity pass and the SBS/DBS dmg convention.
-                if F1R2_dmg_antimask[mm]:
-                    hp_dmg_count[row, col] += 1
-                    hp_dmg_count[row, opp_col] -= 1
-                if F2R1_dmg_antimask[mm]:
-                    hp_dmg_count[row, col_rc] += 1
-                    hp_dmg_count[row, opp_col_rc] -= 1
+                # Dmg: F2R1 folds in via the complemented base.
+                if hp_ctx and dmg_opp_antimask[ctx]:
+                    if F1R2_dmg_antimask[mm]:
+                        hp_dmg_count[row, col] += 1
+                        hp_dmg_count[row, opp_col] -= 1
+                    if F2R1_dmg_antimask[mm]:
+                        hp_dmg_count[row, col_rc] += 1
+                        hp_dmg_count[row, opp_col_rc] -= 1
             else:
-                # Inserted base doesn't match the flanking homopolymer:
-                # not a real slippage event -- str.txt row 0, +-1
-                # column. Row 0 now does receive opportunity credit (see
-                # the row-0 opportunity pass above), so this position's
-                # own event needs the same reconciliation subtraction
-                # rows 1-4 get below -- otherwise it would be double-
-                # counted as both "no event" (col 5) and "this event"
-                # (col). No base identity to RC-fold either way.
-                col = indelLen + 5
-                if F1R2_antimask[mm]:
-                    str_alt_count[0, col] += F1R2_alt_count[mm]
-                    str_alt_count[0, 5] -= F1R2_alt_count[mm]
-                if F2R1_antimask[mm]:
-                    str_alt_count[0, col] += F2R1_alt_count[mm]
-                    str_alt_count[0, 5] -= F2R1_alt_count[mm]
-                if dmg_antimask[mm]:
-                    str_dmg_count[0, col] += 1
-                    str_dmg_count[0, 5] -= 1
+                # Mismatched 1bp insertion: str.txt row 0, with the same
+                # opportunity reconciliation as rows 1-4.
+                _book_str_event(0, indelLen + 5, mm)
         else:
             # Length >=2: always STR-context, keyed by this position's
             # real STR-length bin (0 if not actually annotated -- no
-            # hp-length fallback). Row 0 receives opportunity credit same
-            # as rows 1-4 (see the row-0 opportunity pass above), so the
-            # reconciliation subtraction applies uniformly regardless of
-            # row.
-            row = str_bin_here
-            col = indelLen + 5
-            if F1R2_antimask[mm]:
-                str_alt_count[row, col] += F1R2_alt_count[mm]
-                str_alt_count[row, 5] -= F1R2_alt_count[mm]
-            if F2R1_antimask[mm]:
-                str_alt_count[row, col] += F2R1_alt_count[mm]
-                str_alt_count[row, 5] -= F2R1_alt_count[mm]
-            if dmg_antimask[mm]:
-                str_dmg_count[row, col] += 1
-                str_dmg_count[row, 5] -= 1
+            # hp-length fallback).
+            _book_str_event(str_bin_here, indelLen + 5, mm)
 
     return (
         F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,

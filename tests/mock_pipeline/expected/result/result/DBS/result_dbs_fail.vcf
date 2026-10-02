@@ -1,7 +1,8 @@
 ##fileformat=VCFv4.2
 ##FILTER=<ID=PASS,Description="All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call">
 ##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on">
-##FILTER=<ID=underpowered,Description="Passed the default calling threshold but failed the FDR-refined per-channel threshold">
+##FILTER=<ID=underpowered,Description="Candidate with LR > 0 that failed the FDR-refined per-channel threshold">
+##FILTER=<ID=zero_LR,Description="Candidate with no evidence for the alt over the ref (log10 LR == 0, e.g. alt and non-alt reads cancelling); reported for completeness, never PASS. A DBS inherits it from either of its own read family's SNVs">
 ##FILTER=<ID=high_nm,Description="Read family failed the NM/blacklist filter -- only reported under --rescue">
 ##FILTER=<ID=low_mapq,Description="Read family failed the mapq filter -- only reported under --rescue">
 ##FILTER=<ID=low_ASXS,Description="Read family failed the AS-XS filter -- only reported under --rescue">
@@ -14,6 +15,7 @@
 ##FILTER=<ID=duplex_vaf,Description="The extracted tumor allele fraction (AC/DP) exceeds --maxAF -- real AC/RC/DP attached; only reported under --rescue">
 ##FILTER=<ID=normal_vaf,Description="The extracted matched-normal allele fraction exceeds --naf (likely germline or a systematic artifact) -- real AC/RC/DP attached; only reported under --rescue">
 ##FILTER=<ID=n_cov_mask,Description="Matched-normal depth at this position fell below --minNdepth once real depth was extracted -- real AC/RC/DP attached; only reported under --rescue">
+##FILTER=<ID=strand_independence,Description="SBS or indel call with a strand whose strand independence hypothesis p-value (INFO MSP) is <= --p_threshold: more non-alt reads than read error explains, i.e. a mixed read family. A DBS containing such an SBS (same read family) fails too, and so does that DBS's other SBS">
 ##INFO=<ID=F1R2,Number=1,Type=Integer,Description="Number of F1R2 read(s) in the read bundle">
 ##INFO=<ID=F2R1,Number=1,Type=Integer,Description="Number of F2R1 read(s) in the read bundle">
 ##INFO=<ID=TAG1,Number=1,Type=String,Description="Barcode of top strand 5 prime">

@@ -19,13 +19,15 @@ All files are written under the directory specified by `-o / --output` (call it 
           won't need either)
 ```
 
+The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle`.
+
 `{sample}_duplex_allele_counts.txt` is documented in [`estimate_outputs.md`](estimate_outputs.md#sampleduplex_allele_countstxt) — it requires `_coverage.bed.gz` and is actually written by `estimate`, not `call`.
 
 ---
 
 ## `SBS/{sample}_sbs.vcf` and `SBS/{sample}_sbs_fail.vcf`
 
-Called single-base substitutions and MNVs. `_sbs.vcf` contains only `FILTER=PASS` records; `_sbs_fail.vcf` contains everything else (unless `--rescue` is set — see below). The two files together are a complete partition of all evaluated SBS candidates.
+Called single-base substitutions and MNVs. `_sbs.vcf` contains only `FILTER=PASS` records; `_sbs_fail.vcf` contains everything else (unless `--rescue` is set — see below). The two files together are a complete partition of all evaluated SBS candidates with log10 LR >= 0; candidates whose reads favor the reference (log10 LR < 0) are never written to either file, though they do enter the per-channel mutation-rate (mu) solve.
 
 ## `INDEL/{sample}_indel.vcf` and `INDEL/{sample}_indel_fail.vcf`
 
@@ -41,7 +43,9 @@ Same PASS/fail split, for dinucleotide substitutions (DBS) — two adjacent SBS 
 | --- | --- |
 | `PASS` | All filters passed, including snp_mask/noise_mask (`SNPM`/`NOISEM` INFO fields both 0) — a fully unmasked call. |
 | `masked` | Blocked only by `snp_mask`/`noise_mask` (see `SNPM`/`NOISEM` INFO fields for which). Still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but not `PASS`. A masked candidate that never got real depth extracted (LR below the channel threshold, or `--skipCoveragePass`) is dropped entirely and never appears in `_fail.vcf` unless `--rescue` is set. |
-| `underpowered` | Passed the default calling threshold but failed the per-channel FDR-refined threshold. |
+| `underpowered` | Candidate with LR > 0 that failed the per-channel FDR-refined threshold. |
+| `zero_LR` | Candidate with no evidence for the alt over the ref (log10 LR == 0; near-zero floating-point LRs are snapped to exactly 0). Reported for completeness, never PASS. A DBS inherits it from either of its own read family's SBS. |
+| `strand_independence` | SBS or indel call with a strand whose strand independence hypothesis p-value (INFO `MSP`) is <= `--p_threshold` (not corrected for the number of calls): the strand has more non-alt reads than read error explains, i.e. a mixed read family (early-cycle PCR error, or two molecules sharing a barcode). Tested on the final PASS SBS and indel calls (on the unrounded p, not the printed MSP); a strand with no non-alt read has p = 1 and never fails. A DBS fails if either of its own read family's SBS (same TAG1/TAG2/SP) fails, and then its other SBS gets this FILTER too, whatever its own MSP. Always written to the fail VCF. |
 
 The remaining values are only ever emitted when `--rescue` is set (otherwise those candidates are dropped instead of appearing in `_fail.vcf`):
 
@@ -66,8 +70,8 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | --- | --- | --- |
 | `F1R2` | Integer | Number of F1R2 reads in the read family (top-strand read count). |
 | `F2R1` | Integer | Number of F2R1 reads in the read family (bottom-strand read count). |
-| `LR` | Float | Log-likelihood ratio of the major base over the minor base. |
-| `LM` | Float | Maximum log-likelihood ratio of major base over minor base across alt bases. |
+| `LR` | Float | log10 likelihood ratio of the alt allele (SBS: the position's non-reference base, majority or not; indel: the indel) over the reference allele. |
+| `LM` | Float | Maximum log10 likelihood ratio the context's damage rates allow (the call's LR ceiling). |
 | `TC` | Integer×4 | Top-strand base counts, order A, T, C, G. |
 | `BC` | Float×4 | Bottom-strand base counts, order A, T, C, G. |
 | `DF` | Integer | Distance of the variant from the fragment (template) end. |
@@ -77,10 +81,11 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | `SP` | Integer | Read family's reference start position. |
 | `TN` | String | Trinucleotide context of the variant (reference base ± 1 flanking base). |
 | `HP` | Integer | Homopolymer length at the site. Always 0 for SBS. |
-| `STR` | Integer | Reference-allele-length bin of short tandem repeats at the site: 0 = no STR or <10bp, 1 = 10–24bp, 2 = 25–39bp, 3 = 40bp+. Always 0 for SBS. |
+| `STR` | Integer | STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that isn't a whole number of the tract's repeat units (scored and counted as STR0); 1 = 2–9bp, 2 = 10–24bp, 3 = 25–39bp, 4 = 40bp+. Always 0 for SBS. |
 | `SNPM` | Integer | 1 if this position falls in `snp_mask`. SBS only, always 0 for indel. Never set on a `PASS` record. |
 | `NOISEM` | Integer | 1 if this position (or, for indels, any base of its span) falls in `noise_mask`. Never set on a `PASS` record. |
 | `FDR` | Float | Local false discovery rate for this call: `(1-mu)/(rawLR*mu + 1-mu)`, where `mu` is this call's channel's final FDR-refined mutation-rate estimate. Reported regardless of filter, so a fail-VCF record's own `FDR` explains why it didn't clear its channel's threshold. `1.0` if the channel has no determinable `mu` (e.g. an indel with no HP/STR channel at all). |
+| `MSP` | String (2) | Strand independence hypothesis p-values for F1R2,F2R1: P(X >= k), k = the strand's non-alt reads (every read covering the position, at its actual BQ; no `--minBq` cut), X Poisson-binomial over those reads with per-read non-alt probability 10^(-BQ/10) + the context's amplification error. For indels, k = the strand's REF reads among its informative (ALT+REF, BQ above `--minBq`) reads, X binomial with per-read probability the learned amplification error that reverts the indel in the mutant molecule's context (no separate BQ term). `1` when the strand has no non-alt read. Computed only for SBS and indel calls that are PASS going into the strand independence filter (so it appears on PASS and `strand_independence` records); `.` on every other record. |
 
 ### INFO fields — DBS records (a separate, smaller INFO set)
 

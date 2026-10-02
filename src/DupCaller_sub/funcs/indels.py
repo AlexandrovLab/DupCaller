@@ -4,47 +4,83 @@ _BASE2NUM = {"A": 0, "T": 1, "C": 2, "G": 3}
 _NUM2BASE = "ATCG"
 
 
+# A/T/C/G -> 0-3, anything else (N) -> 4, for whole read sequences.
+_BASE_CODE_LUT = np.full(256, 4, dtype=np.int64)
+for _b, _c in (("A", 0), ("T", 1), ("C", 2), ("G", 3)):
+    _BASE_CODE_LUT[ord(_b)] = _c
+
+
+def base_codes(seq):
+    """Base codes (A,T,C,G = 0-3, anything else 4) of a sequence string."""
+    return _BASE_CODE_LUT[np.frombuffer(seq.encode("ascii"), dtype=np.uint8)]
+
+
+def str_unit_multiple(indel_len, unit_len):
+    """True iff an indel of indel_len (signed, uncapped) is a whole number
+    of repeat units of an STR with this unit length. 1bp indels always
+    count (they're routed by homopolymer context, not STR bin)."""
+    return abs(indel_len) < 2 or abs(indel_len) % unit_len == 0
+
+
+def str_length_bin(unit_len, total_len):
+    """STR bin (str.txt row) of a tract: 0 = not a repeat (unit < 2 or
+    fewer than two units), 1 = 2-9bp, 2 = 10-24bp, 3 = 25-39bp, 4 = 40+bp."""
+    if unit_len < 2 or total_len < 2 * unit_len:
+        return 0
+    if total_len >= 40:
+        return 4
+    if total_len >= 25:
+        return 3
+    if total_len >= 10:
+        return 2
+    return 1
+
+
+def str_slip_tract(indel_len, inserted_seq, ctx, reference_int, str_raw):
+    """(unit_len, total_len) of the STR tract a >=2bp indel is a slip of, or
+    None if it isn't a slip (an STR0 event).
+
+    A slip is a whole number of the tract's units, at the tract start (a
+    left-aligned slip always lands there), and made of the tract itself: a
+    deletion that stays inside the tract, or an insertion of copies of the
+    tract's unit in phase. "GG" inserted into (AC)n, or a deletion running
+    out of the tract, has the right length but is not a slip.
+
+    ctx: indel_context_index of the indel; reference_int and str_raw (unit,
+    repeat count, start flag rows) share its local frame. Shared by learning
+    and calling."""
+    if abs(indel_len) < 2 or ctx >= str_raw.shape[1]:
+        return None
+    unit_len = int(str_raw[0, ctx])
+    if unit_len < 2 or not str_raw[2, ctx] or abs(indel_len) % unit_len:
+        return None
+    total_len = unit_len * int(str_raw[1, ctx])
+    if indel_len < 0:
+        return (unit_len, total_len) if -indel_len <= total_len else None
+    if ctx + unit_len > len(reference_int) or len(inserted_seq) != indel_len:
+        return None
+    unit = reference_int[ctx : ctx + unit_len]
+    inserted = [_BASE2NUM.get(b, -1) for b in inserted_seq.upper()]
+    for i, b in enumerate(inserted):
+        if b != unit[i % unit_len]:
+            return None
+    return unit_len, total_len
+
+
 def left_align_indel(indel, reference_int, reference_start):
-    """Shift a raw CIGAR-derived indel string (findIndels output) to its
-    canonical leftmost representation, the same normalization bcftools
-    norm/vt normalize apply as a post-alignment step -- BWA (like most
-    aligners) does not left-align indels itself, so within a repeat run,
-    different reads covering the identical true event can report it at
-    different raw CIGAR positions. Left-aligning here, before any indel
-    ever enters a set()-based consensus (genotypeDSIndel, funcs/prob.py;
-    profileTriNucMismatches, funcs/learn.py), makes reads of the same
-    physical event converge onto one canonical string instead of being
-    treated as distinct indels, and guarantees the "before" side of any
-    downstream repeat-count scan (Estimate.py's classify_indel_record/
-    classify_indel_channel) is always empty.
+    """Shift a raw findIndels indel to its leftmost equivalent position
+    (the bcftools norm convention), so reads reporting the same event at
+    different places inside a repeat agree on one string.
 
-    Standard single-base-at-a-time shift: for a deletion, shifting the
-    del_len-base deleted window one position left produces an identical
-    resulting sequence exactly when the base newly excluded from the
-    window (the old last deleted base) equals the base newly included
-    (one before the old anchor) -- ref[anchor] == ref[anchor+del_len].
-    For an insertion, the analogous condition is ref[anchor] == S[-1]
-    (the last inserted base), with the inserted sequence rotating by one
-    base each shift (S -> S[-1]+S[:-1]) to keep representing the same net
-    change.
+    A deletion shifts left while ref[anchor] == ref[anchor + del_len]; an
+    insertion shifts left while ref[anchor] == its last inserted base,
+    rotating the inserted sequence by one base per shift. Shifting stops
+    at the edges of reference_int.
 
-    indel: raw indel string from findIndels -- "{pos}:{len}:{seq}" for an
-        insertion or "{pos}:-{len}" for a deletion. pos is the 0-based
-        genomic anchor (last matched base before the event, VCF POS
-        convention).
-    reference_int: base2num-encoded reference array (A=0,T=1,C=2,G=3;
-        anything else treated as non-matching/ambiguous) for the window
-        containing this indel, starting at reference_start.
-    reference_start: genomic position reference_int[0] corresponds to.
-
-    Shifting simply stops early if it would move the anchor past the left
-    edge of reference_int (the returned anchor is never < reference_start),
-    or (for a deletion) past the right edge when reading
-    reference_int[anchor + del_len] -- identical in spirit to how repeat-context
-    computations elsewhere in this codebase (e.g. call.py's
-    last_cut_valid) already accept degraded results right at a
-    processing-window boundary, since real repeat runs are far shorter
-    than a window.
+    indel: "{pos}:{len}:{seq}" (insertion) or "{pos}:-{len}" (deletion);
+        pos is the 0-based anchor (last reference base before the event).
+    reference_int: base2num-encoded reference (A=0,T=1,C=2,G=3, other=4)
+        starting at reference_start.
     """
     parts = indel.split(":")
     pos = int(parts[0])
@@ -79,11 +115,13 @@ def left_align_indel(indel, reference_int, reference_start):
 
 def indel_mask_span(local_pos, indel_len):
     """[lo, hi) local interval that must be unmasked for an indel anchored
-    at local_pos (0-based, relative to the window's antimask): the anchor
-    itself, plus every deleted base for a deletion. Shared by learning
-    (funcs/learn.py) and calling (funcs/prob.py, funcs/call.py) so both
-    apply the identical locus mask."""
-    return local_pos, local_pos + max(-indel_len, 0) + 1
+    at local_pos (0-based, relative to the window's antimask): the anchor,
+    plus every deleted base for a deletion or the context base (the first
+    base after the insertion point) for an insertion -- the same bases the
+    Eeff site masks require (funcs/misc.py's indel_eeff_site_masks). Shared
+    by learning (funcs/learn.py) and calling (funcs/prob.py, funcs/call.py)
+    so both apply the identical locus mask."""
+    return local_pos, local_pos + max(-indel_len, 1) + 1
 
 
 def indel_passes_mask(antimask, local_pos, indel_len):
@@ -98,11 +136,39 @@ def indel_passes_mask(antimask, local_pos, indel_len):
 
 def indel_context_index(local_pos):
     """Local index whose hp_raw/str_raw/reference_int value classifies an
-    indel's sequence context: the base right after the anchor, i.e. the
-    first deleted base for a deletion, the first reference base after
-    the insertion point for an insertion. Shared by learning and calling
-    so an event is learned and scored in the same HP/STR bin."""
+    indel's HP/STR context: anchor + 1, i.e. the first deleted base of a
+    deletion or the first reference base after an insertion. hp.h5 and
+    str.h5 store the whole run's/tract's values at every position in it,
+    and for a left-aligned event anchor + 1 is the run/tract start, where
+    learning credits the opportunity. Shared by learning and calling."""
     return local_pos + 1
+
+
+def indel_context_fits_window(indel, local_pos, reference_int, hp_raw, str_raw):
+    """True iff the homopolymer run (1bp indels routed to hp.txt) or STR
+    tract (a slip, str_slip_tract) an indel is scored in ends inside the
+    window, the base after it included -- the runs/tracts the Eeff site
+    masks count (hp_repeat_valid, str_tract_valid). Reads cut inside the
+    run/tract can't show its length. Other indels (STR0) always fit.
+
+    indel: left-aligned "{pos}:{len}[:{seq}]"; local_pos: its anchor in
+    the window frame shared by reference_int, hp_raw and str_raw."""
+    parts = indel.split(":")
+    indel_len = int(parts[1])
+    ctx = indel_context_index(local_pos)
+    window_len = len(reference_int)
+    if ctx >= window_len:
+        return False
+    if abs(indel_len) == 1:
+        if indel_len == 1:
+            inserted = _BASE2NUM.get(parts[2][:1].upper(), -1) if len(parts) > 2 else -1
+            if inserted != reference_int[ctx]:
+                return True
+        return ctx + int(hp_raw[0, ctx]) < window_len
+    slip = str_slip_tract(
+        indel_len, parts[2] if indel_len > 0 else "", ctx, reference_int, str_raw
+    )
+    return slip is None or ctx + slip[1] < window_len
 
 
 def findIndels(seq):
@@ -128,92 +194,158 @@ def findIndels(seq):
     return indels
 
 
-def getIndelArr(seq, indels, min_bq):
-    refPosList = seq.get_reference_positions(full_length=True)
-    refPosListNoNone = [_ if _ else -1 for _ in refPosList]
-    reference_positions = np.array(refPosListNoNone, dtype=int)
-    """
-    refQualArr = np.zeros(len(indels))
-    altQualArr = np.zeros(len(indels))
-    refCountArr = np.zeros(len(indels))
-    altCountArr = np.zeros(len(indels))
-    """
-    seqArr = np.zeros(len(indels), dtype=int)
+# Per-read evidence states for one candidate indel (getIndelArr).
+INDEL_ALT = 1
+INDEL_REF = 0
+# The read carries a different indel inside the candidate's locus
+# (genotypeDSIndel drops the candidate).
+INDEL_CONFLICT = -1
+# Informative read whose post-anchor BQ doesn't clear min_bq.
+INDEL_LOW_BQ = -2
+# The read can't establish either allele: it doesn't span the locus, ends
+# or is soft-clipped inside it, or its only matching evidence is a soft
+# clip / an unanchored end-of-read insertion.
+INDEL_UNINFORMATIVE = -3
+
+
+def _read_indel_events(seq):
+    """findIndels, paired with whether each event has an aligned (M) block
+    on both sides. Events at either end of the alignment are unanchored."""
+    events = findIndels(seq)
+    ops = [op for op, _ in seq.cigartuples if op in (0, 1, 2)]
+    anchored = []
+    for k, op in enumerate(ops):
+        if op in (1, 2):
+            anchored.append(0 in ops[:k] and 0 in ops[k + 1 :])
+    return list(zip(events, anchored))
+
+
+def _indel_right_end(local_pos, indel_len, inserted_seq, reference_int):
+    """Last local reference position a read must align through
+    (contiguously from the anchor) to show the reference allele: the base
+    after the event's rightmost equivalent placement in a repeat. None if
+    that position is outside reference_int."""
+    n = len(reference_int)
+    anchor = local_pos
+    if indel_len < 0:
+        del_len = -indel_len
+        while (
+            anchor + 1 + del_len < n
+            and 0 <= reference_int[anchor + 1] <= 3
+            and reference_int[anchor + 1] == reference_int[anchor + 1 + del_len]
+        ):
+            anchor += 1
+        end = anchor + del_len + 1
+    else:
+        seq_nums = [_BASE2NUM.get(b, -1) for b in inserted_seq]
+        while (
+            anchor + 1 < n
+            and seq_nums[0] != -1
+            and 0 <= reference_int[anchor + 1] <= 3
+            and reference_int[anchor + 1] == seq_nums[0]
+        ):
+            seq_nums = seq_nums[1:] + seq_nums[:1]
+            anchor += 1
+        end = anchor + 1
+    return end if end < n else None
+
+
+def _event_overlaps(event, lo, hi):
+    """True iff raw indel `event` touches the open reference interval
+    (lo, hi) between a candidate's anchor lo and its REF span end hi."""
+    parts = event.split(":")
+    a, length = int(parts[0]), int(parts[1])
+    if length < 0:
+        # deleted bases a+1..a-length
+        return a + 1 < hi and a - length > lo
+    # junction between a and a+1
+    return lo <= a < hi
+
+
+def getIndelArr(seq, indels, min_bq, reference_int, reference_start):
+    """Per-candidate evidence of one read: returns (seqArr, qualArr), seqArr
+    holding INDEL_ALT / INDEL_REF / INDEL_CONFLICT / INDEL_LOW_BQ /
+    INDEL_UNINFORMATIVE per candidate in `indels` (left-aligned
+    "pos:len[:seq]" strings), qualArr the representative BQ for ALT/REF
+    reads (0 otherwise).
+
+    ALT needs the read's own anchored CIGAR indel, left-aligned against
+    the same reference_int, to equal the candidate. A different anchored
+    indel inside the candidate's locus is a CONFLICT. REF needs the read
+    to align contiguously from the anchor through _indel_right_end.
+    Anything else (non-spanning read, soft clip, read ending inside the
+    locus) is UNINFORMATIVE rather than a guess at either allele."""
+    ref_pos = np.array(
+        [-1 if p is None else p for p in seq.get_reference_positions(full_length=True)],
+        dtype=int,
+    )
+    quals = seq.query_qualities
+    own = {}
+    for raw, anchored in _read_indel_events(seq):
+        if anchored:
+            own[left_align_indel(raw, reference_int, reference_start)] = raw
+
+    def _median_bq(anchor, window_len):
+        idx = np.nonzero(ref_pos == anchor)[0]
+        if idx.size == 0:
+            return 0.0
+        i = idx[0]
+        return float(np.median(quals[i + 1 : i + 1 + window_len]))
+
+    seqArr = np.full(len(indels), INDEL_UNINFORMATIVE, dtype=int)
     qualArr = np.zeros(len(indels))
     for nn, indel in enumerate(indels):
-        indel_parts = indel.split(":")
-        refPos = int(indel_parts[0])
-        indelLen = int(indel_parts[1])
-        if refPos >= seq.reference_end or refPos < seq.reference_start:
-            seqArr[nn] = -1
-            continue
-        readPos = np.where(reference_positions == refPos)[0]
-        if len(readPos) == 0 or readPos >= seq.query_length - 1:
-            continue
-        readPos = readPos[0]
-        if indelLen > 0:
-            if (reference_positions[readPos + 1 : readPos + indelLen + 1] == -1).all():
-                # Unaligned could mean a real insertion here, or just a
-                # soft clip -- check whether the read bases actually spell
-                # out this candidate's inserted sequence before calling it
-                # ALT, instead of assuming a conflict (-1, which drops the
-                # whole candidate).
-                inserted_seq = indel_parts[2]
-                read_window = seq.query_sequence[readPos + 1 : readPos + 1 + indelLen]
-                if read_window.upper() == inserted_seq.upper():
-                    seqArr[nn] = 1
-                else:
-                    seqArr[nn] = 0
-            elif reference_positions[readPos + 1] - reference_positions[readPos] != -1:
-                seqArr[nn] = 0
-            else:
-                seqArr[nn] = -1
-        if indelLen < 0 and reference_positions.size > readPos:
-            next_refpos = reference_positions[readPos + 1]
-            if (
-                next_refpos != -1
-                and next_refpos - reference_positions[readPos] == -indelLen + 1
+        parts = indel.split(":")
+        pos = int(parts[0])
+        indel_len = int(parts[1])
+        inserted_seq = parts[2] if len(parts) > 2 else ""
+        if indel in own:
+            state = INDEL_ALT
+            bq_anchor = int(own[indel].split(":")[0])
+        else:
+            local_end = _indel_right_end(
+                pos - reference_start, indel_len, inserted_seq, reference_int
+            )
+            span_end = (
+                reference_start + local_end
+                if local_end is not None
+                else reference_start + len(reference_int)
+            )
+            if any(
+                _event_overlaps(raw, pos, span_end)
+                for key, raw in own.items()
+                if key != indel
             ):
-                seqArr[nn] = 1
-            elif next_refpos != -1 and next_refpos - reference_positions[readPos] == 1:
-                seqArr[nn] = 0
-            elif next_refpos == -1 and readPos + 1 >= seq.query_alignment_end:
-                # Unaligned because the read is soft-clipped right here,
-                # not a competing indel -- same reasoning as the insertion
-                # branch above.
-                seqArr[nn] = 0
-            else:
-                seqArr[nn] = -1
+                seqArr[nn] = INDEL_CONFLICT
+                continue
+            if local_end is None:
+                continue
+            idx = np.nonzero(ref_pos == pos)[0]
+            if idx.size == 0:
+                continue
+            i = idx[0]
+            k = span_end - pos
+            if i + k >= ref_pos.size or not np.array_equal(
+                ref_pos[i : i + k + 1], np.arange(pos, span_end + 1)
+            ):
+                continue
+            state = INDEL_REF
+            bq_anchor = pos
 
-        if seqArr[nn] == -1:
-            continue
-
-        # BQ is the median over a window of |indelLen| bases immediately
-        # following the anchor, in read-coordinate space -- for an
-        # insertion this is exactly the inserted bases; for a deletion
-        # (which consumes reference, not read bases) this is the
-        # |indelLen| real read bases immediately after the deletion
-        # point, since there's nothing "inside" a deletion to read a
-        # quality from. Same window and same aggregation regardless of
-        # ALT/REF status, so a read's quality contribution doesn't depend
-        # on which side of the call it happens to support.
-        window_len = abs(indelLen)
-        median_bq = np.median(
-            seq.query_qualities[readPos + 1 : readPos + 1 + window_len]
-        )
-
-        # A read whose representative BQ doesn't clear min_bq is dropped
-        # from this candidate's alt/ref counts -- but with a sentinel
-        # distinct from the -1 used above for "read doesn't cover/can't
-        # classify this position". Both values exclude the read from the
-        # ==1/==0 count filters in prob.py/learn.py identically, but
-        # prob.py's mask_multiallele only reacts to -1: that mask exists
-        # to drop a whole candidate when a read is structurally ambiguous
-        # for it, not to drop a whole candidate because one read happened
-        # to be low quality (which single low-BQ reads would do routinely
-        # once minBq gating is reused as the same sentinel).
+        # BQ: median over the |indel_len| read bases after the anchor (the
+        # inserted bases, or the bases after the deletion point), for ALT
+        # and REF alike.
+        median_bq = _median_bq(bq_anchor, abs(indel_len))
         if median_bq <= min_bq:
-            seqArr[nn] = -2
+            seqArr[nn] = INDEL_LOW_BQ
             continue
+        seqArr[nn] = state
         qualArr[nn] = median_bq
     return seqArr, qualArr
+
+
+def indel_has_context(local_pos, window_len):
+    """True iff the indel's anchor is not the window's first base (where
+    left_align_indel may have been stopped by the window edge) and its
+    context base (indel_context_index) is inside the window."""
+    return local_pos >= 1 and indel_context_index(local_pos) < window_len
