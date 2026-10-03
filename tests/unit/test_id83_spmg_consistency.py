@@ -1,12 +1,12 @@
 """classify_indel_channel must give the same ID83 channel as
 SigProfilerMatrixGenerator (1.3.6) for left-aligned indels. Expected labels
 below are SPMG's own output for these contexts (checked 2026-10-02 against
-the installed package, and on 46,370 planted chr22 indels: 7 mismatches,
-all the documented str.h5 overlap-resolution gap).
+the installed package, and on 46,370 planted chr22 indels).
 
 Each case gives the reference from the base after the anchor onward
-(`after_anchor`), the event, and the hp.h5/str.h5 values at that position
-(hp_run, str_unit_len, str_repeat_count), as Estimate.py reads them.
+(`after_anchor`) and the event; the anchor is chosen so the event stays
+left-aligned. The `anno` column (hp.h5/str.h5 values, which the classifier
+no longer reads) is kept to show that the str.h5 annotation is irrelevant.
 """
 
 import pytest
@@ -63,7 +63,10 @@ CASES = [
 ]
 
 
-def _classify(after_anchor, kind, payload, anno):
+def _classify(after_anchor, kind, payload, anno=None):
+    last = after_anchor[payload - 1] if kind == "del" else payload[-1]
+    anchor = next(b for b in "GCTA" if b != last and b != after_anchor[0])
+    ref_before = "TTGCA" + anchor
     if kind == "del":
         indel_seq = after_anchor[:payload]
         ref_after = after_anchor[payload:]
@@ -72,7 +75,7 @@ def _classify(after_anchor, kind, payload, anno):
         indel_seq = payload
         ref_after = after_anchor
         indel_len = len(payload)
-    label = classify_indel_channel(indel_seq, ref_after, indel_len, anno)
+    label = classify_indel_channel(indel_seq, ref_before, ref_after, indel_len)
     return INDEL83_TO_SIGPROFILER_LABELS[label]
 
 
@@ -85,8 +88,27 @@ def test_matches_sigprofiler(after_anchor, kind, payload, anno, expected):
     assert _classify(after_anchor, kind, payload, anno) == expected
 
 
-def test_known_gap_long_unit_multiple_copies():
-    # Documented, accepted gap: a >10bp unit (never in str.h5, PERF -M 10)
-    # with >=2 following copies is undercounted; SPMG gives 5:Del:R:2.
+def test_long_unit_multiple_copies():
+    # >10bp unit (never in str.h5, PERF -M 10) with 2 following copies.
     after = "ACGTTGCAAGCT" * 3 + "GG"
-    assert _classify(after, "del", 12, (1, 0, 0)) == "5:Del:R:1"
+    assert _classify(after, "del", 12) == "5:Del:R:2"
+
+
+@pytest.mark.parametrize(
+    "after_anchor,payload,expected",
+    [
+        # short repeats whose str.h5 tract lost to an overlapping longer one
+        ("AGAGATGGGG", "AG", "2:Ins:R:2"),  # (AG)2 vs (TAG)2
+        ("TTATTTATTTATTTG", "TTAT", "4:Ins:R:3"),  # (TTAT)3 vs (ATTATTT)2
+        ("CACATCACATCACA", "CA", "2:Ins:R:2"),  # (CA)2 vs (CACAT)2
+    ],
+)
+def test_overlapped_short_repeats(after_anchor, payload, expected):
+    assert _classify(after_anchor, "ins", payload) == expected
+
+
+def test_left_copies_counted():
+    # Not left-aligned (VCFs from DupCaller always are), but SPMG also
+    # counts copies ending at the anchor: ins AC after ...ACAC^ACGG.
+    label = classify_indel_channel("AC", "GGACAC", "ACGG", 2)
+    assert INDEL83_TO_SIGPROFILER_LABELS[label] == "2:Ins:R:3"

@@ -2,6 +2,11 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.6] - 2026-10-02
+
+### Changed
+- ID83 classification of observed indels is now SigProfilerMatrixGenerator's own rule, computed from the reference sequence around each call: the repeat count is the number of tandem copies of the inserted/deleted sequence on both sides of the event, and microhomology is checked on both sides. It no longer reads `hp.h5`/`str.h5`, so the two gaps listed for 1.2.5 are gone: units longer than 10bp with two or more copies, and short repeats whose `str.h5` tract lost to a longer overlapping one now get SPMG's count. Matches SPMG 1.3.6 on all of 46,370 planted chr22 indels and 46,199 more, including 591 in real 11-30bp minisatellites. Only `estimate` output changes; the opportunity side (`call`, reference composition) is unchanged.
+
 ## [1.2.5] - 2026-10-02
 
 ### Fixed

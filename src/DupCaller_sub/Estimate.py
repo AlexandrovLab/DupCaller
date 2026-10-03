@@ -107,13 +107,34 @@ def _decode_ref_seq(int_arr):
     return "".join(_NUM2BASE[b] if 0 <= b <= 3 else "N" for b in int_arr)
 
 
-# How many reference bases to fetch after an indel when resolving its
-# ID83 channel: classify_indel_record's MH-vs-repeat-unit check only needs
-# up to abs(indel_len) bases (typical deletions are a handful of bp), and
-# repeat_count itself now comes straight from hp.h5/str.h5 (classify_
-# indel_channel's `anno`), not from scanning ref_after -- this window only
-# needs to cover the deletion/insertion length itself.
+# Minimum reference flank fetched on each side of an indel to resolve its
+# ID83 channel (classify_indel_channel). The flank is widened to 6 event
+# lengths when that is longer, so the repeat-count scan always reaches the
+# capped 5+/6+ bins.
 INDEL_CONTEXT_WINDOW = 50
+
+
+def _indel83_record_label(ref_h5, rec):
+    """ID83 channel (internal label) of one indel VCF record, plus the
+    (indel_seq, ref_after, indel_len) it was resolved from. rec.pos
+    (1-based anchor) is the 0-based index of the base after the anchor, so
+    ref_before = [.., anchor] ends at rec.pos - 1."""
+    indel_len = len(rec.alts[0]) - len(rec.ref)
+    chrom_ref = ref_h5[rec.chrom]
+    chrom_len = chrom_ref.shape[0]
+    flank = max(INDEL_CONTEXT_WINDOW, 6 * abs(indel_len))
+    if indel_len < 0:
+        indel_seq = _decode_ref_seq(chrom_ref[rec.pos : rec.pos - indel_len])
+        after_start = rec.pos - indel_len
+    else:
+        indel_seq = rec.alts[0][1:].upper()
+        after_start = rec.pos
+    ref_before = _decode_ref_seq(chrom_ref[max(0, rec.pos - flank) : rec.pos])
+    ref_after = _decode_ref_seq(
+        chrom_ref[after_start : min(chrom_len, after_start + flank)]
+    )
+    label = classify_indel_channel(indel_seq, ref_before, ref_after, indel_len)
+    return label, indel_seq, ref_after, indel_len
 
 
 def calculate_ref_indel100(args):
@@ -1956,8 +1977,6 @@ def do_estimate(args):
         label2num_83, labels_indel83 = build_indel83_labels()
         indel83_mut_np = np.zeros([83, len(indel100_by_rf.columns)], dtype=int)
         ref_h5 = h5py.File(args.reference + ".ref.h5", "r")
-        hp_h5 = h5py.File(args.reference + ".hp.h5", "r")
-        str_h5 = h5py.File(args.reference + ".str.h5", "r")
 
         indel_count = 0
         indel_progress = {"start": time.time(), "last": time.time()}
@@ -1973,35 +1992,13 @@ def do_estimate(args):
             TAC = rec.samples["TUMOR"]["AC"]
             TDP = rec.samples["TUMOR"]["DP"]
 
-            # ID83 channel from the event's sequence and the reference after
-            # it (classify_indel_channel), with the repeat count from
-            # hp.h5/str.h5. rec.pos (1-based anchor) is the 0-based index
-            # of the base after the anchor.
+            # ID83 channel from the event's sequence and the flanking
+            # reference (classify_indel_channel, SigProfilerMatrixGenerator
+            # rules).
             F1R2 = rec.info["F1R2"]
             F2R1 = rec.info["F2R1"]
             duplex_no = str(F1R2) + "+" + str(F2R1)
-            indel_len = len(rec.alts[0]) - len(rec.ref)
-            chrom_len = ref_h5[rec.chrom].shape[0]
-            if indel_len < 0:
-                del_len = -indel_len
-                indel_seq = _decode_ref_seq(
-                    ref_h5[rec.chrom][rec.pos : rec.pos + del_len]
-                )
-                after_start = rec.pos + del_len
-            else:
-                indel_seq = rec.alts[0][1:].upper()
-                after_start = rec.pos
-            after_end = min(chrom_len, after_start + INDEL_CONTEXT_WINDOW)
-            ref_after = _decode_ref_seq(ref_h5[rec.chrom][after_start:after_end])
-            # HP/STR annotation at the base after the anchor (first deleted
-            # base / first base after the insertion), the same position as
-            # indel_context_index; hp.h5 and str.h5 are read independently.
-            anno = (
-                int(hp_h5[rec.chrom][0, rec.pos]),
-                int(str_h5[rec.chrom][0, rec.pos]),
-                int(str_h5[rec.chrom][1, rec.pos]),
-            )
-            label = classify_indel_channel(indel_seq, ref_after, indel_len, anno)
+            label, indel_seq, ref_after, indel_len = _indel83_record_label(ref_h5, rec)
             duplex_idx = duplex_no_dict[duplex_no]
             indel83_mut_np[label2num_83[label], duplex_idx] += 1
             if not unique_mutations.get(mutation_key):
@@ -2600,25 +2597,7 @@ def do_estimate(args):
                     continue
                 indel_count += 1
                 # Same ID83 classification as the main indel83 pipeline above.
-                indel_len = len(rec.alts[0]) - len(rec.ref)
-                chrom_len = ref_h5[rec.chrom].shape[0]
-                if indel_len < 0:
-                    del_len = -indel_len
-                    indel_seq = _decode_ref_seq(
-                        ref_h5[rec.chrom][rec.pos : rec.pos + del_len]
-                    )
-                    after_start = rec.pos + del_len
-                else:
-                    indel_seq = rec.alts[0][1:].upper()
-                    after_start = rec.pos
-                after_end = min(chrom_len, after_start + INDEL_CONTEXT_WINDOW)
-                ref_after = _decode_ref_seq(ref_h5[rec.chrom][after_start:after_end])
-                anno = (
-                    int(hp_h5[rec.chrom][0, rec.pos]),
-                    int(str_h5[rec.chrom][0, rec.pos]),
-                    int(str_h5[rec.chrom][1, rec.pos]),
-                )
-                label = classify_indel_channel(indel_seq, ref_after, indel_len, anno)
+                label = _indel83_record_label(ref_h5, rec)[0]
                 indel_mut83_re[label2num_83[label]] += 1
             for rec in vcf.fetch():
                 if "PASS" not in rec.filter:

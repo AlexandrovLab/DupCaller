@@ -85,7 +85,7 @@ def log_progress(state, label, index, total=None, extra="", interval=5.0):
 # Deletion Length 2-5+ and Insertion Length 2-5+ are always computed at a
 # fixed homopolymer-length-1 context (microhomology-style for deletion;
 # "novel repeat unit" / rep0 for insertion, mirroring
-# classify_indel_record's is_hp/indel_len>=2 branch), not the position's
+# the no-repeat case of an indel_len>=2 event), not the position's
 # actual repeat context — Insertion Length columns are further restricted
 # to is_hp positions, since only there can no-repeat-yet even apply.
 #
@@ -686,7 +686,7 @@ def indel100_reference_bucket_indices(
     classification"); the two independently derive the same anchor
     convention (a position P is "opportunity for a 1bp/unit event whose
     VCF-reported anchor would be P-1"), which is also why
-    Estimate.py.classify_indel_record below looks up context at rec.pos
+    Estimate.py's indel context lookups use rec.pos
     directly (VCF's 1-based anchor position numerically equals P in
     0-based terms). Keep bucket boundaries here in sync with both if
     build_indel100_labels ever changes.
@@ -865,266 +865,98 @@ def load_repeat_context(hp_dataset, str_dataset, start=None, end=None):
     return np.vstack((unit_len_arr, cut_arr, repeat_count_arr)).astype(np.int16)
 
 
-def _prefix_match_len(a, b, max_len):
-    """Length of the longest common prefix of `a` and `b`, capped at
-    max_len. Matching is inherently monotonic (if the first n characters
-    agree, so do the first n-1), so a simple greedy walk from the start
-    finds the maximum directly — no need to test every n independently."""
-    n = 0
-    while n < max_len and a[n] == b[n]:
-        n += 1
-    return n
+def _count_tandem_copies(seq, unit, from_end=False):
+    """Number of back-to-back copies of `unit` at the start of `seq` (or,
+    with from_end=True, at its end)."""
+    n = len(unit)
+    k = 0
+    if from_end:
+        end = len(seq)
+        while end - n >= 0 and seq[end - n : end] == unit:
+            k += 1
+            end -= n
+    else:
+        while (k + 1) * n <= len(seq) and seq[k * n : (k + 1) * n] == unit:
+            k += 1
+    return k
 
 
-def classify_indel_record(indel_seq, ref_after, indel_len):
-    """Classify a single OBSERVED indel call by actual sequence content,
-    rather than by pre-computed repeat annotation (unit_len/repeat_count
-    from .hp.h5) as the previous version of this function did.
+def classify_indel_channel(indel_seq, ref_before, ref_after, indel_len):
+    """Resolve a single observed indel call to its ID83 channel label
+    (internal syntax, see Estimate.py's build_indel83_labels; mapped to
+    COSMIC strings by INDEL83_TO_SIGPROFILER_LABELS), using the same rules
+    as SigProfilerMatrixGenerator (catalogue_generator_INDEL_single in
+    SPMG 1.3.6's MutationMatrixGenerator.py, default limited_indel=True).
+    Classification is purely from reference sequence; it does not read
+    hp.h5/str.h5, so it is independent of how the opportunity side
+    (call.py, indel100_reference_bucket_indices) annotates repeats.
 
-    Only ever looks AFTER the event, never before: every indel reaching
-    this function has already been left-aligned (funcs/indels.py's
-    left_align_indel, applied to every raw CIGAR-derived indel before it
-    ever enters a duplex family's consensus set — see genotypeDSIndel/
-    profileTriNucMismatches). A left-aligned event's anchor is, by
-    construction, the leftmost position that still represents the same
-    net change — if a matching copy of the unit existed immediately
-    before it, left-alignment would already have shifted the anchor to
-    absorb it. So checking "before" would always find zero overlap; it's
-    not computed at all rather than computed and asserted to be 0.
-
-    indel_seq: the deleted or inserted bases themselves (uppercase, length
+    indel_seq: the deleted or inserted bases (uppercase, length
         abs(indel_len)).
-    ref_after: reference bases immediately following the indel (only the
-        first min(len(ref_after), abs(indel_len)) matter).
-    indel_len: signed length of the event (+insertion, -deletion); its
-        magnitude must equal len(indel_seq).
+    ref_before: reference bases up to and including the VCF anchor base.
+    ref_after: reference bases after the event (after the deleted bases,
+        or after the anchor for an insertion).
+    indel_len: signed length (+insertion, -deletion).
+    Both flanks must reach far enough for the capped bins: 5 copies of
+    the event (5*abs(indel_len) bases) on each side is enough.
 
-    Deletion (indel_len < 0): microhomology length is the longest prefix
-        of ref_after matching a prefix of indel_seq (e.g. deleting "ATCG"
-        out of "[ATCG]ATCGAAAA" has mh_len=4, since deleted=="ATCG" ==
-        the next 4 bases). If mh_len equals the deletion length (the
-        entire deleted run duplicates the following sequence), it's a
-        repeat-unit ("STR") deletion rather than a microhomology one — a
-        partial match is what makes it MH. mh_len == 0 (no overlap at
-        all) is a "novel_deletion": the deleted unit occurs once, which
-        ID83 files as repeat count 1 ("{L}:Del:R:0"), not as MH.
-
-    Insertion (indel_len > 0): only an exact, full-length match is checked
-        (no partial-overlap microhomology concept for insertions) — if
-        indel_seq equals the equal-length window of ref_after, it's
-        extending an existing repeat; otherwise it's a novel/rep0
-        insertion.
-
-    Returns a dict describing the classification:
-        {"category": "str_deletion", "unit_len": L}
-        {"category": "novel_deletion", "unit_len": L}
-        {"category": "mh_deletion", "del_len": L, "mh_len": n}  (n >= 1)
-        {"category": "repeat_insertion", "ins_len": L}
-        {"category": "novel_insertion", "ins_len": L}
+    Rules (L = abs(indel_len), unit = indel_seq):
+      - copies = tandem copies of unit immediately left (ending at the
+        anchor) plus immediately right of the event. For a left-aligned
+        event the left side is always 0.
+      - Deletion, L == 1: {C|T}delhp{1+copies}, capped at 6+ (C+G -> C,
+        A+T -> T by the deleted base).
+      - Deletion, L >= 2, copies > 0: {L}delstr{1+copies} (6+); the unit
+        is the deleted sequence itself, so ACAC from (AC)8 is 4delstr4.
+      - Deletion, L >= 2, copies == 0: microhomology = the longer of the
+        longest prefix of unit[:-1] matching ref_after and the longest
+        suffix of unit[1:] matching ref_before; mh > 0 -> {L}delMH{mh}
+        (5+ for L >= 5 and mh >= 5), mh == 0 -> {L}delstr1 (= {L}:Del:R:0,
+        plotted as repeat size 1).
+      - Insertion, L == 1: {C|T}inshp{copies} (5+).
+      - Insertion, L >= 2: {L}insstr{copies} (5+). SPMG's insertion
+        microhomology collapses to R:0 under limited_indel, so a
+        non-repeat insertion is {L}insstr0 either way.
+    L >= 5 is reported in the "5+" length group.
     """
     assert len(indel_seq) == abs(indel_len)
+    unit = indel_seq
+    L = len(unit)
+    copies = _count_tandem_copies(ref_before, unit, from_end=True)
+    copies += _count_tandem_copies(ref_after, unit)
+    pool = "C" if unit[0] in ("C", "G") else "T"
+    len_label = "5+" if L >= 5 else str(L)
 
-    if indel_len < 0:
-        del_len = -indel_len
-        if del_len == 1:
-            # A single deleted base is always a homopolymer-run deletion,
-            # never microhomology (ID83 has no 1delMH* bucket — MH channels
-            # start at del_len==2). This holds regardless of whether the
-            # deleted base happens to match a flanking base: a match means
-            # a real run of length >=2 (mh_len==del_len below would also
-            # catch it), and a non-match just means the run's length is 1
-            # (an isolated, non-repeated base) — classify_indel_channel's
-            # repeat-count scan already expects and handles that case
-            # ("repeat count is 1 ... plus however many more flank it").
-            return {"category": "str_deletion", "unit_len": 1}
-        mh_len = _prefix_match_len(ref_after, indel_seq, min(len(ref_after), del_len))
-        if mh_len == del_len:
-            return {"category": "str_deletion", "unit_len": del_len}
-        if mh_len == 0:
-            # No following copy and no overlap at all: SigProfilerMatrix-
-            # Generator files this under the repeat channel with zero extra
-            # copies ("{L}:Del:R:0", plotted as repeat size 1), not under
-            # microhomology -- ID83's MH channels start at mh_len==1.
-            return {"category": "novel_deletion", "unit_len": del_len}
-        return {"category": "mh_deletion", "del_len": del_len, "mh_len": mh_len}
+    if indel_len > 0:
+        count_label = "5+" if copies >= 5 else str(copies)
+        if L == 1:
+            return f"{pool}inshp{count_label}"
+        return f"{len_label}insstr{count_label}"
 
-    ins_len = indel_len
-    matches_after = len(ref_after) >= ins_len and ref_after[:ins_len] == indel_seq
-    if matches_after:
-        return {"category": "repeat_insertion", "ins_len": ins_len}
-    return {"category": "novel_insertion", "ins_len": ins_len}
+    count = 1 + copies
+    count_label = "6+" if count >= 6 else str(count)
+    if L == 1:
+        return f"{pool}delhp{count_label}"
+    if copies > 0:
+        return f"{len_label}delstr{count_label}"
 
-
-def _event_is_tract_multiple(unit, ref_after, is_ins, tract_unit_len, tract_count):
-    """True if the str.h5 tract at this event (tract_unit_len,
-    tract_count) really is the repeat the event belongs to: the event is k
-    whole copies of the tract's motif, and the reference from the event
-    position onward actually reads as that motif repeated (checked as far
-    as ref_after reaches). Guards against a tract of the right unit length
-    but a different motif or phase (e.g. inserting GG at an (AG)2 tract).
-
-    The reference from the event position is ref_after for an insertion,
-    and the deleted bases followed by ref_after for a deletion.
-    """
-    u = tract_unit_len
-    if u < 2 or tract_count < 1 or len(unit) % u:
-        return False
-    ref_from_event = ref_after if is_ins else unit + ref_after
-    motif = ref_from_event[:u]
-    if len(motif) < u or unit != motif * (len(unit) // u):
-        return False
-    span = min(u * tract_count, len(ref_from_event))
-    return ref_from_event[:span] == (motif * tract_count)[:span]
-
-
-def classify_indel_channel(indel_seq, ref_after, indel_len, anno=None):
-    """Resolve a single observed indel call to its exact ID83-style channel
-    label (see Estimate.py's build_indel83_labels for the full ordered
-    list), building on classify_indel_record's MH-vs-repeat-unit
-    determination with an additional repeat-count scan: how many times the
-    deleted/inserted unit already repeats in the reference, counting
-    outward from the event. That count is what picks the hp1-6+ /
-    STR-rep1-6+ (deletion) or hp0-5+ / STR-rep0-5+ (insertion) sub-bucket
-    — classify_indel_record alone only determines unit size and
-    MH-vs-repeat-unit status, not how long the run actually is. Only
-    scans AFTER the event, for the same left-alignment reason
-    classify_indel_record only looks after it — see that function's
-    docstring.
-
-    For a "str_deletion" (classify_indel_record's mh_len==del_len case),
-    the deleted sequence's own length IS the repeat unit — one base for
-    homopolymers (unit_len==1, pooled C+G -> "C" / A+T -> "T"), or the
-    deletion's own length for STR unit sizes 2/3/4/5+. Repeat count is 1
-    (the deleted unit itself) plus however many more of that same unit
-    immediately follow it (never "before": that side is always empty for
-    a left-aligned event, see classify_indel_record).
-
-    For insertions, "repeat_insertion" (matched after) and
-    "novel_insertion" (matched neither) are really the same computation at
-    two different repeat counts, not two different code paths: a
-    non-repeat-insertion is exactly the repeat_count==0 case, so both
-    categories are handled identically here — a 1bp insertion matching
-    nothing after it naturally resolves to "{pool}inshp0", never a
-    separate "novel" bucket.
-
-    For "mh_deletion", no repeat-count scan applies — the microhomology
-    channels are keyed only by (deletion length, microhomology length),
-    with the microhomology length capped at 5 ("5+") per the standard ID83
-    convention. A deletion with zero overlap never reaches here: it is a
-    "novel_deletion" and goes to "{L}delstr1" ("{L}:Del:R:0"), matching
-    SigProfilerMatrixGenerator.
-
-    anno: optional (hp_run, str_unit_len, str_repeat_count) read directly
-        from hp.h5 (self-derived homopolymer run length) and str.h5
-        (unit_len/repeat_count) at this event's anchor position — the same
-        raw values the opportunity side (call.py's cov_mat_indel/indel100
-        accumulation, funcs/misc.py's indel100_reference_bucket_indices)
-        already reads. Purely mechanical, no live re-scanning of the
-        reference: a unit_len==1 event (homopolymer) always takes its
-        repeat_count from hp_run — hp.h5 is self-derived and always valid,
-        so this never needs a fallback. A unit_len>=2 event made of one
-        base (AA, TTT) takes it from hp_run // unit_len. Any other
-        unit_len>=2 event (STR) takes it
-        from str.h5 when the event is k whole copies of the annotated
-        tract's motif (k=1 being the tract's own unit; motif and phase
-        checked against the reference by _event_is_tract_multiple): repeat_count is
-        str_repeat_count * str_unit_len // unit_len, i.e. the number of
-        event-length copies in the tract, as SigProfilerMatrixGenerator
-        counts it (ACAC in (AC)8 -> 4). Otherwise (str.h5 has no matching
-        annotation here) repeat_count defaults to the minimum count consistent with
-        what was actually observed — classify_indel_record has already
-        confirmed at least one matching copy follows the event (that's
-        what makes it "str_deletion"/"repeat_insertion" rather than
-        "mh_deletion"/"novel_insertion" in the first place). That minimum
-        is 2 for a deletion (the deleted unit plus the following copy) but
-        1 for an insertion (the inserted unit isn't in the reference; only
-        the following copy is), matching SigProfilerMatrixGenerator's
-        copy counting. No longer run str.h5 doesn't know about is
-        hypothesized. If anno is omitted entirely, the same defaults apply
-        throughout (1 for homopolymers; 2/1 for STR deletion/insertion).
-    """
-    result = classify_indel_record(indel_seq, ref_after, indel_len)
-    cat = result["category"]
-
-    if cat in ("str_deletion", "novel_deletion", "repeat_insertion", "novel_insertion"):
-        is_ins = cat not in ("str_deletion", "novel_deletion")
-        unit = indel_seq
-        unit_len = len(unit)
-        if cat == "novel_insertion":
-            # No matching copy exists at all (that's the definition of
-            # "novel") -- repeat_count is 0 by construction, not a lookup.
-            repeat_count = 0
-        elif cat == "novel_deletion":
-            # Only the deleted unit itself, no copy on either side --
-            # repeat_count 1 ("{L}delstr1" = "{L}:Del:R:0"), not a lookup.
-            repeat_count = 1
-        elif unit_len == 1:
-            repeat_count = anno[0] if anno is not None else 1
-        elif anno is not None and unit == unit[0] * unit_len:
-            # Multi-base unit made of one base (AA, TTT): str.h5 carries no
-            # such tracts, but hp.h5's run at the event (a left-aligned
-            # event starts at the run start) gives the count directly --
-            # event-length copies in the run, as SigProfilerMatrixGenerator
-            # counts it: TT into T5 -> 2insstr2, AA from A6 -> 2delstr3.
-            repeat_count = anno[0] // unit_len
-        elif anno is not None and _event_is_tract_multiple(
-            unit, ref_after, is_ins, anno[1], anno[2]
-        ):
-            # The event is k whole copies of the annotated tract's unit
-            # (k=1: the tract's own unit; k>1: e.g. ACAC in (AC)8). A
-            # left-aligned event starts at the tract start, so the count is
-            # how many event-length copies fit in the tract (SigProfiler-
-            # MatrixGenerator counts copies of the event sequence itself):
-            # (AC)8 holds 4 ACAC -> 4delstr4 / 4insstr4.
-            repeat_count = anno[2] * anno[1] // unit_len
-        elif is_ins:
-            # One existing copy follows the insertion (that's what made it
-            # "repeat_insertion"); the inserted unit itself isn't in the
-            # reference, so the minimum observed count is 1, not 2.
-            # Known, accepted gap vs SigProfilerMatrixGenerator (shared
-            # with the deletion branch below): Index.py's
-            # resolve_str_overlaps keeps the longest of overlapping PERF
-            # tracts, so a short repeat at the event can lose its
-            # annotation to a longer tract of another unit (e.g. (AG)2 in
-            # TAG^AGAGATG, covered by a 6bp unit-3 tract). The motif check
-            # then correctly rejects that tract and the count falls back
-            # to the minimum here; SPMG would count the real copies.
-            # 7/46,370 planted chr22 indels hit this (2026-10-02).
-            repeat_count = 1
-        else:
-            # Deleted unit + the one matching copy that follows it.
-            # Known, accepted gap vs SigProfilerMatrixGenerator: str.h5 is
-            # built with PERF -M 10, so an event whose unit is >10bp is
-            # never annotated and always lands here. With exactly one
-            # following copy this still matches SPMG ("5:Del:R:1"), but a
-            # >10bp unit with >=2 following copies (minisatellite/VNTR)
-            # is undercounted -- SPMG gives "5:Del:R:2+". Deliberately not
-            # handled: such calls are rare (low mappability, often noise-
-            # masked) and only shift between 5+delstr bins.
-            repeat_count = 2
-        pool = "C" if unit[0] in ("C", "G") else "T"
-
-        if is_ins:
-            count_label = "5+" if repeat_count >= 5 else str(repeat_count)
-            if unit_len == 1:
-                return f"{pool}inshp{count_label}"
-            unit_label = "5+" if unit_len >= 5 else str(unit_len)
-            return f"{unit_label}insstr{count_label}"
-        else:
-            count_label = "6+" if repeat_count >= 6 else str(repeat_count)
-            if unit_len == 1:
-                return f"{pool}delhp{count_label}"
-            unit_label = "5+" if unit_len >= 5 else str(unit_len)
-            return f"{unit_label}delstr{count_label}"
-
-    # mh_deletion
-    del_len = result["del_len"]
-    mh_len = result["mh_len"]
-    del_group = "5+" if del_len >= 5 else str(del_len)
-    max_mh = {"2": 1, "3": 2, "4": 3, "5+": 5}[del_group]
-    reported_mh = min(max(mh_len, 1), max_mh)
-    mh_label = "5+" if (del_group == "5+" and reported_mh == 5) else str(reported_mh)
-    return f"{del_group}delMH{mh_label}"
+    forward = unit[:-1]
+    for_hom = 0
+    for i in range(len(forward), 0, -1):
+        if ref_after[:i] == forward[:i]:
+            for_hom = i
+            break
+    reverse = unit[1:]
+    rev_hom = 0
+    for i in range(len(reverse), 0, -1):
+        if len(ref_before) >= i and ref_before[-i:] == reverse[-i:]:
+            rev_hom = i
+            break
+    mh = max(for_hom, rev_hom)
+    if mh == 0:
+        return f"{len_label}delstr1"
+    mh_label = "5+" if (L >= 5 and mh >= 5) else str(mh)
+    return f"{len_label}delMH{mh_label}"
 
 
 def indel_coverage_category_index(indel_seq, ref_after, indel_len):
@@ -1135,13 +967,11 @@ def indel_coverage_category_index(indel_seq, ref_after, indel_len):
     thresholded against (call.py's cov_mat_indel columns, same order),
     not an average across all 16 unrelated categories.
 
-    Reuses classify_indel_record's repeat-vs-mismatch determination for
-    the 1bp cases (the only place this coarser scheme distinguishes
-    repeat-unit from novel/mismatched events -- deletions and insertions
-    of length >=2 are bucketed by length alone here, regardless of
-    true-STR vs microhomology, since that finer distinction only exists
-    in the 83-channel scheme classify_indel_channel builds on top of
-    this).
+    Only the 1bp insertion case looks at sequence (does the inserted base
+    extend the following base?) -- deletions and insertions of length >=2
+    are bucketed by length alone here, regardless of true-STR vs
+    microhomology, since that finer distinction only exists in the
+    83-channel scheme (classify_indel_channel).
 
     Every +-1bp repeat-matching event lands on the homopolymer columns
     (14/15), never 0/1 (STR-only, one copy of a real annotated repeat
@@ -1149,7 +979,7 @@ def indel_coverage_category_index(indel_seq, ref_after, indel_len):
     genotypeDSIndel, which always scores a +-1bp event via the HP table
     regardless of STR membership (see funcs/prob.py's indelErrorProbs).
 
-    indel_seq/ref_after/indel_len: same arguments as classify_indel_record.
+    indel_seq/ref_after/indel_len: same arguments as classify_indel_channel.
     """
     if indel_len < 0:
         del_len = -indel_len
