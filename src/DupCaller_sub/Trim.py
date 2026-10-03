@@ -26,6 +26,23 @@ def _validate_pattern(pattern):
         )
 
 
+def _check_pattern_pair(pattern, pattern2):
+    """Read 1 and read 2 patterns must extract barcodes of the same length:
+    each end of a molecule is read by read 1 on one strand and by read 2 on
+    the other, and call pairs the strands by swapping (bc1, bc2), so a
+    different N count would split every duplex into two single-strand
+    families."""
+    n1, n2 = pattern.count("N"), pattern2.count("N")
+    if n1 != n2:
+        raise ValueError(
+            f"Barcode patterns '{pattern}' (read 1) and '{pattern2}' (read 2) have "
+            f"{n1} and {n2} N (barcode) bases. They must match: each molecule end's "
+            "barcode is read by read 1 on one strand and by read 2 on the other, so "
+            "different lengths would stop the two strands of a molecule from being "
+            "grouped into one duplex family. Only the X (skipped) bases may differ."
+        )
+
+
 def _read_base_name(header, path, record_no):
     """Read name without the leading '@', any comment, or a trailing /1 or /2."""
     header = header.rstrip("\r\n")
@@ -49,13 +66,17 @@ def _check_read(name, seq, qual, pattern_len, path, record_no):
         )
 
 
-def trim(readPair, pattern):
+def trim(readPair, pattern, pattern2=None):
     """Move each mate's barcode bases (pattern N positions) into the read
-    name and DB tag and clip the pattern off the read. Records are
-    [header, seq, qual] with or without trailing newlines; mate headers must
-    name the same fragment (a trailing /1 or /2 is dropped) and both mates
-    get the same rewritten name."""
+    name and DB tag and clip the pattern off the read. Read 2 uses pattern2
+    when given, else pattern. Records are [header, seq, qual] with or
+    without trailing newlines; mate headers must name the same fragment (a
+    trailing /1 or /2 is dropped) and both mates get the same rewritten
+    name."""
+    if pattern2 is None:
+        pattern2 = pattern
     adapterLen = len(pattern)
+    adapterLen2 = len(pattern2)
     (name1, seq1, qual1), (name2, seq2, qual2) = readPair
     seq1, seq2 = seq1.rstrip("\r\n"), seq2.rstrip("\r\n")
     qual1, qual2 = qual1.rstrip("\r\n"), qual2.rstrip("\r\n")
@@ -66,16 +87,16 @@ def trim(readPair, pattern):
         [base for nn, base in enumerate(seq1[0:adapterLen]) if pattern[nn] == "N"]
     )
     bc2 = "".join(
-        [base for nn, base in enumerate(seq2[0:adapterLen]) if pattern[nn] == "N"]
+        [base for nn, base in enumerate(seq2[0:adapterLen2]) if pattern2[nn] == "N"]
     )
     if len(bc1) > 0:
         namenew = f"@{base_name}_{bc1}+{bc2} DB:Z:{bc1}-{bc2}\n"
     else:
         namenew = f"@{base_name}\n"
     seqnew1 = seq1[adapterLen:] + "\n"
-    seqnew2 = seq2[adapterLen:] + "\n"
+    seqnew2 = seq2[adapterLen2:] + "\n"
     qualnew1 = qual1[adapterLen:] + "\n"
-    qualnew2 = qual2[adapterLen:] + "\n"
+    qualnew2 = qual2[adapterLen2:] + "\n"
     return [namenew, seqnew1, qualnew1], [namenew, seqnew2, qualnew2]
 
 
@@ -86,7 +107,11 @@ def do_trim(args):
     if not os.path.exists(args.fq2):
         raise FileNotFoundError(f"Input fastq file not found: {args.fq2}")
     _validate_pattern(args.pattern)
+    pattern2 = getattr(args, "pattern2", None) or args.pattern
+    _validate_pattern(pattern2)
+    _check_pattern_pair(args.pattern, pattern2)
     pattern_len = len(args.pattern)
+    pattern2_len = len(pattern2)
 
     fq1 = _open_fastq(args.fq)
     fq2 = _open_fastq(args.fq2)
@@ -138,9 +163,9 @@ def do_trim(args):
                     "FASTQs are not in the same order."
                 )
             _check_read(base1, seq1, qual1, pattern_len, args.fq, record_no)
-            _check_read(base2, seq2, qual2, pattern_len, args.fq2, record_no)
+            _check_read(base2, seq2, qual2, pattern2_len, args.fq2, record_no)
             readPair = [[name1, seq1, qual1], [name2, seq2, qual2]]
-            read1, read2 = trim(readPair, args.pattern)
+            read1, read2 = trim(readPair, args.pattern, pattern2)
             lineIndex = 0
             record_no += 1
             fq1Out.write(read1[0] + read1[1] + "+\n" + read1[2])

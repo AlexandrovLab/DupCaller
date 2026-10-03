@@ -61,6 +61,16 @@ if __name__ == "__main__":
         "-p", "--pattern", type=str, required=True, help="pattern of sequence barcode"
     )
     trim_parser.add_argument(
+        "-p2",
+        "--pattern2",
+        type=str,
+        default=None,
+        help="barcode pattern for read 2, if it differs from read 1's (-p). Must have "
+        "the same number of N (barcode) bases as -p; only the X (skipped) bases may "
+        "differ, since each molecule end's barcode is read by read 1 on one strand and "
+        "by read 2 on the other. Default: -p for both reads",
+    )
+    trim_parser.add_argument(
         "-o",
         "--output",
         type=str,

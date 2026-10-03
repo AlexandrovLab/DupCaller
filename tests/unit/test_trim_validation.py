@@ -19,9 +19,9 @@ def _fq(path, records, gz=False):
     return str(path)
 
 
-def _run(tmp_path, r1, r2, pattern="NNNXX"):
+def _run(tmp_path, r1, r2, pattern="NNNXX", pattern2=None):
     args = argparse.Namespace(
-        fq=r1, fq2=r2, pattern=pattern, output=str(tmp_path / "out")
+        fq=r1, fq2=r2, pattern=pattern, pattern2=pattern2, output=str(tmp_path / "out")
     )
     do_trim(args)
     return (
@@ -64,3 +64,43 @@ def test_invalid_pattern_fails(tmp_path):
     r2 = _fq(tmp_path / "e_2.fq", [("@f", "TTTAAGG", "IIIIIII")])
     with pytest.raises(ValueError, match="Invalid barcode pattern"):
         _run(tmp_path, r1, r2, pattern="NNA")
+
+
+def test_read2_pattern_clips_read2_separately(tmp_path):
+    # -p NNNXX on read 1, -p2 NNNXXXX on read 2: same 3-base barcodes,
+    # read 2 loses 7 bases instead of 5.
+    r1 = _fq(tmp_path / "f_1.fq", [("@f", "ACGTTGGGG", "IIIIIIIII")])
+    r2 = _fq(tmp_path / "f_2.fq", [("@f", "TTTAACCGGGG", "IIIIIIIIIII")])
+    o1, o2 = _run(tmp_path, r1, r2, pattern="NNNXX", pattern2="NNNXXXX")
+    assert o1[0] == o2[0] == "@f_ACG+TTT DB:Z:ACG-TTT"
+    assert o1[1] == "GGGG" and o2[1] == "GGGG"
+    assert o1[3] == "IIII" and o2[3] == "IIII"
+
+
+def test_read2_pattern_defaults_to_read1_pattern(tmp_path):
+    r1 = _fq(tmp_path / "g_1.fq", [("@f", "ACGTTGGGG", "IIIIIIIII")])
+    r2 = _fq(tmp_path / "g_2.fq", [("@f", "TTTAAGGGG", "IIIIIIIII")])
+    assert _run(tmp_path, r1, r2, pattern2=None) == _run(
+        tmp_path, r1, r2, pattern2="NNNXX"
+    )
+
+
+def test_read2_pattern_with_other_barcode_length_fails(tmp_path):
+    r1 = _fq(tmp_path / "h_1.fq", [("@f", "ACGTTGGGG", "IIIIIIIII")])
+    r2 = _fq(tmp_path / "h_2.fq", [("@f", "TTTAAGGGG", "IIIIIIIII")])
+    with pytest.raises(ValueError, match="N \\(barcode\\) bases"):
+        _run(tmp_path, r1, r2, pattern="NNNXX", pattern2="NNNNX")
+
+
+def test_read2_shorter_than_its_pattern_fails(tmp_path):
+    r1 = _fq(tmp_path / "i_1.fq", [("@f", "ACGTTGGGG", "IIIIIIIII")])
+    r2 = _fq(tmp_path / "i_2.fq", [("@f", "TTTAAG", "IIIIII")])
+    with pytest.raises(ValueError, match="shorter than"):
+        _run(tmp_path, r1, r2, pattern="NNNXX", pattern2="NNNXXXX")
+
+
+def test_invalid_read2_pattern_fails(tmp_path):
+    r1 = _fq(tmp_path / "j_1.fq", [("@f", "ACGTTGG", "IIIIIII")])
+    r2 = _fq(tmp_path / "j_2.fq", [("@f", "TTTAAGG", "IIIIIII")])
+    with pytest.raises(ValueError, match="Invalid barcode pattern"):
+        _run(tmp_path, r1, r2, pattern2="NNA")
