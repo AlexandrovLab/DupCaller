@@ -2,6 +2,15 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.5] - 2026-10-02
+
+### Fixed
+- ID83 classification of observed indels now matches SigProfilerMatrixGenerator (checked against SPMG 1.3.6 on 46,370 planted chr22 indels: 7 differ, see below). This changes only `estimate` outputs (ID83 counts, burden and rates); `call` output is unchanged, so an existing call directory can be re-estimated.
+  - A deletion of 2bp or more with no repeat and no microhomology goes to `{L}:Del:R:0` (repeat size 1) instead of `{L}:Del:M:1`, which used to merge zero and one base of microhomology.
+  - A repeat insertion of 2bp or more with no matching `str.h5` tract counts the single copy after it (`{L}:Ins:R:1`) instead of 2.
+  - An event that is k whole copies of the annotated tract's motif counts event-length copies in the tract (ACAC in (AC)8 → `4:Del:R:3` / `4:Ins:R:4`); the motif and phase are checked against the reference. Multi-base units made of one base (AA, TTT) are counted from the homopolymer run.
+- Known remaining differences (documented in `classify_indel_channel`): units longer than 10bp with two or more following copies (PERF `-M 10`), and short repeats whose `str.h5` annotation lost to a longer overlapping tract.
+
 ## [1.2.4] - 2026-10-02
 
 ### Changed
