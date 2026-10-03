@@ -2,14 +2,67 @@
 
 nextflow.enable.dsl=2
 
+// Defaults for params a config may not set (pipeline.config, or a -c file,
+// overrides any of these). skip_bwa_index defaults to true so a config
+// written before it existed never starts an unrequested bwa-mem2 index;
+// likewise skip_index for the DupCaller index (Step 1a).
+params.skip_index      = true
+params.skip_bwa_index  = true
+params.normal_bam      = null
+params.germline_vcf    = null
+params.noise_mask      = null
+params.target_bed      = null
+params.indel_bed       = null
+params.gene_bed        = null
+params.seed            = null
+params.p_threshold     = null
+params.estimate_dilute = false
+params.estimate_clonal = null
+
 if (!params.sample_map) error "params.sample_map is required"
 if (!params.reference)  error "params.reference is required"
+if (params.estimate_clonal) {
+    error "params.estimate_clonal was removed: DupCaller.py estimate has no clonal option"
+}
+
+// bwa-mem2 index files expected next to params.reference (bwa-mem2 index).
+def BWA_MEM2_INDEX_SUFFIXES = ['0123', 'amb', 'ann', 'bwt.2bit.64', 'pac']
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 1: Index reference genome
+// Optional inputs
+//
+// Nextflow `path` inputs are staged files, so an unset optional resource is
+// bound to a real placeholder file shipped in assets/ (one distinctly named
+// file per input, so two placeholders never collide in one task's work dir).
+// DupCaller opens every optional VCF/BED with tabix, so each one is staged
+// together with its .tbi.
+// ─────────────────────────────────────────────────────────────────────────────
+def placeholder(name) {
+    file("${projectDir}/assets/${name}", checkIfExists: true)
+}
+
+// Exact names only, so a real input that happens to start with NO_ is used.
+def isPlaceholder(f) {
+    f.name in ['NO_GERMLINE_VCF', 'NO_TARGET_BED', 'NO_INDEL_BED', 'NO_GENE_BED', 'NO_NOISE_MASK']
+}
+
+def indexedResource(p, param_name) {
+    if (!p.toString().endsWith('.gz')) {
+        error "params.${param_name} = ${p}: must be bgzip-compressed (.gz) with a tabix index (.gz.tbi) next to it"
+    }
+    [file(p, checkIfExists: true), file("${p}.tbi", checkIfExists: true)]
+}
+
+def optionalIndexedResource(p, param_name, placeholder_name) {
+    p ? indexedResource(p, param_name)
+      : [placeholder(placeholder_name), placeholder("${placeholder_name}.tbi")]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 1a: DupCaller reference index (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 process INDEX_REFERENCE {
-    container 'yuhecheng62/dupcaller:1.2.1'
+    container 'yuhecheng62/dupcaller:1.2.7'
 
     input:
     path reference
@@ -29,11 +82,29 @@ process INDEX_REFERENCE {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Step 1b: bwa-mem2 reference index (optional)
+// ─────────────────────────────────────────────────────────────────────────────
+process BWA_MEM2_INDEX {
+    container 'quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0'
+
+    input:
+    path reference
+
+    output:
+    path "${reference}.{0123,amb,ann,bwt.2bit.64,pac}"
+
+    script:
+    """
+    bwa-mem2 index ${reference}
+    """
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Step 2: Trim barcodes
 // ─────────────────────────────────────────────────────────────────────────────
 process TRIM_BARCODES {
     tag "${sample_id}:${type}"
-    container 'yuhecheng62/dupcaller:1.2.1'
+    container 'yuhecheng62/dupcaller:1.2.7'
 
     input:
     tuple val(sample_id), val(type), path(read1), path(read2)
@@ -54,16 +125,16 @@ process TRIM_BARCODES {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 3: Align reads
+// Step 3: Align reads (bwa-mem2)
 // ─────────────────────────────────────────────────────────────────────────────
-process BWA_MEM {
+process BWA_MEM2 {
     tag "${sample_id}:${type}"
-    container 'biocontainers/bwa:v0.7.17_cv1'
+    container 'quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0'
     cpus params.threads
 
     input:
     tuple val(sample_id), val(type), path(read1), path(read2)
-    path bwa_index  // reference FASTA + all BWA index files staged together
+    path bwa_index  // reference FASTA + all bwa-mem2 index files staged together
 
     output:
     tuple val(sample_id), val(type), path("${sample_id}_${type}.sam")
@@ -71,7 +142,7 @@ process BWA_MEM {
     script:
     def ref_name = file(params.reference).name
     """
-    bwa mem -C -T 0 \
+    bwa-mem2 mem -C -T 0 \
         -t ${task.cpus} \
         -R "@RG\\tID:${sample_id}_${type}\\tSM:${sample_id}\\tPL:ILLUMINA" \
         ${ref_name} ${read1} ${read2} \
@@ -144,7 +215,7 @@ process MARK_DUPLICATES {
 // ─────────────────────────────────────────────────────────────────────────────
 process CALL_VARIANTS {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.1'
+    container 'yuhecheng62/dupcaller:1.2.7'
     cpus params.threads
     publishDir "${params.outdir}", mode: 'copy'
 
@@ -154,35 +225,34 @@ process CALL_VARIANTS {
           path(normal_bam), path(normal_bai)
     path dc_ref             // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5 + .str.h5 + .dbs.h5
     tuple path(germline_vcf), path(germline_tbi)
-    path noise_mask_files     // all noise/snp mask .bed.gz + .bed.gz.tbi files staged together (may be empty)
+    path noise_mask_files     // noise/snp mask .bed.gz + .bed.gz.tbi files, or the NO_NOISE_MASK placeholder
     val  noise_mask_names     // basenames of just the mask files (not their .tbi), in -m order
-    path target_bed
-    path indel_bed
+    tuple path(target_bed), path(target_tbi)
+    tuple path(indel_bed),  path(indel_tbi)
 
     output:
     tuple val(sample_id), path("${sample_id}", type: 'dir')
 
     script:
     def ref_name     = file(params.reference).name
-    def normal_arg   = (normal_bam.name   != 'NO_FILE')        ? "-n ${normal_bam}"    : ""
-    def germline_arg = (germline_vcf.name != 'NO_GERMLINE_VCF') ? "-g ${germline_vcf}" : ""
+    def germline_arg = isPlaceholder(germline_vcf) ? "" : "-g ${germline_vcf}"
     def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.collect { "'${it}'" }.join(' ') : ""
-    def target_arg   = (target_bed.name   != 'NO_TARGET_BED')   ? "-R ${target_bed}"   : ""
-    def indel_arg    = (indel_bed.name    != 'NO_INDEL_BED')    ? "-id ${indel_bed}"   : ""
+    def target_arg   = isPlaceholder(target_bed)   ? "" : "-R ${target_bed}"
+    def indel_arg    = isPlaceholder(indel_bed)    ? "" : "-id ${indel_bed}"
     // Omitted by default (DupCaller.py call itself then generates a fresh
     // random seed every run) -- set params.seed to pin it, e.g. to
     // reproduce/compare against a specific prior run's exact seed.
-    def seed_arg     = params.seed != null                      ? "--seed ${params.seed}" : ""
+    def seed_arg     = params.seed != null         ? "--seed ${params.seed}" : ""
     // Omitted by default (DupCaller.py call's own default, 0.05, applies).
-    def pt_arg       = params.p_threshold != null               ? "-pt ${params.p_threshold}" : ""
+    def pt_arg       = params.p_threshold != null  ? "-pt ${params.p_threshold}" : ""
     """
     DupCaller.py call \
         -b  ${tumor_bam} \
+        -n  ${normal_bam} \
         -f  ${ref_name} \
         -o  ${sample_id} \
         -p  ${task.cpus} \
         -r  ${params.regions} \
-        ${normal_arg} \
         ${germline_arg} \
         ${noise_arg} \
         ${target_arg} \
@@ -203,21 +273,21 @@ process CALL_VARIANTS {
 // ─────────────────────────────────────────────────────────────────────────────
 process ESTIMATE_BURDEN {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.1'
+    container 'yuhecheng62/dupcaller:1.2.7'
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(call_dir)
+    tuple val(sample_id), path(call_dir, stageAs: 'call_in/*')
     path dc_ref        // reference FASTA + .fai + .ref.h5 + .tn.h5 + .hp.h5 + .str.h5 + .dbs.h5
-    path gene_bed
+    tuple path(gene_bed), path(gene_tbi)
 
     output:
     tuple val(sample_id), path("${sample_id}", type: 'dir')
+    path "${sample_id}_estimate_params.log"
 
     script:
     def ref_name   = file(params.reference).name
-    def gene_arg   = (gene_bed.name != 'NO_GENE_BED') ? "-gb ${gene_bed}" : ""
-    def clonal_arg = params.estimate_clonal ? "-c" : ""
+    def gene_arg   = isPlaceholder(gene_bed) ? "" : "-gb ${gene_bed}"
     def dilute_arg = params.estimate_dilute ? "-d" : ""
     """
     # sigProfilerPlotting's plotSBS() caches a template pickle inside its own
@@ -226,12 +296,23 @@ process ESTIMATE_BURDEN {
     # work dir instead.
     export SIGPROFILERPLOTTING_VOLUME=\$PWD/spp_templates
 
+    # estimate writes its outputs into the call directory. The staged one is
+    # CALL_VARIANTS' own (cached) output, so work in a mirror of symlinks to
+    # it instead: new files land in this task, and the call task's output
+    # stays unchanged for -resume and for later runs with other options.
+    # estimate appends base coverage to _stats.txt, so that file is a real
+    # copy (without coverage lines from any earlier estimate) rather than a
+    # link through which the append would reach the call output.
+    cp -rs "\$(readlink -f ${call_dir})" ${sample_id}
+    rm ${sample_id}/${sample_id}_stats.txt
+    grep -v -e '^SBS Base Coverage' -e '^Indel Base Coverage' -e '^DBS Base Coverage' \
+        "\$(readlink -f ${call_dir})/${sample_id}_stats.txt" > ${sample_id}/${sample_id}_stats.txt
+
     DupCaller.py estimate \
-        -i ${call_dir} \
+        -i ${sample_id} \
         -f ${ref_name} \
         -r ${params.regions} \
         ${gene_arg} \
-        ${clonal_arg} \
         ${dilute_arg}
     """
 }
@@ -243,16 +324,20 @@ workflow {
 
     // ── Reference file channels ──────────────────────────────────────────────
 
-    // All BWA index files staged together so 'bwa mem' finds them in the work dir
-    bwa_ref_ch = Channel.fromPath([
-        params.reference,
-        "${params.reference}.fai",
-        "${params.reference}.bwt",
-        "${params.reference}.pac",
-        "${params.reference}.ann",
-        "${params.reference}.amb",
-        "${params.reference}.sa"
-    ], checkIfExists: true).collect()
+    // bwa-mem2 index files staged together with the FASTA so 'bwa-mem2 mem'
+    // finds them in the work dir -- pre-built next to params.reference
+    // (default), or built here by BWA_MEM2_INDEX when skip_bwa_index = false.
+    if (!params.skip_bwa_index) {
+        bwa_idx    = BWA_MEM2_INDEX(Channel.fromPath(params.reference, checkIfExists: true))
+        bwa_ref_ch = Channel.fromPath(params.reference, checkIfExists: true)
+            .concat(bwa_idx.flatten())
+            .collect()
+    } else {
+        bwa_ref_ch = Channel.fromPath(
+            [params.reference] + BWA_MEM2_INDEX_SUFFIXES.collect { "${params.reference}.${it}" },
+            checkIfExists: true
+        ).collect()
+    }
 
     // DupCaller h5 index files — may be produced by INDEX_REFERENCE or pre-existing
     if (!params.skip_index) {
@@ -284,12 +369,10 @@ workflow {
 
     // ── Optional resource file channels ─────────────────────────────────────
 
-    germline_ch = params.germline_vcf
-        ? Channel.value([
-            file(params.germline_vcf,           checkIfExists: true),
-            file("${params.germline_vcf}.tbi",  checkIfExists: true)
-          ])
-        : Channel.value([file('NO_GERMLINE_VCF'), file('NO_GERMLINE_TBI')])
+    germline_ch = Channel.value(optionalIndexedResource(params.germline_vcf, 'germline_vcf', 'NO_GERMLINE_VCF'))
+    target_ch   = Channel.value(optionalIndexedResource(params.target_bed,   'target_bed',   'NO_TARGET_BED'))
+    indel_ch    = Channel.value(optionalIndexedResource(params.indel_bed,    'indel_bed',    'NO_INDEL_BED'))
+    gene_ch     = Channel.value(optionalIndexedResource(params.gene_bed,     'gene_bed',     'NO_GENE_BED'))
 
     // params.noise_mask may be a single path or a list of paths (DupCaller.py
     // call's -m/--noise takes nargs="+" -- e.g. a SNP mask and a noise mask
@@ -297,29 +380,12 @@ workflow {
     noise_mask_list = params.noise_mask
         ? (params.noise_mask instanceof List ? params.noise_mask : [params.noise_mask])
         : []
-    // A path input bound to an empty list has no file to stage; always
-    // stage at least one placeholder so CALL_VARIANTS' `path
-    // noise_mask_files` input is never given a genuinely empty list.
     noise_files_ch = Channel.value(
         noise_mask_list
-            ? noise_mask_list.collectMany { m ->
-                [file(m, checkIfExists: true), file("${m}.tbi", checkIfExists: true)]
-              }
-            : [file('NO_NOISE_MASK')]
+            ? noise_mask_list.collectMany { m -> indexedResource(m, 'noise_mask') }
+            : [placeholder('NO_NOISE_MASK')]
     )
     noise_names_ch = Channel.value(noise_mask_list.collect { file(it).name })
-
-    target_ch = params.target_bed
-        ? Channel.value(file(params.target_bed, checkIfExists: true))
-        : Channel.value(file('NO_TARGET_BED'))
-
-    indel_ch = params.indel_bed
-        ? Channel.value(file(params.indel_bed,  checkIfExists: true))
-        : Channel.value(file('NO_INDEL_BED'))
-
-    gene_ch = params.gene_bed
-        ? Channel.value(file(params.gene_bed,   checkIfExists: true))
-        : Channel.value(file('NO_GENE_BED'))
 
     // ── Parse sample map ─────────────────────────────────────────────────────
     // Emits (sample_id, type, fq1, fq2). Normal rows are only emitted (and
@@ -346,7 +412,7 @@ workflow {
     // ── Steps 2–4: trim → align → mark-dup (tumor, and normal unless shared) ─
 
     trimmed_ch = TRIM_BARCODES(reads_ch)
-    sam_ch     = BWA_MEM(trimmed_ch, bwa_ref_ch)
+    sam_ch     = BWA_MEM2(trimmed_ch, bwa_ref_ch)
     aligned_ch = SAMTOOLS_SORT(sam_ch)
     markdup_ch = MARK_DUPLICATES(aligned_ch)
 

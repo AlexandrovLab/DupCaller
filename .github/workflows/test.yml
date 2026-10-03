@@ -74,18 +74,13 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
-      # bwa=0.7.17 and samtools/gatk4 keep landing on mutually
-      # unsatisfiable pins when solved together (bwa needs an old
-      # libzlib range; samtools needs an htslib/libdeflate combo that
-      # keeps shifting as bioconda adds new builds, so a version pair
-      # "verified" against today's channel snapshot can stop solving a
-      # week later with no change on our end). Solve bwa in its own env,
-      # isolated from samtools/gatk4's htslib chain entirely, and put
-      # both envs' bin dirs on PATH.
-      - name: Install bwa, samtools, gatk4
+      # The aligner is solved in its own env, isolated from samtools/
+      # gatk4's htslib chain (whose libdeflate/zlib pins keep shifting as
+      # bioconda adds builds), and both envs' bin dirs go on PATH.
+      - name: Install bwa-mem2, samtools, gatk4
         run: |
-          conda create -y -n bwa_env bwa=0.7.17
-          conda create -y -n pipeline_env samtools gatk4=4.6.2.0
+          conda create -y -n bwa_env bwa-mem2=2.3
+          conda create -y -n pipeline_env samtools gatk4=4.3.0.0
           echo "$(conda info --base)/envs/bwa_env/bin" >> "$GITHUB_PATH"
           echo "$(conda info --base)/envs/pipeline_env/bin" >> "$GITHUB_PATH"
 
@@ -116,15 +111,6 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
-      # See the mock-pipeline job above for why bwa is solved in its own
-      # env, isolated from samtools/gatk4.
-      - name: Install bwa, samtools, gatk4
-        run: |
-          conda create -y -n bwa_env bwa=0.7.17
-          conda create -y -n pipeline_env samtools gatk4=4.6.2.0
-          echo "$(conda info --base)/envs/bwa_env/bin" >> "$GITHUB_PATH"
-          echo "$(conda info --base)/envs/pipeline_env/bin" >> "$GITHUB_PATH"
-
       - name: Install Nextflow
         env:
           # Pinned so a Nextflow release change can't silently alter what
@@ -150,8 +136,8 @@ jobs:
       - name: Install DupCaller
         run: pip install .[test]
 
-      # The test itself skips (rather than fails) when nextflow/bwa/
-      # samtools/a container runtime aren't on PATH, so that a laptop
+      # The test itself skips (rather than fails) when nextflow or a
+      # container runtime isn't on PATH, so that a laptop
       # without those tools doesn't get a spurious failure. In CI all of
       # them are guaranteed present by the steps above, so a skip here
       # means the job's own setup is broken, not an expected outcome --
@@ -163,6 +149,6 @@ jobs:
           pytest tests/mock_pipeline/test_mock_pipeline_nextflow.py -v -rs \
             | tee pytest_nextflow.log
           if grep -q "SKIPPED" pytest_nextflow.log; then
-            echo "::error::test_mock_pipeline_nextflow.py was skipped even though this job installs nextflow/bwa/samtools/docker -- fix the job setup rather than letting this pass on a skip."
+            echo "::error::test_mock_pipeline_nextflow.py was skipped even though this job installs nextflow/docker -- fix the job setup rather than letting this pass on a skip."
             exit 1
           fi

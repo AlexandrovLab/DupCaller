@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the full DupCaller pipeline (index -> trim -> bwa mem -> gatk
+# Runs the full DupCaller pipeline (index -> trim -> bwa-mem2 mem -> gatk
 # MarkDuplicates -> call -> estimate) against the synthetic dataset in
 # data/, entirely inside OUTDIR. Used both by test_mock_pipeline.py (to
 # validate a fresh install against the premade expected/ outputs) and to
@@ -8,8 +8,8 @@
 #
 # Usage: run_pipeline.sh OUTDIR
 #
-# Requires DupCaller.py, bwa, samtools, and gatk on PATH (or overridden via
-# the DUPCALLER/BWA/SAMTOOLS/GATK env vars).
+# Requires DupCaller.py, bwa-mem2, samtools, and gatk on PATH (or overridden
+# via the DUPCALLER/BWA_MEM2/SAMTOOLS/GATK env vars).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +17,7 @@ DATA_DIR="${SCRIPT_DIR}/data"
 OUTDIR="${1:?usage: run_pipeline.sh OUTDIR}"
 
 DUPCALLER="${DUPCALLER:-DupCaller.py}"
-BWA="${BWA:-bwa}"
+BWA_MEM2="${BWA_MEM2:-bwa-mem2}"
 SAMTOOLS="${SAMTOOLS:-samtools}"
 GATK="${GATK:-gatk}"
 
@@ -33,8 +33,8 @@ echo "[2/6] trim"
 "$DUPCALLER" trim -i mock_1.fastq -i2 mock_2.fastq -p NNNXXXX -o mock_trm
 
 echo "[3/6] align"
-"$BWA" index reference.fa
-"$BWA" mem -C -R "@RG\tID:mock\tSM:mock\tPL:ILLUMINA" reference.fa mock_trm_1.fastq mock_trm_2.fastq \
+"$BWA_MEM2" index reference.fa
+"$BWA_MEM2" mem -C -R "@RG\tID:mock\tSM:mock\tPL:ILLUMINA" reference.fa mock_trm_1.fastq mock_trm_2.fastq \
     | "$SAMTOOLS" sort -o mock.bam -
 "$SAMTOOLS" index mock.bam
 

@@ -1294,8 +1294,7 @@ def _collect_call_barcode(call_barcodes, key, mut):
     supporting this candidate. Shared by the SNV/indel/DBS depth-
     extraction loops below, each of which needs this same accounting so
     extractDepthBatchSnv/Indel/Dbs's call_barcodes arg can exempt a
-    founding-family read from the minBq filter regardless of base
-    quality."""
+    founding-family read from the minBq and --mapq filters."""
     call_barcodes.setdefault(key, set()).add(
         (mut["infos"]["TAG1"], mut["infos"]["TAG2"], abs(mut["infos"]["TL"]))
     )

@@ -24,7 +24,7 @@ Tab-separated, one header row plus one row per sample, in the order given to `-i
 | `uncorrected_burden_upper_ci` | `_sbs_burden.txt` key `Uncorrected burden 95% upper` | |
 | `uncorrected_burden_lower_ci` | `_sbs_burden.txt` key `Uncorrected burden 95% lower` | |
 | `corrected_mutations` | `_sbs_burden.txt` key `Corrected mutation number` | |
-| `mutations_per_genome` | `_sbs_burden.txt` key `Mutation number per genome` | Distinct from `corrected_mutations`: this is `corrected_mutations` extrapolated to the full considered reference footprint (not just the effective duplex-covered subset), so it is numerically larger. See `write_genome_extrapolation` in `Estimate.py` and `estimate_outputs.md`. |
+| `mutations_per_genome` | `_sbs_burden.txt` key `Mutation number per genome` | Distinct from `corrected_mutations`: this is `corrected_mutations` extrapolated to the full considered reference footprint (not just the effective duplex-covered subset), so it is numerically larger. It is per **haploid** genome (one copy of each considered reference base); ×2 for diploid. See `write_genome_extrapolation` in `Estimate.py` and `estimate_outputs.md`. |
 | `genome_length` | `_sbs_burden.txt` key `Reference base number` | |
 | `corrected_burden` | `_sbs_burden.txt` key `Corrected burden` | |
 | `corrected_burden_upper_ci` | `_sbs_burden.txt` key `Corrected burden 95% upper` | |

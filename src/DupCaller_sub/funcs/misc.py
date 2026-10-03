@@ -2351,6 +2351,13 @@ def _channel_eeff_at_threshold(kind, ctx_key):
     raise ValueError(f"unknown channel kind {kind!r}")
 
 
+# Mutation rate given to a channel whose mu solve has no root (mu0 = 0) even
+# though it has sites (n_sites > 0): too little effective coverage relative to
+# its candidates to estimate a rate, so a fixed background rate is used and
+# the channel still gets a finite FDR threshold.
+MU0_NO_ROOT_RATE = 3.5e-9
+
+
 def _refine_channel(mu0, threshold0, fdr_thr):
     """Non-iterative FDR-controlled threshold for one channel.
 
@@ -2370,10 +2377,10 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     round 2's post-hoc re-filter (no bam rescan) could never recover it
     even if mu0 alone would justify a looser threshold here.
 
-    mu0 == 0 (this channel had too little effective coverage relative to
-    its candidate count in round 1, including zero coverage outright --
-    see refine_channel_task's n - Eeff0 + pseudocount >= 0 short-circuit)
-    makes the local-fdr formula's implied LR threshold a division by zero
+    mu0 == 0 (a channel with no sites whose mu solve has no root -- a
+    channel with sites gets MU0_NO_ROOT_RATE instead, see
+    refine_channel_task -- or a -mr table entry of 0) makes the local-fdr
+    formula's implied LR threshold a division by zero
     (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
     channel at all, so instead of solving for a finite cutoff, report
     nothing as PASS in round 2 for it: a threshold of +inf fails every
@@ -2428,9 +2435,10 @@ def refine_channel_task(job):
     a root, but g can still dip below 0 inside it: a term with raw_lr > 1
     grows as mu shrinks. g is then scanned on a log grid from 1e-12 up and
     the first sign change (the smallest-mu local maximum of the
-    likelihood) is solved with brentq. Only if g never goes negative is
-    mu0 = 0 -- too little coverage relative to the candidate count to
-    estimate a mutation rate from.
+    likelihood) is solved with brentq. If g never goes negative there is
+    no root -- too little coverage relative to the candidate count to
+    estimate a mutation rate from: mu0 is MU0_NO_ROOT_RATE (3.5e-9) when
+    the channel has sites (n > 0), and 0 when it has none.
     """
     (
         name,
@@ -2477,6 +2485,8 @@ def refine_channel_task(job):
                     mu0 = brentq(g, lo, hi)
                     break
                 lo = hi
+            if mu0 == 0.0 and n > 0:
+                mu0 = MU0_NO_ROOT_RATE
     new_threshold = _refine_channel(mu0, threshold0, fdr_thr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 

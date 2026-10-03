@@ -22,6 +22,7 @@ from DupCaller_sub.funcs.misc import (
     indel_eeff_site_masks,
     indel_mu_channel,
     init_refine_worker,
+    MU0_NO_ROOT_RATE,
     refine_channel_task,
     str_tract_valid,
 )
@@ -225,10 +226,15 @@ def test_mu_solve_finds_interior_root_when_candidates_reach_eeff():
     assert 0.01 < mu0 < 0.2
 
 
-def test_mu_solve_falls_back_to_zero_without_a_root():
+def test_mu_solve_without_a_root_uses_fixed_rate_when_sites_exist():
     # One strong call on one site (the mock HP8 case): g ~ 1.5/mu - 1 > 0
-    # on all of (0, 1).
-    assert _solve(np.array([1e8]), 1) == 0.0
+    # on all of (0, 1), so no root; the channel has a site, so 3.5e-9.
+    assert _solve(np.array([1e8]), 1) == MU0_NO_ROOT_RATE == 3.5e-9
+
+
+def test_mu_solve_without_a_root_or_sites_stays_zero():
+    # No sites and no coverage: g = pseudocount/mu > 0, no root, mu0 = 0.
+    assert _solve(np.empty(0), 0) == 0.0
 
 
 def test_mu_solve_small_eeff_takes_the_pseudocount_root():

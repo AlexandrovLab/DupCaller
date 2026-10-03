@@ -9,9 +9,10 @@
 # run_sample.slurm.sh for a SLURM example.
 #
 # Requires: nextflow, and either Docker (running) or Singularity, on PATH.
-# The reference must already have a bwa index (.bwt/.pac/.amb/.ann/.sa)
-# and, unless you pass -I, a DupCaller.py index (.ref.h5/.tn.h5/.hp.h5/
-# .str.h5/.dbs.h5) alongside it.
+# The reference must already have a samtools faidx index (.fai), a
+# bwa-mem2 index (.0123/.amb/.ann/.bwt.2bit.64/.pac, from `bwa-mem2 index`)
+# and a DupCaller.py index (.ref.h5/.tn.h5/.hp.h5/.str.h5/.dbs.h5)
+# alongside it.
 #
 # Usage:
 #   run_dupcaller_sample.sh -s SAMPLE_ID \
@@ -24,6 +25,7 @@
 #       [-b BARCODE_PATTERN] \
 #       [-B NORMAL_BAM] \
 #       [-p THREADS] \
+#       [-M MAX_MEMORY] \
 #       [-o OUTDIR] \
 #       [-P PROFILE] \
 #       [-R REPO_ROOT]
@@ -33,6 +35,10 @@
 #   BAM instead of aligning -3/-4 -- e.g. one matched normal shared across
 #   many tumor-only benchmark/mock samples. Skips trim/align/markdup for
 #   the normal entirely. -3/-4 are ignored (and not required) when set.
+# -M MAX_MEMORY: cap every task's memory request (Nextflow memory string,
+#   e.g. 24.GB); default pipeline.config's 96.GB. Lower it on smaller
+#   machines -- the local executor refuses tasks that ask for more than
+#   the machine has (bwa-mem2 mem and DupCaller call ask for 32 GB).
 # Defaults:  -p $(nproc), -o ./results/SAMPLE_ID, -P docker,local,
 #            -r (DupCaller.py's own default: chr1-22,chrX),
 #            -b pipeline.config's default (NNNXXXX) -- CHECK THIS MATCHES
@@ -59,10 +65,11 @@ NOISE_MASKS=""
 GERMLINE_VCF=""
 BARCODE_PATTERN=""
 NORMAL_BAM=""
+MAX_MEMORY=""
 OUTDIR=""
 SAMPLE_ID=""
 
-while getopts "s:1:2:3:4:f:m:g:r:b:B:p:o:P:R:h" opt; do
+while getopts "s:1:2:3:4:f:m:g:r:b:B:p:M:o:P:R:h" opt; do
     case "$opt" in
         s) SAMPLE_ID="$OPTARG" ;;
         1) TUMOR_FASTQ_1="$OPTARG" ;;
@@ -76,6 +83,7 @@ while getopts "s:1:2:3:4:f:m:g:r:b:B:p:o:P:R:h" opt; do
         b) BARCODE_PATTERN="$OPTARG" ;;
         B) NORMAL_BAM="$OPTARG" ;;
         p) THREADS="$OPTARG" ;;
+        M) MAX_MEMORY="$OPTARG" ;;
         o) OUTDIR="$OPTARG" ;;
         P) PROFILE="$OPTARG" ;;
         R) REPO_ROOT="$OPTARG" ;;
@@ -146,6 +154,10 @@ barcode_config_line=""
 if [ -n "$BARCODE_PATTERN" ]; then
     barcode_config_line="    barcode_pattern = \"${BARCODE_PATTERN}\""
 fi
+max_memory_config_line=""
+if [ -n "$MAX_MEMORY" ]; then
+    max_memory_config_line="    max_memory   = \"${MAX_MEMORY}\""
+fi
 normal_bam_config_line=""
 if [ -n "$NORMAL_BAM" ]; then
     normal_bam_config_line="    normal_bam = \"${NORMAL_BAM}\""
@@ -161,6 +173,7 @@ params {
     regions      = "${REGIONS}"
     threads      = ${THREADS}
     max_cpus     = ${THREADS}
+${max_memory_config_line}
 ${barcode_config_line}
 ${normal_bam_config_line}
 }

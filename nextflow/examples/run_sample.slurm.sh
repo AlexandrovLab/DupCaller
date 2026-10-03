@@ -21,20 +21,12 @@
 #     NORMAL_FASTQ_1=...,NORMAL_FASTQ_2=... \
 #     run_sample.slurm.sh
 #
-# The reference, mask pair, and per-flag defaults below were validated
-# against a real production sample's actual call command to confirm they
-# resolve to the exact same DupCaller.py call invocation.
-#
-# BARCODE_PATTERN default below (NNNXXXX, pipeline.config's own stock
-# default) was confirmed correct by comparing raw-fastq vs. trimmed-BAM
-# read length for this production data: 151bp raw -> 144bp in the BAM,
-# a 7-base prefix removed, matching len("NNNXXXX")==7 exactly. A DB
-# tag's own length (e.g. DB:Z:TCC-CTG) only reveals the barcode's N-count
-# (3 here), NOT how many trailing X (skipped, non-barcode) bases were
-# also stripped -- checking that alone previously led to an incorrect
-# "NNN" pattern that made results worse, not better. Re-derive via the
-# read-length-delta method above if reusing this script for different
-# data, not just the DB tag.
+# BARCODE_PATTERN defaults to NNNXXXX (pipeline.config's default). Check it
+# against your own data by comparing raw-FASTQ read length with the trimmed
+# BAM's: the difference is the full pattern length (e.g. 151bp -> 144bp is 7
+# bases, len("NNNXXXX")). A DB tag (e.g. DB:Z:TCC-CTG) only shows the number
+# of N (barcode) bases, not how many trailing X (skipped) bases were also
+# removed, so it alone cannot determine the pattern.
 
 set -euo pipefail
 

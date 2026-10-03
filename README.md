@@ -31,9 +31,9 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
 ## Prerequisites
 
 DupCaller requires python>=3.11 to run (setup.py pins numpy==2.3.4/scipy==1.16.2, both of which require >=3.11). Earlier versions are not supported.
-The complete DupCaller pipeline also requires the following tools for data preprocessing. The versions listed are the ones used for the published analyses, and the Nextflow pipeline (`nextflow/`) runs the same versions and commands. Other versions may work but have not been validated.
+The complete DupCaller pipeline also requires the following tools for data preprocessing. The Nextflow pipeline (`nextflow/`) runs exactly these versions and commands. Other versions may work but have not been validated.
 
-- BWA 0.7.17 (https://bio-bwa.sourceforge.net), run as `bwa mem -C -T 0` (Step 3)
+- bwa-mem2 2.3 (https://github.com/bwa-mem2/bwa-mem2), run as `bwa-mem2 mem -C -T 0` (Step 3). bwa-mem2 is designed to produce the same alignments as BWA-MEM 0.7.17 (used for the published analyses) and is several times faster. (The v2.3 release still prints `2.2.1` from `bwa-mem2 version` and in the BAM `@PG` header.)
 - GATK 4.3.0.0 (https://github.com/broadinstitute/gatk/releases), for MarkDuplicates (Step 4)
 - samtools, for sorting and indexing BAMs
 - htslib, which provides `tabix` and `bgzip` for compressed, indexed genomic files (recommended installation: `conda install bioconda::htslib`)
@@ -60,26 +60,26 @@ pip install .
 
 ### Docker / Singularity
 
-A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.1`.
+A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.7`.
 
 **Pull and run with Singularity:**
 
 Pull the image from Docker Hub (only needed once):
 
 ```bash
-singularity pull dupcaller-1.2.1.sif docker://yuhecheng62/dupcaller:1.2.1
+singularity pull dupcaller-1.2.7.sif docker://yuhecheng62/dupcaller:1.2.7
 ```
 
 For quick verification:
 
 ```bash
-singularity exec dupcaller-1.2.1.sif DupCaller.py --help
+singularity exec dupcaller-1.2.7.sif DupCaller.py --help
 ```
 
 For installation-free execution of DupCaller commands, run all DupCaller.py commands with `singularity exec` and binding of current directories:
 
 ```bash
-singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.1.sif DupCaller.py {your commands}
+singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.7.sif DupCaller.py {your commands}
 ```
 
 ---
@@ -109,6 +109,13 @@ The command will generate five h5 files in the same folder as the reference: `{r
 
 For human reference genome hg38 and mouse reference genome mm39, we provided pre-built indexes and resource files in the [Resources](#resources).
 
+The reference also needs a samtools FASTA index and a bwa-mem2 index (for Step 3), built once:
+
+```bash
+samtools faidx reference.fa
+bwa-mem2 index reference.fa   # writes reference.fa.{0123,amb,ann,bwt.2bit.64,pac}; ~90 GB RAM for GRCh38 (28 bytes per base)
+```
+
 #### Parameters
 
 | Short | Long        | Description                                                                                                                                                                                                                                               |
@@ -126,7 +133,7 @@ DupCaller.py trim -i read1.fq -i2 read2.fq -p barcode_pattern -o sample_name
 
 - `read1.fq` / `read2.fq` — FASTQ files from read 1 and read 2. Both unzipped and gzip-compressed files are supported.
 - `barcode_pattern` — pattern of barcodes starting from the 5-prime end, with `N` representing a barcode base and `X` representing a skipped base (similar notation to [UMI-tools](https://github.com/CGATOxford/UMI-tools)). For example, NanoSeq uses a 3-base barcode followed by 4 constant bases, so the pattern should be `NNNXXXX`.
-- `sample_name` — prefix of output paired FASTQs. After the run completes, `{sample_name}_1.fastq` and `{sample_name}_2.fastq` will be generated. Barcodes are appended to each read name (`{original_read_name}_{read1_barcode}+{read2_barcode}`, for optical-duplicate read-name matching only) and also written as a `DB:Z:{read1_barcode}-{read2_barcode}` FASTQ comment; the comment is promoted to a BAM tag by `bwa mem -C` (Step 3) and is what `DupCaller.py call` actually reads to assign duplex family membership — it never parses the read name for barcodes.
+- `sample_name` — prefix of output paired FASTQs. After the run completes, `{sample_name}_1.fastq` and `{sample_name}_2.fastq` will be generated. Barcodes are appended to each read name (`{original_read_name}_{read1_barcode}+{read2_barcode}`, for optical-duplicate read-name matching only) and also written as a `DB:Z:{read1_barcode}-{read2_barcode}` FASTQ comment; the comment is promoted to a BAM tag by `bwa-mem2 mem -C` (Step 3) and is what `DupCaller.py call` actually reads to assign duplex family membership — it never parses the read name for barcodes.
 
 If the matched normal is prepared in the same way as the sample, apply trimming with the same scheme to the matched normal FASTQs. For traditional bulk normal, trimming is not needed.
 
@@ -134,17 +141,17 @@ If the matched normal is prepared in the same way as the sample, apply trimming 
 
 ### Step 3: Align Reads
 
-Use a DNA NGS aligner such as BWA-MEM to align the trimmed FASTQs of both sample and matched normal. GATK requires read group fields `ID`, `SM`, and `PL`, so adding those tags during BWA alignment is recommended. **FASTQ tags must be kept — for `bwa mem` this requires the `-C` option.** The published analyses (and the Nextflow pipeline) also use `-T 0`, which outputs every alignment regardless of its score, so low-scoring alignments are filtered by DupCaller (MAPQ/AS-XS) rather than dropped by BWA.
+Align the trimmed FASTQs of both sample and matched normal with bwa-mem2 (`bwa-mem2 index` from Step 1 must already exist). GATK requires read group fields `ID`, `SM`, and `PL`, so adding those tags during alignment is recommended. **FASTQ tags must be kept — for `bwa-mem2 mem` (as for `bwa mem`) this requires the `-C` option.** The published analyses (and the Nextflow pipeline) also use `-T 0`, which outputs every alignment regardless of its score, so low-scoring alignments are filtered by DupCaller (MAPQ/AS-XS) rather than dropped by the aligner.
 
 ```bash
-bwa mem -C -T 0 -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" \
+bwa-mem2 mem -C -T 0 -t {threads} -R "@RG\tID:{sample_name}\tSM:{sample_name}\tPL:ILLUMINA" \
     reference.fa {sample_name}_1.fastq {sample_name}_2.fastq \
     | samtools sort -@ {threads} > {sample_name}.bam
 samtools index -@ {threads} {sample_name}.bam
 ```
 
 - `threads` — number of cores used for aligning
-- `reference.fa` — reference genome FASTA file
+- `reference.fa` — reference genome FASTA file, with its bwa-mem2 index next to it
 - `{sample_name}_1.fastq` / `{sample_name}_2.fastq` — trimmed FASTQ files from Step 2
 
 ---
@@ -442,6 +449,8 @@ Written to the `ERROR/` subfolder of the `call` output directory. If a complete 
 | `{sample}_duplex_allele_counts.txt`             | Duplex depths and allele counts for each unique mutation                                                                                                  |
 | `{sample}_estimate_params.log`                  | Full record of all resolved parameters used for the`estimate` run                                                                                       |
 
+`Mutation number per genome` (and its 95% bounds) in each `_burden.txt` is the corrected burden multiplied by `Reference base number`, the number of reference bases considered (one copy of each region in `-r`). It is therefore the expected number of mutations **per haploid genome**; double it for a diploid genome. The same applies to the per-channel `mutation_number_genome` column of the `_corrected.txt` files and to `summarize`'s `*_mutations_per_genome` columns.
+
 ### Visualization Files
 
 | File                                              | Description                                                                  |
@@ -468,7 +477,7 @@ Written to the `ERROR/` subfolder of the `call` output directory. If a complete 
 
 ## End-to-End Examples
 
-The following examples assume the reference genome has already been indexed (`DupCaller.py index`) and that the germline VCF and noise mask are available. Replace all placeholder paths with your actual files.
+The following examples assume the reference genome has already been indexed (`DupCaller.py index`, `samtools faidx`, `bwa-mem2 index`; Step 1) and that the germline VCF and noise mask are available. Replace all placeholder paths with your actual files.
 
 ### With Matched Normal
 
@@ -485,11 +494,11 @@ DupCaller.py trim -i ${SAMPLE}_R1.fq.gz -i2 ${SAMPLE}_R2.fq.gz -p NNNXXXX -o ${S
 DupCaller.py trim -i ${NORMAL}_R1.fq.gz -i2 ${NORMAL}_R2.fq.gz -p NNNXXXX -o ${NORMAL}
 
 # 2. Align
-bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
+bwa-mem2 mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
     ${REF} ${SAMPLE}_1.fastq ${SAMPLE}_2.fastq | samtools sort -@ ${THREADS} > ${SAMPLE}.bam
 samtools index -@ ${THREADS} ${SAMPLE}.bam
 
-bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${NORMAL}\tSM:${NORMAL}\tPL:ILLUMINA" \
+bwa-mem2 mem -C -T 0 -t ${THREADS} -R "@RG\tID:${NORMAL}\tSM:${NORMAL}\tPL:ILLUMINA" \
     ${REF} ${NORMAL}_1.fastq ${NORMAL}_2.fastq | samtools sort -@ ${THREADS} > ${NORMAL}.bam
 samtools index -@ ${THREADS} ${NORMAL}.bam
 
@@ -527,7 +536,7 @@ THREADS=16
 DupCaller.py trim -i ${SAMPLE}_R1.fq.gz -i2 ${SAMPLE}_R2.fq.gz -p NNNXXXX -o ${SAMPLE}
 
 # 2. Align
-bwa mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
+bwa-mem2 mem -C -T 0 -t ${THREADS} -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
     ${REF} ${SAMPLE}_1.fastq ${SAMPLE}_2.fastq | samtools sort -@ ${THREADS} > ${SAMPLE}.bam
 samtools index -@ ${THREADS} ${SAMPLE}.bam
 

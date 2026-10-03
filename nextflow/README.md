@@ -1,24 +1,33 @@
 # DupCaller Nextflow Pipeline
 
 Runs the full DupCaller workflow end-to-end, one or more tumor/normal
-samples at a time: barcode trimming → BWA-MEM alignment → GATK duplicate
+samples at a time: barcode trimming → bwa-mem2 alignment → GATK duplicate
 marking → `DupCaller.py call` → `DupCaller.py estimate`.
 
-Preprocessing uses the same tools and commands as the published analyses
-and the main README: BWA 0.7.17 (`bwa mem -C -T 0`) and GATK 4.3.0.0
-MarkDuplicates.
+Preprocessing uses the same tools and commands as the main README:
+bwa-mem2 2.3 (`bwa-mem2 mem -C -T 0`) and GATK 4.3.0.0 MarkDuplicates.
+Containers: `yuhecheng62/dupcaller:1.2.7`,
+`quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0`, `broadinstitute/gatk:4.3.0.0`.
+(bwa-mem2 v2.3 still reports itself as `2.2.1` in `bwa-mem2 version` and
+the BAM `@PG` header.)
 
 ## Prerequisites
 
 - Nextflow >= 21.10.0
 - Docker or Singularity (all processes run in containers — no local
-  DupCaller/BWA/GATK install is required)
+  DupCaller/bwa-mem2/GATK install is required)
 - A reference FASTA with:
-  - a BWA index (`.bwt`/`.pac`/`.ann`/`.amb`/`.sa`), and
+  - a samtools FASTA index (`.fai`),
+  - a bwa-mem2 index (`.0123`/`.amb`/`.ann`/`.bwt.2bit.64`/`.pac`) —
+    pre-built with `bwa-mem2 index` (default, `skip_bwa_index = true`), or
+    built as part of the run (`skip_bwa_index = false`; ~90 GB RAM and
+    about an hour for GRCh38), and
   - a DupCaller index (`.ref.h5`/`.tn.h5`/`.hp.h5`/`.str.h5`/`.dbs.h5`) —
     either pre-built (point `reference` at it and leave `skip_index = true`,
     the default), or built as part of the run (`skip_index = false` plus
     a `repeat_tsv`; see `DupCaller.py index --help`)
+
+  An index from plain `bwa index` (`.bwt`/`.sa`) is not used by bwa-mem2.
 
 ## Quick start: one sample
 
@@ -39,7 +48,8 @@ nextflow/examples/run_dupcaller_sample.sh \
     -P singularity,local
 ```
 
-Required: `-s -1 -2 -3 -4 -f`. Run with `-h` for the full flag list
+Required: `-s -1 -2 -f`, plus either `-3 -4` (normal FASTQs) or `-B` (an
+already-aligned, indexed normal BAM). Run with `-h` for the full flag list
 (masks/germline/regions/profile/output dir/thread count all have sensible
 defaults). This script also sets up a stable `-resume` launch directory
 under `-o`, so re-running the same command after a failure resumes instead
@@ -101,16 +111,24 @@ table below is a quick reference.
 |---|---|---|
 | `skip_index` | Skip `DupCaller.py index` (reuse an existing `.ref.h5`/`.tn.h5`/`.hp.h5`/`.str.h5`/`.dbs.h5` set next to `reference`) | `true` |
 | `repeat_tsv` | PERF-format repeat TSV, required only when `skip_index = false` | `null` |
+| `skip_bwa_index` | Skip `bwa-mem2 index` (reuse an existing `.0123`/`.amb`/`.ann`/`.bwt.2bit.64`/`.pac` set next to `reference`) | `true` |
 
 ### Optional resource files
 
-| Parameter | Description | Default |
-|---|---|---|
-| `germline_vcf` | Tabix-indexed germline VCF with an AF field | `null` |
-| `noise_mask` | Tabix-indexed noise/SNP mask BED, or a list of several (e.g. `["snp_mask.bed.gz", "noise_mask.bed.gz"]`) — passed to `DupCaller.py call`'s `-m`/`--noise` (`nargs="+"`) | `null` |
-| `target_bed` | Restrict calling to target regions | `null` |
-| `indel_bed` | Indel-enhanced panel of normals | `null` |
-| `gene_bed` | Gene BED for per-gene duplex coverage in burden estimation | `null` |
+Every file here must be bgzip-compressed (`.gz`) with its tabix index
+(`.gz.tbi`) next to it: DupCaller opens them all with tabix, and the
+pipeline stages each file together with its `.tbi` (a path that does not
+end in `.gz`, or a missing `.tbi`, stops the run at launch). Leaving a
+parameter `null` omits the matching DupCaller option; the task is then
+given an empty placeholder from `assets/` instead.
+
+| Parameter | Description | DupCaller option | Default |
+|---|---|---|---|
+| `germline_vcf` | Germline VCF with an AF field (`.vcf.gz` + `.tbi`) | `call -g` | `null` |
+| `noise_mask` | Noise/SNP mask BED (`.bed.gz` + `.tbi`), or a list of several (e.g. `["snp_mask.bed.gz", "noise_mask.bed.gz"]`) | `call -m` | `null` |
+| `target_bed` | Restrict calling to target regions (`.bed.gz` + `.tbi`) | `call -R` | `null` |
+| `indel_bed` | Indel-enhanced panel of normals (`.bed.gz` + `.tbi`) | `call -id` | `null` |
+| `gene_bed` | Gene BED for per-gene duplex coverage, 4th column `{gene}_{exon}` (`.bed.gz` + `.tbi`) | `estimate -gb` | `null` |
 
 ### Calling / burden options
 
@@ -118,8 +136,8 @@ table below is a quick reference.
 |---|---|---|
 | `barcode_pattern` | Barcode pattern (`N`=barcode base, `X`=skipped) | `NNNXXXX` |
 | `regions` | Contigs to call, space-separated | `chr1`...`chr22 chrX` |
-| `threads` | Threads for BWA and `DupCaller.py call` | `1` |
-| `max_af` | Max allele fraction in matched normal (`-maf`/`--naf`) — matches `DupCaller.py call`'s own default | `0.01` |
+| `threads` | Threads for bwa-mem2 and `DupCaller.py call` | `1` |
+| `max_af` | Max tumor allele fraction to call a mutation (`-maf`/`--maxAF`; not `--naf`, the matched-normal VAF cap). Values below 1 also mask positions with raw tumor depth < 1/`max_af` | `1` |
 | `germline_af_cutoff` | Skip positions above this population AF (`-gaf`) | `0.001` |
 | `min_n_depth` | Minimum normal depth for a called variant (`-d`) | `10` |
 | `trim_template` | Ignore mutations within N bp of template ends (`-tt`) | `7` |
@@ -127,8 +145,10 @@ table below is a quick reference.
 | `mapq` | Minimum alignment MAPQ (`-mq`) | `40` |
 | `seed` | Pin the Monte Carlo seed (omit to let `DupCaller.py call` pick a fresh one every run) | unset |
 | `p_threshold` | Strand independence hypothesis SBS/indel filter (`-pt`/`--p_threshold`): per-strand p threshold, not corrected for the number of calls (strand p <= this); failed calls get FILTER `strand_independence`; `0` disables. Unset uses `DupCaller.py call`'s default (`0.05`) | unset |
-| `estimate_clonal` | Treat multi-molecule mutations as one in burden estimation | `false` |
-| `estimate_dilute` | Set when sample and matched normal share starting DNA material | `false` |
+| `estimate_dilute` | Set when sample and matched normal share starting DNA material (`estimate -d`) | `false` |
+
+`estimate_clonal` was removed: it passed `-c`, which `DupCaller.py
+estimate` has never accepted. Setting it now stops the run with an error.
 
 These calling/burden defaults are deliberately kept in sync with
 `DupCaller.py call`/`estimate`'s own CLI defaults — if you change one in
@@ -139,7 +159,12 @@ the underlying tool, update `pipeline.config` to match.
 `max_cpus`/`max_memory`/`max_time` cap the per-process resource requests
 computed in `nextflow.config`; per-process defaults (memory/time, scaled
 up automatically on retry) live in that file's `process { withName: ... }`
-blocks — edit them there if a step needs more than its default.
+blocks — edit them there if a step needs more than its default. For
+GRCh38, `bwa-mem2 mem` needs about 32 GB and `bwa-mem2 index` about
+90 GB (28 bytes per reference base), so keep `max_memory` (default
+`96.GB`) at least that high. On a smaller machine, lower it (the example
+script's `-M`, e.g. `-M 24.GB`); the local executor refuses any task that
+asks for more memory than the machine has.
 
 ## Execution profiles
 
@@ -164,7 +189,9 @@ SLURM.
 Each sample's `CALL_VARIANTS` and `ESTIMATE_BURDEN` outputs are copied
 (via `publishDir`) into `${outdir}/${sample_id}/` — the same directory
 `DupCaller.py call -o` / `estimate -i` would produce standalone (VCFs,
-coverage beds, error-profile tables, burden/signature outputs). Nextflow's
+coverage beds, error-profile tables, burden/signature outputs) — plus
+`${outdir}/${sample_id}_estimate_params.log`. `Mutation number per genome`
+in the `_burden.txt` files is per haploid genome (see the main README). Nextflow's
 own `work/` directory (set via `-w`) holds all intermediate trim/align/
 markdup files and can be deleted once you're happy with the results in
 `outdir`.
@@ -177,8 +204,9 @@ these two are the only params without a default; both must be set.
 **`checkIfExists` error on a reference/mask/VCF file** — every file input
 is staged with `checkIfExists: true`, so a typo'd path fails immediately
 at pipeline-launch time rather than partway through a run. Check that
-tabix-indexed inputs (`germline_vcf`, `noise_mask`, `indel_bed`) have
-their `.tbi` sitting right next to them.
+every optional resource (`germline_vcf`, `noise_mask`, `target_bed`,
+`indel_bed`, `gene_bed`) is bgzipped and has its `.tbi` right next to it
+(`bgzip file.bed && tabix -p bed file.bed.gz`).
 
 **Reusing a completed run's error profiles** — `DupCaller.py call` only
 re-runs round-0 error-rate learning if the six error files don't already
@@ -191,10 +219,13 @@ actually recomputes instead of silently reusing stale rates.
 `-w` work directory; `examples/run_dupcaller_sample.sh` does this for you
 automatically via a stable per-sample launch directory.
 
-## Known gaps
+## Tests
 
-`test_pipeline.sh` in this directory predates the current `sample_map`-based
-parameter interface (it still checks for `--sample_name`/`--read1`-style
-flags that no longer exist) and does not currently reflect the pipeline
-as implemented above — treat it as unmaintained until it's rewritten
-against the current interface.
+`tests/mock_pipeline/run_nextflow_pipeline.sh OUTDIR [docker|singularity] all`
+runs the whole pipeline (including `DupCaller.py index` and `bwa-mem2
+index`) on a 3.2 kb synthetic contig: once with every optional resource
+unset, then once per optional input (`germline_vcf`, `noise_mask`,
+`target_bed`, `indel_bed`, `gene_bed`, `estimate_dilute`, `normal_bam`).
+`tests/mock_pipeline/test_mock_pipeline_nextflow.py` wraps it in pytest
+and checks that each case passed the right option to DupCaller (and that
+the default case passed none).

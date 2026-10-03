@@ -2,6 +2,22 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.8] - 2026-10-03
+
+### Changed
+- Per-channel mutation rate: when a channel's mu solve has no root (mu0 = 0) but the channel has sites (`n_sites` > 0), its rate is set to 3.5e-9 (`MU0_NO_ROOT_RATE` in `funcs/misc.py`) instead of 0, so it gets a finite FDR threshold (about log10 LR 9.73 at `-lfdr 0.05`) and its calls a finite local FDR. A channel with no sites still gets 0 (threshold +inf). `-mr` tables are used as given.
+- Tumor depth extraction applies `--mapq` per read with the same founding-family exemption as minBq: the pileup takes every MAPQ, and a read below `--mapq` still counts toward a candidate if its duplex barcode pair (either order) and |template length| match one of that candidate's supporting families. Any other read still needs MAPQ >= `--mapq`, and a low-MAPQ read outside every founding family does not claim its read name, so its mate can still count. Applies to SNV, indel and DBS depth (AC/RC/DP and the no_good_alt_read check). Normal-BAM depth is unchanged (MAPQ >= `--mapq` for every read).
+- Nextflow pipeline runs `yuhecheng62/dupcaller:1.2.7` (the 1.2.8 calling changes above need a rebuilt image) and aligns with bwa-mem2 2.3 (`quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0`, `bwa-mem2 mem -C -T 0`) instead of BWA 0.7.17. The reference now needs a bwa-mem2 index (`.0123`/`.amb`/`.ann`/`.bwt.2bit.64`/`.pac`); `skip_bwa_index = false` builds it in the run. GATK stays at 4.3.0.0 everywhere, including CI (was 4.6.2.0 there). README, Nextflow README and the mock-pipeline tests use bwa-mem2 too.
+- Nextflow optional inputs: an unset `germline_vcf`, `noise_mask`, `target_bed`, `indel_bed` or `gene_bed` is bound to a real empty placeholder in `nextflow/assets/` (the old `file('NO_...')` names did not exist). Each of these resources is staged with its `.tbi`, and a path that is not bgzipped (`.gz`) stops the run at launch.
+- Nextflow `estimate_clonal` removed: it passed `-c`, which `DupCaller.py estimate` does not accept. Setting it now stops the run with an error.
+- Nextflow defaults `max_memory = 96.GB` and `max_time = 72.h` (were 16 GB / 1 h, below what bwa-mem2 needs for GRCh38; `bwa-mem2 index` takes about 28 bytes per reference base, ~90 GB for GRCh38). `ESTIMATE_BURDEN` also publishes `{sample}_estimate_params.log`.
+- Nextflow `ESTIMATE_BURDEN` no longer writes into `CALL_VARIANTS`' cached output: estimate runs in a mirror of symlinks to the call directory, with `{sample}_stats.txt` (which estimate appends base coverage to) as a real copy. Before, a retry or a `-resume` run with other estimate options appended another coverage block to the call output each time.
+- Nextflow `skip_index` defaults to true in `DupCaller.nf`, like `skip_bwa_index`. `examples/run_dupcaller_sample.sh` takes `-M MAX_MEMORY` (e.g. `24.GB`) to cap per-task memory on smaller machines.
+- Docs: `Mutation number per genome` (and per-channel `mutation_number_genome`, `summarize`'s `*_mutations_per_genome`) is stated to be per haploid genome.
+
+### Added
+- `tests/mock_pipeline/run_nextflow_pipeline.sh ... all` runs the Nextflow pipeline on the mock data with every optional resource unset and then once per optional input; `test_mock_pipeline_nextflow.py` checks each case's DupCaller options.
+
 ## [1.2.7] - 2026-10-03
 
 ### Changed
@@ -117,8 +133,8 @@ All notable changes to DupCaller are recorded here, most recent first.
 ### Added
 - `nextflow/pipeline.config` is now tracked in git (it previously wasn't, despite `nextflow/README.md`'s Quick Start depending on it -- a fresh clone had no way to get it).
 - `nextflow/examples/run_dupcaller_sample.sh`: a platform-agnostic script that runs `DupCaller.nf` end-to-end for one tumor/normal sample given just a sample ID, 4 fastq paths, and a reference -- no scheduler assumptions, works with `-P docker,local` on a workstation or `-P singularity,local` on any HPC node.
-- `nextflow/examples/run_sample.slurm.sh`: a thin SLURM wrapper around the above carrying only this cluster's scheduler/account/reference/mask specifics (`platinum`/`hcp-ddp302`/`ddp302`, matching the real `PD*.2pass.sl` resource convention).
-- Both validated end-to-end (2026-09-08) against a 100k-read-pair subsample of a real production sample (PD43276), real hg38 reference, and the real production mask pair -- the resolved `DupCaller.py call` command matched the actual `PD43276.2pass.sl` production script argument-for-argument (aside from the deliberately-scoped `-r`/`-p` for a fast validation run). Also confirmed the trim step is byte-identical between the containerized and direct-CLI invocation on the same real fastq data.
+- `nextflow/examples/run_sample.slurm.sh`: a thin SLURM wrapper around the above that adds only scheduler resource requests and site-specific paths (placeholders to fill in).
+- Both validated end-to-end (2026-09-08) on a 100k-read-pair subsample with an hg38 reference and a mask pair: the resolved `DupCaller.py call` command matched a direct-CLI invocation argument-for-argument (aside from the deliberately scoped `-r`/`-p`), and the trim step was byte-identical between the containerized and direct-CLI runs on the same FASTQs.
 
 ### Notes
 - Added a regression test (`tests/unit/test_profile_trinuc_mismatches.py`) reproducing the crash above.

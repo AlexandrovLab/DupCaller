@@ -61,6 +61,15 @@ def _family_id_matches(family_ids, read_bc1, read_bc2, read_tl):
     return False
 
 
+def _matches_any(family_ids_by_spec, read_bc1, read_bc2, read_tl):
+    """True if the read belongs to a founding family of any candidate at
+    this column (family_ids_by_spec: one call_barcodes set per candidate)."""
+    return any(
+        _family_id_matches(ids, read_bc1, read_bc2, read_tl)
+        for ids in family_ids_by_spec
+    )
+
+
 def extractDepthBatchSnv(
     bam,
     candidates,
@@ -98,6 +107,15 @@ def extractDepthBatchSnv(
     pysam's pileup only supports one global threshold. Deletions have no
     base quality to check at all, so (as when call_barcodes is None) they
     always count.
+
+    Mapping quality is handled the same way: the pileup takes every MAPQ
+    (min_mapping_quality=0) and the --mapq cut is applied per read. With
+    call_barcodes, a read below --mapq still counts toward a candidate whose
+    founding family (barcode pair + |template_length|) it belongs to; any
+    other read needs MAPQ >= --mapq. A low-MAPQ read that belongs to no
+    founding family at the column is skipped without claiming its query
+    name, so its mate can still be counted. Without call_barcodes (normal
+    BAMs) every read needs MAPQ >= --mapq, as before.
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
@@ -114,6 +132,7 @@ def extractDepthBatchSnv(
                 cluster[0] - 1,
                 cluster[-1],
                 min_base_quality=pileup_minbq,
+                min_mapping_quality=0,
                 truncated=True,
                 max_depth=params["maxDepth"],
             ):
@@ -143,9 +162,17 @@ def extractDepthBatchSnv(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
+                    mapq_ok = aln.mapping_quality >= params["mapq"]
+                    if not mapq_ok:
+                        if not barcode_aware:
+                            continue
+                        read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
+                        if not _matches_any(
+                            bc_pairs_by_spec, read_bc1, read_bc2, read_tl
+                        ):
+                            continue
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
                         continue
@@ -160,10 +187,11 @@ def extractDepthBatchSnv(
                             pileupread.query_position is None
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
-                        if not quality_ok:
+                        needs_family = not (quality_ok and mapq_ok)
+                        if needs_family and mapq_ok:
                             read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
                     for i, (ref, alt) in enumerate(specs):
-                        if barcode_aware and not quality_ok:
+                        if barcode_aware and needs_family:
                             if not _family_id_matches(
                                 bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
                             ):
@@ -200,7 +228,8 @@ def extractDepthBatchIndel(
     call_barcodes=None,
 ):
     """Batched equivalent of extractDepthIndel — see extractDepthBatchSnv,
-    including the call_barcodes barcode-aware base-quality handling.
+    including the call_barcodes founding-family exemption from minbq and
+    --mapq.
 
     candidates: iterable of (chrom, pos, ref, alt).
     Returns: {(chrom, pos, ref, alt): (altCount, refCount, otherIndelCount, depth)}
@@ -220,6 +249,7 @@ def extractDepthBatchIndel(
                 cluster[0] - 1,
                 cluster[-1],
                 min_base_quality=pileup_minbq,
+                min_mapping_quality=0,
                 truncate=True,
                 max_depth=params["maxDepth"],
             ):
@@ -250,9 +280,17 @@ def extractDepthBatchIndel(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
+                    mapq_ok = aln.mapping_quality >= params["mapq"]
+                    if not mapq_ok:
+                        if not barcode_aware:
+                            continue
+                        read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
+                        if not _matches_any(
+                            bc_pairs_by_spec, read_bc1, read_bc2, read_tl
+                        ):
+                            continue
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
                         continue
@@ -261,10 +299,11 @@ def extractDepthBatchIndel(
                             pileupread.query_position is None
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
-                        if not quality_ok:
+                        needs_family = not (quality_ok and mapq_ok)
+                        if needs_family and mapq_ok:
                             read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
                     for i, (ref, alt, indel_size) in enumerate(specs):
-                        if barcode_aware and not quality_ok:
+                        if barcode_aware and needs_family:
                             if not _family_id_matches(
                                 bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
                             ):
@@ -331,7 +370,9 @@ def extractDepthBatchDbs(
     BOTH of its bases to individually meet minbq (matching what the
     single shared min_base_quality=minbq pileup filter used to enforce
     per column). Deletions have no base quality to check, same as
-    extractDepthBatchSnv/Indel.
+    extractDepthBatchSnv/Indel. The same exemption covers --mapq: with
+    call_barcodes a read below --mapq counts only for a candidate whose
+    founding family it belongs to (see extractDepthBatchSnv).
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
@@ -351,7 +392,8 @@ def extractDepthBatchDbs(
                 wanted_cols.add(p + 1)
             # 1-based pos -> {read_name: entry}. entry is base-or-None
             # (indel) when call_barcodes is None (unchanged); with
-            # call_barcodes it's (base_or_None, quality_ok, family_id) so
+            # call_barcodes it's (base_or_None, ok, family_id), where ok
+            # means the base passes minbq and the read passes --mapq, so
             # the correlation step below can apply the barcode-match
             # exemption per candidate, since the same column can serve as
             # candidate A's own position and candidate B's pos+1, each
@@ -362,12 +404,24 @@ def extractDepthBatchDbs(
                 cluster[0] - 1,
                 cluster[-1] + 1,
                 min_base_quality=pileup_minbq,
+                min_mapping_quality=0,
                 truncated=True,
                 max_depth=params["maxDepth"],
             ):
                 pos = pileupcolumn.pos + 1
                 if pos not in wanted_cols:
                     continue
+                # Founding families of every candidate this column serves:
+                # as its first base (pos) or as its second base (pos - 1).
+                col_family_ids = (
+                    [
+                        call_barcodes.get((chrom, q, ref, alt), ())
+                        for q in (pos, pos - 1)
+                        for ref, alt in pos_to_specs.get(q, ())
+                    ]
+                    if barcode_aware
+                    else None
+                )
                 processed_read_names = {}
                 reads = {}
                 for pileupread in pileupcolumn.pileups:
@@ -378,9 +432,16 @@ def extractDepthBatchDbs(
                         or aln.is_supplementary
                         or processed_read_names.get(aln.query_name)
                         or aln.has_tag("DT")
-                        or aln.mapping_quality < params["mapq"]
                     ):
                         continue
+                    mapq_ok = aln.mapping_quality >= params["mapq"]
+                    fam_id = None
+                    if not mapq_ok:
+                        if not barcode_aware:
+                            continue
+                        fam_id = _read_family_id(aln, params)
+                        if not _matches_any(col_family_ids, *fam_id):
+                            continue
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
                         continue
@@ -391,22 +452,22 @@ def extractDepthBatchDbs(
                         else aln.query_sequence[pileupread.query_position]
                     )
                     if barcode_aware:
-                        quality_ok = (
+                        # ok: this column's base passes minbq and the read
+                        # passes mapq; otherwise the read counts only for a
+                        # candidate whose founding family it belongs to.
+                        ok = mapq_ok and (
                             pileupread.query_position is None
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
                         # Barcode lookup deferred to only the reads that
-                        # actually need it (this column's own quality
-                        # already failed) -- mirrors extractDepthBatchSnv/
+                        # actually need it -- mirrors extractDepthBatchSnv/
                         # Indel's per-read gating. A read whose OTHER
                         # column needs its barcode but this one doesn't
                         # still gets it from that other column at
                         # correlation time below.
-                        if quality_ok:
-                            fam_id = None
-                        else:
+                        if not ok and fam_id is None:
                             fam_id = _read_family_id(aln, params)
-                        reads[aln.query_name] = (base, quality_ok, fam_id)
+                        reads[aln.query_name] = (base, ok, fam_id)
                     else:
                         reads[aln.query_name] = base
                 col_bases[pos] = reads
@@ -429,7 +490,7 @@ def extractDepthBatchDbs(
                             b0, q0_ok, fam_id0 = bases0[rn]
                             b1, q1_ok, fam_id1 = bases1[rn]
                             if not (q0_ok and q1_ok):
-                                # At least one column has quality_ok False,
+                                # At least one column has ok False,
                                 # so at least one of these ids was
                                 # actually computed (non-None) -- prefer
                                 # col0's, fall back to col1's.

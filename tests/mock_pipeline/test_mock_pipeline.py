@@ -1,10 +1,10 @@
 """Install-time regression test for the full DupCaller pipeline.
 
-Runs index -> trim -> bwa mem -> gatk MarkDuplicates -> call -> estimate
+Runs index -> trim -> bwa-mem2 mem -> gatk MarkDuplicates -> call -> estimate
 against the synthetic reference/read set in data/ and diffs every
 deterministic output file against the premade results in expected/.
 
-Requires DupCaller.py, bwa, samtools, and gatk; skipped automatically if
+Requires DupCaller.py, bwa-mem2, samtools, and gatk; skipped automatically if
 any of those aren't on PATH.
 """
 import os
@@ -37,7 +37,7 @@ def _missing_tools():
     missing = []
     if _resolve_dupcaller() is None:
         missing.append("DupCaller.py")
-    for tool in ("bwa", "samtools", "gatk"):
+    for tool in ("bwa-mem2", "samtools", "gatk"):
         if shutil.which(tool) is None:
             missing.append(tool)
     return missing

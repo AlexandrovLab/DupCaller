@@ -29,7 +29,7 @@ HP7_T	-1	0	0.0	0.0	per_run_signed
 HP7_C	1	0	0.0	0.0	per_run_signed
 HP7_T	1	0	0.0	0.0	per_run_signed
 HP8_C	-1	0	0.0	0.0	per_run_signed
-HP8_T	-1	1	1.0	0.0	per_run_signed
+HP8_T	-1	1	1.0	3.5e-09	per_run_signed
 HP8_C	1	0	0.0	0.0	per_run_signed
 HP8_T	1	0	1.0	0.5000000000005003	per_run_signed
 HP9_C	-1	0	0.0	0.0	per_run_signed
