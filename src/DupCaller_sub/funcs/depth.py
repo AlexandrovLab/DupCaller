@@ -39,10 +39,23 @@ def _cluster_positions(positions, max_gap):
     return clusters
 
 
-def _barcode_pair_matches(bc_pairs, read_bc1, read_bc2):
-    for bc1, bc2 in bc_pairs:
-        if (read_bc1 == bc1 and read_bc2 == bc2) or (
-            read_bc1 == bc2 and read_bc2 == bc1
+def _read_family_id(aln, params):
+    """(bc1, bc2, |template_length|) of aln -- the founding-family
+    identifier matched against call_barcodes by _family_id_matches."""
+    read_bc1, read_bc2 = get_duplex_barcode(aln, params)
+    return read_bc1, read_bc2, abs(aln.template_length)
+
+
+def _family_id_matches(family_ids, read_bc1, read_bc2, read_tl):
+    """True if the read's duplex barcode pair (either orientation) AND
+    absolute template length match one of family_ids' (bc1, bc2, |TL|).
+    Absolute value because a family's leftmost reads carry +TL and their
+    mates -TL (see misc._compute_read_label), and either mate can be the
+    read covering a pileup column."""
+    for bc1, bc2, tl in family_ids:
+        if read_tl == tl and (
+            (read_bc1 == bc1 and read_bc2 == bc2)
+            or (read_bc1 == bc2 and read_bc2 == bc1)
         ):
             return True
     return False
@@ -69,13 +82,16 @@ def extractDepthBatchSnv(
     Candidates with zero pileup coverage are simply absent from the
     result — same information as extractDepthSnv returning all zeros.
 
-    call_barcodes, when given, is {(chrom, pos, ref, alt): {(bc1, bc2), ...}}
-    -- the duplex barcode pair(s) of every family that itself supports that
+    call_barcodes, when given, is
+    {(chrom, pos, ref, alt): {(bc1, bc2, abs_template_length), ...}} -- the
+    duplex barcode pair plus absolute template length of every family that
+    itself supports that
     candidate (used for the tumor BAM: a candidate can be supported by more
     than one duplex family). This switches on barcode-aware base-quality
     handling: the pileup itself only requires BQ>0 (min_base_quality=1)
     instead of minbq, and a primary read whose own duplex barcode pair
-    matches one of a candidate's call_barcodes (either orientation) counts
+    (either orientation) and |template_length| match one of a candidate's
+    call_barcodes counts
     toward that candidate's depth regardless of its base quality, since
     it's one of the founding reads of the call being verified -- every
     other read is still held to minbq, checked manually per read since
@@ -145,11 +161,11 @@ def extractDepthBatchSnv(
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
                         if not quality_ok:
-                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
+                            read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
                     for i, (ref, alt) in enumerate(specs):
                         if barcode_aware and not quality_ok:
-                            if not _barcode_pair_matches(
-                                bc_pairs_by_spec[i], read_bc1, read_bc2
+                            if not _family_id_matches(
+                                bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
                             ):
                                 continue
                         if is_indel:
@@ -246,11 +262,11 @@ def extractDepthBatchIndel(
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
                         if not quality_ok:
-                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
+                            read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
                     for i, (ref, alt, indel_size) in enumerate(specs):
                         if barcode_aware and not quality_ok:
-                            if not _barcode_pair_matches(
-                                bc_pairs_by_spec[i], read_bc1, read_bc2
+                            if not _family_id_matches(
+                                bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
                             ):
                                 continue
                         if pileupread.indel == indel_size:
@@ -309,8 +325,8 @@ def extractDepthBatchDbs(
     call_barcodes, when given, is the same barcode-aware base-quality
     switch as extractDepthBatchSnv/Indel: both columns are pileup'd at
     BQ>0 (min_base_quality=1) instead of minbq, and a read whose own
-    duplex barcode pair matches one of a candidate's call_barcodes
-    (either orientation) counts toward that candidate's depth regardless
+    duplex barcode pair (either orientation) and |template_length| match
+    one of a candidate's call_barcodes counts toward that candidate's depth regardless
     of its base quality at either position; otherwise it still needs
     BOTH of its bases to individually meet minbq (matching what the
     single shared min_base_quality=minbq pileup filter used to enforce
@@ -335,7 +351,7 @@ def extractDepthBatchDbs(
                 wanted_cols.add(p + 1)
             # 1-based pos -> {read_name: entry}. entry is base-or-None
             # (indel) when call_barcodes is None (unchanged); with
-            # call_barcodes it's (base_or_None, quality_ok, bc1, bc2) so
+            # call_barcodes it's (base_or_None, quality_ok, family_id) so
             # the correlation step below can apply the barcode-match
             # exemption per candidate, since the same column can serve as
             # candidate A's own position and candidate B's pos+1, each
@@ -387,10 +403,10 @@ def extractDepthBatchDbs(
                         # still gets it from that other column at
                         # correlation time below.
                         if quality_ok:
-                            read_bc1 = read_bc2 = None
+                            fam_id = None
                         else:
-                            read_bc1, read_bc2 = get_duplex_barcode(aln, params)
-                        reads[aln.query_name] = (base, quality_ok, read_bc1, read_bc2)
+                            fam_id = _read_family_id(aln, params)
+                        reads[aln.query_name] = (base, quality_ok, fam_id)
                     else:
                         reads[aln.query_name] = base
                 col_bases[pos] = reads
@@ -410,18 +426,15 @@ def extractDepthBatchDbs(
                     )
                     for rn in shared_reads:
                         if barcode_aware:
-                            b0, q0_ok, bc1_0, bc2_0 = bases0[rn]
-                            b1, q1_ok, bc1_1, bc2_1 = bases1[rn]
+                            b0, q0_ok, fam_id0 = bases0[rn]
+                            b1, q1_ok, fam_id1 = bases1[rn]
                             if not (q0_ok and q1_ok):
                                 # At least one column has quality_ok False,
-                                # so at least one of these pairs was
+                                # so at least one of these ids was
                                 # actually computed (non-None) -- prefer
                                 # col0's, fall back to col1's.
-                                read_bc1 = bc1_0 if bc1_0 is not None else bc1_1
-                                read_bc2 = bc2_0 if bc2_0 is not None else bc2_1
-                                if not _barcode_pair_matches(
-                                    bc_pairs, read_bc1, read_bc2
-                                ):
+                                fam_id = fam_id0 if fam_id0 is not None else fam_id1
+                                if not _family_id_matches(bc_pairs, *fam_id):
                                     continue
                         else:
                             b0 = bases0[rn]

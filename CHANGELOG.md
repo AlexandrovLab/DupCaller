@@ -2,6 +2,11 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.7] - 2026-10-03
+
+### Changed
+- Tumor depth extraction's minBq exemption for a call's own founding reads now identifies the founding duplex family by barcode pair plus absolute template length, not barcode pair alone. A low-BQ read is exempt only if its barcode pair (either order) and |template length| both match a supporting family, so a read from a different molecule that shares the barcode is still held to minBq. Absolute value because a family's leftmost reads carry +TL and their mates -TL. Applies to SNV, indel and DBS depth (AC/RC/DP and the no_good_alt_read check).
+
 ## [1.2.6] - 2026-10-02
 
 ### Changed

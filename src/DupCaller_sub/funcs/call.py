@@ -1289,14 +1289,15 @@ def _process_duplex_family(
 
 
 def _collect_call_barcode(call_barcodes, key, mut):
-    """Record one more founding duplex family's (TAG1, TAG2) barcode pair
-    as supporting this candidate -- shared by the SNV/indel/DBS depth-
+    """Record one more founding duplex family's (TAG1, TAG2, |TL|)
+    identifier -- barcode pair plus absolute template length -- as
+    supporting this candidate. Shared by the SNV/indel/DBS depth-
     extraction loops below, each of which needs this same accounting so
     extractDepthBatchSnv/Indel/Dbs's call_barcodes arg can exempt a
     founding-family read from the minBq filter regardless of base
     quality."""
     call_barcodes.setdefault(key, set()).add(
-        (mut["infos"]["TAG1"], mut["infos"]["TAG2"])
+        (mut["infos"]["TAG1"], mut["infos"]["TAG2"], abs(mut["infos"]["TL"]))
     )
 
 
@@ -2724,10 +2725,11 @@ def callBam(params, processNo):
     deferred_depth_keys = params.get("deferred_depth_keys", frozenset())
     mut_dict = dict()
     snv_candidate_keys = []
-    # (TAG1, TAG2) of every duplex family that itself supports each
+    # (TAG1, TAG2, |TL|) of every duplex family that itself supports each
     # candidate -- tumor depth extraction below counts a primary read
     # toward a candidate's depth regardless of base quality when its own
-    # duplex barcode pair matches one of these (either orientation), since
+    # duplex barcode pair (either orientation) and |template_length| match
+    # one of these, since
     # it's one of the founding reads of the call being verified. A
     # candidate can be supported by more than one duplex family, so this
     # collects every one seen among this candidate's own eligible mut
