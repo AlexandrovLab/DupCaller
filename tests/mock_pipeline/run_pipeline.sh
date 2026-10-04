@@ -8,6 +8,10 @@
 #
 # Usage: run_pipeline.sh OUTDIR
 #
+# R2_SHORT=N (optional) cuts N bases off the 3' end of every read 2 with
+# make_short_read2.py, so read 2 is N bases shorter than read 1 after trim;
+# the outputs must still reproduce expected/ exactly.
+#
 # Requires DupCaller.py, bwa-mem2, samtools, and gatk on PATH (or overridden
 # via the DUPCALLER/BWA_MEM2/SAMTOOLS/GATK env vars).
 set -euo pipefail
@@ -24,6 +28,9 @@ GATK="${GATK:-gatk}"
 mkdir -p "$OUTDIR"
 cp "$DATA_DIR/reference.fa" "$DATA_DIR/repeats.tsv" "$DATA_DIR/mock_1.fastq" "$DATA_DIR/mock_2.fastq" "$OUTDIR/"
 cd "$OUTDIR"
+if [ -n "${R2_SHORT:-}" ]; then
+    "${PYTHON:-python3}" "${SCRIPT_DIR}/make_short_read2.py" "$DATA_DIR/mock_2.fastq" mock_2.fastq "$R2_SHORT"
+fi
 
 echo "[1/6] index"
 "$SAMTOOLS" faidx reference.fa

@@ -2,10 +2,19 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
-## [Unreleased]
+## [1.2.10] - 2026-10-03
+
+### Removed
+- `trim -p2/--pattern2` (added in 1.2.9). A per-read pattern does not cover the Tn5-based protocols it was meant for, whose barcode length varies from read to read with the inserted transposon.
+
+### Fixed
+- `call`: the first downstream mate (template length < 0) of a family whose mates start at different positions could split off into a stray one-read family instead of joining its family. That read triggers the batch transition, so it was checked against the rugged-mate redirect table before the upstream family that fills it was indexed. It is now re-checked after indexing. With read 2 two bases shorter than read 1, the mock data lost 3 of 16 duplex families before the fix; real data is affected wherever mates of one family start at different positions (e.g. unequal mate lengths after trimming, or soft clipping).
+
+### Added
+- Mock test for unequal mate lengths: `make_short_read2.py` cuts 2 bases off every read 2's 3' end, and the direct-CLI suite runs the pipeline on that data as well, required to reproduce `expected/` exactly.
 
 ### Changed
-- Nextflow pipeline and README Docker/Singularity instructions use `yuhecheng62/dupcaller:1.2.9`, which includes the 1.2.8 calling changes (MAPQ founding-family exemption, 3.5e-9 no-root rate) and `trim -p2`.
+- Nextflow pipeline and README Docker/Singularity instructions use `yuhecheng62/dupcaller:1.2.9`, which includes the 1.2.8 calling changes (MAPQ founding-family exemption, 3.5e-9 no-root rate).
 
 ## [1.2.9] - 2026-10-03
 

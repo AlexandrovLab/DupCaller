@@ -4,6 +4,11 @@ Runs index -> trim -> bwa-mem2 mem -> gatk MarkDuplicates -> call -> estimate
 against the synthetic reference/read set in data/ and diffs every
 deterministic output file against the premade results in expected/.
 
+Also runs once more with every read 2 cut 2 bases shorter at its 3' end
+(make_short_read2.py), so read 2 is shorter than read 1 after trim and each
+family's downstream mates start at different positions; they must still pair
+into the same duplex families and reproduce expected/ exactly.
+
 Requires DupCaller.py, bwa-mem2, samtools, and gatk; skipped automatically if
 any of those aren't on PATH.
 """
@@ -43,14 +48,17 @@ def _missing_tools():
     return missing
 
 
-@pytest.fixture(scope="module")
-def pipeline_output(tmp_path_factory):
+@pytest.fixture(scope="module", params=["plain", "short_read2"])
+def pipeline_output(request, tmp_path_factory):
     missing = _missing_tools()
     if missing:
         pytest.skip(f"required tool(s) not on PATH: {', '.join(missing)}")
 
-    outdir = tmp_path_factory.mktemp("mock_pipeline_run")
+    outdir = tmp_path_factory.mktemp(f"mock_pipeline_{request.param}")
     env = dict(os.environ)
+    env["PYTHON"] = sys.executable
+    if request.param == "short_read2":
+        env["R2_SHORT"] = "2"
     dupcaller_cmd = _resolve_dupcaller()
     if len(dupcaller_cmd) == 1:
         env["DUPCALLER"] = dupcaller_cmd[0]

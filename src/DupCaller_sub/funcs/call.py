@@ -2009,10 +2009,15 @@ def callBam(params, processNo):
             # start of any key still to come in this same batch, and a
             # later key's start_ind can go negative. Floor the window at the
             # batch's true minimum read start to rule that out up front.
+            # currentReadDict can be empty: a batch whose only read was
+            # redirected into rugged_reads_pool (see the end of this block).
             batch_min_start = min(
-                r.reference_start
-                for entry in currentReadDict.values()
-                for r in entry["seqs"]
+                (
+                    r.reference_start
+                    for entry in currentReadDict.values()
+                    for r in entry["seqs"]
+                ),
+                default=currentStart,
             )
             for key in currentReadDict.keys():
                 flt_rs = "PASS"
@@ -2352,8 +2357,16 @@ def callBam(params, processNo):
             Calling block ends
             """
             currentReadDict = {}
-            _place_read_in_dict(rec, label, currentReadDict)
             currentStart = start
+            if rec.template_length < 0 and rec.query_name in rugged_reads_index:
+                # This read triggered the transition, so it was checked
+                # against rugged_reads_index above before the batch just
+                # flushed was indexed by _index_rugged_mates -- re-check now,
+                # or the first downstream mate of a rugged family (e.g. mates
+                # of unequal length) starts a stray one-read family here.
+                rugged_reads_pool[rugged_reads_index.pop(rec.query_name)].append(rec)
+            else:
+                _place_read_in_dict(rec, label, currentReadDict)
             _drain_rugged_pool(
                 chrom, currentStart, rugged_reads_pool, params, currentReadDict
             )
