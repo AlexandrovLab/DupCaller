@@ -60,26 +60,26 @@ pip install .
 
 ### Docker / Singularity
 
-A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.9`.
+A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.10`.
 
 **Pull and run with Singularity:**
 
 Pull the image from Docker Hub (only needed once):
 
 ```bash
-singularity pull dupcaller-1.2.9.sif docker://yuhecheng62/dupcaller:1.2.9
+singularity pull dupcaller-1.2.10.sif docker://yuhecheng62/dupcaller:1.2.10
 ```
 
 For quick verification:
 
 ```bash
-singularity exec dupcaller-1.2.9.sif DupCaller.py --help
+singularity exec dupcaller-1.2.10.sif DupCaller.py --help
 ```
 
 For installation-free execution of DupCaller commands, run all DupCaller.py commands with `singularity exec` and binding of current directories:
 
 ```bash
-singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.9.sif DupCaller.py {your commands}
+singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.10.sif DupCaller.py {your commands}
 ```
 
 ---

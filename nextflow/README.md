@@ -6,7 +6,7 @@ marking → `DupCaller.py call` → `DupCaller.py estimate`.
 
 Preprocessing uses the same tools and commands as the main README:
 bwa-mem2 2.3 (`bwa-mem2 mem -C -T 0`) and GATK 4.3.0.0 MarkDuplicates.
-Containers: `yuhecheng62/dupcaller:1.2.9`,
+Containers: `yuhecheng62/dupcaller:1.2.10`,
 `quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0`, `broadinstitute/gatk:4.3.0.0`.
 (bwa-mem2 v2.3 still reports itself as `2.2.1` in `bwa-mem2 version` and
 the BAM `@PG` header.)

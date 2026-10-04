@@ -16,7 +16,7 @@ All notable changes to DupCaller are recorded here, most recent first.
 - Mock test for unequal mate lengths: `make_short_read2.py` cuts 2 bases off every read 2's 3' end, and the direct-CLI suite runs the pipeline on that data as well, required to reproduce `expected/` exactly.
 
 ### Changed
-- Nextflow pipeline and README Docker/Singularity instructions use `yuhecheng62/dupcaller:1.2.9`, which includes the 1.2.8 calling changes (MAPQ founding-family exemption, 3.5e-9 no-root rate).
+- Nextflow pipeline and README Docker/Singularity instructions use `yuhecheng62/dupcaller:1.2.10`, which includes the rugged-mate fix and the `B` trim mode (the Nextflow pipeline itself does not expose `B`/`--barcode-list`).
 
 ## [1.2.9] - 2026-10-03
 

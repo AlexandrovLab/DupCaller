@@ -62,7 +62,7 @@ def optionalIndexedResource(p, param_name, placeholder_name) {
 // Step 1a: DupCaller reference index (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 process INDEX_REFERENCE {
-    container 'yuhecheng62/dupcaller:1.2.9'
+    container 'yuhecheng62/dupcaller:1.2.10'
 
     input:
     path reference
@@ -104,7 +104,7 @@ process BWA_MEM2_INDEX {
 // ─────────────────────────────────────────────────────────────────────────────
 process TRIM_BARCODES {
     tag "${sample_id}:${type}"
-    container 'yuhecheng62/dupcaller:1.2.9'
+    container 'yuhecheng62/dupcaller:1.2.10'
 
     input:
     tuple val(sample_id), val(type), path(read1), path(read2)
@@ -215,7 +215,7 @@ process MARK_DUPLICATES {
 // ─────────────────────────────────────────────────────────────────────────────
 process CALL_VARIANTS {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.9'
+    container 'yuhecheng62/dupcaller:1.2.10'
     cpus params.threads
     publishDir "${params.outdir}", mode: 'copy'
 
@@ -273,7 +273,7 @@ process CALL_VARIANTS {
 // ─────────────────────────────────────────────────────────────────────────────
 process ESTIMATE_BURDEN {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.9'
+    container 'yuhecheng62/dupcaller:1.2.10'
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
