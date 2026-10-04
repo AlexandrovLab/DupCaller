@@ -2,10 +2,15 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [Unreleased]
+
+### Changed
+- Nextflow pipeline and README Docker/Singularity instructions use `yuhecheng62/dupcaller:1.2.9`, which includes the 1.2.8 calling changes (MAPQ founding-family exemption, 3.5e-9 no-root rate) and `trim -p2`.
+
 ## [1.2.9] - 2026-10-03
 
 ### Added
-- `trim -p2/--pattern2`: a separate barcode pattern for read 2 (`-p` then applies to read 1 only). It must have the same number of `N` (barcode) bases as `-p`, differing only in `X` (skipped) bases; otherwise `trim` stops with an error, since barcodes of different lengths would keep the two strands of a molecule from pairing into a duplex family in `call`. Not yet exposed in the Nextflow pipeline (its 1.2.7 image has no `-p2`).
+- `trim -p2/--pattern2`: a separate barcode pattern for read 2 (`-p` then applies to read 1 only). It must have the same number of `N` (barcode) bases as `-p`, differing only in `X` (skipped) bases; otherwise `trim` stops with an error, since barcodes of different lengths would keep the two strands of a molecule from pairing into a duplex family in `call`. Not yet exposed as a Nextflow parameter.
 
 ## [1.2.8] - 2026-10-03
 
