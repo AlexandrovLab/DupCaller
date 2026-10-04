@@ -58,7 +58,27 @@ if __name__ == "__main__":
         "-i2", "--fq2", type=str, required=True, help="read 2 fastq file"
     )
     trim_parser.add_argument(
-        "-p", "--pattern", type=str, required=True, help="pattern of sequence barcode"
+        "-p",
+        "--pattern",
+        type=str,
+        required=True,
+        help="pattern of sequence barcode: N = barcode base, X = skipped base, "
+        "B = one barcode from --barcode-list (any length; later positions count "
+        "from its end)",
+    )
+    trim_parser.add_argument(
+        "-bl",
+        "--barcode-list",
+        type=str,
+        default=None,
+        help="file of allowed barcodes, one per line, for a pattern with B",
+    )
+    trim_parser.add_argument(
+        "-mm",
+        "--max-mismatch",
+        type=int,
+        default=1,
+        help="mismatches allowed when matching B against --barcode-list (default 1)",
     )
     trim_parser.add_argument(
         "-o",

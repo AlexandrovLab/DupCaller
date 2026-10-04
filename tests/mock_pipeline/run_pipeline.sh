@@ -12,6 +12,11 @@
 # make_short_read2.py, so read 2 is N bases shorter than read 1 after trim;
 # the outputs must still reproduce expected/ exactly.
 #
+# BARCODE_LIST=1 (optional) rewrites the reads with make_barcode_list_reads.py
+# (variable-length listed codes + Tn5 ME instead of NNNXXXX) and trims with
+# -p B + 19 X -bl barcodes.txt; outputs must match expected/ once the codes
+# are mapped back to the original barcodes (barcode_map.tsv).
+#
 # Requires DupCaller.py, bwa-mem2, samtools, and gatk on PATH (or overridden
 # via the DUPCALLER/BWA_MEM2/SAMTOOLS/GATK env vars).
 set -euo pipefail
@@ -37,7 +42,14 @@ echo "[1/6] index"
 "$DUPCALLER" index -f reference.fa -rt repeats.tsv
 
 echo "[2/6] trim"
-"$DUPCALLER" trim -i mock_1.fastq -i2 mock_2.fastq -p NNNXXXX -o mock_trm
+if [ -n "${BARCODE_LIST:-}" ]; then
+    "${PYTHON:-python3}" "${SCRIPT_DIR}/make_barcode_list_reads.py" mock_1.fastq mock_2.fastq \
+        mock_bl_1.fastq mock_bl_2.fastq barcodes.txt barcode_map.tsv
+    "$DUPCALLER" trim -i mock_bl_1.fastq -i2 mock_bl_2.fastq -p "BXXXXXXXXXXXXXXXXXXX" \
+        -bl barcodes.txt -o mock_trm
+else
+    "$DUPCALLER" trim -i mock_1.fastq -i2 mock_2.fastq -p NNNXXXX -o mock_trm
+fi
 
 echo "[3/6] align"
 "$BWA_MEM2" index reference.fa

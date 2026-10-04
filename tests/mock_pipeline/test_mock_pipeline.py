@@ -9,10 +9,17 @@ Also runs once more with every read 2 cut 2 bases shorter at its 3' end
 family's downstream mates start at different positions; they must still pair
 into the same duplex families and reproduce expected/ exactly.
 
+And once with META-CS-style reads (make_barcode_list_reads.py): each read
+starts with a variable-length listed code (some with one mismatch) plus the
+Tn5 ME, trimmed with the B pattern letter and --barcode-list. Outputs must
+match expected/ once VCF TAG1/TAG2 codes are mapped back to the original
+barcodes.
+
 Requires DupCaller.py, bwa-mem2, samtools, and gatk; skipped automatically if
 any of those aren't on PATH.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,7 +55,7 @@ def _missing_tools():
     return missing
 
 
-@pytest.fixture(scope="module", params=["plain", "short_read2"])
+@pytest.fixture(scope="module", params=["plain", "short_read2", "barcode_list"])
 def pipeline_output(request, tmp_path_factory):
     missing = _missing_tools()
     if missing:
@@ -59,6 +66,8 @@ def pipeline_output(request, tmp_path_factory):
     env["PYTHON"] = sys.executable
     if request.param == "short_read2":
         env["R2_SHORT"] = "2"
+    if request.param == "barcode_list":
+        env["BARCODE_LIST"] = "1"
     dupcaller_cmd = _resolve_dupcaller()
     if len(dupcaller_cmd) == 1:
         env["DUPCALLER"] = dupcaller_cmd[0]
@@ -80,6 +89,19 @@ def pipeline_output(request, tmp_path_factory):
     return outdir
 
 
+def _map_codes_back(vcf_path, code_map):
+    """Copy of vcf_path with TAG1/TAG2 listed codes replaced by the 3-base
+    barcodes they stand for (barcode_list run)."""
+    codes = dict(line.split("\t") for line in code_map.read_text().split("\n") if line)
+    pattern = re.compile(r"(TAG[12]=)([ACGT]+)")
+    text = pattern.sub(
+        lambda m: m.group(1) + codes.get(m.group(2), m.group(2)), vcf_path.read_text()
+    )
+    out = vcf_path.with_suffix(".mapped.vcf")
+    out.write_text(text)
+    return out
+
+
 def _expected_files():
     return sorted(p for p in EXPECTED_DIR.rglob("*") if p.is_file())
 
@@ -92,5 +114,8 @@ def test_output_matches_expected(pipeline_output, rel_path):
     expected_path = EXPECTED_DIR / rel_path
     actual_path = pipeline_output / rel_path
     assert actual_path.exists(), f"pipeline did not produce {rel_path}"
+    code_map = pipeline_output / "barcode_map.tsv"
+    if code_map.exists() and rel_path.endswith(".vcf"):
+        actual_path = _map_codes_back(actual_path, code_map)
     diffs = compare_file(expected_path, actual_path)
     assert not diffs, "\n".join(diffs)
