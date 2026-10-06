@@ -39,6 +39,7 @@ from .misc import build_trinuc64_order
 from .misc import load_repeat_context
 from .misc import log_progress
 from .misc import get_duplex_barcode
+from .misc import family_fragment_starts
 from .misc import (
     DEPTH_HPSTR_NCAT,
     DEPTH_HPSTR_STR0_ANY,
@@ -561,6 +562,7 @@ def _process_duplex_family(
                     "TN": ".",
                     "HP": hps[pass_inds[nn]],
                     "TL": readSet[0].template_length,
+                    "FS": family_fragment_starts(readSet),
                     "STR": strs[nn],
                     "HM": int(hp_match[pass_inds[nn]]),
                     "SNPM": 0,
@@ -1134,6 +1136,7 @@ def _process_duplex_family(
                     "TN": mut_trinuc,
                     "HP": "0",
                     "TL": readSet[0].template_length,
+                    "FS": family_fragment_starts(readSet),
                     "STR": 0,
                     "SNPM": int(masks[0, muts_ind[nn]]),
                     "NOISEM": int(masks[1, muts_ind[nn]]),
@@ -1159,6 +1162,7 @@ def _process_duplex_family(
                 currentStart,
                 readSet[0].template_length,
                 num2base,
+                readSet,
             )
         )
         if flt_rs == "PASS":
@@ -1289,15 +1293,17 @@ def _process_duplex_family(
 
 
 def _collect_call_barcode(call_barcodes, key, mut):
-    """Record one more founding duplex family's (TAG1, TAG2, |TL|)
-    identifier -- barcode pair plus absolute template length -- as
+    """Record one more founding duplex family's (TAG1, TAG2, |TL|,
+    fragment start) identifiers -- barcode pair, absolute template length
+    and each fragment start of the family's reads (INFO "FS") -- as
     supporting this candidate. Shared by the SNV/indel/DBS depth-
     extraction loops below, each of which needs this same accounting so
     extractDepthBatchSnv/Indel/Dbs's call_barcodes arg can exempt a
     founding-family read from the minBq and --mapq filters."""
-    call_barcodes.setdefault(key, set()).add(
-        (mut["infos"]["TAG1"], mut["infos"]["TAG2"], abs(mut["infos"]["TL"]))
-    )
+    infos = mut["infos"]
+    ids = call_barcodes.setdefault(key, set())
+    for fs in infos["FS"]:
+        ids.add((infos["TAG1"], infos["TAG2"], abs(infos["TL"]), fs))
 
 
 COVERAGE_WINDOW_ROWS = 1000000
@@ -1729,15 +1735,22 @@ def callBam(params, processNo):
         prob_amp_str_L = params["ampmat_str"]
         prob_dmg_str_L = params["dmgmat_str"]
         pcutoffi_L = params["pcutoffi"]
+        min_lr_L = params.get("minLR", 0.0)
 
         def indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c):
             # Uniform default cutoff, capped per-context by the theoretical
             # ceiling of masked LR for that context (same formula as
             # genotypeDSSnv's LR_max/"LM" field -- see indelMaxLR), mirroring
-            # pcutoff_sbs's min(pcut, maxLR_ctx) treatment above.
-            return min(
-                pcutoffi_L,
-                float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c)),
+            # pcutoff_sbs's min(pcut, maxLR_ctx) treatment above. Only used
+            # for the coverage pass's power tables, for contexts without a
+            # channel threshold, so it takes the same --minLR floor as
+            # Caller.py's calling cutoff for those contexts.
+            return max(
+                min_lr_L,
+                min(
+                    pcutoffi_L,
+                    float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c)),
+                ),
             )
 
         def simulateIndelPowerGrid(
@@ -2737,11 +2750,12 @@ def callBam(params, processNo):
     deferred_depth_keys = params.get("deferred_depth_keys", frozenset())
     mut_dict = dict()
     snv_candidate_keys = []
-    # (TAG1, TAG2, |TL|) of every duplex family that itself supports each
-    # candidate -- tumor depth extraction below counts a primary read
-    # toward a candidate's depth regardless of base quality when its own
-    # duplex barcode pair (either orientation) and |template_length| match
-    # one of these, since
+    # (TAG1, TAG2, |TL|, fragment start) of every duplex family that itself
+    # supports each candidate (see _collect_call_barcode) -- tumor depth
+    # extraction below counts a primary read toward a candidate's depth
+    # regardless of base quality when its own duplex barcode pair (either
+    # orientation), |template_length| and fragment start match one of these,
+    # since
     # it's one of the founding reads of the call being verified. A
     # candidate can be supported by more than one duplex family, so this
     # collects every one seen among this candidate's own eligible mut

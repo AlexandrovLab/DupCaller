@@ -4,6 +4,7 @@ import numpy as np
 import pysam
 from .misc import getAlignmentObject as BAM
 from .misc import get_duplex_barcode
+from .misc import family_fragment_starts, fragment_start  # noqa: F401
 
 # Candidates on the same chromosome farther apart than this start a new
 # pileup() scan in extractDepthBatchSnv/extractDepthBatchIndel, rather than
@@ -40,32 +41,34 @@ def _cluster_positions(positions, max_gap):
 
 
 def _read_family_id(aln, params):
-    """(bc1, bc2, |template_length|) of aln -- the founding-family
-    identifier matched against call_barcodes by _family_id_matches."""
+    """(bc1, bc2, |template_length|, fragment start) of aln -- the
+    founding-family identifier matched against call_barcodes by
+    _family_id_matches."""
     read_bc1, read_bc2 = get_duplex_barcode(aln, params)
-    return read_bc1, read_bc2, abs(aln.template_length)
+    return read_bc1, read_bc2, abs(aln.template_length), fragment_start(aln)
 
 
-def _family_id_matches(family_ids, read_bc1, read_bc2, read_tl):
-    """True if the read's duplex barcode pair (either orientation) AND
-    absolute template length match one of family_ids' (bc1, bc2, |TL|).
-    Absolute value because a family's leftmost reads carry +TL and their
-    mates -TL (see misc._compute_read_label), and either mate can be the
-    read covering a pileup column."""
-    for bc1, bc2, tl in family_ids:
-        if read_tl == tl and (
-            (read_bc1 == bc1 and read_bc2 == bc2)
-            or (read_bc1 == bc2 and read_bc2 == bc1)
-        ):
-            return True
-    return False
+def _family_id_matches(family_ids, read_bc1, read_bc2, read_tl, read_fs):
+    """True if the read's duplex barcode pair (either orientation),
+    absolute template length AND fragment start match one of family_ids'
+    (bc1, bc2, |TL|, fragment start). Absolute value because a family's
+    leftmost reads carry +TL and their mates -TL (see
+    misc._compute_read_label), and either mate can be the read covering a
+    pileup column; the fragment start separates two molecules that share
+    barcodes and template length."""
+    return (read_bc1, read_bc2, read_tl, read_fs) in family_ids or (
+        read_bc2,
+        read_bc1,
+        read_tl,
+        read_fs,
+    ) in family_ids
 
 
-def _matches_any(family_ids_by_spec, read_bc1, read_bc2, read_tl):
+def _matches_any(family_ids_by_spec, read_bc1, read_bc2, read_tl, read_fs):
     """True if the read belongs to a founding family of any candidate at
     this column (family_ids_by_spec: one call_barcodes set per candidate)."""
     return any(
-        _family_id_matches(ids, read_bc1, read_bc2, read_tl)
+        _family_id_matches(ids, read_bc1, read_bc2, read_tl, read_fs)
         for ids in family_ids_by_spec
     )
 
@@ -92,15 +95,16 @@ def extractDepthBatchSnv(
     result — same information as extractDepthSnv returning all zeros.
 
     call_barcodes, when given, is
-    {(chrom, pos, ref, alt): {(bc1, bc2, abs_template_length), ...}} -- the
-    duplex barcode pair plus absolute template length of every family that
+    {(chrom, pos, ref, alt): {(bc1, bc2, abs_template_length,
+    fragment_start), ...}} -- the duplex barcode pair, absolute template
+    length and fragment start (see fragment_start) of every family that
     itself supports that
     candidate (used for the tumor BAM: a candidate can be supported by more
     than one duplex family). This switches on barcode-aware base-quality
     handling: the pileup itself only requires BQ>0 (min_base_quality=1)
     instead of minbq, and a primary read whose own duplex barcode pair
-    (either orientation) and |template_length| match one of a candidate's
-    call_barcodes counts
+    (either orientation), |template_length| and fragment start match one of
+    a candidate's call_barcodes counts
     toward that candidate's depth regardless of its base quality, since
     it's one of the founding reads of the call being verified -- every
     other read is still held to minbq, checked manually per read since
@@ -111,7 +115,8 @@ def extractDepthBatchSnv(
     Mapping quality is handled the same way: the pileup takes every MAPQ
     (min_mapping_quality=0) and the --mapq cut is applied per read. With
     call_barcodes, a read below --mapq still counts toward a candidate whose
-    founding family (barcode pair + |template_length|) it belongs to; any
+    founding family (barcode pair + |template_length| + fragment start) it
+    belongs to; any
     other read needs MAPQ >= --mapq. A low-MAPQ read that belongs to no
     founding family at the column is skipped without claiming its query
     name, so its mate can still be counted. Without call_barcodes (normal
@@ -168,10 +173,8 @@ def extractDepthBatchSnv(
                     if not mapq_ok:
                         if not barcode_aware:
                             continue
-                        read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
-                        if not _matches_any(
-                            bc_pairs_by_spec, read_bc1, read_bc2, read_tl
-                        ):
+                        fam_id = _read_family_id(aln, params)
+                        if not _matches_any(bc_pairs_by_spec, *fam_id):
                             continue
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
@@ -189,12 +192,10 @@ def extractDepthBatchSnv(
                         )
                         needs_family = not (quality_ok and mapq_ok)
                         if needs_family and mapq_ok:
-                            read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
+                            fam_id = _read_family_id(aln, params)
                     for i, (ref, alt) in enumerate(specs):
                         if barcode_aware and needs_family:
-                            if not _family_id_matches(
-                                bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
-                            ):
+                            if not _family_id_matches(bc_pairs_by_spec[i], *fam_id):
                                 continue
                         if is_indel:
                             indel_counts[i] += 1
@@ -286,10 +287,8 @@ def extractDepthBatchIndel(
                     if not mapq_ok:
                         if not barcode_aware:
                             continue
-                        read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
-                        if not _matches_any(
-                            bc_pairs_by_spec, read_bc1, read_bc2, read_tl
-                        ):
+                        fam_id = _read_family_id(aln, params)
+                        if not _matches_any(bc_pairs_by_spec, *fam_id):
                             continue
                     processed_read_names[aln.query_name] = 1
                     if aln.is_duplicate:
@@ -301,12 +300,10 @@ def extractDepthBatchIndel(
                         )
                         needs_family = not (quality_ok and mapq_ok)
                         if needs_family and mapq_ok:
-                            read_bc1, read_bc2, read_tl = _read_family_id(aln, params)
+                            fam_id = _read_family_id(aln, params)
                     for i, (ref, alt, indel_size) in enumerate(specs):
                         if barcode_aware and needs_family:
-                            if not _family_id_matches(
-                                bc_pairs_by_spec[i], read_bc1, read_bc2, read_tl
-                            ):
+                            if not _family_id_matches(bc_pairs_by_spec[i], *fam_id):
                                 continue
                         if pileupread.indel == indel_size:
                             alt_counts[i] += 1
@@ -364,8 +361,8 @@ def extractDepthBatchDbs(
     call_barcodes, when given, is the same barcode-aware base-quality
     switch as extractDepthBatchSnv/Indel: both columns are pileup'd at
     BQ>0 (min_base_quality=1) instead of minbq, and a read whose own
-    duplex barcode pair (either orientation) and |template_length| match
-    one of a candidate's call_barcodes counts toward that candidate's depth regardless
+    duplex barcode pair (either orientation), |template_length| and
+    fragment start match one of a candidate's call_barcodes counts toward that candidate's depth regardless
     of its base quality at either position; otherwise it still needs
     BOTH of its bases to individually meet minbq (matching what the
     single shared min_base_quality=minbq pileup filter used to enforce

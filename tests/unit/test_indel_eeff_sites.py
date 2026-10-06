@@ -22,7 +22,6 @@ from DupCaller_sub.funcs.misc import (
     indel_eeff_site_masks,
     indel_mu_channel,
     init_refine_worker,
-    MU0_NO_ROOT_RATE,
     refine_channel_task,
     str_tract_valid,
 )
@@ -191,6 +190,7 @@ def _solve(raw_lr, eeff, pseudocount=0.5, neg_log_lr=None):
         pseudocount,
         None,
         np.empty(0, dtype=np.float32) if neg_log_lr is None else neg_log_lr,
+        0.0,
     )
     return refine_channel_task(job)[4]
 
@@ -218,29 +218,56 @@ def test_cli_rejects_nonpositive_pseudocount():
             cli.positive_float(bad)
 
 
-def test_mu_solve_finds_interior_root_when_candidates_reach_eeff():
-    # n == Eeff with 5 strong calls: g(1) > 0, but g dips below 0 near
-    # mu ~ 0.07; the old shortcut returned 0.
+def _map_equation_residual(raw_lr, eeff, mu, a=0.5):
+    post = mu * raw_lr / (1 - mu + mu * raw_lr)
+    return mu * (eeff + 2 * a) - (post.sum() + a)
+
+
+def test_mu_solve_satisfies_symmetric_pseudocount_equation():
+    # mu * (Eeff + 2a) = sum(post) + a
+    raw_lr = np.concatenate([np.full(5, 1e6), np.full(95, 1e-3)])
+    mu0 = _solve(raw_lr, 1000)
+    assert abs(_map_equation_residual(raw_lr, 1000, mu0)) < 1e-8
+
+
+def test_mu_solve_has_root_when_sites_equal_eeff():
+    # n == Eeff: the old solve had no interior root and fell back to a
+    # fixed 3.5e-9; one strong site on one opportunity now gives 0.75.
+    assert _solve(np.array([1e8]), 1) == pytest.approx(0.75, rel=1e-6)
     raw_lr = np.concatenate([np.full(5, 1e6), np.full(95, 1e-3)])
     mu0 = _solve(raw_lr, 100)
-    assert 0.01 < mu0 < 0.2
+    assert 0 < mu0 < 1
+    assert abs(_map_equation_residual(raw_lr, 100, mu0)) < 1e-8
 
 
-def test_mu_solve_without_a_root_uses_fixed_rate_when_sites_exist():
-    # One strong call on one site (the mock HP8 case): g ~ 1.5/mu - 1 > 0
-    # on all of (0, 1), so no root; the channel has a site, so 3.5e-9.
-    assert _solve(np.array([1e8]), 1) == MU0_NO_ROOT_RATE == 3.5e-9
+def test_mu_solve_more_sites_than_eeff_uses_n(capsys):
+    # A broken site/Eeff invariant is reported and solved with Eeff = n.
+    mu0 = _solve(np.full(4, 1e-3), 2)
+    assert "WARNING" in capsys.readouterr().out
+    assert abs(_map_equation_residual(np.full(4, 1e-3), 4, mu0)) < 1e-8
 
 
-def test_mu_solve_without_a_root_or_sites_stays_zero():
-    # No sites and no coverage: g = pseudocount/mu > 0, no root, mu0 = 0.
+def test_mu_solve_without_coverage_or_sites_is_zero():
     assert _solve(np.empty(0), 0) == 0.0
 
 
-def test_mu_solve_small_eeff_takes_the_pseudocount_root():
-    # No real evidence on one site: the pseudocount alone gives a root at
-    # about pseudocount / Eeff (the old shortcut returned 0 here).
-    assert _solve(np.full(3, 1e-3), 1) == pytest.approx(0.5, abs=0.01)
+def test_mu_solve_no_sites_is_pseudocount_floor():
+    # No sites: mu = a / (Eeff + 2a).
+    assert _solve(np.empty(0), 1) == pytest.approx(0.25, rel=1e-9)
+    assert _solve(np.empty(0), 45) == pytest.approx(0.5 / 46, rel=1e-9)
+
+
+def test_refine_channel_threshold_floor():
+    from DupCaller_sub.funcs.misc import _refine_channel
+
+    # mu 0.0332 alone would give log10 LR threshold ~2.74.
+    assert _refine_channel(0.0332, 0.0, 0.05) == pytest.approx(
+        np.log10(19 * (1 - 0.0332) / 0.0332)
+    )
+    assert _refine_channel(0.0332, 0.0, 0.05, 5.0) == 5.0
+    # A threshold already above the floor is unchanged.
+    assert _refine_channel(1e-9, 0.0, 0.05, 5.0) > 5.0
+    assert _refine_channel(0.0, 0.0, 0.05, 5.0) == float("inf")
 
 
 def test_mu_solve_float32_log_negatives_match_raw():
@@ -288,3 +315,17 @@ def test_mu_override_refuses_tables_without_eeff_stamp(tmp_path):
     old["eeff_sites"] = INDEL_EEFF_SITE_SET
     old.to_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t", index=False)
     assert _load_mutation_rate_override(prefix)["HP1_len-1_T"] == 1e-6
+
+
+@pytest.mark.parametrize("mu0", [0.75, 0.0332, 1.9e-4, 1e-6, 1e-9])
+def test_fdr_mu_cap_reproduces_channel_threshold(mu0):
+    from DupCaller_sub.funcs.misc import _refine_channel, mu_at_min_lr
+
+    f, min_lr = 0.05, 5.0
+    cap = mu_at_min_lr(f, min_lr)
+    assert np.log10((1 - f) * (1 - cap) / (f * cap)) == pytest.approx(min_lr)
+    mu = min(mu0, cap)
+    threshold = _refine_channel(mu0, 0.0, f, min_lr)
+    # A call exactly at the channel's threshold has local fdr f.
+    lfdr = (1 - mu) / (10**threshold * mu + 1 - mu)
+    assert lfdr == pytest.approx(f, rel=1e-9)

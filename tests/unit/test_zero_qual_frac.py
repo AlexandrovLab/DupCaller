@@ -1,6 +1,6 @@
-"""genotypeDSSnv masks a position when at least --maxZeroQualFrac of the
-family's reads have no usable base there (deleted, N, off the read, or
-BQ <= minBq), for both coverage (antimask) and candidates."""
+"""genotypeDSSnv no longer masks a position by the fraction of the
+family's reads with no usable base there (--maxZeroQualFrac was removed):
+reads without a usable base simply don't contribute to the LR."""
 
 from types import SimpleNamespace
 
@@ -78,41 +78,30 @@ def _deletion_family():
     ]
 
 
-def test_default_threshold_is_0_9(base_params):
-    # 4 of 6 reads deleted (0.67): kept at the default 0.9.
-    candidate, covered = _genotype(base_params, _deletion_family())
-    assert candidate and covered
-    # 9 of 10 reads deleted: masked.
+def test_mostly_deleted_position_is_not_masked(base_params):
+    # 9 of 10 reads deleted, one C>T read: still covered and a candidate.
     reads = [_read(True) for _ in range(5)] + [_read(False) for _ in range(4)]
     reads.append(_read(False, "T"))
     candidate, covered = _genotype(base_params, reads)
-    assert not candidate and not covered
-
-
-def test_mostly_deleted_position_is_masked_at_half(base_params):
-    params = dict(base_params, maxZeroQualFrac=0.5)
-    candidate, covered = _genotype(params, _deletion_family())
-    assert not candidate and not covered
-
-
-def test_mostly_deleted_position_kept_when_filter_relaxed(base_params):
-    params = dict(base_params, maxZeroQualFrac=1.0)
-    candidate, covered = _genotype(params, _deletion_family())
     assert candidate and covered
 
 
-def test_one_strand_all_low_bq_is_masked_at_half(base_params):
-    # 2+2 family whose bottom-strand bases are all BQ <= minBq: half the
-    # reads have no usable base.
-    params = dict(base_params, maxZeroQualFrac=0.5)
+def test_one_strand_all_low_bq_is_not_masked(base_params):
+    # 2+2 family whose bottom-strand bases are all below minBq.
     reads = [
         _read(True, "C"),
         _read(True, "C"),
         _read(False, "C", 5),
         _read(False, "C", 5),
     ]
-    _, covered = _genotype(params, reads)
-    assert not covered
+    _, covered = _genotype(base_params, reads)
+    assert covered
+
+
+def test_position_without_usable_bases_is_not_a_candidate(base_params):
+    reads = [_read(True) for _ in range(3)] + [_read(False) for _ in range(3)]
+    candidate, _ = _genotype(base_params, reads)
+    assert not candidate
 
 
 def test_clean_position_is_not_masked(base_params):

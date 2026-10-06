@@ -199,8 +199,15 @@ if __name__ == "__main__":
         "-a",
         "--pseudocount",
         type=positive_float,
-        help="regularization pseudocount (> 0) added to each channel's per-channel mixture-weight MLE solve (mu), making an interior root between 0 and 1 more likely; a channel where the solve still can't bracket a root falls back to mu=0 rather than being excluded",
+        help="pseudocount (> 0) for each channel's mutation-rate (mu) solve: a pseudo-mutations and a pseudo-reference sites, mu*(Eeff+2a) = sum of site posteriors + a, which always has exactly one root between 0 and 1. A channel with no effective coverage and no sites gets mu=0. Also the pseudocount of the SBS amplification-error (SRD) fit",
         default=0.5,
+    )
+    call_parser.add_argument(
+        "-mlr",
+        "--minLR",
+        type=float,
+        help="minimum log10 LR for a PASS call: floor on every channel's FDR-refined LR threshold, applied to calling and to the detection-power simulation used for the burden's sensitivity correction",
+        default=5.0,
     )
     call_parser.add_argument(
         "-sc",
@@ -343,13 +350,6 @@ if __name__ == "__main__":
         action="store_true",
         help="output discarded variants with reason in the filter field",
         default=False,
-    )
-    call_parser.add_argument(
-        "--maxZeroQualFrac",
-        "-z",
-        type=float,
-        help="Maximum fraction of bases in a read family that has 0 quality",
-        default=0.9,
     )
     call_parser.add_argument(
         "--maxPileupDepth",

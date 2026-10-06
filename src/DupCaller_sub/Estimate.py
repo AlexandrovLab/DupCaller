@@ -9,6 +9,7 @@ import sigProfilerPlotting as sigPlt
 from pysam import VariantFile as VCF, TabixFile
 from scipy.stats import gamma, barnard_exact
 import pysam
+from . import __version__
 from .funcs.misc import check_h5_usable
 from .funcs.misc import log_progress
 from .funcs.misc import _ensure_type_subdirs
@@ -1619,6 +1620,7 @@ def do_estimate(args):
     log_path = args.prefix + "_estimate_params.log"
     with open(log_path, "w") as log:
         log.write("DupCaller estimate — parameter log\n")
+        log.write(f"Version:  {__version__}\n")
         log.write(f"Run time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         log.write(f"Command:  {' '.join(sys.argv)}\n")
         log.write("\n--- All parameters (resolved values) ---\n")

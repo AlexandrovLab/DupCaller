@@ -15,6 +15,11 @@ Tn5 ME, trimmed with the B pattern letter and --barcode-list. Outputs must
 match expected/ once VCF TAG1/TAG2 codes are mapped back to the original
 barcodes.
 
+And once with MATCHED_NORMAL=1: call/estimate with the same reads as matched
+normal and the Nextflow pipeline's options, compared against
+expected_matched_normal/ -- the same files test_mock_pipeline_nextflow.py
+compares the containerized Nextflow run against.
+
 Requires DupCaller.py, bwa-mem2, samtools, and gatk; skipped automatically if
 any of those aren't on PATH.
 """
@@ -30,6 +35,7 @@ import pytest
 MOCK_DIR = Path(__file__).resolve().parent
 REPO_ROOT = MOCK_DIR.parent.parent
 EXPECTED_DIR = MOCK_DIR / "expected"
+EXPECTED_MATCHED_DIR = MOCK_DIR / "expected_matched_normal"
 
 sys.path.insert(0, str(MOCK_DIR))
 from compare_outputs import compare_file  # noqa: E402
@@ -55,19 +61,20 @@ def _missing_tools():
     return missing
 
 
-@pytest.fixture(scope="module", params=["plain", "short_read2", "barcode_list"])
-def pipeline_output(request, tmp_path_factory):
+def _run_pipeline(tmp_path_factory, mode):
     missing = _missing_tools()
     if missing:
         pytest.skip(f"required tool(s) not on PATH: {', '.join(missing)}")
 
-    outdir = tmp_path_factory.mktemp(f"mock_pipeline_{request.param}")
+    outdir = tmp_path_factory.mktemp(f"mock_pipeline_{mode}")
     env = dict(os.environ)
     env["PYTHON"] = sys.executable
-    if request.param == "short_read2":
+    if mode == "short_read2":
         env["R2_SHORT"] = "2"
-    if request.param == "barcode_list":
+    if mode == "barcode_list":
         env["BARCODE_LIST"] = "1"
+    if mode == "matched_normal":
+        env["MATCHED_NORMAL"] = "1"
     dupcaller_cmd = _resolve_dupcaller()
     if len(dupcaller_cmd) == 1:
         env["DUPCALLER"] = dupcaller_cmd[0]
@@ -89,6 +96,16 @@ def pipeline_output(request, tmp_path_factory):
     return outdir
 
 
+@pytest.fixture(scope="module", params=["plain", "short_read2", "barcode_list"])
+def pipeline_output(request, tmp_path_factory):
+    return _run_pipeline(tmp_path_factory, request.param)
+
+
+@pytest.fixture(scope="module")
+def matched_normal_output(tmp_path_factory):
+    return _run_pipeline(tmp_path_factory, "matched_normal")
+
+
 def _map_codes_back(vcf_path, code_map):
     """Copy of vcf_path with TAG1/TAG2 listed codes replaced by the 3-base
     barcodes they stand for (barcode_list run)."""
@@ -102,8 +119,8 @@ def _map_codes_back(vcf_path, code_map):
     return out
 
 
-def _expected_files():
-    return sorted(p for p in EXPECTED_DIR.rglob("*") if p.is_file())
+def _expected_files(root=EXPECTED_DIR):
+    return sorted(p for p in root.rglob("*") if p.is_file())
 
 
 @pytest.mark.parametrize(
@@ -118,4 +135,18 @@ def test_output_matches_expected(pipeline_output, rel_path):
     if code_map.exists() and rel_path.endswith(".vcf"):
         actual_path = _map_codes_back(actual_path, code_map)
     diffs = compare_file(expected_path, actual_path)
+    assert not diffs, "\n".join(diffs)
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        str(p.relative_to(EXPECTED_MATCHED_DIR))
+        for p in _expected_files(EXPECTED_MATCHED_DIR)
+    ],
+)
+def test_matched_normal_output_matches_expected(matched_normal_output, rel_path):
+    actual_path = matched_normal_output / rel_path
+    assert actual_path.exists(), f"pipeline did not produce {rel_path}"
+    diffs = compare_file(EXPECTED_MATCHED_DIR / rel_path, actual_path)
     assert not diffs, "\n".join(diffs)

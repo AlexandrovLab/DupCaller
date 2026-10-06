@@ -23,7 +23,7 @@
 ##INFO=<ID=TAG2,Number=1,Type=String,Description="Barcode of bottom strand 5 prime">
 ##INFO=<ID=SP,Number=1,Type=Integer,Description="Read family reference start position">
 ##INFO=<ID=TL,Number=1,Type=Integer,Description="Template length of the read pair">
-##INFO=<ID=FDR,Number=1,Type=Float,Description="Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).">
+##INFO=<ID=FDR,Number=1,Type=Float,Description="Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's mutation rate estimate capped at the rate whose LR threshold is --minLR. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).">
 ##FORMAT=<ID=AC,Number=1,Type=Integer,Description="Count of alt allele">
 ##FORMAT=<ID=RC,Number=1,Type=Integer,Description="Count of ref allele">
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth at the location">

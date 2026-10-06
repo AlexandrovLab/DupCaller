@@ -2,6 +2,26 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.11] - 2026-10-06
+
+### Changed
+- Per-channel mutation rate (mu) is solved from `mu*(Eeff + 2a) = sum of site posteriors + a` (`a` = `-a/--pseudocount`): `a` pseudo-mutations plus `a` pseudo-reference sites, the MAP estimate under a symmetric Beta(a+1, a+1) prior. It always has exactly one root between 0 and 1, so the log-grid root scan and the 3.5e-9 no-root rate (`MU0_NO_ROOT_RATE`, 1.2.8) are gone. The previous form (`mu*Eeff = sum + a`) had no root when a channel's opportunity was about as small as its site count, e.g. one strong call on one covered site, which then fell back to 3.5e-9 and failed. A channel with no effective coverage and no sites still gets mu = 0 (threshold +inf); one with at least as many sites as Eeff + a (an Eeff/site-set mismatch) is reported and solved with Eeff raised to the site count, which gives a high mu, so its threshold sits at the `--minLR` floor. Rates change noticeably only in channels with Eeff below about 50.
+- New `call -mlr/--minLR` (log10, default 5): floor on every channel's FDR-refined LR threshold. A channel's mu includes its own candidates, so in a channel with little effective coverage one weak call could raise mu enough to pass itself (e.g. a 1+1 HP9 insertion at log10 LR 3.7 in a channel with Eeff 45, mu 0.033). The floor applies to calling and to the coverage pass's detection-power simulation, so the burden's sensitivity correction uses the same cutoff. It is applied after round 1, so candidates with log10 LR between 0 and the floor still enter the mu solve and the fail VCF. Per-call FDR (INFO `FDR`, "Total FDR" lines) uses the channel's mu capped at the rate whose threshold is `--minLR` (about 1.9e-4 at the defaults), so a call at its channel's threshold has FDR `--lfdrThreshold`; the rate tables keep the uncapped mu.
+- Tumor depth extraction's minBq/`--mapq` exemption identifies the founding family by duplex barcode pair, |template length| and fragment start (the leftmost read's start, i.e. a read's own start when its template length is >= 0, else its mate's), instead of barcode pair and |template length| alone. Two molecules sharing barcodes and template length but starting elsewhere no longer share the exemption. Call records carry the family's fragment starts (`FS`, not written to the VCF).
+- `estimate` writes `Version:` to `_estimate_params.log`, like `_call_params.log`. `setup.py` reads the version from `DupCaller_sub/__init__.py`, the single version source.
+- Nextflow: the DupCaller image tag is defined once (`DUPCALLER_VERSION` in `nextflow/nextflow.config`, also the manifest version); `DupCaller.nf` no longer sets containers itself. It still points at `yuhecheng62/dupcaller:1.2.10` until the 1.2.11 image is published; until then the Nextflow test's comparison against `expected_matched_normal/` fails (rate tables, FDRs), which is the intended check.
+
+### Removed
+- `call -z/--maxZeroQualFrac`: the per-position mask by the fraction of a family's reads without a usable base. Its denominator included reads that do not reach the position, so at its 0.9 default it almost never fired (chr22 PD43272 and 80mM-48h: identical calls with and without it); reads without a usable base already add nothing to the LR.
+
+### Tests
+- The mock-pipeline alignment uses `bwa-mem2 mem -C -T 0`, the released command. `expected/` regenerated.
+- New `expected_matched_normal/`: the direct CLI run with the same reads as matched normal and the Nextflow pipeline's call options (`run_pipeline.sh` with `MATCHED_NORMAL=1`). The Nextflow test's default case must reproduce these files exactly, so a container or workflow change that alters calls fails it. The Nextflow test config pins `seed = 1`.
+- Founding-family exemption tests for barcode + template-length collisions with a different fragment start (SNV, indel, DBS); mu-solve tests for the new equation and the `--minLR` floor.
+
+### Documentation
+- README: dropped the statements about which aligner and options the published analyses used (BWA-MEM 0.7.17, `-T 0`); it documents only the released command (bwa-mem2 2.3, `bwa-mem2 mem -C -T 0`).
+
 ## [1.2.10] - 2026-10-03
 
 ### Removed

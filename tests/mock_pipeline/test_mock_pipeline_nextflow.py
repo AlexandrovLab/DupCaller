@@ -10,16 +10,28 @@ with every optional resource unset, then one run per optional input
 normal BAM), each checked for the DupCaller.py option it should (or, by
 default, should not) produce.
 
+The default case's deterministic outputs (VCFs, burdens, spectra, rate
+tables, error profiles, stats) must also match expected_matched_normal/,
+the same files the direct-CLI regression (test_mock_pipeline.py,
+MATCHED_NORMAL=1 run) is held to: a container image or workflow change that
+alters calls fails here.
+
 Skipped automatically unless nextflow is on PATH and either a reachable
 docker daemon or singularity is available.
 """
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 MOCK_DIR = Path(__file__).resolve().parent
+EXPECTED_MATCHED_DIR = MOCK_DIR / "expected_matched_normal"
+
+sys.path.insert(0, str(MOCK_DIR))
+from compare_outputs import compare_file  # noqa: E402
+
 CASES = [
     "default",
     "germline",
@@ -161,3 +173,18 @@ def test_stats_has_one_coverage_block(pipeline_output, case):
     lines = (pipeline_output / case / "mock/mock_stats.txt").read_text().splitlines()
     for key in ("SBS Base Coverage", "Indel Base Coverage", "DBS Base Coverage"):
         assert sum(line.startswith(key + "\t") for line in lines) == 1, key
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    sorted(
+        str(p.relative_to(EXPECTED_MATCHED_DIR))
+        for p in EXPECTED_MATCHED_DIR.rglob("*")
+        if p.is_file()
+    ),
+)
+def test_default_case_matches_direct_cli_expected(pipeline_output, rel_path):
+    actual_path = pipeline_output / "default" / rel_path
+    assert actual_path.exists(), f"nextflow pipeline did not produce {rel_path}"
+    diffs = compare_file(EXPECTED_MATCHED_DIR / rel_path, actual_path)
+    assert not diffs, "\n".join(diffs)

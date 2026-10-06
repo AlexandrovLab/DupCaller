@@ -8,12 +8,11 @@
 # directives) using the published yuhecheng62/dupcaller image.
 #
 # The pipeline's CALL_VARIANTS step always wants a matched normal (no
-# tumor-only mode), unlike run_pipeline.sh's data/ usage -- so mock_1/2 are
-# staged as both tumor and normal fastqs here. That means SBS/indel calls
-# will differ from run_pipeline.sh's expected/ output (the "normal" now
-# looks identical to the tumor); this script only exercises that the
-# Nextflow pipeline itself runs end-to-end on the published image, not
-# numeric parity with the direct-CLI run.
+# tumor-only mode), unlike run_pipeline.sh's default data/ usage -- so
+# mock_1/2 are staged as both tumor and normal fastqs here. The "default"
+# case's outputs are compared (test_mock_pipeline_nextflow.py) against
+# expected_matched_normal/, which run_pipeline.sh MATCHED_NORMAL=1 produces
+# with the direct CLI and the same options.
 #
 # Usage: run_nextflow_pipeline.sh OUTDIR [PROFILE] [CASE ...]
 #   PROFILE defaults to "docker"; pass "singularity" to use that instead.

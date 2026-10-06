@@ -45,7 +45,6 @@ def _base_args(tmp_path, bam_path, learn_only):
         minMeanASXS=50,
         naf=0.05,
         rescue=False,
-        maxZeroQualFrac=1.0,
         maxPileupDepth=100000,
         mapq=40,
         barcode="DB,1,-",
@@ -56,6 +55,7 @@ def _base_args(tmp_path, bam_path, learn_only):
         minRef=0,
         minAlt=0,
         pseudocount=0.5,
+        minLR=5.0,
         learnOnly=learn_only,
     )
 

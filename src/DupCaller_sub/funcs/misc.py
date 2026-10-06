@@ -411,6 +411,7 @@ def _detect_dbs_pairs(
     currentStart,
     template_length,
     num2base,
+    reads,
 ):
     """Detect DBS (dinucleotide substitution) events within one duplex
     read group's SNV candidate list: two positions changing
@@ -429,6 +430,10 @@ def _detect_dbs_pairs(
     list through that loop, so this can be added without touching any of
     its existing lines).
 
+    reads: the read group's reads; their fragment starts (FS, see
+    family_fragment_starts) go on every DBS record for the depth-
+    extraction founding-family exemption.
+
     Returns a list of DBS mut dicts (ref/alt are 2-character
     dinucleotides), in the same shape as the SNV mut dict built above,
     minus the SNV-only INFO fields (LR/LM/TC/BC/TN/HP/STR) that don't
@@ -441,12 +446,15 @@ def _detect_dbs_pairs(
         return "masked"
 
     dbs_muts = []
+    fragment_starts = None
     for k in range(len(mut_positions) - 1):
         if mut_positions[k + 1] != mut_positions[k] + 1:
             continue
         i0, i1 = muts_ind[k], muts_ind[k + 1]
         if _flt(i0) != "PASS" or _flt(i1) != "PASS":
             continue
+        if fragment_starts is None:
+            fragment_starts = family_fragment_starts(reads)
         ref_dinuc = num2base[ref_int[i0]] + num2base[ref_int[i1]]
         alt_dinuc = num2base[alt_int[i0]] + num2base[alt_int[i1]]
         dbs_muts.append(
@@ -463,6 +471,7 @@ def _detect_dbs_pairs(
                     "TAG2": setBc[1],
                     "SP": currentStart,
                     "TL": template_length,
+                    "FS": fragment_starts,
                 },
                 "formats": ["AC", "RC", "DP"],
                 # No independent raw-BAM depth re-verification for DBS
@@ -1280,6 +1289,22 @@ def get_duplex_barcode(rec, params):
     if not params.get("barcodeNormalize", True):
         return raw, raw
     return tuple(raw.split(params.get("barcodeSep", "-")))
+
+
+def fragment_start(aln):
+    """Leftmost reference start of aln's fragment: its own start when it is
+    the fragment's leftmost read (template_length >= 0), else its mate's.
+    Both mates of a pair, and every read of one molecule, share it."""
+    if aln.template_length >= 0:
+        return aln.reference_start
+    return aln.next_reference_start
+
+
+def family_fragment_starts(reads):
+    """Sorted tuple of the fragment starts of one duplex family's reads --
+    stored on every call record ("FS", not written to the VCF) so depth
+    extraction can recognize the founding family's reads and their mates."""
+    return tuple(sorted({fragment_start(r) for r in reads}))
 
 
 def bamIterateMultipleRegion(bam, regions, ref, regionFile=None):
@@ -2351,14 +2376,17 @@ def _channel_eeff_at_threshold(kind, ctx_key):
     raise ValueError(f"unknown channel kind {kind!r}")
 
 
-# Mutation rate given to a channel whose mu solve has no root (mu0 = 0) even
-# though it has sites (n_sites > 0): too little effective coverage relative to
-# its candidates to estimate a rate, so a fixed background rate is used and
-# the channel still gets a finite FDR threshold.
-MU0_NO_ROOT_RATE = 3.5e-9
+def mu_at_min_lr(fdr_thr, min_log10_lr):
+    """The mutation rate whose local-fdr threshold (see _refine_channel)
+    equals min_log10_lr: (1-f)/((1-f) + f*10**min_log10_lr), about 1.9e-4
+    at f = 0.05, min_log10_lr = 5. The threshold falls as mu rises, so a
+    channel's final threshold max(min_log10_lr, threshold(mu0)) is exactly
+    threshold(min(mu0, this)); per-call FDRs use that capped mu, so a call
+    at its channel's threshold has local fdr fdr_thr."""
+    return (1.0 - fdr_thr) / ((1.0 - fdr_thr) + fdr_thr * 10.0**min_log10_lr)
 
 
-def _refine_channel(mu0, threshold0, fdr_thr):
+def _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr=0.0):
     """Non-iterative FDR-controlled threshold for one channel.
 
     mu0 (this channel's round-1 MLE mixture weight, from the direct
@@ -2369,6 +2397,13 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     every PASS call's own local FDR is computed against downstream
     (Caller.py's per-call FDR stamping).
 
+    Clamped to never go below min_log10_lr (--minLR): a channel's mu
+    includes its own candidates, so in a channel with little effective
+    coverage a single call can raise mu enough to pass itself; the floor
+    keeps such self-supported weak calls out. The same final threshold
+    drives the coverage pass's detection-power simulation, so calling and
+    the burden's sensitivity correction use the same cutoff.
+
     Clamped to never go below threshold0: round 1's bam scan only ever
     records a candidate whose LR clears threshold0 in the first place
     (funcs/call.py's LR_pass_bool gate, evaluated long before any
@@ -2377,9 +2412,8 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     round 2's post-hoc re-filter (no bam rescan) could never recover it
     even if mu0 alone would justify a looser threshold here.
 
-    mu0 == 0 (a channel with no sites whose mu solve has no root -- a
-    channel with sites gets MU0_NO_ROOT_RATE instead, see
-    refine_channel_task -- or a -mr table entry of 0) makes the local-fdr
+    mu0 == 0 (a channel with no effective coverage, see
+    refine_channel_task, or a -mr table entry of 0) makes the local-fdr
     formula's implied LR threshold a division by zero
     (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
     channel at all, so instead of solving for a finite cutoff, report
@@ -2389,17 +2423,17 @@ def _refine_channel(mu0, threshold0, fdr_thr):
     if mu0 == 0:
         return float("inf")
     lr_threshold = (1.0 - fdr_thr) / (fdr_thr * mu0 / (1 - mu0))
-    return max(threshold0, float(np.log10(lr_threshold)))
+    return max(threshold0, min_log10_lr, float(np.log10(lr_threshold)))
 
 
 def refine_channel_task(job):
     """One independent unit of work for the FDR-threshold pool: computes
     this channel's raw (unweighted) Eeff, then either takes mu0 from
     Caller.py's -mr/--muterateprefix override (mu0_override, if not None)
-    or solves directly for this channel's own MLE mixture weight (mu0)
+    or solves directly for this channel's own mixture weight (mu0)
     from raw_lr_list/Eeff0 -- either way, the LR threshold at which its
     local fdr (using mu0) equals fdr_thr is then solved for, clamped to
-    never go below threshold0 -- see _refine_channel. Channels (each SBS96
+    never go below threshold0 or min_log10_lr -- see _refine_channel. Channels (each SBS96
     class / each HP-length x indel-length / STR-bin x indel-length combo,
     ~200 total) are fully independent -- own raw_lr list, own Eeff formula
     -- so do_call dispatches these across a Pool (one task per channel)
@@ -2416,29 +2450,18 @@ def refine_channel_task(job):
     neg_log_lr the log10 LRs (float32) of its LR < 0 sites, which callBam
     keeps as bare numbers rather than records. Both enter raw_lr below.
 
-    Without an override, mu0 solves
-    g(mu) = sum(raw_lr/(1-mu+mu*raw_lr)) - Eeff0 + pseudocount/mu == 0
-    directly via brentq. The pseudocount/mu term sends g(0) to literally
-    +inf (np.divide(pseudocount, 0.0) rather than plain float division,
-    which would raise ZeroDivisionError instead); g(1) works out to
-    n - Eeff0 + pseudocount (n = the number of sites, since each
-    raw_lr/(1-1+1*raw_lr) term is exactly 1), so a bracketing sign change
-    (g(0) = +inf, g(1) < 0) is only guaranteed when n - Eeff0 + pseudocount
-    < 0, not for every Eeff0 > 0. In practice this always holds --
-    candidate mutations are rare relative to a channel's total effective
-    coverage (n/Eeff0 << 1) -- but a channel with too little effective
-    coverage relative to its candidate count (up to and including
-    Eeff0 == 0) can still violate it; this is exactly the small-region
-    scenario -mr/--muterateprefix exists to sidestep.
-
-    When n - Eeff0 + pseudocount >= 0 (g(1) >= 0), (0, 1) doesn't bracket
-    a root, but g can still dip below 0 inside it: a term with raw_lr > 1
-    grows as mu shrinks. g is then scanned on a log grid from 1e-12 up and
-    the first sign change (the smallest-mu local maximum of the
-    likelihood) is solved with brentq. If g never goes negative there is
-    no root -- too little coverage relative to the candidate count to
-    estimate a mutation rate from: mu0 is MU0_NO_ROOT_RATE (3.5e-9) when
-    the channel has sites (n > 0), and 0 when it has none.
+    Without an override, mu0 is the MAP mixture weight under a symmetric
+    Beta(pseudocount+1, pseudocount+1) prior -- pseudocount (a) pseudo-
+    mutations plus a pseudo-reference sites:
+        mu * (Eeff0 + 2a) = sum(post_i) + a,   post_i = mu*r_i/(1-mu+mu*r_i)
+    i.e. g(mu) = sum(r_i/(1-mu+mu*r_i)) - Eeff0 - 2a + a/mu == 0, solved
+    with brentq on (0, 1). g(0+) = +inf and g(1) = n - Eeff0 - a, and
+    g/(1-mu) is the derivative of a concave log-posterior, so whenever
+    n < Eeff0 + a there is exactly one root in (0, 1). Each site is one
+    covered family-position, so n <= Eeff0 by construction; a channel
+    that breaks this (an Eeff/site-set mismatch) is reported and solved
+    with Eeff0 raised to n. A channel with no effective coverage and no
+    sites has no rate estimate at all: mu0 = 0 (threshold +inf).
     """
     (
         name,
@@ -2450,14 +2473,14 @@ def refine_channel_task(job):
         pseudocount,
         mu0_override,
         neg_log_lr,
+        min_log10_lr,
     ) = job
     Eeff0 = _channel_eeff_at_threshold(kind, ctx_key)
 
     if mu0_override is not None:
         mu0 = mu0_override
     else:
-        # g(0) must be +inf for the brentq brackets below; pseudocount 0
-        # makes it NaN.
+        # g(0) must be +inf for the brentq bracket below.
         assert pseudocount > 0, f"pseudocount must be > 0, got {pseudocount}"
         raw_lr = np.concatenate(
             [
@@ -2466,28 +2489,36 @@ def refine_channel_task(job):
             ]
         )
         n = len(raw_lr)
-
-        def g(mu):
-            with np.errstate(divide="ignore"):
-                return (
-                    np.sum(raw_lr / (1.0 - mu + mu * raw_lr))
-                    - Eeff0
-                    + np.divide(pseudocount, mu)
-                )
-
-        if n - Eeff0 + pseudocount < 0:
-            mu0 = brentq(g, 0.0, 1.0)
-        else:
+        if n == 0 and Eeff0 <= 0:
             mu0 = 0.0
-            lo = 0.0
-            for hi in np.logspace(-12, 0, 241)[:-1]:
-                if g(hi) < 0:
-                    mu0 = brentq(g, lo, hi)
-                    break
-                lo = hi
-            if mu0 == 0.0 and n > 0:
-                mu0 = MU0_NO_ROOT_RATE
-    new_threshold = _refine_channel(mu0, threshold0, fdr_thr)
+        else:
+            eeff_solve = Eeff0
+            if n >= Eeff0 + pseudocount:
+                print(
+                    f"WARNING: channel {name} has {n} mu sites but Eeff "
+                    f"{Eeff0:g}; solving its mutation rate with Eeff = {n}"
+                )
+                eeff_solve = float(n)
+
+            def g(mu):
+                denom = 1.0 - mu + mu * raw_lr
+                with np.errstate(divide="ignore"):
+                    return (
+                        np.sum(
+                            np.divide(
+                                raw_lr,
+                                denom,
+                                out=np.zeros_like(raw_lr),
+                                where=denom > 0,
+                            )
+                        )
+                        - eeff_solve
+                        - 2 * pseudocount
+                        + np.divide(pseudocount, mu)
+                    )
+
+            mu0 = brentq(g, 0.0, 1.0)
+    new_threshold = _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 
 

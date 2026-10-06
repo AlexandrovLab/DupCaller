@@ -34,9 +34,10 @@
 ##INFO=<ID=STR,Number=1,Type=Integer,Description="STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that is not a whole number of the tract's repeat units; 1 = 2-9bp; 2 = 10-24bp; 3 = 25-39bp; 4 = 40bp+. Always 0 for SBS">
 ##INFO=<ID=SNPM,Number=1,Type=Integer,Description="1 if this position falls in snp_mask. A candidate blocked only by snp_mask/noise_mask (see NOISEM) is still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but stays filter=masked rather than PASS -- never set on a PASS record. SBS only, always 0 for indel.">
 ##INFO=<ID=NOISEM,Number=1,Type=Integer,Description="1 if this position (or, for indels, any base of its span) falls in noise_mask. A candidate blocked only by snp_mask/noise_mask is still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but stays filter=masked rather than PASS -- never set on a PASS record">
-##INFO=<ID=FDR,Number=1,Type=Float,Description="Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).">
+##INFO=<ID=FDR,Number=1,Type=Float,Description="Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's mutation rate estimate capped at the rate whose LR threshold is --minLR. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).">
 ##FORMAT=<ID=AC,Number=1,Type=Integer,Description="Count of alt allele">
 ##FORMAT=<ID=RC,Number=1,Type=Integer,Description="Count of ref allele">
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth at the location">
 ##contig=<ID=mockchr1,length=3200>
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR	NORMAL
+mockchr1	2050	.	TA	T	.	PASS	F1R2=3;F2R1=3;LR=7.882961012690195;LM=7.884760119946382;MSP=1,1;TC=3,0;BC=3,0;DF=22;DR=22;TAG1=CGC;TAG2=GGA;SP=2028;TN=.;HP=8;STR=0;SNPM=0;NOISEM=0;FDR=6.890574933518789e-05	AC:RC:DP	1:0:1	0:0:0

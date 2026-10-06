@@ -185,8 +185,7 @@ def genotypeDSSnv(
     """Genotype every position of one duplex family's window.
 
     antimask and mut_antimask_scope get the same checks below (trinuc
-    validity, zero-quality fraction >= maxZeroQualFrac, more than one
-    non-reference base). antimask (all of the
+    validity, more than one non-reference base). antimask (all of the
     caller's masks) gates cov_mat; mut_antimask_scope (include_mask only)
     gates candidate detection, so a candidate blocked only by a rescuable
     mask still gets an LR for --rescue.
@@ -286,9 +285,6 @@ def genotypeDSSnv(
     F1R2_qual_mat[F1R2_qual_mat < params["minBq"]] = 0
     F2R1_qual_mat[F2R1_qual_mat < params["minBq"]] = 0
 
-    F1R2_qual_mat_0_count = np.count_nonzero(F1R2_qual_mat == 0, axis=0)
-    F2R1_qual_mat_0_count = np.count_nonzero(F2R1_qual_mat == 0, axis=0)
-
     F1R2_qual_mat_merged = np.zeros([4, n])
     F1R2_count_mat = np.zeros([4, n], dtype=int)
 
@@ -310,13 +306,6 @@ def genotypeDSSnv(
             np.logical_and(F2R1_seq_mat == nn, F2R1_qual_mat != 0)
         ).sum(axis=0)
     total_count_mat = F1R2_count_mat + F2R1_count_mat
-    # Positions where too many of the family's reads have no usable base
-    # (deleted, N, off the read, or BQ < minBq) are masked.
-    zero_qual_frac_fail = (
-        (F1R2_qual_mat_0_count + F2R1_qual_mat_0_count) / (m_F1R2 + m_F2R1)
-    ) >= params.get("maxZeroQualFrac", 0.9)
-    antimask[zero_qual_frac_fail] = False
-    mut_antimask_scope[zero_qual_frac_fail] = False
     # base1 is the position's non-reference base, base2 the reference. A
     # position with more than one distinct non-reference base (counted
     # reads only) is masked.

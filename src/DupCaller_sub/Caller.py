@@ -23,7 +23,7 @@ from . import __version__
 from .funcs.call import callBam  # , output_masked_mutations
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
-from .funcs.misc import init_refine_worker, refine_channel_task
+from .funcs.misc import init_refine_worker, refine_channel_task, mu_at_min_lr
 from .funcs.misc import indel_mu_channel
 from .funcs.prob import indelErrorProbs, indelMaxLR, indel_strand_pvalue, strand_pvalue
 from .funcs.misc import createVcfStrings
@@ -373,6 +373,7 @@ def do_call(args):
         # per-channel afterward.
         "pcutoff": 0,
         "pcutoffi": 0,
+        "minLR": args.minLR,
         "mapq": args.mapq,
         "noise": args.noise,
         "indel_bed": args.indelbed,
@@ -389,7 +390,6 @@ def do_call(args):
         "pseudocount": args.pseudocount,
         "normalVAF": args.naf,
         "rescue": args.rescue,
-        "maxZeroQualFrac": args.maxZeroQualFrac,
         "maxDepth": args.maxPileupDepth,
         "barcodeTag": barcode_spec["tag"],
         "barcodeNormalize": barcode_spec["normalize"],
@@ -1058,7 +1058,7 @@ def do_call(args):
         "FDR": [
             1,
             "Float",
-            "Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's final (FDR-refined) mutation rate estimate. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).",
+            "Local false discovery rate for this call: (1-mu)/(rawLR*mu+1-mu), mu being this call's channel's mutation rate estimate capped at the rate whose LR threshold is --minLR. Computed and reported regardless of filter, so a fail.vcf record's own FDR explains why it didn't clear its channel's threshold. 1.0 if this call's channel has no determinable mu (e.g. an indel with no HP/STR channel at all).",
         ],
     }
     dbsInfoDict = {
@@ -1268,6 +1268,7 @@ def do_call(args):
                 args.pseudocount,
                 _mu0_for(f"SBS96:{label}"),
                 neg_lr_96_n1[k],
+                args.minLR,
             )
         )
 
@@ -1364,6 +1365,7 @@ def do_call(args):
             args.pseudocount,
             _mu0_for("STR0_len1"),
             neg_lr_indel.get("STR0_len1", _no_neg_lr),
+            args.minLR,
         )
     ]
     for hp_len in range(1, 11):
@@ -1381,6 +1383,7 @@ def do_call(args):
                         args.pseudocount,
                         _mu0_for(f"HP{hp_len}_len{id_len}_{pool}"),
                         neg_lr_indel.get(f"HP{hp_len}_len{id_len}_{pool}", _no_neg_lr),
+                        args.minLR,
                     )
                 )
     for str_bin in range(0, 5):
@@ -1397,6 +1400,7 @@ def do_call(args):
                     args.pseudocount,
                     _mu0_for(f"STR{str_bin}_len{id_len}"),
                     neg_lr_indel.get(f"STR{str_bin}_len{id_len}", _no_neg_lr),
+                    args.minLR,
                 )
             )
 
@@ -1442,17 +1446,19 @@ def do_call(args):
     indel_results = refine_results[len(sbs_jobs) :]
 
     channel_thresholds = {}
-    # Every channel's mu0 (its round-1 MLE mixture weight). Used below to
-    # compute each PASS call's own local FDR (1/(1+rawLR*mu0_channel)) for
-    # the per-type "Total FDR" stats.txt lines.
+    # Every channel's mu for the per-call local FDR and the per-type "Total
+    # FDR" stats.txt lines: mu0 capped at the rate whose threshold is
+    # --minLR (mu_at_min_lr), i.e. the rate that matches the channel's
+    # actual threshold. The rate tables keep the uncapped mu0.
     channel_final_mu = {}
+    mu_fdr_cap = mu_at_min_lr(args.lfdrThreshold, args.minLR)
     # Every channel gets a real new_threshold from _refine_channel's direct
     # FDR-at-mu0 solve; round 2 re-simulates calling from real per-position
     # data at that threshold.
 
     sbs96_rate_rows = []
     for k, (name, kind, ctx_key, Eeff0, mu0, new_threshold) in enumerate(sbs_results):
-        channel_final_mu[name] = mu0
+        channel_final_mu[name] = min(mu0, mu_fdr_cap)
         channel_thresholds[name] = new_threshold
         sbs96_rate_rows.append(
             {
@@ -1487,7 +1493,7 @@ def do_call(args):
             "mutation_rate_mle": mu0,
         }
     )
-    channel_final_mu[name] = mu0
+    channel_final_mu[name] = min(mu0, mu_fdr_cap)
     channel_thresholds[name] = new_threshold
     for hp_len in range(1, 11):
         for id_len in hp_indel_lengths:
@@ -1495,7 +1501,7 @@ def do_call(args):
                 name, kind, ctx_key, Eeff0, mu0, new_threshold = next(
                     indel_results_iter
                 )
-                channel_final_mu[name] = mu0
+                channel_final_mu[name] = min(mu0, mu_fdr_cap)
                 indel_rate_rows.append(
                     {
                         "context": f"HP{hp_len}_{pool}",
@@ -1510,7 +1516,7 @@ def do_call(args):
     for str_bin in range(0, 5):
         for id_len in str_indel_lengths:
             name, kind, ctx_key, Eeff0, mu0, new_threshold = next(indel_results_iter)
-            channel_final_mu[name] = mu0
+            channel_final_mu[name] = min(mu0, mu_fdr_cap)
             indel_rate_rows.append(
                 {
                     "context": f"STR{str_bin}",
@@ -1620,7 +1626,9 @@ def do_call(args):
         if old_filter not in ("PASS", "masked"):
             continue
         ctx_key = (trinuc2num_64.get(mut["infos"]["TN"]), base2num.get(mut["alt"]))
-        threshold = pcutoff_sbs_override.get(ctx_key, params["pcutoff"])
+        threshold = pcutoff_sbs_override.get(
+            ctx_key, max(params["pcutoff"], args.minLR)
+        )
         if old_filter == "PASS":
             # LR == 0: no evidence either way.
             if mut["infos"]["LR"] <= 0:
@@ -1638,7 +1646,9 @@ def do_call(args):
             continue
         # The channel indelErrorProbs scored this call against (multi-bp:
         # STR bin; 1bp: HP, or STR0_len1 for a mismatched insertion).
-        threshold = channel_thresholds.get(_indel_channel(indel), params["pcutoffi"])
+        threshold = channel_thresholds.get(
+            _indel_channel(indel), max(params["pcutoffi"], args.minLR)
+        )
         if old_filter == "PASS":
             if indel["infos"]["LR"] <= 0:
                 indel["filter"] = "zero_LR"
@@ -1989,8 +1999,8 @@ def do_call(args):
         )
 
     # Per-call FDR: the same local-fdr formula every channel already uses
-    # internally ((1-mu0)/(rawLR*mu0+1-mu0), mu0 being that call's own
-    # channel's round-1 MLE mutation rate -- see _refine_channel). Computed and
+    # internally ((1-mu)/(rawLR*mu+1-mu), mu being that call's own
+    # channel's mu0 capped at mu_at_min_lr -- see _refine_channel). Computed and
     # stamped onto every SBS/indel record's own "FDR" INFO field (not
     # just PASS -- a fail.vcf record's own FDR is exactly what explains
     # why it didn't clear its channel), and separately averaged over just

@@ -1,8 +1,19 @@
+import re
+from pathlib import Path
+
 from setuptools import find_packages, setup
+
+# Single version source: src/DupCaller_sub/__init__.py (also written to
+# every _call_params.log and _estimate_params.log).
+VERSION = re.search(
+    r'^__version__ = "([^"]+)"',
+    (Path(__file__).parent / "src" / "DupCaller_sub" / "__init__.py").read_text(),
+    re.M,
+).group(1)
 
 setup(
     name="DupCaller",
-    version="1.2.10",
+    version=VERSION,
     description="A variant caller for barcoded DNA sequencing",
     url="https://github.com/AlexandrovLab/DupCaller",
     author="Yuhe Cheng",

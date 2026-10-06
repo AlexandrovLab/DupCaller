@@ -62,7 +62,6 @@ def optionalIndexedResource(p, param_name, placeholder_name) {
 // Step 1a: DupCaller reference index (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 process INDEX_REFERENCE {
-    container 'yuhecheng62/dupcaller:1.2.10'
 
     input:
     path reference
@@ -85,7 +84,6 @@ process INDEX_REFERENCE {
 // Step 1b: bwa-mem2 reference index (optional)
 // ─────────────────────────────────────────────────────────────────────────────
 process BWA_MEM2_INDEX {
-    container 'quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0'
 
     input:
     path reference
@@ -104,7 +102,6 @@ process BWA_MEM2_INDEX {
 // ─────────────────────────────────────────────────────────────────────────────
 process TRIM_BARCODES {
     tag "${sample_id}:${type}"
-    container 'yuhecheng62/dupcaller:1.2.10'
 
     input:
     tuple val(sample_id), val(type), path(read1), path(read2)
@@ -129,7 +126,6 @@ process TRIM_BARCODES {
 // ─────────────────────────────────────────────────────────────────────────────
 process BWA_MEM2 {
     tag "${sample_id}:${type}"
-    container 'quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0'
     cpus params.threads
 
     input:
@@ -153,7 +149,6 @@ process BWA_MEM2 {
 // Step 3b: sort + index (samtools lives in the GATK image)
 process SAMTOOLS_SORT {
     tag "${sample_id}:${type}"
-    container 'broadinstitute/gatk:4.3.0.0'
     cpus params.threads
 
     input:
@@ -176,7 +171,6 @@ process SAMTOOLS_SORT {
 // ─────────────────────────────────────────────────────────────────────────────
 process MARK_DUPLICATES {
     tag "${sample_id}:${type}"
-    container 'broadinstitute/gatk:4.3.0.0'
 
     input:
     tuple val(sample_id), val(type), path(bam), path(bai)
@@ -215,7 +209,6 @@ process MARK_DUPLICATES {
 // ─────────────────────────────────────────────────────────────────────────────
 process CALL_VARIANTS {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.10'
     cpus params.threads
     publishDir "${params.outdir}", mode: 'copy'
 
@@ -273,7 +266,6 @@ process CALL_VARIANTS {
 // ─────────────────────────────────────────────────────────────────────────────
 process ESTIMATE_BURDEN {
     tag "${sample_id}"
-    container 'yuhecheng62/dupcaller:1.2.10'
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
