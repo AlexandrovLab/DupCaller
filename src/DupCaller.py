@@ -199,7 +199,7 @@ if __name__ == "__main__":
         "-a",
         "--pseudocount",
         type=positive_float,
-        help="pseudocount (> 0) for each channel's mutation-rate (mu) solve: a pseudo-mutations and a pseudo-reference sites, mu*(Eeff+2a) = sum of site posteriors + a, which always has exactly one root between 0 and 1. A channel with no effective coverage and no sites gets mu=0. Also the pseudocount of the SBS amplification-error (SRD) fit",
+        help="pseudocount (> 0) of the SBS amplification-error (SRD) fit and of the error-matrix smoothing. The per-channel mutation-rate (mu) solve uses none",
         default=0.5,
     )
     call_parser.add_argument(

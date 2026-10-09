@@ -176,7 +176,7 @@ def test_buckets_are_distinct_and_in_range():
     assert max(buckets) == DEPTH_HPSTR_NCAT - 1
 
 
-def _solve(raw_lr, eeff, pseudocount=0.5, neg_log_lr=None):
+def _solve(raw_lr, eeff, neg_log_lr=None):
     depth_hpstr = np.zeros((10, 10, DEPTH_HPSTR_NCAT), dtype=np.int64)
     depth_hpstr[1, 1, 0] = eeff
     init_refine_worker(np.zeros((10, 10, 64), dtype=np.int64), depth_hpstr)
@@ -187,18 +187,11 @@ def _solve(raw_lr, eeff, pseudocount=0.5, neg_log_lr=None):
         raw_lr,
         1.0,
         0.05,
-        pseudocount,
         None,
         np.empty(0, dtype=np.float32) if neg_log_lr is None else neg_log_lr,
         0.0,
     )
     return refine_channel_task(job)[4]
-
-
-def test_mu_solve_refuses_zero_pseudocount():
-    # pseudocount 0 makes g(0) NaN, which brentq can't bracket.
-    with pytest.raises(AssertionError, match="pseudocount"):
-        _solve(np.concatenate([np.full(100, 0.01), [5.0]]), 60, pseudocount=0)
 
 
 def test_cli_rejects_nonpositive_pseudocount():
@@ -218,43 +211,48 @@ def test_cli_rejects_nonpositive_pseudocount():
             cli.positive_float(bad)
 
 
-def _map_equation_residual(raw_lr, eeff, mu, a=0.5):
+def _mle_equation_residual(raw_lr, eeff, mu):
     post = mu * raw_lr / (1 - mu + mu * raw_lr)
-    return mu * (eeff + 2 * a) - (post.sum() + a)
+    return mu * eeff - post.sum()
 
 
-def test_mu_solve_satisfies_symmetric_pseudocount_equation():
-    # mu * (Eeff + 2a) = sum(post) + a
+def test_mu_solve_satisfies_mle_equation():
+    # mu * Eeff = sum(post)
     raw_lr = np.concatenate([np.full(5, 1e6), np.full(95, 1e-3)])
     mu0 = _solve(raw_lr, 1000)
-    assert abs(_map_equation_residual(raw_lr, 1000, mu0)) < 1e-8
-
-
-def test_mu_solve_has_root_when_sites_equal_eeff():
-    # n == Eeff: the old solve had no interior root and fell back to a
-    # fixed 3.5e-9; one strong site on one opportunity now gives 0.75.
-    assert _solve(np.array([1e8]), 1) == pytest.approx(0.75, rel=1e-6)
-    raw_lr = np.concatenate([np.full(5, 1e6), np.full(95, 1e-3)])
-    mu0 = _solve(raw_lr, 100)
     assert 0 < mu0 < 1
-    assert abs(_map_equation_residual(raw_lr, 100, mu0)) < 1e-8
+    assert abs(_mle_equation_residual(raw_lr, 1000, mu0)) < 1e-8
+
+
+def test_mu_solve_single_site_closed_form():
+    # One site: mu = (r - Eeff) / (Eeff * (r - 1)), below 1 / Eeff.
+    assert _solve(np.array([11.0]), 10) == pytest.approx(0.01, rel=1e-9)
+
+
+def test_mu_solve_no_root_is_zero():
+    # sum(r) <= Eeff: the likelihood peaks at mu = 0.
+    assert _solve(np.array([10.0]), 10) == 0.0
+    assert _solve(np.concatenate([np.full(50, 2.0), np.full(50, 1e-3)]), 1000) == 0.0
+    assert _solve(np.empty(0), 45) == 0.0
+    assert _solve(np.empty(0), 0) == 0.0
+
+
+def test_mu_solve_every_opportunity_a_strong_site():
+    # n == Eeff and the score stays positive up to mu = 1: upper bracket end.
+    from DupCaller_sub.funcs.misc import MU0_UPPER_GAP, _refine_channel
+
+    mu0 = _solve(np.array([1e8]), 1)
+    assert mu0 == 1.0 - MU0_UPPER_GAP
+    assert _refine_channel(mu0, 0.0, 0.05, 5.0) == 5.0
 
 
 def test_mu_solve_more_sites_than_eeff_uses_n(capsys):
     # A broken site/Eeff invariant is reported and solved with Eeff = n.
-    mu0 = _solve(np.full(4, 1e-3), 2)
+    raw_lr = np.array([1e3, 1e-3, 1e-3, 1e-3])
+    mu0 = _solve(raw_lr, 2)
     assert "WARNING" in capsys.readouterr().out
-    assert abs(_map_equation_residual(np.full(4, 1e-3), 4, mu0)) < 1e-8
-
-
-def test_mu_solve_without_coverage_or_sites_is_zero():
-    assert _solve(np.empty(0), 0) == 0.0
-
-
-def test_mu_solve_no_sites_is_pseudocount_floor():
-    # No sites: mu = a / (Eeff + 2a).
-    assert _solve(np.empty(0), 1) == pytest.approx(0.25, rel=1e-9)
-    assert _solve(np.empty(0), 45) == pytest.approx(0.5 / 46, rel=1e-9)
+    assert 0 < mu0 < 1
+    assert abs(_mle_equation_residual(raw_lr, 4, mu0)) < 1e-8
 
 
 def test_refine_channel_threshold_floor():

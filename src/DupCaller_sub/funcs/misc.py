@@ -2412,11 +2412,11 @@ def _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr=0.0):
     round 2's post-hoc re-filter (no bam rescan) could never recover it
     even if mu0 alone would justify a looser threshold here.
 
-    mu0 == 0 (a channel with no effective coverage, see
-    refine_channel_task, or a -mr table entry of 0) makes the local-fdr
-    formula's implied LR threshold a division by zero
+    mu0 == 0 (a channel whose sites' LRs sum to no more than its
+    opportunity, see refine_channel_task, or a -mr table entry of 0) makes
+    the local-fdr formula's implied LR threshold a division by zero
     (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
-    channel at all, so instead of solving for a finite cutoff, report
+    channel, so instead of solving for a finite cutoff, report
     nothing as PASS in round 2 for it: a threshold of +inf fails every
     finite LR in Caller.py's LR < threshold re-filter.
     """
@@ -2424,6 +2424,11 @@ def _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr=0.0):
         return float("inf")
     lr_threshold = (1.0 - fdr_thr) / (fdr_thr * mu0 / (1 - mu0))
     return max(threshold0, min_log10_lr, float(np.log10(lr_threshold)))
+
+
+# Upper end of the mu0 bracket: mu0 = 1 would make _refine_channel's
+# mu0/(1-mu0) divide by zero.
+MU0_UPPER_GAP = 1e-12
 
 
 def refine_channel_task(job):
@@ -2450,18 +2455,22 @@ def refine_channel_task(job):
     neg_log_lr the log10 LRs (float32) of its LR < 0 sites, which callBam
     keeps as bare numbers rather than records. Both enter raw_lr below.
 
-    Without an override, mu0 is the MAP mixture weight under a symmetric
-    Beta(pseudocount+1, pseudocount+1) prior -- pseudocount (a) pseudo-
-    mutations plus a pseudo-reference sites:
-        mu * (Eeff0 + 2a) = sum(post_i) + a,   post_i = mu*r_i/(1-mu+mu*r_i)
-    i.e. g(mu) = sum(r_i/(1-mu+mu*r_i)) - Eeff0 - 2a + a/mu == 0, solved
-    with brentq on (0, 1). g(0+) = +inf and g(1) = n - Eeff0 - a, and
-    g/(1-mu) is the derivative of a concave log-posterior, so whenever
-    n < Eeff0 + a there is exactly one root in (0, 1). Each site is one
-    covered family-position, so n <= Eeff0 by construction; a channel
-    that breaks this (an Eeff/site-set mismatch) is reported and solved
-    with Eeff0 raised to n. A channel with no effective coverage and no
-    sites has no rate estimate at all: mu0 = 0 (threshold +inf).
+    Without an override, mu0 is the maximum-likelihood mixture weight
+    (no pseudocount):
+        mu * Eeff0 = sum(post_i),   post_i = mu*r_i/(1-mu+mu*r_i)
+    i.e. the root of the log-likelihood's derivative
+        score(mu) = sum((r_i-1)/(1-mu+mu*r_i)) - (Eeff0-n)/(1-mu),
+    which is strictly decreasing (concave log-likelihood), so there is at
+    most one root in (0, 1). score(0) = sum(r_i) - Eeff0: when the sites'
+    LRs sum to no more than the channel's opportunity, their evidence is
+    no more than noise alone gives on average (E[LR] = 1 under the null),
+    the likelihood peaks at mu = 0 and mu0 = 0 (threshold +inf; nothing in
+    the channel can pass at any realistic --lfdrThreshold anyway). Each
+    site is one covered family-position, so n <= Eeff0 by construction; a
+    channel that breaks this (an Eeff/site-set mismatch) is reported and
+    solved with Eeff0 raised to n. With n == Eeff0 the score at mu -> 1 is
+    finite and can stay positive (every opportunity is a strong site);
+    mu0 then takes the bracket's upper end, just below 1.
     """
     (
         name,
@@ -2470,7 +2479,6 @@ def refine_channel_task(job):
         raw_lr_list,
         threshold0,
         fdr_thr,
-        pseudocount,
         mu0_override,
         neg_log_lr,
         min_log10_lr,
@@ -2480,8 +2488,6 @@ def refine_channel_task(job):
     if mu0_override is not None:
         mu0 = mu0_override
     else:
-        # g(0) must be +inf for the brentq bracket below.
-        assert pseudocount > 0, f"pseudocount must be > 0, got {pseudocount}"
         raw_lr = np.concatenate(
             [
                 np.asarray(raw_lr_list, dtype=float),
@@ -2489,35 +2495,24 @@ def refine_channel_task(job):
             ]
         )
         n = len(raw_lr)
-        if n == 0 and Eeff0 <= 0:
+        eeff_solve = Eeff0
+        if n > Eeff0:
+            print(
+                f"WARNING: channel {name} has {n} mu sites but Eeff "
+                f"{Eeff0:g}; solving its mutation rate with Eeff = {n}"
+            )
+            eeff_solve = float(n)
+        if n == 0 or raw_lr.sum() <= eeff_solve:
             mu0 = 0.0
         else:
-            eeff_solve = Eeff0
-            if n >= Eeff0 + pseudocount:
-                print(
-                    f"WARNING: channel {name} has {n} mu sites but Eeff "
-                    f"{Eeff0:g}; solving its mutation rate with Eeff = {n}"
-                )
-                eeff_solve = float(n)
 
-            def g(mu):
-                denom = 1.0 - mu + mu * raw_lr
-                with np.errstate(divide="ignore"):
-                    return (
-                        np.sum(
-                            np.divide(
-                                raw_lr,
-                                denom,
-                                out=np.zeros_like(raw_lr),
-                                where=denom > 0,
-                            )
-                        )
-                        - eeff_solve
-                        - 2 * pseudocount
-                        + np.divide(pseudocount, mu)
-                    )
+            def score(mu):
+                return np.sum((raw_lr - 1.0) / (1.0 - mu + mu * raw_lr)) - (
+                    eeff_solve - n
+                ) / (1.0 - mu)
 
-            mu0 = brentq(g, 0.0, 1.0)
+            mu_hi = 1.0 - MU0_UPPER_GAP
+            mu0 = brentq(score, 0.0, mu_hi) if score(mu_hi) < 0 else mu_hi
     new_threshold = _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 

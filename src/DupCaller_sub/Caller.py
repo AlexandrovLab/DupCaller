@@ -1200,7 +1200,7 @@ def do_call(args):
 
     # SBS-96 mutation rate per channel (n_sites/Eeff/mutation_rate_mle),
     # written out below alongside indel_rate_by_hp_str once sbs_results is
-    # available -- same columns/source (the per-channel brentq/pseudocount
+    # available -- same columns/source (the per-channel brentq
     # solve in refine_channel_task) as the indel table, for consistency.
     startTime_refine = time.time()
     # The mu solve uses every unmasked site that passes all other filters,
@@ -1265,7 +1265,6 @@ def do_call(args):
                 raw_lr_96_n1[k],
                 params["pcutoff"],
                 args.lfdrThreshold,
-                args.pseudocount,
                 _mu0_for(f"SBS96:{label}"),
                 neg_lr_96_n1[k],
                 args.minLR,
@@ -1362,7 +1361,6 @@ def do_call(args):
             raw_lr_indel["STR0_len1"],
             _indel_ctx_threshold(0, 0, 1),
             args.lfdrThreshold,
-            args.pseudocount,
             _mu0_for("STR0_len1"),
             neg_lr_indel.get("STR0_len1", _no_neg_lr),
             args.minLR,
@@ -1380,7 +1378,6 @@ def do_call(args):
                         raw_lr_indel[f"HP{hp_len}_len{id_len}_{pool}"],
                         threshold0,
                         args.lfdrThreshold,
-                        args.pseudocount,
                         _mu0_for(f"HP{hp_len}_len{id_len}_{pool}"),
                         neg_lr_indel.get(f"HP{hp_len}_len{id_len}_{pool}", _no_neg_lr),
                         args.minLR,
@@ -1397,7 +1394,6 @@ def do_call(args):
                     raw_lr_indel[f"STR{str_bin}_len{id_len}"],
                     threshold0,
                     args.lfdrThreshold,
-                    args.pseudocount,
                     _mu0_for(f"STR{str_bin}_len{id_len}"),
                     neg_lr_indel.get(f"STR{str_bin}_len{id_len}", _no_neg_lr),
                     args.minLR,
@@ -1407,13 +1403,13 @@ def do_call(args):
     # Per-channel FDR control: for every channel above (96 SBS96 classes +
     # 90 HP combos + 24 STR combos, ~210 total), mu0 (this channel's MLE
     # mixture weight at its default threshold0, from a direct brentq solve
-    # regularized by args.pseudocount) is taken as the channel's mutation
+    # with no pseudocount) is taken as the channel's mutation
     # rate outright, with no iterative re-simulation/re-MLE step-up. The LR
     # threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals args.lfdrThreshold is
     # solved for directly and used unconditionally as this channel's round
-    # 2 calling threshold -- see funcs/call.py's _refine_channel. The
-    # pseudocount regularization guarantees mu0 has a real root in (0, 1)
-    # for every channel, so there is no exclusion case to handle here.
+    # 2 calling threshold -- see funcs/call.py's _refine_channel. A channel
+    # whose likelihood has no root in (0, 1) gets mu0 = 0 (threshold +inf,
+    # no PASS calls), so there is no exclusion case to handle here.
     #
     # Each channel's Eeff0/mu0/threshold solve is independent of every
     # other channel's, and each Eeff evaluation is a Monte Carlo

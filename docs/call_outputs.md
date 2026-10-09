@@ -19,7 +19,7 @@ All files are written under the directory specified by `-o / --output` (call it 
           won't need either)
 ```
 
-The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle` (the channel's rate solved from `mu*(Eeff+2a) = sum of site posteriors + a`, `a` = `--pseudocount`; 0 for a channel with no effective coverage and no sites).
+The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle` (the channel's maximum-likelihood rate, solved from `mu*Eeff = sum of site posteriors`; 0 when the sites' LRs sum to no more than Eeff, in which case the channel has no PASS calls).
 
 `{sample}_duplex_allele_counts.txt` is documented in [`estimate_outputs.md`](estimate_outputs.md#sampleduplex_allele_countstxt) — it requires `_coverage.bed.gz` and is actually written by `estimate`, not `call`.
 

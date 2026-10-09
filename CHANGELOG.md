@@ -2,6 +2,21 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
+## [1.2.12] - 2026-10-09
+
+### Changed
+- Per-channel mutation rate (mu) is the maximum-likelihood estimate with no pseudocount: the root of `mu*Eeff = sum of site posteriors`, i.e. of the log-likelihood's derivative `sum((r-1)/(1-mu+mu*r)) - (Eeff-n)/(1-mu)`, which has at most one root between 0 and 1. The 1.2.11 symmetric prior (`a` = 0.5 pseudo-mutations and pseudo-reference sites, `mu*(Eeff+2a) = sum + a`) pulled mu toward about 0.5/Eeff in channels with little opportunity, lowering their thresholds.
+- A channel whose sites' LRs sum to no more than its Eeff (including a channel with no sites) has no root: its evidence is no more than noise alone gives on average, the likelihood peaks at mu = 0, and the channel gets mu = 0, threshold +inf, no PASS calls and zero detection power in the coverage pass. At the default `--lfdrThreshold` 0.05, no site in such a channel would pass under the 1.2.11 prior either. Calls in these channels carry `FDR` 1.0, and the trinucleotide/ID83-corrected burdens count no opportunity for them.
+- A channel with more sites than Eeff (an Eeff/site-set mismatch) is still reported and solved with Eeff raised to the site count. When every one of its opportunities is a strong site, the score stays positive up to mu = 1; mu is then set just below 1 (1 - 1e-12) and the threshold sits at the `--minLR` floor.
+- `call -a/--pseudocount` now only sets the SBS amplification-error (SRD) fit and the error-matrix smoothing; the mu solve no longer uses it. `estimate -a` and `learn -a` are unchanged.
+- Rate tables (`_sbs96_rate_n1.txt`, `_indel_rate_by_hp_str.txt`): `mutation_rate_mle` is the pseudocount-free rate and can be 0 for a channel with Eeff > 0.
+
+### Tests
+- mu-solve tests rewritten for the maximum-likelihood equation: equation residual, the single-site closed form (`mu = (r - Eeff) / (Eeff*(r - 1))`), mu = 0 when there is no root (including no sites), mu just below 1 when every opportunity is a strong site (threshold at the `--minLR` floor), and Eeff raised to the site count. The zero-pseudocount refusal test and the pseudocount-floor tests are removed.
+
+### Documentation
+- README, `call --help` and `docs/call_outputs.md` describe `-a/--pseudocount` and `mutation_rate_mle` for the new solve.
+
 ## [1.2.11] - 2026-10-06
 
 ### Changed
