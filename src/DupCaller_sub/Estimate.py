@@ -1617,18 +1617,24 @@ def write_genome_extrapolation(f, point, lb, ub, scale):
     f.write(f"Mutation number per genome 95% upper\t{ub * scale}\n")
 
 
-def call_skipped_coverage_pass(prefix, sample):
-    """True when the call run that wrote prefix used --skipCoveragePass
-    (its _call_params.log), so there is no {sample}_coverage.bed.gz."""
+def call_flag_set(prefix, sample, flag):
+    """True when the call run that wrote prefix had store_true option flag
+    set (its _call_params.log)."""
     path = os.path.join(prefix, f"{sample}_call_params.log")
     if not os.path.exists(path):
         return False
     with open(path) as f:
         for line in f:
             key, sep, value = line.strip().partition(":")
-            if sep and key == "skipCoveragePass":
+            if sep and key == flag:
                 return value.strip() == "True"
     return False
+
+
+def call_skipped_coverage_pass(prefix, sample):
+    """True when the call run that wrote prefix used --skipCoveragePass, so
+    there is no {sample}_coverage.bed.gz."""
+    return call_flag_set(prefix, sample, "skipCoveragePass")
 
 
 def do_estimate(args):
@@ -1716,7 +1722,10 @@ def do_estimate(args):
         # "Unmasked Coverage" in stats.txt is already the base (per-locus)
         # coverage -- call.py divides its raw opportunity sum (summed over
         # the 3 possible alt bases per locus) by 3 before writing it.
-        unmasked_cov = float(stats["Unmasked Coverage"])
+        # --doNotOutputMaskedSite: no masked records, Unmasked Coverage is
+        # N/A, so the Unmasked burden is N/A too.
+        no_masked = call_flag_set(prefix, sample, "doNotOutputMaskedSite")
+        unmasked_cov = None if no_masked else float(stats["Unmasked Coverage"])
         ###Read DBS events up front: classify each PASS event into its
         ### DBS78 channel (used later, in the DBS burden section), and
         ### record its two constituent genomic positions so the SBS96
@@ -1748,40 +1757,44 @@ def do_estimate(args):
         # Any other "masked"/rescue-label record in the fail VCF (below LR
         # threshold, or a non-snp/noise mask without --rescue) has no real
         # depth and must not count.
-        vcf_fail = VCF(sbs_dir + "/" + sample + "_sbs_fail.vcf", "r")
-        unmasked_mut_count = 0
-        count_progress = {"start": time.time(), "last": time.time()}
-        for i, rec in enumerate(vcf.fetch()):
-            log_progress(
-                count_progress,
-                "Counting unmasked SNVs",
-                i,
-                extra=f"{rec.chrom}:{rec.pos}",
+        if no_masked:
+            unmasked_sbs_burden = "N/A"
+            unmasked_sbs_burden_lb = unmasked_sbs_burden_ub = "N/A"
+        else:
+            vcf_fail = VCF(sbs_dir + "/" + sample + "_sbs_fail.vcf", "r")
+            unmasked_mut_count = 0
+            count_progress = {"start": time.time(), "last": time.time()}
+            for i, rec in enumerate(vcf.fetch()):
+                log_progress(
+                    count_progress,
+                    "Counting unmasked SNVs",
+                    i,
+                    extra=f"{rec.chrom}:{rec.pos}",
+                )
+                unmasked_mut_count += 1
+            for i, rec in enumerate(vcf_fail.fetch()):
+                log_progress(
+                    count_progress,
+                    "Counting unmasked SNVs (masked, rescued by LR)",
+                    i,
+                    extra=f"{rec.chrom}:{rec.pos}",
+                )
+                if not (
+                    "masked" in rec.filter
+                    and (rec.info.get("SNPM") or rec.info.get("NOISEM"))
+                    and rec.samples["TUMOR"]["DP"] > 0
+                ):
+                    continue
+                unmasked_mut_count += 1
+            vcf_fail.close()
+            unmasked_sbs_burden = (
+                float(unmasked_mut_count) / float(unmasked_cov)
+                if unmasked_cov > 0
+                else float("nan")
             )
-            unmasked_mut_count += 1
-        for i, rec in enumerate(vcf_fail.fetch()):
-            log_progress(
-                count_progress,
-                "Counting unmasked SNVs (masked, rescued by LR)",
-                i,
-                extra=f"{rec.chrom}:{rec.pos}",
+            unmasked_sbs_burden_lb, unmasked_sbs_burden_ub = fay_feuer_confint(
+                unmasked_mut_count, 1.0, unmasked_cov
             )
-            if not (
-                "masked" in rec.filter
-                and (rec.info.get("SNPM") or rec.info.get("NOISEM"))
-                and rec.samples["TUMOR"]["DP"] > 0
-            ):
-                continue
-            unmasked_mut_count += 1
-        vcf_fail.close()
-        unmasked_sbs_burden = (
-            float(unmasked_mut_count) / float(unmasked_cov)
-            if unmasked_cov > 0
-            else float("nan")
-        )
-        unmasked_sbs_burden_lb, unmasked_sbs_burden_ub = fay_feuer_confint(
-            unmasked_mut_count, 1.0, unmasked_cov
-        )
         snv_progress = {"start": time.time(), "last": time.time()}
         for i, rec in enumerate(vcf.fetch()):
             log_progress(

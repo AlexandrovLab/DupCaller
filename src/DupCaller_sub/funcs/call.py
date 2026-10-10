@@ -3059,7 +3059,7 @@ def callBam(params, processNo):
                     mut["filter"] = "normal_vaf"
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         mut_pass_filter.append(mut)
-    if power_tally is not None:
+    if power_tally is not None and not params.get("no_masked_output"):
         _early_deferred_depth(
             muts, tumorBam, normalBams, params, extractDepthBatchSnv, indel=False
         )
@@ -3171,7 +3171,7 @@ def callBam(params, processNo):
                     continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         muts_indels_pass_filter.append(mut)
-    if power_tally is not None:
+    if power_tally is not None and not params.get("no_masked_output"):
         _early_deferred_depth(
             muts_indels,
             tumorBam,

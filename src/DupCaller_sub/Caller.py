@@ -774,6 +774,9 @@ def do_call(args):
     # power-table index (funcs/power_tally.py), contracted below once the
     # final thresholds are known, in place of round 2.
     params["power_tally"] = bool(getattr(args, "skipCoveragePass", False))
+    # --doNotOutputMaskedSite: masked candidates get no depth extraction in
+    # either round and are dropped before output.
+    params["no_masked_output"] = bool(getattr(args, "doNotOutputMaskedSite", False))
     if args.threads == 1:
         """
         Single-thread execution
@@ -1675,8 +1678,10 @@ def do_call(args):
                 mut["filter"] = "zero_LR"
             elif mut["infos"]["LR"] < threshold:
                 mut["filter"] = "underpowered"
-        elif mut["infos"]["LR"] >= threshold and (
-            mut["infos"].get("SNPM") or mut["infos"].get("NOISEM")
+        elif (
+            not params["no_masked_output"]
+            and mut["infos"]["LR"] >= threshold
+            and (mut["infos"].get("SNPM") or mut["infos"].get("NOISEM"))
         ):
             deferred_depth_keys.add(_mut_key(mut))
             deferred_thresholds[_mut_key(mut)] = threshold
@@ -1696,7 +1701,11 @@ def do_call(args):
                 indel["filter"] = "zero_LR"
             elif indel["infos"]["LR"] < threshold:
                 indel["filter"] = "underpowered"
-        elif indel["infos"]["LR"] >= threshold and indel["infos"].get("NOISEM"):
+        elif (
+            not params["no_masked_output"]
+            and indel["infos"]["LR"] >= threshold
+            and indel["infos"].get("NOISEM")
+        ):
             deferred_depth_keys.add(_mut_key(indel))
 
     # A DBS call requires both constituent SNVs to individually PASS (see
@@ -2053,6 +2062,10 @@ def do_call(args):
 
         mutsAll = [m for m in mutsAll if not _masked_no_depth(m)]
         indelsAll = [m for m in indelsAll if not _masked_no_depth(m)]
+    # --doNotOutputMaskedSite: no masked record is output, --rescue or not.
+    if params["no_masked_output"]:
+        mutsAll = [m for m in mutsAll if m.get("filter") != "masked"]
+        indelsAll = [m for m in indelsAll if m.get("filter") != "masked"]
 
     # Strand independence filter: MSP for the final PASS SBS and indel calls
     # from their _strand inputs (every other record keeps "."); calls with a
@@ -2181,7 +2194,11 @@ def do_call(args):
         # estimate computes -- so an "Unmasked Indel Coverage" line
         # here could only ever be raw, not-yet-comparable opportunity
         # units, and was removed rather than kept misleading.
-        f.write(f"Unmasked Coverage\t{unmasked_coverage / 3}\n")
+        # N/A under --doNotOutputMaskedSite, like estimate's Unmasked burden.
+        if params["no_masked_output"]:
+            f.write("Unmasked Coverage\tN/A\n")
+        else:
+            f.write(f"Unmasked Coverage\t{unmasked_coverage / 3}\n")
         f.write(
             f"Per Read Family Coverage \t{(coverage / 3) / duplex_num if duplex_num > 0 else 0.0}\n"
         )

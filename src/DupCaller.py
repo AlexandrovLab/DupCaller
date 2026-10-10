@@ -220,6 +220,16 @@ if __name__ == "__main__":
         default=False,
     )
     call_parser.add_argument(
+        "-nms",
+        "--doNotOutputMaskedSite",
+        action="store_true",
+        help="skip snp_mask/noise_mask (-m) candidates entirely: no depth extraction for "
+        "them and no masked records in the fail VCFs. Calls, mutation rates and corrected "
+        "burdens are unchanged; the Unmasked Coverage (_stats.txt) and Unmasked burden "
+        "(_sbs_burden.txt) lines are written as N/A.",
+        default=False,
+    )
+    call_parser.add_argument(
         "-mq",
         "--mapq",
         type=float,

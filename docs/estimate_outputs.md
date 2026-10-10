@@ -52,7 +52,7 @@ These same three normalized values are also appended to `_stats.txt` as `SBS Bas
 | `Mutation number per genome` | Genome-wide extrapolation per **haploid** genome (see above); ×2 for diploid. |
 | `Mutation number per genome 95% lower/upper` | Fay-Feuer CI on `Corrected burden`, scaled to genome-wide units. |
 | `Duplex coverage` | See normalization above. |
-| `Unmasked burden` | SNV burden including PASS calls plus noise-masked candidates that cleared LR and got real depth extracted (i.e. before the noise mask is applied as a filter). |
+| `Unmasked burden` | SNV burden including PASS calls plus noise-masked candidates that cleared LR and got real depth extracted (i.e. before the noise mask is applied as a filter). `N/A` (with its CI) when the call used `--doNotOutputMaskedSite`. |
 | `Unmasked burden 95% lower/upper` | Poisson 95% CI on unmasked burden. |
 | `Reference base number` | Total trinucleotide count of the reference genome across the considered regions (`ref_trinuc_64.sum()`). |
 
