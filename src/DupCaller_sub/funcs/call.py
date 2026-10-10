@@ -67,7 +67,7 @@ from .misc import (
     _index_rugged_mates,
     _drain_rugged_pool,
 )
-from .indels import findIndels, indel_mask_span
+from .indels import STR_NCOL, findIndels, indel_mask_span
 from .power_tally import (
     PowerTally,
     contract_power_tally,
@@ -383,6 +383,7 @@ def _process_duplex_family(
             F2R1_alt_count,
             hp_match,
             rev_rate,
+            str_units,
         ) = genotypeDSIndel(
             readSet,
             rs_reference_start,
@@ -482,6 +483,7 @@ def _process_duplex_family(
                     int(strs[nn]),
                     int(hp_match[pass_inds[nn]]),
                     indel_ref[1] if indel_size < 0 else indel_alt[1],
+                    int(str_units[pass_inds[nn]]),
                 )
                 if channel is not None:
                     neg_lr_indel.setdefault(channel, array("f")).append(
@@ -573,6 +575,9 @@ def _process_duplex_family(
                     "FS": family_fragment_starts(readSet),
                     "STR": strs[nn],
                     "HM": int(hp_match[pass_inds[nn]]),
+                    # Repeat unit of the STR tract the indel slips (0: not
+                    # a slip); routes the call to its STR channel.
+                    "SU": int(str_units[pass_inds[nn]]),
                     "SNPM": 0,
                     "NOISEM": int(np.any(masks_indel[1, indel_slice])),
                 },
@@ -1255,7 +1260,7 @@ def _process_duplex_family(
                 n_bot_anchor[1:] = n_bot_indel[:-1]
                 (
                     hp_eeff_bool,
-                    str_eeff_by_len,
+                    str_eeff_by_unit,
                     str0_any_eeff_bool,
                     str0_eeff_by_len,
                 ) = indel_eeff_site_masks(
@@ -1301,7 +1306,7 @@ def _process_duplex_family(
                             depth_hpstr_str_bucket(
                                 np.maximum(str_bin_row, 1), signed_k
                             ),
-                            str_eeff_by_len[signed_k],
+                            str_eeff_by_unit[signed_k],
                             DEPTH_HPSTR_NCAT,
                         )
                         _accumulate_depth_matrix(
@@ -1404,9 +1409,18 @@ def _early_deferred_depth(records, tumorBam, normalBams, params, extract, indel)
     final threshold), so round 1 extracts every masked candidate that could
     join it -- raw LR >= --minLR, which every final threshold is at least --
     the way round 2's eligible branch would, and keeps the result aside in
-    the record's "deferred_depth" (samples, filter). Caller.py applies it to
-    the keys that end up deferred, as it merges round 2's records. A record
-    round 2 would drop (indel ni > 0) gets no "deferred_depth"."""
+    the record's "deferred_depth": a list of (LR cut, (samples, filter)).
+    Caller.py applies it to the keys that end up deferred, as it merges
+    round 2's records. A record round 2 would drop (indel ni > 0) gets no
+    "deferred_depth".
+
+    Round 2 exempts the reads of the founding families from the minBq/
+    mapq filters, and its founding families are the records it emits at
+    the key. For SNVs that is the families whose LR clears the channel's
+    final threshold, unknown here, so the tumor depth is extracted once per
+    distinct family LR (>= --minLR) with the families at or above it, and
+    Caller.py takes the entry whose cut matches the final threshold.
+    Indel records use the same gate in both rounds: one entry, cut -inf."""
     floor = params.get("minLR", 0.0)
     keys = {}
     for mut in records:
@@ -1419,25 +1433,46 @@ def _early_deferred_depth(records, tumorBam, normalBams, params, extract, indel)
             keys[(mut["chrom"], mut["pos"], mut["ref"], mut["alt"])] = None
     if not keys:
         return
-    barcodes = {}
+    at_key = {}
     for mut in records:
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
         if key in keys:
-            _collect_call_barcode(barcodes, key, mut)
+            at_key.setdefault(key, []).append(mut)
+    cuts = {
+        key: (
+            [-np.inf]
+            if indel
+            else sorted(
+                {m["infos"]["LR"] for m in muts if m["infos"]["LR"] >= floor},
+                reverse=True,
+            )
+        )
+        for key, muts in at_key.items()
+    }
+    tumor_levels = []
+    for level in range(max(len(c) for c in cuts.values())):
+        level_keys = [k for k, c in cuts.items() if len(c) > level]
+        barcodes = {}
+        for key in level_keys:
+            for mut in at_key[key]:
+                if mut["infos"]["LR"] >= cuts[key][level]:
+                    _collect_call_barcode(barcodes, key, mut)
+        tumor_levels.append(
+            extract(
+                tumorBam,
+                level_keys,
+                params,
+                minbq=params["minBq"],
+                call_barcodes=barcodes,
+            )
+        )
     key_list = list(keys)
-    tumor = extract(
-        tumorBam, key_list, params, minbq=params["minBq"], call_barcodes=barcodes
-    )
     normals = (
         [extract(nb, key_list, params, minbq=params["minBq"]) for nb in normalBams]
         if normalBams
         else []
     )
-    for mut in records:
-        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
-        if key not in keys:
-            continue
-        ta, tr, ti, tdp = tumor.get(key, (0, 0, 0, 0))
+    for key, muts in at_key.items():
         na = nr = ni = ndp = 0
         for depths in normals:
             na_now, nr_now, ni_now, ndp_now = depths.get(key, (0, 0, 0, 0))
@@ -1445,19 +1480,25 @@ def _early_deferred_depth(records, tumorBam, normalBams, params, extract, indel)
             nr += nr_now
             ni += ni_now
             ndp += ndp_now
-        flt = mut["filter"]
-        if ta == 0:
-            flt = "no_good_alt_read"
-        elif ta / tdp > params["maxAF"]:
-            flt = "duplex_vaf"
-        elif normalBams:
-            if ndp < params["minNdepth"]:
-                flt = "n_cov_mask"
-            elif na / ndp > params["normalVAF"]:
-                flt = "normal_vaf"
-            elif indel and ni > 0:
-                continue
-        mut["deferred_depth"] = ([[ta, tr, tdp], [na, nr, ndp]], flt)
+        for mut in muts:
+            entries = []
+            for level, cut in enumerate(cuts[key]):
+                ta, tr, ti, tdp = tumor_levels[level].get(key, (0, 0, 0, 0))
+                flt = mut["filter"]
+                if ta == 0:
+                    flt = "no_good_alt_read"
+                elif ta / tdp > params["maxAF"]:
+                    flt = "duplex_vaf"
+                elif normalBams:
+                    if ndp < params["minNdepth"]:
+                        flt = "n_cov_mask"
+                    elif na / ndp > params["normalVAF"]:
+                        flt = "normal_vaf"
+                    elif indel and ni > 0:
+                        break  # round 2 drops the record
+                entries.append((cut, ([[ta, tr, tdp], [na, nr, ndp]], flt)))
+            else:
+                mut["deferred_depth"] = entries
 
 
 def sample_power_quals(tumorBam, regions, min_bq, max_reads=1000):
@@ -1726,11 +1767,13 @@ def build_power_tables(params, all_quals, build=True):
                             threshold,
                         )
 
-        # Length-bin indels (raw length 2/3/4/5+, either direction): axes
-        # are top count, bottom count, STR-length-bin row (0="0-1"/not a
-        # real repeat through 4="40+"), idLen+5. Always STR-context -- a
-        # length>=2 indel outside an annotated repeat is row 0, so this is
-        # a single loop over all 5 str.txt rows.
+        # >=2bp indels, either direction: axes are top count, bottom count,
+        # STR-length-bin row (0="0-1"/not a real repeat through 4="40+"),
+        # idLen+5. In rows 1-4 |idLen| is the repeat unit (2-5+): the
+        # one-unit slip of that unit's str.txt group, the same (bin, signed
+        # unit) as the STR channels; in row 0 it is the indel length.
+        # Always STR-context -- a length>=2 indel outside an annotated
+        # repeat is row 0, so this is a single loop over all 5 str.txt rows.
         L_indel_len = np.zeros([10, 10, 5, 11])
         len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
         indel_len_threshold_override = params.get("indel_len_threshold_override", {})
@@ -1754,6 +1797,7 @@ def build_power_tables(params, all_quals, build=True):
                         prob_dmg_hp_L,
                         prob_amp_str_L,
                         prob_dmg_str_L,
+                        unit_len=abs(idLen_c),
                     )
                     threshold = indel_len_threshold_override.get(
                         (strs_c, idLen_c),
@@ -1771,8 +1815,8 @@ def build_power_tables(params, all_quals, build=True):
                         threshold,
                     )
             # Row 0 ("not a real repeat") at idLen=+1 specifically: the
-            # mismatched-insertion background scenario (str.txt row 0's
-            # only real column), needed below for the "Insertion A/T/C/G"
+            # mismatched-insertion background scenario (str.txt row 0's u1
+            # insertion), needed below for the "Insertion A/T/C/G"
             # coverage columns -- a *novel* insertion (next reference base
             # != the inserted base, i.e. not a repeat extension; see that
             # code's own comment), which is exactly the row-0/mismatch
@@ -1945,10 +1989,10 @@ def callBam(params, processNo):
     neg_lr_indel = {}
     mismatch_mat = np.zeros([64, 4])
     hp_alt_mat = np.zeros([10, 12])
-    str_alt_mat = np.zeros([5, 11])
+    str_alt_mat = np.zeros([5, STR_NCOL])
     mismatch_dmg_mat = np.zeros([64, 4])
     hp_dmg_mat = np.zeros([10, 12])
-    str_dmg_mat = np.zeros([5, 11])
+    str_dmg_mat = np.zeros([5, STR_NCOL])
     # Amp-error BQ histogram accumulated across families (SBS only) --
     # see funcs/learn.py's profileTriNucMismatches for the (channel, BQ)
     # shape convention and NUM_BQ, and estimate_sbs_srd_rates for how it

@@ -17,6 +17,7 @@ from DupCaller_sub.funcs.indels import (
     indel_mask_span,
     indel_passes_mask,
     left_align_indel,
+    str_col,
 )
 from DupCaller_sub.funcs.learn import profileTriNucMismatches
 
@@ -171,8 +172,10 @@ def _learn_event_rows(antimask):
         params={"trinuc2num_dict": {}, "minBq": 10, "minRef": 1, "minAlt": 1},
     )
     str_dmg_count = result[5]
-    col = -DEL_LEN + 5
-    return set(np.nonzero(str_dmg_count[:, col])[0].tolist())
+    # Deletion columns of every unit group: a slip books under its tract's
+    # unit, a non-slip deletion under its length.
+    cols = [str_col(g, -1) for g in range(1, 6)]
+    return set(np.nonzero(str_dmg_count[:, cols].any(axis=1))[0].tolist())
 
 
 def _call_contexts(monkeypatch, family, ref, antimask, str_raw):

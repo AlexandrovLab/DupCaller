@@ -22,6 +22,43 @@ def str_unit_multiple(indel_len, unit_len):
     return abs(indel_len) < 2 or abs(indel_len) % unit_len == 0
 
 
+# str.txt columns: five repeat-unit groups u1, u2, u3, u4, u5+, each a
+# (deletion, reference, insertion) triple. In STR rows 1-4 the group is the
+# tract's repeat unit and a slip of any whole number of units counts in its
+# unit's deletion/insertion column; u1 stays empty there (1bp slips are
+# homopolymer events, hp.txt). In row 0 (not a slip) the group is the indel
+# length; u1 holds the mismatched 1bp insertion. Each group's reference
+# column is its own opportunity count.
+STR_UNIT_GROUPS = 5
+STR_NCOL = STR_UNIT_GROUPS * 3
+STR_COL_LABELS = [
+    f"u{g if g < STR_UNIT_GROUPS else str(g) + '+'}:{d}"
+    for g in range(1, STR_UNIT_GROUPS + 1)
+    for d in ("del", "ref", "ins")
+]
+STR_REF_COLS = [g * 3 + 1 for g in range(STR_UNIT_GROUPS)]
+
+
+def str_unit_group(n):
+    """Unit group 1-5 (5 = 5+) of a repeat unit or indel length n."""
+    return min(max(abs(int(n)), 1), STR_UNIT_GROUPS)
+
+
+def str_col(group, sign):
+    """str.txt column of unit group 1-5 and sign (-1 deletion, 0 reference,
+    +1 insertion)."""
+    return (group - 1) * 3 + 1 + sign
+
+
+def str_event_col(str_bin, unit_len, indel_len):
+    """str.txt column of a >=2bp indel (or row-0 1bp event): the tract's
+    unit group in STR rows 1-4, the indel length's group in row 0."""
+    if str_bin >= 1 and unit_len < 2:
+        raise ValueError(f"STR bin {str_bin} needs a repeat unit >= 2, got {unit_len}")
+    group = str_unit_group(unit_len if str_bin >= 1 else indel_len)
+    return str_col(group, 1 if indel_len > 0 else -1)
+
+
 def str_length_bin(unit_len, total_len):
     """STR bin (str.txt row) of a tract: 0 = not a repeat (unit < 2 or
     fewer than two units), 1 = 2-9bp, 2 = 10-24bp, 3 = 25-39bp, 4 = 40+bp."""

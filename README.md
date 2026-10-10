@@ -278,7 +278,7 @@ The `-m` option accepts BED files and will ignore any mutations overlapping an e
 
 #### Low-Coverage Error-Profile Fallback
 
-DupCaller ships a set of reference error profiles (`src/ERROR/fallback_latest.*.txt`, installed with the package). When a context in the sample's own learned error profile has fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin), any error type in that context with zero observed counts takes its rate from the bundled profile instead of the flat pseudocount prior. Error types that were observed, and well-sampled contexts, use the sample's own rates, with one exception: a context whose error rates sum past 1 (after this fallback and the homopolymer monotonicity step) takes the bundled profile's whole row instead. This applies to the SBS amplification (SRD) and damage matrices and to the homopolymer/STR indel matrices.
+DupCaller ships a set of reference error profiles (`src/ERROR/fallback_latest.*.txt`, installed with the package). When a context in the sample's own learned error profile has fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin × repeat unit), any error type in that context with zero observed counts takes its rate from the bundled profile instead of the flat pseudocount prior. Error types that were observed, and well-sampled contexts, use the sample's own rates, with one exception: a context whose error rates sum past 1 (after this fallback and the homopolymer monotonicity step) takes the bundled profile's whole row instead. This applies to the SBS amplification (SRD) and damage matrices and to the homopolymer/STR indel matrices.
 
 #### Strand Independence Filter
 

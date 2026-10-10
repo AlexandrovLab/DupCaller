@@ -1,7 +1,7 @@
 """Indel Eeff (depth_by_hpstr) site set: one site per homopolymer run (its
 first base, where every left-aligned event in it is called), runs cut by
-the window edge excluded; STR channels count the starts of tracts whose
-unit divides the indel length; STR0 insertions every position, STR0
+the window edge excluded; STR channels count the starts of tracts of their
+repeat unit (u2, u3, u4, u5+); STR0 insertions every position, STR0
 deletions every non-slip deletion site; deletions and insertions are
 counted separately; the anchor and context base (and every deleted base)
 must pass the indel masks; reads on both strands.
@@ -22,6 +22,8 @@ from DupCaller_sub.funcs.misc import (
     indel_eeff_site_masks,
     indel_mu_channel,
     init_refine_worker,
+    parse_str_channel_name,
+    str_channel_name,
     refine_channel_task,
     str_tract_valid,
 )
@@ -89,14 +91,15 @@ def test_masked_anchor_or_context_is_not_a_site():
     assert any_[8]
 
 
-def test_single_str_tract_counts_by_unit_length():
+def test_single_str_tract_counts_under_its_unit():
     # (CA)5 at 4-13 is the window's only tract; it ends well inside.
     ref = "GTGC" + "CA" * 5 + "GTTCAGGTC"
     _, st, _, st0 = _masks(ref, np.ones(len(ref), dtype=bool), [(4, 2, 5)])
-    for k in (2, 4, 5):  # whole-unit slips; pooled 5+ (6, 8, ...)
-        assert np.nonzero(st[-k])[0].tolist() == [4]
-        assert np.nonzero(st[k])[0].tolist() == [4]
-    assert not st[-3].any() and not st[3].any()  # not a dinucleotide slip
+    # Slips of any number of CA units are the dinucleotide channel's.
+    assert np.nonzero(st[-2])[0].tolist() == [4]
+    assert np.nonzero(st[2])[0].tolist() == [4]
+    for k in (3, 4, 5):
+        assert not st[-k].any() and not st[k].any()
     # STR0 insertions: anywhere (a non-matching insertion can go anywhere).
     for k in (2, 3, 5):
         assert st0[k][2:].all()
@@ -114,16 +117,20 @@ def test_deletion_site_needs_every_deleted_base_unmasked():
     antimask = np.ones(len(ref), dtype=bool)
     antimask[6] = False  # third base of the tract
     _, st, _, _ = _masks(ref, antimask, [(4, 2, 5)])
-    assert st[-2][4] and st[2][4]  # deletes 4-5, inserts before 4
-    assert not st[-4][4]  # deletes 4-7, 6 masked
-    assert st[4][4]
+    assert st[-2][4] and st[2][4]  # one unit: deletes 4-5, inserts before 4
+    antimask[6] = True
+    antimask[5] = False  # second base: inside the one-unit deletion
+    _, st, _, _ = _masks(ref, antimask, [(4, 2, 5)])
+    assert not st[-2][4] and st[2][4]
 
 
-def test_deletion_longer_than_the_tract_is_not_a_slip_site():
-    ref = "GTGC" + "CA" * 2 + "GTTCAGGTC"
-    _, st, _, _ = _masks(ref, np.ones(len(ref), dtype=bool), [(4, 2, 2)])
-    assert st[-4][4] and not st[-5][4]
-    assert st[5][4]
+@pytest.mark.parametrize("unit", [5, 6, 8])
+def test_long_units_pool_into_u5(unit):
+    motif = "CAGTACTT"[:unit]
+    ref = "GTGC" + motif * 2 + "GTTCAGGTC"
+    _, st, _, _ = _masks(ref, np.ones(len(ref), dtype=bool), [(4, unit, 2)])
+    assert st[-5][4] and st[5][4]
+    assert not any(st[k].any() for k in (-4, -3, -2, 2, 3, 4))
 
 
 def test_tract_reaching_the_window_end_is_not_a_site():
@@ -156,7 +163,7 @@ def test_channel_eeff_needs_both_strands_and_uses_length_buckets():
     depth_hpstr[3, 3, depth_hpstr_str0_bucket(7)] = 23
     init_refine_worker(np.zeros((10, 10, 64), dtype=np.int64), depth_hpstr)
     assert _channel_eeff_at_threshold("hp", (3, -1, "T")) == 5
-    # Deletions and insertions of one length have their own buckets.
+    # Deletions and insertions of one unit have their own buckets.
     assert _channel_eeff_at_threshold("str", (2, -3)) == 11
     assert _channel_eeff_at_threshold("str", (2, 3)) == 0
     assert _channel_eeff_at_threshold("str", (2, 2)) == 19
@@ -229,6 +236,18 @@ def test_mu_solve_single_site_closed_form():
     assert _solve(np.array([11.0]), 10) == pytest.approx(0.01, rel=1e-9)
 
 
+def test_mu_solve_tiny_root_is_exact():
+    # Root 6.7e-13 sits below brentq's default absolute tolerance (2e-12).
+    eeff = 1e12
+    r = 3.0 * eeff
+    assert _solve([r], eeff) == pytest.approx((r - eeff) / (eeff * (r - 1)), rel=1e-9)
+
+
+def test_mu_solve_refuses_non_finite_lr():
+    with pytest.raises(ValueError, match="non-finite"):
+        _solve([np.inf, 10.0], 100)
+
+
 def test_mu_solve_no_root_is_zero():
     # sum(r) <= Eeff: the likelihood peaks at mu = 0.
     assert _solve(np.array([10.0]), 10) == 0.0
@@ -280,12 +299,51 @@ def test_mu_solve_float32_log_negatives_match_raw():
 
 
 def test_indel_mu_channel_routing():
-    assert indel_mu_channel(3, 1, 2, 1, "A") == "STR2_len3"
-    assert indel_mu_channel(-7, 4, 0, 1, "A") == "STR0_len-5"
-    assert indel_mu_channel(1, 3, 0, 0, "C") == "STR0_len1"
+    assert indel_mu_channel(3, 1, 2, 1, "A", 3) == "STR2_u3_ins"
+    # Two units of a dinucleotide: the dinucleotide channel.
+    assert indel_mu_channel(-4, 1, 2, 1, "A", 2) == "STR2_u2_del"
+    assert indel_mu_channel(6, 1, 3, 1, "A", 6) == "STR3_u5_ins"
+    # Not a slip: by length.
+    assert indel_mu_channel(-7, 4, 0, 1, "A") == "STR0_u5_del"
+    assert indel_mu_channel(3, 1, 0, 1, "A", 2) == "STR0_u3_ins"
+    assert indel_mu_channel(1, 3, 0, 0, "C") == "STR0_u1_ins"
     assert indel_mu_channel(1, 3, 0, 1, "G") == "HP3_len1_C"
     assert indel_mu_channel(-1, 10, 1, 1, "T") == "HP10_len-1_T"
     assert indel_mu_channel(-1, 0, 0, 1, "A") is None
+
+
+@pytest.mark.parametrize("str_bin, signed", [(0, 1), (0, -3), (2, -2), (4, 5), (1, 3)])
+def test_str_channel_name_round_trip(str_bin, signed):
+    assert parse_str_channel_name(str_channel_name(str_bin, signed)) == (
+        str_bin,
+        signed,
+    )
+
+
+def test_mu_override_reads_str_channels(tmp_path):
+    prefix = str(tmp_path / "s")
+    pd.DataFrame(
+        {
+            "context": ["SBS96:A[C>A]A"],
+            "n_sites": [0],
+            "Eeff": [1.0],
+            "mutation_rate_mle": [1e-6],
+        }
+    ).to_csv(prefix + "_sbs96_rate_n1.txt", sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "context": ["STR0_u1", "STR2_u2", "STR3_u5"],
+            "indel_length": [1, -2, 5],
+            "n_sites": [0, 0, 0],
+            "Eeff": [1.0, 1.0, 1.0],
+            "mutation_rate_mle": [1e-7, 2e-7, 3e-7],
+            "eeff_sites": INDEL_EEFF_SITE_SET,
+        }
+    ).to_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t", index=False)
+    table = _load_mutation_rate_override(prefix)
+    assert table["STR0_u1_ins"] == 1e-7
+    assert table["STR2_u2_del"] == 2e-7
+    assert table["STR3_u5_ins"] == 3e-7
 
 
 def test_mu_override_refuses_tables_without_eeff_stamp(tmp_path):

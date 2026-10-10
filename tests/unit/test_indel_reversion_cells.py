@@ -6,12 +6,16 @@ molecule's own context:
   capped only for the row lookup, after subtracting the deleted base);
 - an indel of 2bp or more reverts in the STR bin of the mutant tract
   (reference tract length + indel length), which can differ from the
-  reference tract's bin at the 10/25/40bp edges.
+  reference tract's bin at the 10/25/40bp edges;
+- str.txt columns are a (deletion, reference, insertion) triple per
+  repeat-unit group: the tract's unit in STR bins 1-4 (any number of
+  units), the indel length in bin 0.
 """
 
 import numpy as np
 import pytest
 
+from DupCaller_sub.funcs.indels import STR_NCOL, str_col
 from DupCaller_sub.funcs.prob import (
     _indel_error_cells,
     indelErrorProbs,
@@ -48,8 +52,8 @@ def test_insertion_reversion_row_is_capped_longer_run(run_len):
 def _mats():
     amp_hp = np.arange(120, dtype=float).reshape(10, 12) + 1000
     dmg_hp = np.arange(120, dtype=float).reshape(10, 12) + 2000
-    amp_str = np.arange(55, dtype=float).reshape(5, 11) + 3000
-    dmg_str = np.arange(55, dtype=float).reshape(5, 11) + 4000
+    amp_str = np.arange(5 * STR_NCOL, dtype=float).reshape(5, STR_NCOL) + 3000
+    dmg_str = np.arange(5 * STR_NCOL, dtype=float).reshape(5, STR_NCOL) + 4000
     return amp_hp, dmg_hp, amp_str, dmg_str
 
 
@@ -84,24 +88,67 @@ def test_str_length_bin(unit, total, expected):
 
 def test_str_insertion_reverts_in_mutant_bin():
     # +2 into a 24bp tract (bin 2) makes a 26bp tract (bin 3).
-    reversion, forward = _indel_error_cells(1, 2, 2, 0, 0, strs_mut=3)
-    assert reversion == ("str", 3, 3, 3)
-    assert forward == ("str", 2, 7, 7)
+    reversion, forward = _indel_error_cells(1, 2, 2, 0, 0, strs_mut=3, unit_len=2)
+    u2_del, u2_ins = str_col(2, -1), str_col(2, 1)
+    assert reversion == ("str", 3, u2_del, u2_del)
+    assert forward == ("str", 2, u2_ins, u2_ins)
 
 
 def test_str_deletion_reverts_in_mutant_bin():
     # -2 from a 26bp tract (bin 3) leaves a 24bp tract (bin 2).
     amp_hp, dmg_hp, amp_str, dmg_str = _mats()
     Pamp, Pamp_rev, *_ = indelErrorProbs(
-        1, 3, -2, 0, 0, amp_hp, dmg_hp, amp_str, dmg_str, strs_mut=2
+        1, 3, -2, 0, 0, amp_hp, dmg_hp, amp_str, dmg_str, strs_mut=2, unit_len=2
     )
-    assert Pamp == amp_str[2, 2 + 5]
-    assert Pamp_rev == amp_str[3, -2 + 5]
+    assert Pamp == amp_str[2, str_col(2, 1)]
+    assert Pamp_rev == amp_str[3, str_col(2, -1)]
 
 
 def test_str_mutant_bin_defaults_to_reference_bin():
     # Per-context callers (power tables, thresholds) don't know the tract
     # length; both cells then use the reference bin.
-    reversion, forward = _indel_error_cells(1, 2, 3, 0, 0)
-    assert reversion == ("str", 2, 2, 2)
-    assert forward == ("str", 2, 8, 8)
+    reversion, forward = _indel_error_cells(1, 2, 3, 0, 0, unit_len=3)
+    u3_del, u3_ins = str_col(3, -1), str_col(3, 1)
+    assert reversion == ("str", 2, u3_del, u3_del)
+    assert forward == ("str", 2, u3_ins, u3_ins)
+
+
+@pytest.mark.parametrize(
+    "unit, id_len, group",
+    [
+        (2, -2, 2),
+        (2, -4, 2),  # two units of a dinucleotide: the dinucleotide's column
+        (2, 6, 2),
+        (3, -3, 3),
+        (4, 4, 4),
+        (5, -5, 5),
+        (6, 6, 5),  # 5+ pools longer units
+        (8, -5, 5),  # capped length, unit 8
+    ],
+)
+def test_str_cells_use_tract_unit(unit, id_len, group):
+    reversion, forward = _indel_error_cells(1, 2, id_len, 0, 0, unit_len=unit)
+    sign = 1 if id_len > 0 else -1
+    assert forward[2] == str_col(group, sign)
+    assert reversion[2] == str_col(group, -sign)
+
+
+@pytest.mark.parametrize("id_len, group", [(2, 2), (-3, 3), (4, 4), (5, 5), (-5, 5)])
+def test_str0_cells_use_indel_length(id_len, group):
+    # Not a slip (bin 0): the unit group is the indel length.
+    reversion, forward = _indel_error_cells(1, 0, id_len, 0, 0, unit_len=2)
+    sign = 1 if id_len > 0 else -1
+    assert forward == ("str", 0, str_col(group, sign), str_col(group, sign))
+    assert reversion == ("str", 0, str_col(group, -sign), str_col(group, -sign))
+
+
+def test_mismatched_insertion_uses_str0_u1():
+    reversion, forward = _indel_error_cells(3, 0, 1, A, 2)
+    assert forward == ("str", 0, str_col(1, 1), str_col(1, 1))
+    reversion, _ = _indel_error_cells(3, 0, 1, A, -1)
+    assert reversion == ("str", 0, str_col(1, -1), str_col(1, -1))
+
+
+def test_str_bin_needs_unit():
+    with pytest.raises(ValueError):
+        _indel_error_cells(1, 2, 2, 0, 0)

@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
+from DupCaller_sub.funcs.indels import STR_NCOL, str_col  # noqa: E402
 from DupCaller_sub.funcs.prob import (  # noqa: E402
     indelErrorProbs,
     indelMaxLR,
@@ -26,15 +27,24 @@ def mats():
     # Distinct values in every cell so each lookup is identifiable.
     amp_hp = np.arange(120, dtype=float).reshape(10, 12) + 1000
     dmg_hp = np.arange(120, dtype=float).reshape(10, 12) + 2000
-    amp_str = np.arange(55, dtype=float).reshape(5, 11) + 3000
-    dmg_str = np.arange(55, dtype=float).reshape(5, 11) + 4000
+    amp_str = np.arange(5 * STR_NCOL, dtype=float).reshape(5, STR_NCOL) + 3000
+    dmg_str = np.arange(5 * STR_NCOL, dtype=float).reshape(5, STR_NCOL) + 4000
     return amp_hp, dmg_hp, amp_str, dmg_str
 
 
 def _probs(mats, hps, strs, id_len, ref, ins):
     amp_hp, dmg_hp, amp_str, dmg_str = mats
     return indelErrorProbs(
-        hps, strs, id_len, ref, ins, amp_hp, dmg_hp, amp_str, dmg_str
+        hps,
+        strs,
+        id_len,
+        ref,
+        ins,
+        amp_hp,
+        dmg_hp,
+        amp_str,
+        dmg_str,
+        unit_len=abs(id_len),
     )
 
 
@@ -55,8 +65,8 @@ def test_hp_deletion(mats):
 def test_isolated_base_deletion_reverts_as_mismatched_insertion(mats):
     amp_hp, dmg_hp, amp_str, dmg_str = mats
     Pamp, Pamp_rev, Pdmg, Pdmg_rev, _, _ = _probs(mats, 1, 0, -1, G, G)
-    assert Pamp == amp_str[0, 6]
-    assert Pdmg == dmg_str[0, 6]
+    assert Pamp == amp_str[0, str_col(1, 1)]
+    assert Pdmg == dmg_str[0, str_col(1, 1)]
     assert Pamp_rev == amp_hp[0, G * 3 + 0]
     assert Pdmg_rev == dmg_hp[0, G * 3 + 0]
 
@@ -85,9 +95,9 @@ def test_mismatched_insertion(mats):
     assert Pamp == amp_hp[0, G * 3 + 0]
     assert Pdmg == dmg_hp[0, G * 3 + 0]
     assert Pdmg_bot == dmg_hp[0, RC[G] * 3 + 0]
-    assert Pamp_rev == amp_str[0, 6]
-    assert Pdmg_rev == dmg_str[0, 6]
-    assert Pdmg_rev_bot == dmg_str[0, 6]
+    assert Pamp_rev == amp_str[0, str_col(1, 1)]
+    assert Pdmg_rev == dmg_str[0, str_col(1, 1)]
+    assert Pdmg_rev_bot == dmg_str[0, str_col(1, 1)]
 
 
 def test_str_indel(mats):
@@ -95,10 +105,10 @@ def test_str_indel(mats):
     Pamp, Pamp_rev, Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot = _probs(
         mats, 1, 2, -3, A, A
     )
-    assert Pamp == amp_str[2, 3 + 5]
-    assert Pamp_rev == amp_str[2, -3 + 5]
-    assert Pdmg == Pdmg_bot == dmg_str[2, 3 + 5]
-    assert Pdmg_rev == Pdmg_rev_bot == dmg_str[2, -3 + 5]
+    assert Pamp == amp_str[2, str_col(3, 1)]
+    assert Pamp_rev == amp_str[2, str_col(3, -1)]
+    assert Pdmg == Pdmg_bot == dmg_str[2, str_col(3, 1)]
+    assert Pdmg_rev == Pdmg_rev_bot == dmg_str[2, str_col(3, -1)]
 
 
 @pytest.mark.parametrize(
@@ -114,15 +124,20 @@ def test_str_indel(mats):
 def test_reversion_rate_matches_pamp(mats, hps, strs, id_len, ref, ins):
     amp_hp, _, amp_str, _ = mats
     Pamp = _probs(mats, hps, strs, id_len, ref, ins)[0]
-    assert indelReversionRate(hps, strs, id_len, ref, ins, amp_hp, amp_str) == Pamp
+    assert (
+        indelReversionRate(
+            hps, strs, id_len, ref, ins, amp_hp, amp_str, unit_len=abs(id_len)
+        )
+        == Pamp
+    )
 
 
 def test_forward_damage_rate_lowers_deletion_ceiling():
     # A higher ref->alt deletion damage rate at the candidate's own run
     # must make a deletion call harder (lower max LR), as for SNVs.
     amp_hp = np.full((10, 12), 1e-5)
-    amp_str = np.full((5, 11), 1e-5)
-    dmg_str = np.full((5, 11), 1e-6)
+    amp_str = np.full((5, STR_NCOL), 1e-5)
+    dmg_str = np.full((5, STR_NCOL), 1e-6)
     low = np.full((10, 12), 1e-6)
     high = low.copy()
     high[3, T * 3 + 0] = 1e-3

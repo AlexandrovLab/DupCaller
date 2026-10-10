@@ -1,10 +1,13 @@
 import numpy as np
+import pytest
 
+from DupCaller_sub.funcs.indels import str_col
 from DupCaller_sub.funcs.learn import estimate_sbs_srd_rates
 from DupCaller_sub.funcs.misc import (
     _normalize_indel_hp_mat,
     _normalize_indel_str_mat,
     _read_fallback_counts,
+    _str_ref_conditional,
     apply_sbs_low_coverage_fallback,
     build_trinuc64_order,
     fallback_error_file,
@@ -160,36 +163,74 @@ def test_hp_first_row_takes_fallback_as_is():
     assert np.array_equal(out[0, 1::3], obs_rates[0, 1::3])
 
 
+def _str_rates(m, pc):
+    out = np.zeros_like(m, dtype=float)
+    for g in range(5):
+        b = m[:, g * 3 : g * 3 + 3]
+        out[:, g * 3 : g * 3 + 3] = (b + pc) / (b.sum(axis=1, keepdims=True) + 3 * pc)
+    return out
+
+
 def test_str_fallback_rows():
     pc = 0.5
-    fb = np.full([5, 11], 5.0)
-    fb[:, 5] = 1e6
-    fb[3, 3] = 5000  # 25-39 bin: high -2 rate
-    obs = np.full([5, 11], 1.0)
-    obs[:, 5] = 1e5
-    obs[1, :] = 0
-    obs[1, 5] = 10  # row 1 low, all indels unobserved -> fallback as-is
-    obs[3, :] = 0
-    obs[3, 5] = 10
-    obs[3, 7] = 2  # row 3 low, +2 observed
-    obs[4, :] = 0  # row 4 low, compared to row 3's used rate
+    fb = np.tile([5.0, 1e6, 5.0], (5, 5))
+    fb[3, str_col(2, -1)] = 5000  # 25-39 bin: high dinucleotide deletion rate
+    obs = np.tile([1.0, 1e5, 1.0], (5, 5))
+    obs[1] = np.tile([0, 10, 0], 5)  # row 1 low, indels unobserved -> fallback
+    obs[3] = np.tile([0, 10, 0], 5)
+    obs[3, str_col(2, 1)] = 2  # row 3 low, dinucleotide insertion observed
+    obs[4] = 0  # row 4 low, compared with row 3's used rate
     out = _normalize_indel_str_mat(obs, pc, fb)
-    fb_rates = (fb + pc) / (fb.sum(axis=1, keepdims=True) + 11 * pc)
-    obs_rates = (obs + pc) / (obs.sum(axis=1, keepdims=True) + 11 * pc)
-    idx = np.arange(11) != 5
+    fb_rates, obs_rates = _str_rates(fb, pc), _str_rates(obs, pc)
+    ref = [str_col(g, 0) for g in range(1, 6)]
+    idx = np.ones(15, dtype=bool)
+    idx[ref] = False
     assert np.array_equal(out[0], obs_rates[0])
     assert np.array_equal(out[1, idx], fb_rates[1, idx])
-    assert out[1, 5] == obs_rates[1, 5]
+    assert np.array_equal(out[1, ref], obs_rates[1, ref])
     assert np.array_equal(out[2], obs_rates[2])
-    zero3 = idx & (np.arange(11) != 7)
+    zero3 = idx.copy()
+    zero3[str_col(2, 1)] = False
     assert np.array_equal(out[3, zero3], np.maximum(fb_rates[3, zero3], out[2, zero3]))
-    assert out[3, 7] == obs_rates[3, 7]
+    assert out[3, str_col(2, 1)] == obs_rates[3, str_col(2, 1)]
     assert np.array_equal(out[4, idx], np.maximum(fb_rates[4, idx], out[3, idx]))
-    assert out[4, 3] == fb_rates[3, 3]
+    assert out[4, str_col(2, -1)] == fb_rates[3, str_col(2, -1)]
+
+
+def test_str_unit_groups_have_their_own_opportunity():
+    # A dinucleotide group with a high slip rate doesn't dilute or borrow
+    # the other groups' reference counts.
+    obs = np.tile([10.0, 1e5, 10.0], (5, 5))
+    obs[2, str_col(2, -1)] = 1e4
+    out = _normalize_indel_str_mat(obs, 0.5)
+    assert np.isclose(out[2, str_col(2, -1)], (1e4 + 0.5) / (1e4 + 1e5 + 10 + 1.5))
+    assert out[2, str_col(4, -1)] == out[1, str_col(4, -1)]
+
+
+def test_str_rows_do_not_borrow_from_empty_unit_groups():
+    # No 5+bp-unit tract fits in 2-9bp, so that group is empty in the sample
+    # and the fallback; a low-count 10-24bp u5+ group must take its own
+    # fallback rate, not the empty group's pseudocount 1/3.
+    fb = np.tile([5.0, 1e6, 5.0], (5, 5))
+    fb[1:, 0:3] = 0  # u1: empty in every real-STR row
+    fb[1, 12:15] = 0  # u5+ in 2-9bp
+    obs = np.floor(fb / 1e4)
+    out = _normalize_indel_str_mat(obs, 0.5, fb)
+    fb_rate = 5.5 / (1e6 + 10 + 1.5)
+    for r in (2, 3, 4):
+        assert out[r, str_col(5, -1)] == pytest.approx(fb_rate)
+        assert out[r, str_col(5, 1)] == pytest.approx(fb_rate)
+    rates = _str_ref_conditional(out, fb, 0.5)
+    assert rates[2, str_col(5, -1)] < 1e-4
+
+
+def test_str_old_layout_is_refused():
+    with pytest.raises(ValueError, match="relearn"):
+        _normalize_indel_str_mat(np.zeros([5, 11]), 0.5)
 
 
 def test_indel_without_fallback_unchanged_behavior():
-    obs = np.zeros([5, 11])
-    obs[:2, 5] = 1e5
+    obs = np.zeros([5, 15])
+    obs[:2, [str_col(g, 0) for g in range(1, 6)]] = 1e5
     out = _normalize_indel_str_mat(obs, 0.5)
     assert np.array_equal(out[2], out[1]) and np.array_equal(out[4], out[1])

@@ -19,7 +19,7 @@ All files are written under the directory specified by `-o / --output` (call it 
           won't need either)
 ```
 
-The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle` (the channel's maximum-likelihood rate, solved from `mu*Eeff = sum of site posteriors`; 0 when the sites' LRs sum to no more than Eeff, in which case the channel has no PASS calls).
+Indel channels are `HP{run}_len{±1}_{C|T}` (homopolymer), `STR{bin}_u{U}_{del|ins}` (a slip of repeat unit U, any number of units, in STR length bin 1-4; U = 5 means 5+) and `STR0_u{L}_{del|ins}` (an indel of length L that isn't a slip; `STR0_u1_ins` is the mismatched 1bp insertion). In `_indel_rate_by_hp_str.txt` the STR rows have context `STR{bin}_u{U}` and the signed unit or length in `indel_length`. The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle` (the channel's maximum-likelihood rate, solved from `mu*Eeff = sum of site posteriors`; 0 when the sites' LRs sum to no more than Eeff, in which case the channel has no PASS calls).
 
 `{sample}_duplex_allele_counts.txt` is documented in [`estimate_outputs.md`](estimate_outputs.md#sampleduplex_allele_countstxt) — it requires `_coverage.bed.gz` and is actually written by `estimate`, not `call`.
 
@@ -80,6 +80,7 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | `TAG1` | String | 5′ barcode of the top-strand read. |
 | `TAG2` | String | 5′ barcode of the bottom-strand read. |
 | `SP` | Integer | Read family's reference start position. |
+| `TL` | Integer | Template length of the read pair: SAM TLEN of the family's first read (negative when that read is the downstream mate). |
 | `TN` | String | Trinucleotide context of the variant (reference base ± 1 flanking base). |
 | `HP` | Integer | Homopolymer length at the site. Always 0 for SBS. |
 | `STR` | Integer | STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that isn't a whole number of the tract's repeat units (scored and counted as STR0); 1 = 2–9bp, 2 = 10–24bp, 3 = 25–39bp, 4 = 40bp+. Always 0 for SBS. |
@@ -212,10 +213,10 @@ These seven files capture the sample-specific error model learned automatically 
 | `{sample}.dmg.tn.txt` | Damage SBS error rate matrix (`dmgerr_file`) — errors from DNA damage (e.g. oxidative damage producing C→A artefacts), symmetric on both strands. Same shape as `.amp.tn.txt`. |
 | `{sample}.amp.hp.txt` | Amplification indel error rates for homopolymer contexts. |
 | `{sample}.dmg.hp.txt` | Damage indel error rates for homopolymer contexts. |
-| `{sample}.amp.str.txt` | Amplification indel error rates for short-tandem-repeat (STR) contexts. |
-| `{sample}.dmg.str.txt` | Damage indel error rates for short-tandem-repeat (STR) contexts. |
+| `{sample}.amp.str.txt` | Amplification indel error rates for short-tandem-repeat (STR) contexts: rows are the STR length bins (`0-1` = not a slip of a repeat, `2-9`, `10-24`, `25-39`, `40+` bp), columns a deletion/reference/insertion triple per repeat-unit group (`u1`, `u2`, `u3`, `u4`, `u5+`). In the repeat bins an indel counts under its tract's repeat unit, whatever the number of units slipped; in `0-1` under its length (`u1`: the mismatched 1bp insertion). Each triple's reference column is that group's own opportunity count. |
+| `{sample}.dmg.str.txt` | Damage indel error rates for short-tandem-repeat (STR) contexts; same layout as `.amp.str.txt`. |
 
-These files hold the sample's own learned values. At calling time, any context with fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin) takes the rate for each zero-count error type from the bundled `fallback_latest.*` profiles shipped with DupCaller (`src/ERROR/`). Observed error types and well-sampled contexts keep the sample's own rates. For `.amp.tn.srd.txt` the fallback is already applied in the written file; for the other five it is applied when the file is loaded for calling.
+These files hold the sample's own learned values. STR profiles written before 1.2.12 (11 indel-length columns) are refused; relearn them. At calling time, any context with fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin × repeat unit) takes the rate for each zero-count error type from the bundled `fallback_latest.*` profiles shipped with DupCaller (`src/ERROR/`). Observed error types and well-sampled contexts keep the sample's own rates. For `.amp.tn.srd.txt` the fallback is already applied in the written file; for the other five it is applied when the file is loaded for calling.
 
 ---
 

@@ -141,9 +141,10 @@ def test_run_or_tract_cut_by_the_window_edge_is_dropped():
 
 def _channel_site(indel, local_pos, ref, hp_raw, str_raw, masks):
     """The Eeff mask an indel candidate is counted against, mirroring
-    genotypeDSIndel's routing and Caller.py's channels (None: 5+ pooled,
-    which the site masks only approximate)."""
-    hp, str_by_len, str0_any, str0_by_len = masks
+    genotypeDSIndel's routing and Caller.py's channels: a slip under its
+    tract's repeat unit (any number of units), anything else under its
+    length (None: 5+ pooled, which the site masks only approximate)."""
+    hp, str_by_unit, str0_any, str0_by_len = masks
     parts = indel.split(":")
     length = int(parts[1])
     ctx = indel_context_index(local_pos)
@@ -151,11 +152,13 @@ def _channel_site(indel, local_pos, ref, hp_raw, str_raw, masks):
         if length == 1 and _ref_int(parts[2])[0] != ref[ctx]:
             return str0_any
         return hp
+    sign = 1 if length > 0 else -1
+    slip = str_slip_tract(length, parts[2] if length > 0 else "", ctx, ref, str_raw)
+    if slip is not None:
+        return None if slip[0] >= 5 else str_by_unit[sign * slip[0]]
     if abs(length) >= 5:
         return None
-    sign_k = length
-    slip = str_slip_tract(length, parts[2] if length > 0 else "", ctx, ref, str_raw)
-    return (str_by_len if slip is not None else str0_by_len)[sign_k]
+    return str0_by_len[length]
 
 
 @pytest.mark.parametrize("seed", range(6))

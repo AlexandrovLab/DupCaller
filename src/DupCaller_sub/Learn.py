@@ -12,6 +12,7 @@ from matplotlib import pyplot as plt
 
 
 from .funcs.call import callBam
+from .funcs.indels import STR_COL_LABELS
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
@@ -266,7 +267,7 @@ def do_learn(args):
     hp_row_labels = [f"HP{i}" for i in range(1, 10)] + ["HP10+"]
     hp_col_labels = [f"{b}_{d}" for b in ["A", "T", "C", "G"] for d in (-1, 0, 1)]
     str_row_labels = ["0-1", "2-9", "10-24", "25-39", "40+"]
-    str_col_labels = [str(d) for d in range(-5, 6)]
+    str_col_labels = STR_COL_LABELS
     amp_hp_pd = pd.DataFrame(hp_alt_profile, columns=hp_col_labels, index=hp_row_labels)
     dmg_hp_pd = pd.DataFrame(hp_dmg_profile, columns=hp_col_labels, index=hp_row_labels)
     amp_str_pd = pd.DataFrame(

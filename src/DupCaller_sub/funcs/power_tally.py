@@ -85,7 +85,11 @@ class PowerTally:
         self.counts = {}
         self._buf = {}
         self._buf_n = {}
+        # Sparse DBS pairs: per group, pending key arrays and their
+        # compacted (keys, counts), merged every FLUSH pending keys.
         self.dbs_other = {}
+        self._dbs_n = {}
+        self._dbs_compact = {}
         self.sbs_unmasked = np.zeros(SBS_SIZE, dtype=np.int64)
 
     def _add(self, group, keys):
@@ -105,6 +109,23 @@ class PowerTally:
         if group not in self.counts:
             self.counts[group] = np.zeros(TOTAL_SIZE, dtype=np.int64)
         self.counts[group] += np.bincount(np.concatenate(buf), minlength=TOTAL_SIZE)
+
+    def _compact_dbs(self, group):
+        arrays = self.dbs_other.pop(group, None)
+        self._dbs_n.pop(group, None)
+        if not arrays:
+            return
+        keys = np.concatenate(arrays)
+        counts = np.ones(keys.size, dtype=np.int64)
+        if group in self._dbs_compact:
+            old_keys, old_counts = self._dbs_compact[group]
+            keys = np.concatenate([old_keys, keys])
+            counts = np.concatenate([old_counts, counts])
+        uniq, inv = np.unique(keys, return_inverse=True)
+        self._dbs_compact[group] = (
+            uniq,
+            np.bincount(inv, weights=counts).astype(np.int64),
+        )
 
     def add_sbs(self, group, pidx, pass_bool, unmasked_pass_bool, ref_int):
         """SBS opportunity of one family's window, as call.py's coverage /
@@ -136,9 +157,12 @@ class PowerTally:
         dense = (d1 == d2) & (SHIFT[t1, last2] == t2)
         self._add(group, OFFSET["dbs"] + i1[dense] * 4 + last2[dense])
         if not dense.all():
-            self.dbs_other.setdefault(group, []).append(
-                i1[~dense] * SBS_SIZE + i2[~dense]
-            )
+            other = i1[~dense] * SBS_SIZE + i2[~dense]
+            self.dbs_other.setdefault(group, []).append(other)
+            n = self._dbs_n.get(group, 0) + other.size
+            self._dbs_n[group] = n
+            if n >= self.FLUSH:
+                self._compact_dbs(group)
 
     def add_indel(self, group, keys):
         """Keys from indel_keys for one family's window."""
@@ -155,10 +179,9 @@ class PowerTally:
         for group, vec in self.counts.items():
             nz = np.flatnonzero(vec)
             groups[group] = (nz, vec[nz])
-        dbs_other = {}
-        for group, arrays in self.dbs_other.items():
-            keys, counts = np.unique(np.concatenate(arrays), return_counts=True)
-            dbs_other[group] = (keys, counts)
+        for group in list(self.dbs_other):
+            self._compact_dbs(group)
+        dbs_other = dict(self._dbs_compact)
         return {
             "quals": all_quals,
             "groups": groups,
@@ -251,7 +274,6 @@ def contract_power_tally(summary, L, L_indel_1bp, L_indel_len):
     coverage pass accumulates, plus the masked and unmasked SBS coverage
     totals."""
     L3 = L.reshape(SBS_SIZE, 4)
-    L1 = L_indel_1bp.reshape(N_DEPTH, -1)
     Llen = L_indel_len.reshape(N_DEPTH, 5, 11)
     trinuc, indel, dbs = {}, {}, {}
     coverage = 0.0

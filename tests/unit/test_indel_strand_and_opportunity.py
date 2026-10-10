@@ -14,6 +14,7 @@ import pysam
 import pytest
 from scipy.stats import binom
 
+from DupCaller_sub.funcs.indels import STR_NCOL, str_col
 from DupCaller_sub.funcs.learn import profileTriNucMismatches
 from DupCaller_sub.funcs.prob import (
     indel_strand_evidence,
@@ -132,9 +133,9 @@ def _mats():
             hp[row, base * 3 + 0] = (row + 1) * 1e-4 + base * 1e-6  # -1
             hp[row, base * 3 + 1] = 1.0
             hp[row, base * 3 + 2] = (row + 1) * 1e-5 + base * 1e-7  # +1
-    st = np.zeros([5, 11])
+    st = np.zeros([5, STR_NCOL])
     for row in range(5):
-        for col in range(11):
+        for col in range(STR_NCOL):
             st[row, col] = (row + 1) * 1e-3 + col * 1e-5
     return hp, st
 
@@ -150,7 +151,7 @@ def test_reversion_rate_deletion_from_isolated_base():
     hp, st = _mats()
     g = _B2N["G"]
     # Deleting an isolated G leaves no run: reverting is a non-repeat +1.
-    assert indelReversionRate(1, 0, -1, g, g, hp, st) == st[0, 6]
+    assert indelReversionRate(1, 0, -1, g, g, hp, st) == st[0, str_col(1, 1)]
 
 
 def test_reversion_rate_run_extending_insertion_uses_longer_run():
@@ -170,10 +171,12 @@ def test_reversion_rate_mismatched_insertion_is_isolated_base_deletion():
     assert indelReversionRate(10, 0, 1, a, t, hp, st) == hp[0, t * 3 + 0]
 
 
-def test_reversion_rate_str_uses_opposite_length():
+def test_reversion_rate_str_uses_opposite_sign():
     hp, st = _mats()
-    assert indelReversionRate(1, 2, -2, 0, 0, hp, st) == st[2, 2 + 5]
-    assert indelReversionRate(1, 1, 3, 0, 0, hp, st) == st[1, -3 + 5]
+    rate = indelReversionRate(1, 2, -2, 0, 0, hp, st, unit_len=2)
+    assert rate == st[2, str_col(2, 1)]
+    rate = indelReversionRate(1, 1, 3, 0, 0, hp, st, unit_len=3)
+    assert rate == st[1, str_col(3, -1)]
 
 
 def test_reversion_rate_without_matrices_is_nan():

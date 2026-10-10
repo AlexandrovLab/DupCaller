@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from DupCaller_sub.funcs.indels import str_col
 from DupCaller_sub.funcs.misc import (
     _hp_ref_conditional,
     _sbs_ref_cols,
@@ -61,13 +62,13 @@ def test_hp_negative_ref_uses_fallback_line():
     )
 
 
-def test_str_ref_is_one_minus_row():
-    rates = np.full([5, 11], 0.01)
-    rates[:, 5] = 0.5
-    rates[2, :] = 0.2  # sums past 1 -> fallback
-    fb = np.full([5, 11], 9.5)
-    fb[:, 5] = 899.5  # smoothed: 0.01 each, ref 0.9
+def test_str_ref_is_one_minus_group():
+    rates = np.tile([0.01, 0.5, 0.01], (5, 5))
+    rates[2, :] = 0.6  # deletion + insertion past 1 -> fallback
+    fb = np.tile([9.5, 979.5, 9.5], (5, 5))  # smoothed: 0.01 each, ref 0.98
     out = _str_ref_conditional(rates, fb, 0.5)
-    idx = np.arange(11) != 5
-    assert np.allclose(out[:, 5], 0.9)
-    assert np.allclose(out[:, idx], 0.01 / 0.91)
+    ref = [str_col(g, 0) for g in range(1, 6)]
+    idx = np.ones(15, dtype=bool)
+    idx[ref] = False
+    assert np.allclose(out[:, ref], 0.98)
+    assert np.allclose(out[:, idx], 0.01 / 0.99)

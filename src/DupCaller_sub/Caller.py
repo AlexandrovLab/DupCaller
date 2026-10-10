@@ -24,7 +24,9 @@ from .funcs.call import callBam, contract_worker_tally  # , output_masked_mutati
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
 from .funcs.misc import init_refine_worker, refine_channel_task, mu_at_min_lr
-from .funcs.misc import indel_mu_channel
+from .funcs.misc import indel_mu_channel, str_channel_name, parse_str_channel_name
+from .funcs.misc import str_profile_is_current
+from .funcs.indels import STR_COL_LABELS
 from .funcs.prob import indelErrorProbs, indelMaxLR, indel_strand_pvalue, strand_pvalue
 from .funcs.misc import createVcfStrings
 from .funcs.misc import splitBamRegions
@@ -56,7 +58,9 @@ import pysam
 # older tables (no column) counted every base of a run, about 1/L the mu.
 # "per_run_signed" (2026-10-01): deletion/insertion sites counted
 # separately, STR slips by str_slip_tract, str.h5 schema 3.
-INDEL_EEFF_SITE_SET = "per_run_signed"
+# "per_unit_signed" (2026-10-10, 1.2.12): STR channels per repeat unit
+# (STR{bin}_u{U}_{del|ins}) instead of per indel length.
+INDEL_EEFF_SITE_SET = "per_unit_signed"
 
 
 def _load_mutation_rate_override(prefix):
@@ -77,9 +81,9 @@ def _load_mutation_rate_override(prefix):
     (e.g. "SBS96:A[C>A]A"). The indel table's "context"/"indel_length"
     columns don't carry the full name directly -- reconstructed here from
     the exact same naming convention indel_jobs below builds it with
-    (name == "STR0_len1" for the mismatched-insertion background,
-    "HP{hp_len}_len{id_len}_{pool}" for homopolymer channels,
-    "STR{str_bin}_len{id_len}" for STR-length channels).
+    ("HP{hp_len}_len{id_len}_{pool}" for homopolymer channels; for STR
+    channels the context "STR{str_bin}_u{U}" plus the signed unit/length,
+    see funcs/misc.py's str_channel_name).
     """
     sbs_table = pd.read_csv(prefix + "_sbs96_rate_n1.txt", sep="\t")
     indel_table = pd.read_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t")
@@ -100,13 +104,11 @@ def _load_mutation_rate_override(prefix):
         indel_table["indel_length"],
         indel_table["mutation_rate_mle"],
     ):
-        if context == "STR0" and indel_length == 1:
-            name = "STR0_len1"
-        elif context.startswith("HP"):
+        if context.startswith("HP"):
             hp_len_str, pool = context[2:].rsplit("_", 1)
             name = f"HP{hp_len_str}_len{indel_length}_{pool}"
         elif context.startswith("STR"):
-            name = f"{context}_len{indel_length}"
+            name = str_channel_name(int(context[3:].split("_u")[0]), int(indel_length))
         else:
             raise ValueError(
                 f"unrecognized indel mutation-rate-table context {context!r} "
@@ -294,6 +296,11 @@ def check_input_files_exist(args):
             path = args.errprefix + suffix
             if not os.path.exists(path):
                 missing_files.append(f"{label} (from -E): {path}")
+            elif suffix.endswith(".str.txt") and not str_profile_is_current(path):
+                missing_files.append(
+                    f"{label} (from -E) has the pre-1.2.12 indel-length layout; "
+                    f"relearn it with this version: {path}"
+                )
 
     # Check optional mutation-rate override table pair
     if args.muterateprefix:
@@ -510,14 +517,27 @@ def do_call(args):
     amperri_str_file = params["amperri_file"].replace(".amp.id.txt", ".amp.str.txt")
     dmgerri_hp_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.hp.txt")
     dmgerri_str_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.str.txt")
-    if not (
+    profiles_exist = (
         os.path.exists(params["amperr_file"])
         and os.path.exists(amperri_hp_file)
         and os.path.exists(amperri_str_file)
         and os.path.exists(params["dmgerr_file"])
         and os.path.exists(dmgerri_hp_file)
         and os.path.exists(dmgerri_str_file)
+    )
+    if profiles_exist and not (
+        str_profile_is_current(amperri_str_file)
+        and str_profile_is_current(dmgerri_str_file)
     ):
+        # A profile left by an earlier version at the default prefix (-E
+        # ones are refused above): relearn rather than fail.
+        print(
+            "..........STR error profiles at "
+            + amperri_str_file.rsplit(".amp.", 1)[0]
+            + " predate the per-repeat-unit layout; relearning............"
+        )
+        profiles_exist = False
+    if not profiles_exist:
         learn_flag = True
         if args.threads == 1:
             """
@@ -692,12 +712,13 @@ def do_call(args):
         # the matching call-time selection. hp.txt: 10 rows (HP1..HP9,
         # HP10+), 12 columns (base x idLen in {-1,0,1}, idLen=0 the
         # reference/opportunity count). str.txt: 5 rows (STR-length bin
-        # "0-1"=not a real repeat through "40+"), 11 columns (idLen -5..5,
-        # idLen=0 the opportunity count).
+        # "0-1"=not a real repeat through "40+"), 15 columns (a deletion/
+        # reference/insertion triple per repeat-unit group u1-u5+, each
+        # reference the group's opportunity count).
         hp_row_labels = [f"HP{i}" for i in range(1, 10)] + ["HP10+"]
         hp_col_labels = [f"{b}_{d}" for b in ["A", "T", "C", "G"] for d in (-1, 0, 1)]
         str_row_labels = ["0-1", "2-9", "10-24", "25-39", "40+"]
-        str_col_labels = [str(d) for d in range(-5, 6)]
+        str_col_labels = STR_COL_LABELS
         amp_hp_pd = pd.DataFrame(
             hp_alt_profile, columns=hp_col_labels, index=hp_row_labels
         )
@@ -1046,6 +1067,11 @@ def do_call(args):
         "TAG1": [1, "String", "Barcode of top strand 5 prime"],
         "TAG2": [1, "String", "Barcode of bottom strand 5 prime"],
         "SP": [1, "Integer", "Read family reference start position"],
+        "TL": [
+            1,
+            "Integer",
+            "Template length of the read pair (SAM TLEN of the family's first read; negative when that read is the downstream mate)",
+        ],
         "TN": [1, "String", "trinucleotide context"],
         "HP": [1, "Integer", "Homopolymer length. Always 0 for SBS"],
         "STR": [
@@ -1075,7 +1101,7 @@ def do_call(args):
         "TAG1": infoDict["TAG1"],
         "TAG2": infoDict["TAG2"],
         "SP": infoDict["SP"],
-        "TL": [1, "Integer", "Template length of the read pair"],
+        "TL": infoDict["TL"],
         "FDR": infoDict["FDR"],
     }
     formatDict = {
@@ -1085,7 +1111,7 @@ def do_call(args):
     }
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
-        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on",
+        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below its channel's final threshold) is dropped entirely and never appears in the fail vcf unless --rescue is on",
         "underpowered": "Candidate with LR > 0 that failed the FDR-refined per-channel threshold",
         "zero_LR": "Candidate with no evidence for the alt over the ref (log10 LR == 0, e.g. alt and non-alt reads cancelling); reported for completeness, never PASS. A DBS inherits it from either of its own read family's SNVs",
         "high_nm": "Read family failed the NM/blacklist filter -- only reported under --rescue",
@@ -1164,6 +1190,8 @@ def do_call(args):
                 params["dmgmat_hp"],
                 params["ampmat_str"],
                 params["dmgmat_str"],
+                # STR channels: id_len is the signed repeat unit (bins 1-4).
+                unit_len=abs(id_len),
             )
             return float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c))
 
@@ -1302,6 +1330,8 @@ def do_call(args):
     # final mutation record, not the reference array indelErrorProbs
     # compared against.
     hp_indel_lengths = [-1, 1]
+    # STR channels: signed repeat unit 2-5+ in bins 1-4 (any whole number
+    # of units), signed indel length 2-5+ in STR0 (str_channel_name).
     str_indel_lengths = [-5, -4, -3, -2, 2, 3, 4, 5]
     # Pool an HP channel's 1bp events by ref/alt base -- "C" for C/G,
     # "T" for A/T -- the same two-way split classify_indel_channel/ID83
@@ -1325,13 +1355,14 @@ def do_call(args):
             int(indel["infos"]["STR"]),
             indel["infos"].get("HM", 1),
             indel["ref"][1] if id_len < 0 else indel["alt"][1],
+            indel["infos"].get("SU", 0),
         )
 
     # Raw LRs of the PASS candidates per channel; LR < 0 candidates arrive
     # pre-routed (by the same indel_mu_channel) as float32 log10 LRs in
     # neg_lr_indel and never as records.
     indel_channel_names = (
-        ["STR0_len1"]
+        [str_channel_name(0, 1)]
         + [
             f"HP{hp_len}_len{id_len}_{pool}"
             for hp_len in range(1, 11)
@@ -1339,7 +1370,7 @@ def do_call(args):
             for pool in ("C", "T")
         ]
         + [
-            f"STR{str_bin}_len{id_len}"
+            str_channel_name(str_bin, id_len)
             for str_bin in range(0, 5)
             for id_len in str_indel_lengths
         ]
@@ -1361,16 +1392,17 @@ def do_call(args):
     # computed here in the main process, same as always. Only the Eeff
     # simulation (simulate_power_grid) and the refinement loop itself move
     # into the pool below.
+    str0_ins1 = str_channel_name(0, 1)
     indel_jobs = [
         (
-            "STR0_len1",
+            str0_ins1,
             "str",
             (0, 1),
-            raw_lr_indel["STR0_len1"],
+            raw_lr_indel[str0_ins1],
             _indel_ctx_threshold(0, 0, 1),
             args.lfdrThreshold,
-            _mu0_for("STR0_len1"),
-            neg_lr_indel.get("STR0_len1", _no_neg_lr),
+            _mu0_for(str0_ins1),
+            neg_lr_indel.get(str0_ins1, _no_neg_lr),
             args.minLR,
         )
     ]
@@ -1394,16 +1426,17 @@ def do_call(args):
     for str_bin in range(0, 5):
         for id_len in str_indel_lengths:
             threshold0 = _indel_ctx_threshold(1, str_bin, id_len)
+            str_name = str_channel_name(str_bin, id_len)
             indel_jobs.append(
                 (
-                    f"STR{str_bin}_len{id_len}",
+                    str_name,
                     "str",
                     (str_bin, id_len),
-                    raw_lr_indel[f"STR{str_bin}_len{id_len}"],
+                    raw_lr_indel[str_name],
                     threshold0,
                     args.lfdrThreshold,
-                    _mu0_for(f"STR{str_bin}_len{id_len}"),
-                    neg_lr_indel.get(f"STR{str_bin}_len{id_len}", _no_neg_lr),
+                    _mu0_for(str_name),
+                    neg_lr_indel.get(str_name, _no_neg_lr),
                     args.minLR,
                 )
             )
@@ -1484,15 +1517,15 @@ def do_call(args):
 
     indel_rate_rows = []
     indel_results_iter = iter(indel_results)
-    # STR0_len1 (mismatched-insertion background) was prepended first in
+    # STR0_u1_ins (mismatched-insertion background) was prepended first in
     # indel_jobs above -- consume it here, in the same order.
     name, kind, ctx_key, Eeff0, mu0, new_threshold = next(indel_results_iter)
     indel_rate_rows.append(
         {
-            "context": "STR0",
+            "context": "STR0_u1",
             "indel_length": 1,
-            "n_sites": len(raw_lr_indel["STR0_len1"])
-            + len(neg_lr_indel.get("STR0_len1", _no_neg_lr)),
+            "n_sites": len(raw_lr_indel[name])
+            + len(neg_lr_indel.get(name, _no_neg_lr)),
             "Eeff": Eeff0,
             "mutation_rate_mle": mu0,
         }
@@ -1523,7 +1556,7 @@ def do_call(args):
             channel_final_mu[name] = min(mu0, mu_fdr_cap)
             indel_rate_rows.append(
                 {
-                    "context": f"STR{str_bin}",
+                    "context": f"STR{str_bin}_u{abs(id_len)}",
                     "indel_length": id_len,
                     "n_sites": len(raw_lr_indel[name])
                     + len(neg_lr_indel.get(name, _no_neg_lr)),
@@ -1588,8 +1621,7 @@ def do_call(args):
             # Row = str_bin directly (0-4, matching L_indel_len's row
             # axis) -- no more "9+" offset now that STR has its own
             # dedicated 5-row table instead of sharing rows with hp.txt.
-            str_bin_str, id_len_str = name[3:].split("_len")
-            str_bin, id_len = int(str_bin_str), int(id_len_str)
+            str_bin, id_len = parse_str_channel_name(name)
             indel_len_threshold_override[(str_bin, id_len)] = new_threshold
 
     # SBS/ID/DBS re-filter: a candidate's LR is a property of the observed
@@ -1625,6 +1657,9 @@ def do_call(args):
         return (m["chrom"], m["pos"], m["ref"], m["alt"])
 
     deferred_depth_keys = set()
+    # Final threshold of each deferred key: picks the --skipCoveragePass
+    # round-1 depth entry extracted with the families clearing it.
+    deferred_thresholds = {}
     for mut in mutsAll:
         old_filter = mut.get("filter", "PASS")
         if old_filter not in ("PASS", "masked"):
@@ -1643,13 +1678,15 @@ def do_call(args):
             mut["infos"].get("SNPM") or mut["infos"].get("NOISEM")
         ):
             deferred_depth_keys.add(_mut_key(mut))
+            deferred_thresholds[_mut_key(mut)] = threshold
 
     for indel in indelsAll:
         old_filter = indel.get("filter", "PASS")
         if old_filter not in ("PASS", "masked"):
             continue
         # The channel indelErrorProbs scored this call against (multi-bp:
-        # STR bin; 1bp: HP, or STR0_len1 for a mismatched insertion).
+        # STR bin and repeat unit; 1bp: HP, or STR0_u1_ins for a mismatched
+        # insertion).
         threshold = channel_thresholds.get(
             _indel_channel(indel), max(params["pcutoffi"], args.minLR)
         )
@@ -1799,16 +1836,26 @@ def do_call(args):
         duplex_read_nums_dbs = [c[2] for c in contracted]
         coverages = [c[3] for c in contracted]
         unmasked_coverages = [c[4] for c in contracted]
-        deferred_mut_updates = {
-            _mut_key(m): m["deferred_depth"]
-            for m in mutsAll
-            if "deferred_depth" in m and _mut_key(m) in deferred_depth_keys
-        }
-        deferred_indel_updates = {
-            _mut_key(m): m["deferred_depth"]
-            for m in indelsAll
-            if "deferred_depth" in m and _mut_key(m) in deferred_depth_keys
-        }
+
+        def _deferred_entry(m):
+            # The entry extracted with exactly the families clearing the
+            # key's final threshold (the smallest cut at or above it):
+            # round 2's founding families. Indel entries have cut -inf.
+            final = deferred_thresholds.get(_mut_key(m), -np.inf)
+            entries = [e for e in m["deferred_depth"] if e[0] >= final]
+            return min(entries, key=lambda e: e[0])[1] if entries else None
+
+        deferred_mut_updates = {}
+        deferred_indel_updates = {}
+        for records, updates in (
+            (mutsAll, deferred_mut_updates),
+            (indelsAll, deferred_indel_updates),
+        ):
+            for m in records:
+                if "deferred_depth" in m and _mut_key(m) in deferred_depth_keys:
+                    entry = _deferred_entry(m)
+                    if entry is not None:
+                        updates[_mut_key(m)] = entry
         for m in mutsAll + indelsAll:
             m.pop("deferred_depth", None)
 
@@ -1983,9 +2030,10 @@ def do_call(args):
         ]
         dbsAll = [m for m in dbsAll if m.get("filter", "PASS") not in _reject_reasons]
 
-    # "masked" (SNPM/NOISEM-blocked) records that never went through
-    # round 2's deferred depth-extraction -- raw LR below the channel's
-    # final refined threshold, or --skipCoveragePass -- still carry
+    # "masked" (SNPM/NOISEM-blocked) records that never went through the
+    # deferred depth-extraction (round 2's, or round 1's under
+    # --skipCoveragePass) -- raw LR below the channel's final refined
+    # threshold -- still carry
     # round 1's zero-depth placeholder in "samples". A masked record that
     # *did* get real depth can never land back here with an all-zero
     # tumor triple: call.py's eligible branch relabels ta==0 to

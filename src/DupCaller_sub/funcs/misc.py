@@ -14,6 +14,7 @@ from scipy.optimize import brentq
 
 
 from .prob import calculateSSPosterior, calculateDSPosterior
+from .indels import STR_NCOL, STR_UNIT_GROUPS
 
 
 # ======================================================================
@@ -1718,44 +1719,74 @@ def _normalize_indel_hp_mat(mat, pseudocount, fallback=None):
 
 
 def _normalize_indel_str_mat(mat, pseudocount, fallback=None):
-    """Normalize a raw (5, 11) str.txt count matrix (rows STR-length bin
-    0="0-1"/not a real repeat through 4="40+", columns idLen+5 for idLen
-    in -5..5) into per-context probabilities: each row is Dirichlet-
-    smoothed by `pseudocount` on the counts and divided by its own
-    (smoothed) sum across all 11 columns.
+    """Normalize a raw (5, 15) str.txt count matrix (rows STR-length bin
+    0="0-1"/not a real repeat through 4="40+", columns a (deletion,
+    reference, insertion) triple per repeat-unit group u1-u5+) into
+    per-context probabilities: within each row's unit group, the three
+    counts are Dirichlet-smoothed by `pseudocount` and divided by their own
+    (smoothed) sum, so a group's deletion/reference/insertion add to 1.
 
     `fallback` (the bundled fallback_latest str.txt counts, same shape and
-    smoothing) covers unobserved error categories: in a row with fewer
-    than FALLBACK_MIN_SITES raw observations, an indel-length entry (any
-    column but idLen=0, the opportunity) whose own count is 0 takes the
-    fallback rate. For real-STR rows 2-4 it is then raised to the previous
-    (shorter) real-STR row's rate if higher -- the rate actually used for
-    that row (itself possibly fallback-derived), not its observed rate.
-    Rows 0 (not a real repeat) and 1 (shortest real-STR bin) have no
-    previous real-STR row and take the fallback as-is. Without `fallback`,
-    an all-zero real-STR row 2-4 copies the previous row's rate instead.
+    smoothing) covers unobserved error categories: in a (row, unit group)
+    with fewer than FALLBACK_MIN_SITES raw observations, a deletion or
+    insertion entry whose own count is 0 takes the fallback rate. For
+    real-STR rows 2-4 it is then raised to the previous (shorter) real-STR
+    row's rate for that group if higher -- the rate actually used for that
+    row (itself possibly fallback-derived), not its observed rate. Rows 0
+    (not a real repeat) and 1 (shortest real-STR bin) have no previous
+    real-STR row and take the fallback as-is; so does a group whose
+    previous row has no opportunity in the fallback (u1 in every real-STR
+    row, u5+ in 2-9bp: no such tracts exist), whose smoothed rate is just
+    the pseudocount's 1/3. Without `fallback`, an all-zero group in
+    real-STR rows 2-4 copies the previous row's rates if that row has any
+    (observed or copied).
     """
-    row_sum = mat.sum(axis=1, keepdims=True)
-    mat_new = (mat + pseudocount) / (row_sum + 11 * pseudocount)
-    if fallback is not None:
-        fb_new = (fallback + pseudocount) / (
-            fallback.sum(axis=1, keepdims=True) + 11 * pseudocount
+    if mat.shape != (5, STR_NCOL):
+        raise ValueError(
+            f"str.txt error profile has shape {mat.shape}, expected (5, {STR_NCOL}) "
+            "(per-repeat-unit columns, DupCaller >= 1.2.12); relearn the error "
+            "profile with this DupCaller version"
         )
-        use_fb = (mat == 0) & (row_sum < FALLBACK_MIN_SITES)
-        use_fb[:, 5] = False
-        for r in range(5):
-            cols = use_fb[r]
-            if not cols.any():
-                continue
-            if r >= 2:
-                mat_new[r, cols] = np.maximum(fb_new[r, cols], mat_new[r - 1, cols])
-            else:
-                mat_new[r, cols] = fb_new[r, cols]
-        return mat_new
-    for r in range(2, 5):
-        if row_sum[r, 0] == 0:
-            mat_new[r, :] = mat_new[r - 1, :]
+    mat_new = np.zeros_like(mat, dtype=float)
+    for g in range(STR_UNIT_GROUPS):
+        cols = slice(g * 3, g * 3 + 3)
+        block = mat[:, cols]
+        row_sum = block.sum(axis=1, keepdims=True)
+        block_new = (block + pseudocount) / (row_sum + 3 * pseudocount)
+        if fallback is not None:
+            fb_block = fallback[:, cols]
+            fb_new = (fb_block + pseudocount) / (
+                fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
+            )
+            use_fb = (block == 0) & (row_sum < FALLBACK_MIN_SITES)
+            # deletion (col 0) / insertion (col 2) only; col 1 is the
+            # opportunity.
+            use_fb[:, 1] = False
+            for r in range(5):
+                fb_cols = use_fb[r]
+                if not fb_cols.any():
+                    continue
+                if r >= 2 and fb_block[r - 1, 1] > 0:
+                    block_new[r, fb_cols] = np.maximum(
+                        fb_new[r, fb_cols], block_new[r - 1, fb_cols]
+                    )
+                else:
+                    block_new[r, fb_cols] = fb_new[r, fb_cols]
+        else:
+            has_rates = row_sum[:, 0] > 0
+            for r in range(2, 5):
+                if not has_rates[r] and has_rates[r - 1]:
+                    block_new[r, :] = block_new[r - 1, :]
+                    has_rates[r] = True
+        mat_new[:, cols] = block_new
     return mat_new
+
+
+def str_profile_is_current(path):
+    """True if an .amp/.dmg.str.txt profile has the per-repeat-unit layout
+    (STR_NCOL columns, DupCaller >= 1.2.12); older profiles have 11."""
+    with open(path) as fh:
+        return len(fh.readline().rstrip("\n").split("\t")) - 1 == STR_NCOL
 
 
 # In a context (trinuc row, hp_len x base group, or STR row) with fewer
@@ -1877,12 +1908,17 @@ def _hp_ref_conditional(rates, fallback_counts, pseudocount):
 
 
 def _str_ref_conditional(rates, fallback_counts, pseudocount):
-    """ref_conditional_error_rates on a normalized (5, 11) str matrix:
-    ref (idLen=0, col 5) = 1 - sum(other 10 columns)."""
-    fb_rates = (fallback_counts + pseudocount) / (
-        fallback_counts.sum(axis=1, keepdims=True) + 11 * pseudocount
-    )
-    return ref_conditional_error_rates(rates, 5, fb_rates)
+    """ref_conditional_error_rates per (STR row, unit group) 3-column group
+    of a normalized (5, 15) str matrix: ref = 1 - deletion - insertion."""
+    out = np.array(rates, dtype=float)
+    for g in range(STR_UNIT_GROUPS):
+        cols = slice(g * 3, g * 3 + 3)
+        fb_block = fallback_counts[:, cols]
+        fb_rates = (fb_block + pseudocount) / (
+            fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
+        )
+        out[:, cols] = ref_conditional_error_rates(out[:, cols], 1, fb_rates)
+    return out
 
 
 def load_error_matrices(params):
@@ -1962,7 +1998,7 @@ def load_error_matrices(params):
 
     if isLearn:
         params["ampmat_hp"] = np.zeros([10, 12])
-        params["ampmat_str"] = np.zeros([5, 11])
+        params["ampmat_str"] = np.zeros([5, STR_NCOL])
     else:
         # amperri_file's prefix, split into the two files funcs/learn.py
         # writes (see Caller.py/Learn.py's write-out).
@@ -2050,7 +2086,7 @@ def load_error_matrices(params):
 
     if isLearn:
         params["dmgmat_hp"] = np.zeros([10, 12])
-        params["dmgmat_str"] = np.zeros([5, 11])
+        params["dmgmat_str"] = np.zeros([5, STR_NCOL])
     else:
         dmgerri_hp_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.hp.txt")
         dmgerri_str_file = params["dmgerri_file"].replace(".dmg.id.txt", ".dmg.str.txt")
@@ -2183,7 +2219,7 @@ def simulate_power_grid(
 
 # depth_by_hpstr's context axis:
 #   0-39   homopolymer: base * 10 + run length (1-10+) - 1
-#   40-71  STR bin 1-4 x indel length 2-5+ x deletion/insertion: slip sites
+#   40-71  STR bin 1-4 x repeat unit 2-5+ x deletion/insertion: slip sites
 #          (depth_hpstr_str_bucket)
 #   72     STR0 1bp (mismatched insertion): every position
 #   73-80  STR0 indel length 2-5+ x deletion/insertion: sites of a non-slip
@@ -2200,13 +2236,14 @@ STR_EEFF_LENGTHS = (2, 3, 4, 5)
 
 
 def _signed_len_offset(indel_len):
-    """Offset of a signed indel length 2-5+ within its 8 buckets: length
-    pairs, deletion first."""
+    """Offset of a signed indel length (STR0) or repeat unit (STR bins 1-4)
+    2-5+ within its 8 buckets: pairs, deletion first."""
     return (min(abs(indel_len), 5) - 2) * 2 + (1 if indel_len > 0 else 0)
 
 
 def depth_hpstr_str_bucket(str_bin, indel_len):
-    """depth_by_hpstr bucket of STR bin 1-4 and signed indel length 2-5+."""
+    """depth_by_hpstr bucket of STR bin 1-4 and signed repeat unit 2-5+
+    (negative: deletion)."""
     return DEPTH_HPSTR_STR_BASE + (str_bin - 1) * 8 + _signed_len_offset(indel_len)
 
 
@@ -2246,18 +2283,20 @@ def indel_eeff_site_masks(
     same span as indel_mask_span.
 
     HP: one site per run, its first base, skipping runs cut by the window
-    edge (hp_repeat_valid). STR(+-k): tract starts whose unit divides k
-    (str_slip_tract), whose tract fits the window (str_repeat_valid), and
-    for a deletion k <= the tract length. STR0(+k): every site (an
-    insertion that isn't copies of the tract's unit can go anywhere).
-    STR0(-k): every deletion site that isn't an STR(-k) slip. The capped 5+
-    length pools 5, 6, 7, ...; it is approximated with k = 5's mask span,
-    every tract start for STR and no left-alignment test.
+    edge (hp_repeat_valid). STR(+-u): tract starts of repeat unit u (any
+    number of units slips, str_slip_tract), whose tract fits the window
+    (str_repeat_valid); a deletion site needs the one-unit deletion's span.
+    STR0(+k): every site (an insertion that isn't copies of the tract's
+    unit can go anywhere). STR0(-k): every deletion site that isn't a slip
+    (a tract start whose unit divides k). The capped 5+ unit/length pools
+    5, 6, 7, ...; it is approximated with k = 5's mask span, every tract
+    start of unit 5+ for STR and no left-alignment test.
 
     str_unit: the STR unit length at each position (0/1 outside an STR);
     str_total_len: the tract length (unit * repeat count).
-    Returns (hp, str_by_len, str0_any, str0_by_len), str_by_len and
-    str0_by_len keyed by signed length +-STR_EEFF_LENGTHS."""
+    Returns (hp, str_by_unit, str0_any, str0_by_len), str_by_unit keyed by
+    signed repeat unit and str0_by_len by signed length, both
+    +-STR_EEFF_LENGTHS."""
     n = antimask_indel.shape[0]
     site_ok = antimask_indel & (ref_int < 4)
     site_ok[1:] &= antimask_indel[:-1]
@@ -2269,16 +2308,15 @@ def indel_eeff_site_masks(
     unit = np.maximum(str_unit, 1)
     # str_length_bin: a tract needs two units to be a repeat.
     str_start = str_cut_bool & is_str & (str_total_len >= 2 * unit)
-    str_by_len = {}
+    str_by_unit = {}
     str0_by_len = {}
     for k in STR_EEFF_LENGTHS:
         end = np.minimum(p + k, n)
         del_ok = site_ok & (p + k <= n) & (masked_before[end] - masked_before[p] == 0)
         if k == STR_EEFF_LENGTHS[-1]:
-            slip_ins = str_start
-            slip_del = str_start & (str_total_len >= k)
-            str_by_len[-k] = slip_del & str_repeat_valid & del_ok
-            str_by_len[k] = slip_ins & str_repeat_valid & site_ok
+            unit_start = str_start & (unit >= k)
+            str_by_unit[-k] = unit_start & str_repeat_valid & del_ok
+            str_by_unit[k] = unit_start & str_repeat_valid & site_ok
             str0_by_len[-k] = del_ok
             str0_by_len[k] = site_ok
             continue
@@ -2289,26 +2327,45 @@ def indel_eeff_site_masks(
         before = np.full(n, -2)
         before[1:] = ref_int[:-1]
         left_aligned = after != before
+        unit_start = str_start & (unit == k)
+        str_by_unit[-k] = unit_start & left_aligned & str_repeat_valid & del_ok
+        str_by_unit[k] = unit_start & str_repeat_valid & site_ok
         unit_divides = str_start & (k % unit == 0)
         slip_del = unit_divides & (str_total_len >= k) & left_aligned
-        str_by_len[-k] = slip_del & str_repeat_valid & del_ok
-        str_by_len[k] = unit_divides & str_repeat_valid & site_ok
         str0_by_len[-k] = del_ok & left_aligned & ~slip_del
         str0_by_len[k] = site_ok
-    return site_ok & hp_repeat_valid & hp_cut_bool, str_by_len, site_ok, str0_by_len
+    return site_ok & hp_repeat_valid & hp_cut_bool, str_by_unit, site_ok, str0_by_len
 
 
-def indel_mu_channel(id_len, hp_len, str_bin, hm, base_char):
+def str_channel_name(str_bin, signed_unit):
+    """Name of an STR mu-solve channel: STR{bin}_u{U}_{del|ins}. U is the
+    repeat unit 2-5 (5 = 5+) in STR bins 1-4 and the indel length 1-5
+    (5 = 5+) in STR0 (not a slip; STR0_u1_ins is the mismatched 1bp
+    insertion)."""
+    sign = "del" if signed_unit < 0 else "ins"
+    return f"STR{str_bin}_u{min(abs(int(signed_unit)), 5)}_{sign}"
+
+
+def parse_str_channel_name(name):
+    """(str_bin, signed unit) of a str_channel_name name."""
+    bin_str, unit_str, sign = name[3:].split("_")
+    unit = int(unit_str[1:])
+    return int(bin_str), -unit if sign == "del" else unit
+
+
+def indel_mu_channel(id_len, hp_len, str_bin, hm, base_char, unit_len=0):
     """Name of the mu-solve channel an indel candidate belongs to, or None
     (an HP-routed 1bp event outside any homopolymer). Same branch selection
-    as genotypeDSIndel/indelErrorProbs: |id_len| >= 2 is STR-context (length
-    capped at +-5); a 1bp mismatched insertion (hm == 0) is STR0_len1;
-    any other 1bp event is HP, pooled by base_char (the deleted or inserted
-    base): "C" for C/G, "T" for A/T."""
+    as genotypeDSIndel/indelErrorProbs: |id_len| >= 2 is STR-context, by
+    the tract's repeat unit unit_len in STR bins 1-4 and by the length in
+    STR0; a 1bp mismatched insertion (hm == 0) is STR0_u1_ins; any other
+    1bp event is HP, pooled by base_char (the deleted or inserted base):
+    "C" for C/G, "T" for A/T."""
     if abs(id_len) >= 2:
-        return f"STR{str_bin}_len{max(-5, min(5, id_len))}"
+        unit = unit_len if str_bin >= 1 else abs(id_len)
+        return str_channel_name(str_bin, unit if id_len > 0 else -unit)
     if hm == 0:
-        return "STR0_len1"
+        return str_channel_name(0, 1)
     if hp_len >= 1:
         pool = "C" if base_char in ("C", "G") else "T"
         return f"HP{hp_len}_len{id_len}_{pool}"
@@ -2365,8 +2422,9 @@ def _channel_eeff_at_threshold(kind, ctx_key):
             )
         return total
     if kind == "str":
-        # str_bin 1-4: STR contexts (whole-unit slips); 0: the mismatched 1bp
-        # insertion channel and the >=2bp indels that aren't a slip of an STR.
+        # str_bin 1-4: STR contexts (whole-unit slips, id_len the signed
+        # repeat unit); 0: the mismatched 1bp insertion channel and the
+        # >=2bp indels that aren't a slip of an STR (id_len the length).
         str_bin, id_len = ctx_key
         if str_bin == 0:
             bucket = depth_hpstr_str0_bucket(id_len)
@@ -2495,6 +2553,8 @@ def refine_channel_task(job):
             ]
         )
         n = len(raw_lr)
+        if not np.isfinite(raw_lr).all():
+            raise ValueError(f"channel {name}: non-finite LR among its mu sites")
         eeff_solve = Eeff0
         if n > Eeff0:
             print(
@@ -2512,7 +2572,9 @@ def refine_channel_task(job):
                 ) / (1.0 - mu)
 
             mu_hi = 1.0 - MU0_UPPER_GAP
-            mu0 = brentq(score, 0.0, mu_hi) if score(mu_hi) < 0 else mu_hi
+            # Relative tolerance only: mu can be ~1e-12, below brentq's
+            # default absolute xtol.
+            mu0 = brentq(score, 0.0, mu_hi, xtol=1e-300) if score(mu_hi) < 0 else mu_hi
     new_threshold = _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr)
     return name, kind, ctx_key, Eeff0, mu0, new_threshold
 

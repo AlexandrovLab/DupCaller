@@ -2,6 +2,8 @@ import numpy as np
 from scipy.stats import poisson_binom
 from .indels import (
     base_codes,
+    str_col,
+    str_event_col,
     str_length_bin,
     str_slip_tract,
     INDEL_ALT,
@@ -462,9 +464,14 @@ def genotypeDSSnv(
 
 
 _RC = [1, 0, 3, 2]
+# str.txt row 0 u1 cells: the mismatched 1bp insertion and its deletion.
+_STR0_INS1 = str_col(1, 1)
+_STR0_DEL1 = str_col(1, -1)
 
 
-def _indel_error_cells(hps, strs, idLen, ref_allele, inserted_base, strs_mut=None):
+def _indel_error_cells(
+    hps, strs, idLen, ref_allele, inserted_base, strs_mut=None, unit_len=0
+):
     """Matrix cells of the two amplification/damage events that matter for
     a candidate indel, each as (matrix, row, col, col_bot) with matrix
     "hp" or "str" and col_bot the bottom-strand (base-complemented) column:
@@ -475,27 +482,29 @@ def _indel_error_cells(hps, strs, idLen, ref_allele, inserted_base, strs_mut=Non
 
     hp rows are run length 1-10+ (rows cap at 10; hps is the uncapped run
     length, so the mutant run of a deletion from an 11+ run is still
-    10+), columns base*3 + (idLen + 1); str rows are STR bins, columns
-    idLen + 5.
+    10+), columns base*3 + (idLen + 1); str rows are STR bins, columns a
+    (deletion, reference, insertion) triple per unit group (str_event_col:
+    the tract's repeat unit unit_len in rows 1-4, the indel length in row
+    0).
       1bp deletion from a run of L: forward = -1 in a run of L; reversion
-        = +1 in a run of L-1, or str row 0 +1 when L == 1 (no run left).
+        = +1 in a run of L-1, or str row 0 u1 insertion when L == 1 (no
+        run left).
       Run-extending 1bp insertion into a run of L: forward = +1 in a run
         of L; reversion = -1 in a run of L+1.
-      Mismatched 1bp insertion of base x: forward = str row 0 +1;
-        reversion = -1 of x as a run of 1 (str row 0 -1 if x is not ACGT).
-      Longer indels: forward = idLen in the reference tract's bin (strs);
-        reversion = -idLen in the mutant tract's bin (strs_mut, default
-        strs when the tract length isn't known, e.g. per-context tables).
+      Mismatched 1bp insertion of base x: forward = str row 0 u1
+        insertion; reversion = -1 of x as a run of 1 (str row 0 u1
+        deletion if x is not ACGT).
+      Longer indels: forward = the indel's sign in the reference tract's
+        bin (strs); reversion = the opposite sign in the mutant tract's bin
+        (strs_mut, default strs when the tract length isn't known, e.g.
+        per-context tables).
     """
     if abs(idLen) >= 2:
         if strs_mut is None:
             strs_mut = strs
-        return ("str", strs_mut, -idLen + 5, -idLen + 5), (
-            "str",
-            strs,
-            idLen + 5,
-            idLen + 5,
-        )
+        col_rev = str_event_col(strs_mut, unit_len, -idLen)
+        col_fwd = str_event_col(strs, unit_len, idLen)
+        return ("str", strs_mut, col_rev, col_rev), ("str", strs, col_fwd, col_fwd)
     L_raw = max(1, int(hps))
     L = min(L_raw, 10)
     if idLen == -1:
@@ -504,18 +513,18 @@ def _indel_error_cells(hps, strs, idLen, ref_allele, inserted_base, strs_mut=Non
         if L_raw >= 2:
             reversion = ("hp", min(L_raw - 1, 10) - 1, b * 3 + 2, _RC[b] * 3 + 2)
         else:
-            reversion = ("str", 0, 6, 6)
+            reversion = ("str", 0, _STR0_INS1, _STR0_INS1)
     elif inserted_base == ref_allele:
         b = ref_allele
         forward = ("hp", L - 1, b * 3 + 2, _RC[b] * 3 + 2)
         reversion = ("hp", min(L_raw + 1, 10) - 1, b * 3 + 0, _RC[b] * 3 + 0)
     else:
-        forward = ("str", 0, 6, 6)
+        forward = ("str", 0, _STR0_INS1, _STR0_INS1)
         x = inserted_base
         if 0 <= x <= 3:
             reversion = ("hp", 0, x * 3 + 0, _RC[x] * 3 + 0)
         else:
-            reversion = ("str", 0, 4, 4)
+            reversion = ("str", 0, _STR0_DEL1, _STR0_DEL1)
     return reversion, forward
 
 
@@ -536,6 +545,7 @@ def indelErrorProbs(
     prob_amp_str,
     prob_dmg_str,
     strs_mut=None,
+    unit_len=0,
 ):
     """Amplification and damage rates for a candidate indel, in the slots
     calculateSSPosterior/calculateDSPosterior expect (same convention as
@@ -545,12 +555,14 @@ def indelErrorProbs(
 
     ref_allele is the reference base at indel_context_index; for 1bp
     insertions, inserted_base == ref_allele selects the run-extending
-    (hp) case, anything else the mismatched (str row 0) case.
+    (hp) case, anything else the mismatched (str row 0) case. unit_len is
+    the repeat unit of the tract a >=2bp indel is a slip of (needed when
+    strs >= 1; per-context tables pass the 1-unit slip's |idLen|).
     """
     if idLen == 0:
         raise ValueError("idLen must be nonzero")
     reversion, forward = _indel_error_cells(
-        hps, strs, idLen, ref_allele, inserted_base, strs_mut
+        hps, strs, idLen, ref_allele, inserted_base, strs_mut, unit_len
     )
     Pamp = _cell_value(reversion, prob_amp_hp, prob_amp_str)
     Pamp_rev = _cell_value(forward, prob_amp_hp, prob_amp_str)
@@ -572,6 +584,7 @@ def indelReversionRate(
     prob_amp_hp,
     prob_amp_str,
     strs_mut=None,
+    unit_len=0,
 ):
     """Per-read probability that a read from a molecule carrying this indel
     shows the reference: the amplification reversion of _indel_error_cells
@@ -580,7 +593,7 @@ def indelReversionRate(
     if prob_amp_hp is None or prob_amp_str is None:
         return np.nan
     reversion, _ = _indel_error_cells(
-        hps, strs, idLen, ref_allele, inserted_base, strs_mut
+        hps, strs, idLen, ref_allele, inserted_base, strs_mut, unit_len
     )
     return float(_cell_value(reversion, prob_amp_hp, prob_amp_str))
 
@@ -667,7 +680,7 @@ def genotypeDSIndel(
 
     m = len(indels_masked)
     if m == 0:  # or m >= 2:
-        return [np.zeros(0)] * 11
+        return [np.zeros(0)] * 12
     n_f1r2 = len(F1R2)
     n_f2r1 = len(F2R1)
     mask_multiallele = np.ones(m, dtype=bool)
@@ -704,6 +717,9 @@ def genotypeDSIndel(
 
     hps = np.zeros(pos_masked.size, dtype=int)
     strs = np.zeros(pos_masked.size, dtype=int)
+    # Repeat unit of the tract a >=2bp indel is a slip of (0: not a slip);
+    # selects the str.txt unit group and the call's STR channel.
+    units = np.zeros(pos_masked.size, dtype=int)
     Pamp = np.zeros(pos_masked.size)
     Pamp_rev = np.zeros(pos_masked.size)
     Pdmg = np.zeros(pos_masked.size)
@@ -741,6 +757,7 @@ def genotypeDSIndel(
         )
         if slip is not None:
             unit_len_here, total_len = slip
+            units[nn] = unit_len_here
             strs[nn] = str_length_bin(unit_len_here, total_len)
             # Mutant tract (reference tract plus the uncapped indel
             # length): its bin holds the reversion rate.
@@ -780,6 +797,7 @@ def genotypeDSIndel(
             prob_amp_str,
             prob_dmg_str,
             strs_mut,
+            units[nn],
         )
         rev_rate[nn] = indelReversionRate(
             hp_run,
@@ -790,6 +808,7 @@ def genotypeDSIndel(
             prob_amp_hp,
             prob_amp_str,
             strs_mut,
+            units[nn],
         )
     ln10 = np.log(10)
     F1R2_alt_prob, F1R2_ref_prob = calculateSSPosterior(
@@ -836,4 +855,5 @@ def genotypeDSIndel(
         f2r1_alt_count[take].astype("int"),
         hp_match_arr[take],
         rev_rate[take],
+        units[take],
     )

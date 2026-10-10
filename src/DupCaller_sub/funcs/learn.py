@@ -1,6 +1,9 @@
 import numpy as np
 from .indels import (
     base_codes,
+    STR_NCOL,
+    STR_REF_COLS,
+    str_event_col,
     str_length_bin,
     str_slip_tract,
     INDEL_ALT,
@@ -87,14 +90,15 @@ def profileTriNucMismatches(
     # hp_alt_count/hp_dmg_count: (10, 12) -- rows hp run length 1-10+
     # (capped), columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}
     # (idLen=0 the reference/opportunity column). str_alt_count/
-    # str_dmg_count: (5, 11) -- rows STR-length bin 0="0-1"/1="2-9"/
-    # 2="10-24"/3="25-39"/4="40+", columns idLen+5 for idLen in -5..5
-    # (idLen=0 the opportunity column). See funcs/prob.py's
-    # indelErrorProbs for the matching selection logic.
+    # str_dmg_count: (5, 15) -- rows STR-length bin 0="0-1"/1="2-9"/
+    # 2="10-24"/3="25-39"/4="40+", columns a (deletion, reference,
+    # insertion) triple per repeat-unit group u1-u5+ (funcs/indels.py's
+    # str_col; each group's reference column is its own opportunity). See
+    # funcs/prob.py's indelErrorProbs for the matching selection logic.
     hp_alt_count = np.zeros([10, 12])
     hp_dmg_count = np.zeros([10, 12])
-    str_alt_count = np.zeros([5, 11])
-    str_dmg_count = np.zeros([5, 11])
+    str_alt_count = np.zeros([5, STR_NCOL])
+    str_dmg_count = np.zeros([5, STR_NCOL])
     # Amp-error BQ histogram (SBS only): raw count per (trinuc, base,
     # base-quality) triple. Mirrors mismatch_profile's (64, 4) shape with
     # a trailing BQ axis. Feeds estimate_sbs_srd_rates below.
@@ -138,10 +142,10 @@ def profileTriNucMismatches(
         return (
             np.zeros([64, 4]),
             np.zeros([10, 12]),
-            np.zeros([5, 11]),
+            np.zeros([5, STR_NCOL]),
             np.zeros([64, 4]),
             np.zeros([10, 12]),
-            np.zeros([5, 11]),
+            np.zeros([5, STR_NCOL]),
             np.zeros([64, 4, NUM_BQ]),
         )
 
@@ -414,10 +418,10 @@ def profileTriNucMismatches(
         return (
             F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,
             np.zeros([10, 12]),
-            np.zeros([5, 11]),
+            np.zeros([5, STR_NCOL]),
             dmg_trinuc_alt_count_mat_norm,
             np.zeros([10, 12]),
-            np.zeros([5, 11]),
+            np.zeros([5, STR_NCOL]),
             sbs_alt_bq_hist,
         )
     # Amp opportunity: each strand gated on its own read count, like the
@@ -454,6 +458,8 @@ def profileTriNucMismatches(
     str_bin_arr[is_str & (total_len >= 25)] = 3
     str_bin_arr[is_str & (total_len >= 40)] = 4
     str_mask = (str_raw[2] == 1) & is_str
+    # Unit group (index 0-4 = u1-u5+) of each tract start's reference column.
+    str_group_arr = np.minimum(np.maximum(unit_len, 1), 5) - 1
 
     hp_rc4 = [1, 0, 3, 2]  # base-complement permutation, 4-wide axis
 
@@ -502,28 +508,31 @@ def profileTriNucMismatches(
         F2R1_opp_antimask, F2R1_inf["hp"].sum(axis=0)
     )
 
-    # STR amp opportunity: repeat start positions, column 5 (idLen=0).
+    # STR amp opportunity: repeat start positions, the reference column of
+    # the tract's unit group.
     def _str_amp_opportunity(strand_antimask, weight):
         sel = strand_antimask & str_mask
-        return np.bincount(str_bin_arr[sel], weights=weight[sel], minlength=5)
+        local = np.zeros([5, 5])
+        np.add.at(local, (str_bin_arr[sel], str_group_arr[sel]), weight[sel])
+        return local
 
-    str_alt_count[:, 5] += _str_amp_opportunity(
+    str_alt_count[:, STR_REF_COLS] += _str_amp_opportunity(
         F1R2_opp_antimask, F1R2_inf["str"].sum(axis=0)
     )
-    str_alt_count[:, 5] += _str_amp_opportunity(
+    str_alt_count[:, STR_REF_COLS] += _str_amp_opportunity(
         F2R1_opp_antimask, F2R1_inf["str"].sum(axis=0)
     )
 
     # STR amp opportunity for row 0 (not a repeat): every unmasked
     # position counts, including STR ones, since a mismatched insertion
-    # can happen anywhere.
+    # can happen anywhere -- the same opportunity in every length group.
     def _str_amp_opportunity_row0(strand_antimask, weight):
         return weight[strand_antimask].sum()
 
-    str_alt_count[0, 5] += _str_amp_opportunity_row0(
+    str_alt_count[0, STR_REF_COLS] += _str_amp_opportunity_row0(
         F1R2_opp_antimask, F1R2_inf["str0"].sum(axis=0)
     )
-    str_alt_count[0, 5] += _str_amp_opportunity_row0(
+    str_alt_count[0, STR_REF_COLS] += _str_amp_opportunity_row0(
         F2R1_opp_antimask, F2R1_inf["str0"].sum(axis=0)
     )
 
@@ -539,11 +548,14 @@ def profileTriNucMismatches(
     hp_dmg_count[:, [1, 4, 7, 10]] += hp_dmg_local + hp_dmg_local[:, hp_rc4]
 
     # STR dmg opportunity: *2 for the two orientations.
-    str_dmg_here = str_bin_arr[dmg_opp_antimask][str_mask[dmg_opp_antimask]]
-    str_dmg_count[:, 5] += np.bincount(str_dmg_here, minlength=5) * 2
+    dmg_str_sel = dmg_opp_antimask & str_mask
+    str_dmg_local = np.zeros([5, 5])
+    np.add.at(str_dmg_local, (str_bin_arr[dmg_str_sel], str_group_arr[dmg_str_sel]), 2)
+    str_dmg_count[:, STR_REF_COLS] += str_dmg_local
 
-    # STR dmg opportunity for row 0: every unmasked position, *2.
-    str_dmg_count[0, 5] += np.count_nonzero(dmg_opp_antimask) * 2
+    # STR dmg opportunity for row 0: every unmasked position, *2, in every
+    # length group.
+    str_dmg_count[0, STR_REF_COLS] += np.count_nonzero(dmg_opp_antimask) * 2
 
     if m == 0:
         return (
@@ -620,29 +632,30 @@ def profileTriNucMismatches(
         """Book an STR-table event (row 0 = not a repeat) at ctx, only where
         the opportunity pass credited ctx: row 0 at every unmasked
         position, rows 1-4 at a tract start. Amp moves the strand's ALT
-        reads credited there out of the idLen=0 column; damage needs the
-        damage pattern (ALT on exactly one strand)."""
+        reads credited there out of the event's group's reference column;
+        damage needs the damage pattern (ALT on exactly one strand)."""
         table = "str" if row >= 1 else "str0"
         ctx_ok = row == 0 or bool(str_mask[ctx])
         if not ctx_ok:
             return
+        ref_col = col - col % 3 + 1
         if (
             F1R2_antimask[mm]
             and F1R2_opp_antimask[ctx]
             and _ref_in_opp(F1R2_is_alt, F1R2_inf, table)
         ):
             str_alt_count[row, col] += F1R2_alt_count[mm]
-            str_alt_count[row, 5] -= _alt_in_opp(F1R2_is_alt, F1R2_inf, table)
+            str_alt_count[row, ref_col] -= _alt_in_opp(F1R2_is_alt, F1R2_inf, table)
         if (
             F2R1_antimask[mm]
             and F2R1_opp_antimask[ctx]
             and _ref_in_opp(F2R1_is_alt, F2R1_inf, table)
         ):
             str_alt_count[row, col] += F2R1_alt_count[mm]
-            str_alt_count[row, 5] -= _alt_in_opp(F2R1_is_alt, F2R1_inf, table)
+            str_alt_count[row, ref_col] -= _alt_in_opp(F2R1_is_alt, F2R1_inf, table)
         if dmg_opp_antimask[ctx] and (F1R2_dmg_antimask[mm] or F2R1_dmg_antimask[mm]):
             str_dmg_count[row, col] += 1
-            str_dmg_count[row, 5] -= 1
+            str_dmg_count[row, ref_col] -= 1
 
     # m == 1 here (m >= 2 and m == 0 returned above).
     for mm, indel in enumerate(indels_masked):
@@ -663,6 +676,7 @@ def profileTriNucMismatches(
             str_raw,
         )
         str_bin_here = 0 if slip is None else str_length_bin(*slip)
+        unit_here = 0 if slip is None else slip[0]
 
         if indelLen > 5:
             indelLen = 5
@@ -728,14 +742,17 @@ def profileTriNucMismatches(
                         hp_dmg_count[row, col_rc] += 1
                         hp_dmg_count[row, opp_col_rc] -= 1
             else:
-                # Mismatched 1bp insertion: str.txt row 0, with the same
-                # opportunity reconciliation as rows 1-4.
-                _book_str_event(0, indelLen + 5, mm)
+                # Mismatched 1bp insertion: str.txt row 0's u1 insertion,
+                # with the same opportunity reconciliation as rows 1-4.
+                _book_str_event(0, str_event_col(0, 0, indelLen), mm)
         else:
             # Length >=2: always STR-context, keyed by this position's
             # real STR-length bin (0 if not actually annotated -- no
-            # hp-length fallback).
-            _book_str_event(str_bin_here, indelLen + 5, mm)
+            # hp-length fallback) and the tract's unit group (any whole
+            # number of units; row 0: the length's group).
+            _book_str_event(
+                str_bin_here, str_event_col(str_bin_here, unit_here, indelLen), mm
+            )
 
     return (
         F1R2_trinuc_alt_count_mat_norm + F2R1_trinuc_alt_count_mat_norm,

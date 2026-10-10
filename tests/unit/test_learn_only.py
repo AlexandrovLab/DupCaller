@@ -63,10 +63,10 @@ def _base_args(tmp_path, bam_path, learn_only):
 def _learn_stage_result():
     mismatch_profile = np.zeros((NUM_TRINUC, 4))
     hp_alt_profile = np.zeros((10, 12), dtype=int)
-    str_alt_profile = np.zeros((5, 11), dtype=int)
+    str_alt_profile = np.zeros((5, 15), dtype=int)
     mismatch_dmg_profile = np.zeros((NUM_TRINUC, 4))
     hp_dmg_profile = np.zeros((10, 12), dtype=int)
-    str_dmg_profile = np.zeros((5, 11), dtype=int)
+    str_dmg_profile = np.zeros((5, 15), dtype=int)
     sbs_alt_bq_hist = np.zeros((NUM_TRINUC, 4, NUM_BQ), dtype=int)
     return (
         mismatch_profile,

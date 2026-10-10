@@ -13,6 +13,7 @@ events the same way:
 import numpy as np
 import pysam
 
+from DupCaller_sub.funcs.indels import str_col
 from DupCaller_sub.funcs.learn import _indel_informative_reads, profileTriNucMismatches
 
 CHROM = "chr1"
@@ -136,9 +137,9 @@ def test_str_damage_needs_an_alt_read():
     family.append(_read("t3", True, end=anchor + 1, ins_after=anchor, ins_base="T"))
     family += [_read(f"b{i}", False) for i in range(3)]
     str_dmg_count = _learn(family)[5]
-    assert str_dmg_count[0, 6] == 0
+    assert str_dmg_count[0, str_col(1, 1)] == 0
     # The opportunity column is the only thing credited.
-    assert str_dmg_count[0, 5] > 0
+    assert str_dmg_count[0, str_col(1, 0)] > 0
 
 
 # ------------------------------------------- STR0 rule and SBS read starts
@@ -198,8 +199,22 @@ def test_whole_unit_str_deletion_is_learned_in_its_bin():
     family.append(_str_read("t3", True, del_at=TRACT_START + 4, del_len=2))
     family += [_str_read(f"b{i}", False) for i in range(3)]
     str_alt_count = _learn_str(family)[2]
-    assert str_alt_count[2, -2 + 5] == 1
-    assert str_alt_count[0, -2 + 5] == 0
+    assert str_alt_count[2, str_col(2, -1)] == 1
+    assert str_alt_count[0, str_col(2, -1)] == 0
+
+
+def test_multi_unit_str_deletion_is_learned_under_its_unit():
+    # Two units (4bp) of (CA)6: the dinucleotide's deletion column, not a
+    # 4bp unit's; the tract's opportunity is the dinucleotide reference.
+    family = [_str_read(f"t{i}", True) for i in range(3)]
+    family.append(_str_read("t3", True, del_at=TRACT_START + 4, del_len=4))
+    family += [_str_read(f"b{i}", False) for i in range(3)]
+    str_alt_count = _learn_str(family)[2]
+    assert str_alt_count[2, str_col(2, -1)] == 1
+    assert str_alt_count[2, str_col(4, -1)] == 0
+    assert str_alt_count[2, str_col(2, 0)] > 0
+    others = [str_col(g, 0) for g in (1, 3, 4, 5)]
+    assert (str_alt_count[2, others] == 0).all()
 
 
 def test_non_unit_str_deletion_is_learned_as_str0():
@@ -208,8 +223,8 @@ def test_non_unit_str_deletion_is_learned_as_str0():
     family.append(_str_read("t3", True, del_at=TRACT_START + 5, del_len=3))
     family += [_str_read(f"b{i}", False) for i in range(3)]
     str_alt_count = _learn_str(family)[2]
-    assert str_alt_count[0, -3 + 5] == 1
-    assert str_alt_count[2, -3 + 5] == 0
+    assert str_alt_count[0, str_col(3, -1)] == 1
+    assert str_alt_count[2, str_col(3, -1)] == 0
 
 
 def _short_str_read(name, is_read1, end):
@@ -251,7 +266,7 @@ def test_no_event_without_a_credited_reference_read():
     family.append(ins)
     family += [_short_str_read(f"b{i}", False, TRACT_START + 8) for i in range(3)]
     str_alt_count = _learn_str(family)[2]
-    assert str_alt_count[2, 2 + 5] == 0
+    assert str_alt_count[2, str_col(2, 1)] == 0
     assert (str_alt_count >= 0).all()
 
 

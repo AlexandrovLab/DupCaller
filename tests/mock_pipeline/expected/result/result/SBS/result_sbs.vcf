@@ -1,6 +1,6 @@
 ##fileformat=VCFv4.2
 ##FILTER=<ID=PASS,Description="All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call">
-##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below threshold, or --skipCoveragePass) is dropped entirely and never appears in the fail vcf unless --rescue is on">
+##FILTER=<ID=masked,Description="Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below its channel's final threshold) is dropped entirely and never appears in the fail vcf unless --rescue is on">
 ##FILTER=<ID=underpowered,Description="Candidate with LR > 0 that failed the FDR-refined per-channel threshold">
 ##FILTER=<ID=zero_LR,Description="Candidate with no evidence for the alt over the ref (log10 LR == 0, e.g. alt and non-alt reads cancelling); reported for completeness, never PASS. A DBS inherits it from either of its own read family's SNVs">
 ##FILTER=<ID=high_nm,Description="Read family failed the NM/blacklist filter -- only reported under --rescue">
@@ -29,6 +29,7 @@
 ##INFO=<ID=TAG1,Number=1,Type=String,Description="Barcode of top strand 5 prime">
 ##INFO=<ID=TAG2,Number=1,Type=String,Description="Barcode of bottom strand 5 prime">
 ##INFO=<ID=SP,Number=1,Type=Integer,Description="Read family reference start position">
+##INFO=<ID=TL,Number=1,Type=Integer,Description="Template length of the read pair (SAM TLEN of the family's first read; negative when that read is the downstream mate)">
 ##INFO=<ID=TN,Number=1,Type=String,Description="trinucleotide context">
 ##INFO=<ID=HP,Number=1,Type=Integer,Description="Homopolymer length. Always 0 for SBS">
 ##INFO=<ID=STR,Number=1,Type=Integer,Description="STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that is not a whole number of the tract's repeat units; 1 = 2-9bp; 2 = 10-24bp; 3 = 25-39bp; 4 = 40bp+. Always 0 for SBS">
@@ -40,5 +41,5 @@
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth at the location">
 ##contig=<ID=mockchr1,length=3200>
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	TUMOR	NORMAL
-mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=11.26744117793127;LM=11.267441472305244;MSP=1,1;TC=3,0,0,0;BC=3,0,0,0;DF=61;DR=33;TAG1=GGC;TAG2=AAG;SP=940;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=2.8431855861902905e-08	AC:RC:DP	2:0:2	0:0:0
-mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=11.26744117793127;LM=11.267441472305244;MSP=1,1;TC=3,0,0,0;BC=3,0,0,0;DF=31;DR=31;TAG1=CGT;TAG2=CAA;SP=970;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=2.8431855861902905e-08	AC:RC:DP	2:0:2	0:0:0
+mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=11.26744117793127;LM=11.267441472305244;MSP=1,1;TC=3,0,0,0;BC=3,0,0,0;DF=61;DR=33;TAG1=GGC;TAG2=AAG;SP=940;TL=200;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=2.8431855861902905e-08	AC:RC:DP	2:0:2	0:0:0
+mockchr1	1001	.	C	A	.	PASS	F1R2=3;F2R1=3;LR=11.26744117793127;LM=11.267441472305244;MSP=1,1;TC=3,0,0,0;BC=3,0,0,0;DF=31;DR=31;TAG1=CGT;TAG2=CAA;SP=970;TL=200;TN=ACT;HP=0;STR=0;SNPM=0;NOISEM=0;FDR=2.8431855861902905e-08	AC:RC:DP	2:0:2	0:0:0
