@@ -1449,8 +1449,9 @@ def do_call(args):
     # threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals args.lfdrThreshold is
     # solved for directly and used unconditionally as this channel's round
     # 2 calling threshold -- see funcs/call.py's _refine_channel. A channel
-    # whose likelihood has no root in (0, 1) gets mu0 = 0 (threshold +inf,
-    # no PASS calls), so there is no exclusion case to handle here.
+    # whose likelihood has no root in (0, 1) gets mu0 = 1/(Eeff+1), whose
+    # threshold no site of its own can reach (no PASS calls), so there is
+    # no exclusion case to handle here.
     #
     # Each channel's Eeff0/mu0/threshold solve is independent of every
     # other channel's, and each Eeff evaluation is a Monte Carlo

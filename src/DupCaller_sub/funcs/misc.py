@@ -2470,8 +2470,8 @@ def _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr=0.0):
     round 2's post-hoc re-filter (no bam rescan) could never recover it
     even if mu0 alone would justify a looser threshold here.
 
-    mu0 == 0 (a channel whose sites' LRs sum to no more than its
-    opportunity, see refine_channel_task, or a -mr table entry of 0) makes
+    mu0 == 0 (a channel with no effective coverage and no sites, see
+    refine_channel_task, or a -mr table entry of 0) makes
     the local-fdr formula's implied LR threshold a division by zero
     (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
     channel, so instead of solving for a finite cutoff, report
@@ -2522,8 +2522,12 @@ def refine_channel_task(job):
     most one root in (0, 1). score(0) = sum(r_i) - Eeff0: when the sites'
     LRs sum to no more than the channel's opportunity, their evidence is
     no more than noise alone gives on average (E[LR] = 1 under the null),
-    the likelihood peaks at mu = 0 and mu0 = 0 (threshold +inf; nothing in
-    the channel can pass at any realistic --lfdrThreshold anyway). Each
+    the likelihood peaks at mu = 0, and mu0 falls back to 1/(Eeff0+1).
+    Its threshold, log10(Eeff0*(1-f)/f), sits above every site's LR when
+    f < 0.5 (each r_i <= sum(r_i) <= Eeff0), so the channel still has no
+    PASS calls but gets finite detection power in the coverage pass. A
+    channel with no effective coverage and no sites gets mu0 = 0
+    (threshold +inf). Each
     site is one covered family-position, so n <= Eeff0 by construction; a
     channel that breaks this (an Eeff/site-set mismatch) is reported and
     solved with Eeff0 raised to n. With n == Eeff0 the score at mu -> 1 is
@@ -2562,8 +2566,10 @@ def refine_channel_task(job):
                 f"{Eeff0:g}; solving its mutation rate with Eeff = {n}"
             )
             eeff_solve = float(n)
-        if n == 0 or raw_lr.sum() <= eeff_solve:
+        if eeff_solve <= 0:
             mu0 = 0.0
+        elif n == 0 or raw_lr.sum() <= eeff_solve:
+            mu0 = 1.0 / (eeff_solve + 1.0)
         else:
 
             def score(mu):

@@ -248,12 +248,33 @@ def test_mu_solve_refuses_non_finite_lr():
         _solve([np.inf, 10.0], 100)
 
 
-def test_mu_solve_no_root_is_zero():
-    # sum(r) <= Eeff: the likelihood peaks at mu = 0.
-    assert _solve(np.array([10.0]), 10) == 0.0
-    assert _solve(np.concatenate([np.full(50, 2.0), np.full(50, 1e-3)]), 1000) == 0.0
-    assert _solve(np.empty(0), 45) == 0.0
+def test_mu_solve_no_root_falls_back_to_one_over_eeff_plus_one():
+    # sum(r) <= Eeff: the likelihood peaks at mu = 0; mu falls back to
+    # 1/(Eeff+1).
+    assert _solve(np.array([10.0]), 10) == pytest.approx(1 / 11)
+    no_root = np.concatenate([np.full(50, 2.0), np.full(50, 1e-3)])
+    assert _solve(no_root, 1000) == pytest.approx(1 / 1001)
+    assert _solve(np.empty(0), 45) == pytest.approx(1 / 46)
+    # No effective coverage and no sites: no rate at all.
     assert _solve(np.empty(0), 0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "raw_lr, eeff",
+    [
+        (np.array([10.0]), 10),
+        (np.concatenate([np.full(50, 2.0), np.full(50, 1e-3)]), 1000),
+        (np.array([1e6 - 1.0, 1e-3]), 1e6),
+    ],
+)
+def test_no_root_fallback_threshold_passes_none_of_its_sites(raw_lr, eeff):
+    # The fallback threshold is log10(Eeff*(1-f)/f), above every LR of a
+    # channel whose LRs sum to no more than Eeff.
+    from DupCaller_sub.funcs.misc import _refine_channel
+
+    threshold = _refine_channel(_solve(raw_lr, eeff), 0.0, 0.05)
+    assert threshold == pytest.approx(np.log10(19 * eeff))
+    assert np.log10(raw_lr).max() < threshold
 
 
 def test_mu_solve_every_opportunity_a_strong_site():
