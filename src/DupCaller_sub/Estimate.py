@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import time
 import h5py
@@ -1616,6 +1617,20 @@ def write_genome_extrapolation(f, point, lb, ub, scale):
     f.write(f"Mutation number per genome 95% upper\t{ub * scale}\n")
 
 
+def call_skipped_coverage_pass(prefix, sample):
+    """True when the call run that wrote prefix used --skipCoveragePass
+    (its _call_params.log), so there is no {sample}_coverage.bed.gz."""
+    path = os.path.join(prefix, f"{sample}_call_params.log")
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        for line in f:
+            key, sep, value = line.strip().partition(":")
+            if sep and key == "skipCoveragePass":
+                return value.strip() == "True"
+    return False
+
+
 def do_estimate(args):
     log_path = args.prefix + "_estimate_params.log"
     with open(log_path, "w") as log:
@@ -2369,96 +2384,108 @@ def do_estimate(args):
             )
             f.write(f"DBS Base Coverage\t{dbs_cov_by_minread[0]}\n")
 
-        # Process unique mutations to extract duplex depths and create allele counts table
-        print("......Processing unique mutations for duplex allele counts.......")
-        coverage_file = f"{prefix}/{sample}_coverage.bed.gz"
-        allele_counts_data = []
+        # A call run with --skipCoveragePass writes no coverage.bed.gz, which
+        # the duplex allele counts and per-gene coverage read per locus.
+        no_coverage_file = call_skipped_coverage_pass(prefix, sample)
+        if no_coverage_file:
+            print("Skipping duplex allele count due to no coverage file.")
+        else:
+            # Process unique mutations to extract duplex depths and create allele counts table
+            print("......Processing unique mutations for duplex allele counts.......")
+            coverage_file = f"{prefix}/{sample}_coverage.bed.gz"
+            allele_counts_data = []
 
-        # Open the coverage file using TabixFile
-        tbx = TabixFile(coverage_file)
+            # Open the coverage file using TabixFile
+            tbx = TabixFile(coverage_file)
 
-        n_unique_muts = len(unique_mutations)
-        allele_counts_progress = {"start": time.time(), "last": time.time()}
-        for i, ((chrom, pos, ref, alt), counts) in enumerate(unique_mutations.items()):
-            log_progress(
-                allele_counts_progress,
-                "Extracting duplex allele counts",
-                i,
-                n_unique_muts,
-                extra=f"{chrom}:{pos}",
-            )
-            duplex_depth = 0
-
-            try:
-                # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov
-                # del_unit ins_unit del_2 del_3 del_4 del_5plus
-                # ins_A ins_T ins_C ins_G ins_len2 ins_len3 ins_len4 ins_len5plus
-                # del_hp ins_hp
-                # Columns 3-6 are per-alt-base L-weighted coverage (floats);
-                # columns 7-22 are power-weighted indel coverage per category
-                # (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py), analogous
-                # to columns 3-6 but for indel calling. Kept as a float
-                # (rounded to 3dp, not int-truncated) since this is a
-                # power-weighted effective depth, not a raw read count --
-                # truncating would silently zero out (and drop, see the
-                # duplex_depth==0 check below) any sub-1.0 but real
-                # single-family site, and bias duplex_vaf's denominator low.
-                alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
-                is_snv = len(ref) == 1 and len(alt) == 1 and alt in alt_col
-                # coverage.bed.gz is keyed at the SNV position, or for an
-                # indel at the base after its anchor (0-based index = POS).
-                query_pos = pos - 1 if is_snv else pos
-                for row in tbx.fetch(chrom, query_pos, query_pos + 1):
-                    parts = row.split("\t")
-                    if len(parts) >= 23:
-                        if is_snv:
-                            # SNV: use the coverage column for this mutation's alt base
-                            duplex_depth = round(float(parts[alt_col[alt]]), 3)
-                        else:
-                            # INDEL: use the single coverage column matching
-                            # this specific event's own category (element 3
-                            # of counts, stashed when this mutation_key was
-                            # first seen above) -- not a sum across all 14,
-                            # which would mix in unrelated categories' coverage.
-                            duplex_depth = round(float(parts[7 + counts[3]]), 3)
-                        break
-                gene_name = "."
-                if args.genebed:
-                    for g in TabixFile(args.genebed).fetch(chrom, pos - 1, pos):
-                        gene_name = g.split("\t")[3].split("_")[0]
-                        break
-
-            except Exception as e:
-                print(f"Warning: Could not query coverage for {chrom}:{pos}: {e}")
-                duplex_depth = 0
-            if duplex_depth == 0:
-                print(
-                    f"duplex depth for location {chrom}:{pos} is 0, skipping the mutation..."
+            n_unique_muts = len(unique_mutations)
+            allele_counts_progress = {"start": time.time(), "last": time.time()}
+            for i, ((chrom, pos, ref, alt), counts) in enumerate(
+                unique_mutations.items()
+            ):
+                log_progress(
+                    allele_counts_progress,
+                    "Extracting duplex allele counts",
+                    i,
+                    n_unique_muts,
+                    extra=f"{chrom}:{pos}",
                 )
-                continue
-            allele_counts_data.append(
-                {
-                    "chromosome": chrom,
-                    "position_start": pos,
-                    "ref": ref,
-                    "alt": alt,
-                    "count": counts[0],
-                    "duplex_depth": duplex_depth,
-                    "bam_alt_count": counts[1],
-                    "bam_depth": counts[2],
-                    "duplex_vaf": float(counts[0]) / float(duplex_depth),
-                    "bam_vaf": float(counts[1]) / float(counts[2]),
-                    "gene": gene_name,
-                }
-            )
-        tbx.close()
+                duplex_depth = 0
 
-        # Create DataFrame and write to file
-        allele_counts_df = pd.DataFrame(allele_counts_data)
-        allele_counts_file = args.prefix + "/" + sample + "_duplex_allele_counts.txt"
-        allele_counts_df.to_csv(allele_counts_file, sep="\t", index=False)
-        print(f"Duplex allele counts written to: {allele_counts_file}")
-        if args.genebed:
+                try:
+                    # Coverage bed format: chrom start end A_cov T_cov C_cov G_cov
+                    # del_unit ins_unit del_2 del_3 del_4 del_5plus
+                    # ins_A ins_T ins_C ins_G ins_len2 ins_len3 ins_len4 ins_len5plus
+                    # del_hp ins_hp
+                    # Columns 3-6 are per-alt-base L-weighted coverage (floats);
+                    # columns 7-22 are power-weighted indel coverage per category
+                    # (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py), analogous
+                    # to columns 3-6 but for indel calling. Kept as a float
+                    # (rounded to 3dp, not int-truncated) since this is a
+                    # power-weighted effective depth, not a raw read count --
+                    # truncating would silently zero out (and drop, see the
+                    # duplex_depth==0 check below) any sub-1.0 but real
+                    # single-family site, and bias duplex_vaf's denominator low.
+                    alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
+                    is_snv = len(ref) == 1 and len(alt) == 1 and alt in alt_col
+                    # coverage.bed.gz is keyed at the SNV position, or for an
+                    # indel at the base after its anchor (0-based index = POS).
+                    query_pos = pos - 1 if is_snv else pos
+                    for row in tbx.fetch(chrom, query_pos, query_pos + 1):
+                        parts = row.split("\t")
+                        if len(parts) >= 23:
+                            if is_snv:
+                                # SNV: use the coverage column for this mutation's alt base
+                                duplex_depth = round(float(parts[alt_col[alt]]), 3)
+                            else:
+                                # INDEL: use the single coverage column matching
+                                # this specific event's own category (element 3
+                                # of counts, stashed when this mutation_key was
+                                # first seen above) -- not a sum across all 14,
+                                # which would mix in unrelated categories' coverage.
+                                duplex_depth = round(float(parts[7 + counts[3]]), 3)
+                            break
+                    gene_name = "."
+                    if args.genebed:
+                        for g in TabixFile(args.genebed).fetch(chrom, pos - 1, pos):
+                            gene_name = g.split("\t")[3].split("_")[0]
+                            break
+
+                except Exception as e:
+                    print(f"Warning: Could not query coverage for {chrom}:{pos}: {e}")
+                    duplex_depth = 0
+                if duplex_depth == 0:
+                    print(
+                        f"duplex depth for location {chrom}:{pos} is 0, skipping the mutation..."
+                    )
+                    continue
+                allele_counts_data.append(
+                    {
+                        "chromosome": chrom,
+                        "position_start": pos,
+                        "ref": ref,
+                        "alt": alt,
+                        "count": counts[0],
+                        "duplex_depth": duplex_depth,
+                        "bam_alt_count": counts[1],
+                        "bam_depth": counts[2],
+                        "duplex_vaf": float(counts[0]) / float(duplex_depth),
+                        "bam_vaf": float(counts[1]) / float(counts[2]),
+                        "gene": gene_name,
+                    }
+                )
+            tbx.close()
+
+            # Create DataFrame and write to file
+            allele_counts_df = pd.DataFrame(allele_counts_data)
+            allele_counts_file = (
+                args.prefix + "/" + sample + "_duplex_allele_counts.txt"
+            )
+            allele_counts_df.to_csv(allele_counts_file, sep="\t", index=False)
+            print(f"Duplex allele counts written to: {allele_counts_file}")
+        if args.genebed and no_coverage_file:
+            print("Skipping per-gene duplex coverage due to no coverage file.")
+        elif args.genebed:
             print(f"Calculating per-gene duplex coverage")
             gene_sbs_cov = dict()
             gene_indel_cov = dict()
@@ -2514,6 +2541,12 @@ def do_estimate(args):
             sample = prefix.split("/")[-2]
         else:
             sample = prefix.split("/")[-1]
+        if call_skipped_coverage_pass(prefix, sample):
+            print(
+                "Error: -rb/--reestimatebed needs the per-locus coverage.bed.gz, "
+                "which call --skipCoveragePass does not write."
+            )
+            sys.exit(1)
         sbs_dir, indel_dir, dbs_dir = _ensure_type_subdirs(prefix)
         tn_int = h5py.File(args.reference + ".tn.h5", "r")
         # trinuc_sbs_cov_64[t, b]: L-weighted coverage for raw (un-folded)

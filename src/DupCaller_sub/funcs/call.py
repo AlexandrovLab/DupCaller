@@ -68,6 +68,12 @@ from .misc import (
     _drain_rugged_pool,
 )
 from .indels import findIndels, indel_mask_span
+from .power_tally import (
+    PowerTally,
+    contract_power_tally,
+    indel_keys,
+    sbs_power_index,
+)
 
 
 def prepare_reference_mats(
@@ -259,6 +265,8 @@ def _process_duplex_family(
     unmasked_coverage_indel_cat,
     neg_lr_sbs=None,
     neg_lr_indel=None,
+    power_tally=None,
+    coverage_totals=None,
 ):
     """Genotype and record one candidate duplex family, mutating the
     caller's per-process accumulators (coverage, indel100, VCF-record
@@ -633,6 +641,15 @@ def _process_duplex_family(
             params,
             L,
         )
+        if power_tally is not None:
+            # Where cov_mat would hold L[n_top, n_bot, trinuc] (see
+            # genotypeDSSnv), that L index.
+            sbs_pidx = sbs_power_index(
+                F1R2_count,
+                F2R1_count,
+                trinuc_np[start_ind:end_ind],
+                unmasked_antimask,
+            )
         # Per-position indel category coverage (del_unit, del_2,
         # del_3, del_4, del_5plus, ins_unit, ins_2, ins_3, ins_4,
         # ins_5plus): look up detection power from the
@@ -994,6 +1011,25 @@ def _process_duplex_family(
                     cov_mat_indel[:, 6 + b],
                     np.ones(window_len, dtype=bool),
                 )
+            if power_tally is not None:
+                indel_tally_keys = indel_keys(
+                    n_top_indel,
+                    n_bot_indel,
+                    hp_run_power,
+                    ref_allele_safe,
+                    hp_run_capped10,
+                    hp_repeat_valid,
+                    hp_cut_bool,
+                    is_real_str_row,
+                    str_repeat_valid,
+                    str_cut_bool,
+                    str_bin_row,
+                    str_unit_row,
+                    str_repeat_row,
+                    antimask_indel,
+                    next_ref_arr,
+                    next_ref_valid,
+                )
         ref_int = ref_np[start_ind:end_ind]
         n_win = ref_int.size
         # No CS-based prefilter -- every genotyped candidate
@@ -1177,12 +1213,19 @@ def _process_duplex_family(
             duplex_read_num_dict_dbs[duplex_no] += _compute_dbs_opportunity(
                 cov_mat, ref_int, pass_bool
             )
+            if power_tally is not None:
+                power_tally.add_sbs(
+                    duplex_no, sbs_pidx, pass_bool, unmasked_pass_bool, ref_int
+                )
 
             # Update unmasked coverage and trinuc counts (includes all passing sites)
 
             unmasked_coverage[start_ind:end_ind][unmasked_pass_bool] += cov_mat[
                 unmasked_pass_bool
             ]
+            if coverage_totals is not None:
+                coverage_totals[0] += cov_mat[pass_bool].sum()
+                coverage_totals[1] += cov_mat[unmasked_pass_bool].sum()
             if pass_bool.any():
                 duplex_read_num_dict[duplex_no][0] += 1
             if not isLearn:
@@ -1193,6 +1236,8 @@ def _process_duplex_family(
                     unmasked_antimask_indel
                 ] += cov_mat_indel[unmasked_antimask_indel]
                 duplex_read_num_dict_indel[duplex_no] += indel100
+                if power_tally is not None:
+                    power_tally.add_indel(duplex_no, indel_tally_keys)
                 # Read-family depth-composition totals (see the
                 # matching block earlier in this function for the
                 # full explanation).
@@ -1353,6 +1398,430 @@ def _coverage_window_rows(leftovers, leftover_gstart, window_start):
     )
 
 
+def _early_deferred_depth(records, tumorBam, normalBams, params, extract, indel):
+    """--skipCoveragePass: there is no round 2 to depth-extract Caller.py's
+    deferred set (masked candidates whose raw LR clears their channel's
+    final threshold), so round 1 extracts every masked candidate that could
+    join it -- raw LR >= --minLR, which every final threshold is at least --
+    the way round 2's eligible branch would, and keeps the result aside in
+    the record's "deferred_depth" (samples, filter). Caller.py applies it to
+    the keys that end up deferred, as it merges round 2's records. A record
+    round 2 would drop (indel ni > 0) gets no "deferred_depth"."""
+    floor = params.get("minLR", 0.0)
+    keys = {}
+    for mut in records:
+        infos = mut["infos"]
+        if (
+            mut["filter"] == "masked"
+            and infos["LR"] >= floor
+            and (infos.get("NOISEM") or (not indel and infos.get("SNPM")))
+        ):
+            keys[(mut["chrom"], mut["pos"], mut["ref"], mut["alt"])] = None
+    if not keys:
+        return
+    barcodes = {}
+    for mut in records:
+        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if key in keys:
+            _collect_call_barcode(barcodes, key, mut)
+    key_list = list(keys)
+    tumor = extract(
+        tumorBam, key_list, params, minbq=params["minBq"], call_barcodes=barcodes
+    )
+    normals = (
+        [extract(nb, key_list, params, minbq=params["minBq"]) for nb in normalBams]
+        if normalBams
+        else []
+    )
+    for mut in records:
+        key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
+        if key not in keys:
+            continue
+        ta, tr, ti, tdp = tumor.get(key, (0, 0, 0, 0))
+        na = nr = ni = ndp = 0
+        for depths in normals:
+            na_now, nr_now, ni_now, ndp_now = depths.get(key, (0, 0, 0, 0))
+            na += na_now
+            nr += nr_now
+            ni += ni_now
+            ndp += ndp_now
+        flt = mut["filter"]
+        if ta == 0:
+            flt = "no_good_alt_read"
+        elif ta / tdp > params["maxAF"]:
+            flt = "duplex_vaf"
+        elif normalBams:
+            if ndp < params["minNdepth"]:
+                flt = "n_cov_mask"
+            elif na / ndp > params["normalVAF"]:
+                flt = "normal_vaf"
+            elif indel and ni > 0:
+                continue
+        mut["deferred_depth"] = ([[ta, tr, tdp], [na, nr, ndp]], flt)
+
+
+def sample_power_quals(tumorBam, regions, min_bq, max_reads=1000):
+    """Base qualities (>= min_bq) of the first max_reads mapped reads in
+    regions: the quality distribution simulate_power_grid draws from when
+    build_power_tables builds a worker's detection-power tables. [30] when
+    no read has a usable quality."""
+    all_quals = []
+    reads_sampled = 0
+    for region in regions:
+        for read in tumorBam.fetch(*region):
+            if not read.is_unmapped and read.query_alignment_qualities is not None:
+                quals = np.array(read.query_alignment_qualities, dtype=float)
+                valid_quals = quals[quals >= min_bq]
+                all_quals.extend(valid_quals.tolist())
+                reads_sampled += 1
+                if reads_sampled >= max_reads:
+                    break
+        if reads_sampled >= max_reads:
+            break
+    if not all_quals:
+        all_quals = [30]
+    return np.array(all_quals, dtype=float)
+
+
+def build_power_tables(params, all_quals, build=True):
+    """Per-(trinuc, alt) SBS calling thresholds (pcutoff_sbs, also stored in
+    params["pcutoff_sbs"]) and the detection-power tables L (SBS),
+    L_indel_1bp and L_indel_len (indels; None in learn mode) at params'
+    thresholds, including any per-channel overrides. With build=False the
+    power tables are left all-zero (round 1). Used by callBam and by
+    Caller.py's --skipCoveragePass contraction of round 1's power tallies,
+    which rebuilds each worker's tables from that worker's own all_quals.
+    """
+    pcut = params["pcutoff"]
+    isLearn = params.get("isLearn", False)
+    base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
+    num2trinuc = params["num2trinuc_list"]
+    # Build 10x10x64x4 LR lookup matrix L for coverage/power calculation.
+    # Axis 0: top strand (F1R2) read count 0-9
+    # Axis 1: bottom strand (F2R1) read count 0-9
+    # Axis 2: trinuc context index 0-63
+    # Axis 3: converted (alt) base index 0-3 (A/T/C/G)
+    # Only ever populated (via simulate_power_grid, below) when build is
+    # set (coverage_only mode, or Caller.py's --skipCoveragePass contraction
+    # of round 1's power tallies) -- round-1/genotyping mode leaves this
+    # all-zero, which is fine since genotypeDSSnv treats it exactly like
+    # L=None (cov_mat stays 0, see prob.py) and round 1 doesn't write
+    # coverage.bed at all.
+    L = np.zeros([10, 10, 64, 4])
+
+    prob_amp_mat_L = params["ampmat"]
+    prob_amp_mat_rev_L = params["ampmat_rev"]
+    prob_dmg_t_L = params["dmgmat_top"]
+    prob_dmg_rev_t_L = params["dmgmat_rev_top"]
+    prob_dmg_b_L = params["dmgmat_bot"]
+    prob_dmg_rev_b_L = params["dmgmat_rev_bot"]
+    trinuc_conv_np_L = params["trinuc_convert"]
+    N_SIM = 100
+    # Each simulate_power_grid call below derives its own RNG fresh from
+    # (params["seed"], threshold) via threshold_rng instead of sharing one
+    # live generator across every context/threshold this call processes --
+    # see threshold_rng's docstring for why a shared, order-dependent RNG
+    # broke reproducibility across different -p thread counts.
+    base_seed_L = params["seed"]
+
+    # Per-(trinuc context, alt base) SBS calling threshold: max(pcutoff,
+    # maxLR), where maxLR = log10(1-Pdmg_t) + log10(1-Pdmg_b)
+    # - log10(Pdmg_rev_t) - log10(Pdmg_rev_b) is the theoretical ceiling of
+    # LR_masked for that SBS type (same formula as genotypeDSSnv's
+    # LR_max/"LM" INFO field, here evaluated once per context instead of
+    # once per called family, since Pdmg_t/Pdmg_rev_t/Pdmg_b/Pdmg_rev_b
+    # only depend on context, never on read depth). Contexts t and
+    # (t+32)%64 with alt bases b and b^1 are always exact reverse
+    # complements (see build_trinuc64_order), and dmgmat_bot/
+    # dmgmat_rev_bot are themselves built from dmgmat_top/dmgmat_rev_top
+    # via that same reverse-complement mapping, so maxLR at an RC pair is
+    # always identical -- only the canonical (t<32) half needs computing;
+    # the other half is filled in by mirroring.
+    pcutoff_sbs = np.full((64, 4), pcut, dtype=float)
+    for t_ctx in range(32):
+        ref_base_idx_ctx = base2num[num2trinuc[t_ctx][1]]
+        for b_ctx in range(4):
+            if b_ctx == ref_base_idx_ctx:
+                continue
+            tc_ctx = int(trinuc_conv_np_L[t_ctx, b_ctx])
+            Pdmg_t_ctx = prob_dmg_t_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_rev_t_ctx = prob_dmg_rev_t_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_b_ctx = prob_dmg_b_L[tc_ctx, ref_base_idx_ctx]
+            Pdmg_rev_b_ctx = prob_dmg_rev_b_L[tc_ctx, ref_base_idx_ctx]
+            if Pdmg_t_ctx == 0:
+                Pdmg_t_ctx = 1e-9
+            if Pdmg_rev_t_ctx == 0:
+                Pdmg_rev_t_ctx = 1e-9
+            if Pdmg_b_ctx == 0:
+                Pdmg_b_ctx = 1e-9
+            if Pdmg_rev_b_ctx == 0:
+                Pdmg_rev_b_ctx = 1e-9
+            maxLR_ctx = (
+                np.log10(1 - Pdmg_t_ctx)
+                + np.log10(1 - Pdmg_b_ctx)
+                - np.log10(Pdmg_rev_t_ctx)
+                - np.log10(Pdmg_rev_b_ctx)
+            )
+            chosen_threshold = min(pcut, maxLR_ctx)
+            pcutoff_sbs[t_ctx, b_ctx] = chosen_threshold
+            pcutoff_sbs[t_ctx + 32, b_ctx ^ 1] = chosen_threshold
+    # Per-channel FDR-driven threshold overrides (Caller.py's post-hoc
+    # per-channel refinement), keyed by raw (trinuc, alt) index pairs --
+    # applied after the maxLR ceiling above so a rerun restricted to a
+    # handful of adjusted channels only touches L at those (t, b) cells,
+    # leaving every other cell's power table exactly as the full run built
+    # it. Absent (the normal, non-rerun path) for every other caller.
+    for (t_ov, b_ov), new_threshold in params.get("pcutoff_sbs_override", {}).items():
+        pcutoff_sbs[t_ov, b_ov] = new_threshold
+    params["pcutoff_sbs"] = pcutoff_sbs
+
+    if build:
+        for t in range(64):
+            ref_base_idx_L = base2num[num2trinuc[t][1]]
+            for b in range(4):
+                if b == ref_base_idx_L:
+                    # A base "changing" to itself isn't a mutation
+                    # opportunity; leave L[:, :, t, ref_base_idx_L] at its
+                    # zero-initialized value instead of simulating a
+                    # self-to-self detection power.
+                    continue
+                tc = int(trinuc_conv_np_L[t, b])
+                L[:, :, t, b] = simulate_power_grid(
+                    prob_amp_mat_L[tc, ref_base_idx_L],
+                    prob_amp_mat_rev_L[tc, ref_base_idx_L],
+                    prob_dmg_t_L[tc, ref_base_idx_L],
+                    prob_dmg_rev_t_L[tc, ref_base_idx_L],
+                    prob_dmg_b_L[tc, ref_base_idx_L],
+                    prob_dmg_rev_b_L[tc, ref_base_idx_L],
+                    pcutoff_sbs[t, b],
+                    all_quals,
+                    threshold_rng(base_seed_L, pcutoff_sbs[t, b]),
+                    N_SIM,
+                )
+
+    # Build indel detection-power tables, analogous to L above but for indel
+    # calling. genotypeDSIndel classifies each candidate indel by repeat
+    # context (hps: homopolymer run length; strs: STR bin 0-4, 0 = not a
+    # whole-unit slip of an STR) and indel length (idLen), then selects
+    # Pamp/Pdmg via indelErrorProbs.
+    # These tables simulate that same selection across every (top count,
+    # bottom count) combination and precompute the fraction of simulations
+    # that would clear indel calling's per-context pcutoffi threshold, so
+    # per-position indel coverage can be looked up by depth+context instead
+    # of re-simulated. Only built outside learn mode: ampmat_indel/
+    # dmgmat_indel (and pcutoffi-driven calling) aren't used in learn mode.
+    # Defaults for isLearn mode, where neither table is built below --
+    # kept as None (rather than omitted) so callBam's return signature is
+    # identical in both modes.
+    L_indel_1bp = None
+    L_indel_len = None
+    if not isLearn:
+        prob_amp_hp_L = params["ampmat_hp"]
+        prob_dmg_hp_L = params["dmgmat_hp"]
+        prob_amp_str_L = params["ampmat_str"]
+        prob_dmg_str_L = params["dmgmat_str"]
+        pcutoffi_L = params["pcutoffi"]
+        min_lr_L = params.get("minLR", 0.0)
+
+        def indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c):
+            # Uniform default cutoff, capped per-context by the theoretical
+            # ceiling of masked LR for that context (same formula as
+            # genotypeDSSnv's LR_max/"LM" field -- see indelMaxLR), mirroring
+            # pcutoff_sbs's min(pcut, maxLR_ctx) treatment above. Only used
+            # for the coverage pass's power tables, for contexts without a
+            # channel threshold, so it takes the same --minLR floor as
+            # Caller.py's calling cutoff for those contexts.
+            return max(
+                min_lr_L,
+                min(
+                    pcutoffi_L,
+                    float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c)),
+                ),
+            )
+
+        def simulateIndelPowerGrid(
+            Pamp_c,
+            Pamp_rev_c,
+            Pdmg_c,
+            Pdmg_rev_c,
+            Pdmg_bot_c,
+            Pdmg_rev_bot_c,
+            threshold,
+        ):
+            return simulate_power_grid(
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+                threshold,
+                all_quals,
+                threshold_rng(base_seed_L, threshold),
+                N_SIM,
+            )
+
+        # 1bp indels (deletion/insertion of a homopolymer's repeat unit):
+        # axes are top count, bottom count, hps (0-11: run length, 11 = 11+;
+        # a deletion from an 11+ run reverts as 10+, one from a run of
+        # exactly 10 as 9 -- see _indel_error_cells), ref_allele
+        # (0-3), sign (0=deletion idLen=-1, 1=insertion idLen=+1).
+        # inserted_base is passed equal to ref_allele_c throughout -- this
+        # grid represents the true same-base homopolymer-extension
+        # opportunity at a position with this (hps, ref_allele) context
+        # (what genotypeDSIndel/depth_by_hpstr's base axis actually means),
+        # not an arbitrary mismatched-base scenario. A mismatched 1bp
+        # insertion (str.txt row 0) has no per-(hps, base) coverage grid of
+        # its own -- known gap, see funcs/call.py's indelErrorProbs
+        # docstring and Caller.py's channel job-building for the same
+        # scoping note; such candidates still get scored correctly by
+        # genotypeDSIndel, they just don't get an FDR-refined threshold.
+        L_indel_1bp = np.zeros([10, 10, 12, 4, 2])
+        indel_1bp_threshold_override = params.get("indel_1bp_threshold_override", {})
+        if build:
+            for hps_c in range(12):
+                for ref_allele_c in range(4):
+                    for sign_idx, idLen_c in enumerate((-1, 1)):
+                        (
+                            Pamp_c,
+                            Pamp_rev_c,
+                            Pdmg_c,
+                            Pdmg_rev_c,
+                            Pdmg_bot_c,
+                            Pdmg_rev_bot_c,
+                        ) = indelErrorProbs(
+                            hps_c,
+                            0,
+                            idLen_c,
+                            ref_allele_c,
+                            ref_allele_c,
+                            prob_amp_hp_L,
+                            prob_dmg_hp_L,
+                            prob_amp_str_L,
+                            prob_dmg_str_L,
+                        )
+                        # Per-(hp length, sign, base pool) FDR-driven
+                        # override, same idea as pcutoff_sbs_override
+                        # above; falls back to the per-context threshold
+                        # when absent. Pool ("C"=C/G, "T"=A/T) matches
+                        # Caller.py's raw_lr_hp accumulation -- base2num
+                        # order A,T,C,G, so ref_allele_c in (2,3) is "C".
+                        pool_c = "C" if ref_allele_c in (2, 3) else "T"
+                        # Channels stop at HP10 (10+).
+                        threshold = indel_1bp_threshold_override.get(
+                            (min(hps_c, 10), sign_idx, pool_c),
+                            indelContextThreshold(
+                                Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
+                            ),
+                        )
+                        L_indel_1bp[
+                            :, :, hps_c, ref_allele_c, sign_idx
+                        ] = simulateIndelPowerGrid(
+                            Pamp_c,
+                            Pamp_rev_c,
+                            Pdmg_c,
+                            Pdmg_rev_c,
+                            Pdmg_bot_c,
+                            Pdmg_rev_bot_c,
+                            threshold,
+                        )
+
+        # Length-bin indels (raw length 2/3/4/5+, either direction): axes
+        # are top count, bottom count, STR-length-bin row (0="0-1"/not a
+        # real repeat through 4="40+"), idLen+5. Always STR-context -- a
+        # length>=2 indel outside an annotated repeat is row 0, so this is
+        # a single loop over all 5 str.txt rows.
+        L_indel_len = np.zeros([10, 10, 5, 11])
+        len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
+        indel_len_threshold_override = params.get("indel_len_threshold_override", {})
+        if build:
+            for strs_c in range(5):
+                for idLen_c in len_idLens:
+                    (
+                        Pamp_c,
+                        Pamp_rev_c,
+                        Pdmg_c,
+                        Pdmg_rev_c,
+                        Pdmg_bot_c,
+                        Pdmg_rev_bot_c,
+                    ) = indelErrorProbs(
+                        1,
+                        strs_c,
+                        idLen_c,
+                        0,
+                        0,
+                        prob_amp_hp_L,
+                        prob_dmg_hp_L,
+                        prob_amp_str_L,
+                        prob_dmg_str_L,
+                    )
+                    threshold = indel_len_threshold_override.get(
+                        (strs_c, idLen_c),
+                        indelContextThreshold(
+                            Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
+                        ),
+                    )
+                    L_indel_len[:, :, strs_c, idLen_c + 5] = simulateIndelPowerGrid(
+                        Pamp_c,
+                        Pamp_rev_c,
+                        Pdmg_c,
+                        Pdmg_rev_c,
+                        Pdmg_bot_c,
+                        Pdmg_rev_bot_c,
+                        threshold,
+                    )
+            # Row 0 ("not a real repeat") at idLen=+1 specifically: the
+            # mismatched-insertion background scenario (str.txt row 0's
+            # only real column), needed below for the "Insertion A/T/C/G"
+            # coverage columns -- a *novel* insertion (next reference base
+            # != the inserted base, i.e. not a repeat extension; see that
+            # code's own comment), which is exactly the row-0/mismatch
+            # context, not the hp.txt/matching one L_indel_1bp represents.
+            # Not part of len_idLens above since every other +-1bp
+            # scenario is HP-context, handled by L_indel_1bp instead.
+            (
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+            ) = indelErrorProbs(
+                1,
+                0,
+                1,
+                0,
+                1,
+                prob_amp_hp_L,
+                prob_dmg_hp_L,
+                prob_amp_str_L,
+                prob_dmg_str_L,
+            )
+            threshold = indel_len_threshold_override.get(
+                (0, 1),
+                indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c),
+            )
+            L_indel_len[:, :, 0, 6] = simulateIndelPowerGrid(
+                Pamp_c,
+                Pamp_rev_c,
+                Pdmg_c,
+                Pdmg_rev_c,
+                Pdmg_bot_c,
+                Pdmg_rev_bot_c,
+                threshold,
+            )
+    return pcutoff_sbs, L, L_indel_1bp, L_indel_len
+
+
+def contract_worker_tally(params, summary):
+    """--skipCoveragePass: one round-1 worker's power tallies contracted with
+    the power tables round 2 would have built for it -- same thresholds
+    (params' per-channel overrides), seed and quality sample. Returns
+    contract_power_tally's (trinuc, indel, dbs, coverage, unmasked)."""
+    _, L, L_indel_1bp, L_indel_len = build_power_tables(params.copy(), summary["quals"])
+    return contract_power_tally(summary, L, L_indel_1bp, L_indel_len)
+
+
 def callBam(params, processNo):
     # Get parameters
     bam = params["tumorBam"]
@@ -1495,9 +1964,13 @@ def callBam(params, processNo):
     num2trinuc = params["num2trinuc_list"]
     # Initialize
 
-    total_coverage = np.zeros(4)
+    # SNV coverage totals (masked, unmasked), added as each family's
+    # coverage is accumulated rather than at the coverage.bed flush, which
+    # skips positions with no masked SNV or indel coverage (noise-masked-only
+    # positions) -- the same totals the by-duplex-group tables and
+    # --skipCoveragePass's power tallies count.
+    coverage_totals = np.zeros(2)
     total_coverage_indel_cat = np.zeros(16)
-    total_unmasked_coverage = np.zeros(4)
     total_unmasked_coverage_indel_cat = np.zeros(16)
     # Read-family depth-composition totals: depth_mat[top_count, bot_count,
     # category] = number of passing loci with that exact (F1R2, F2R1) count
@@ -1589,342 +2062,20 @@ def callBam(params, processNo):
         print(
             f"Process {str(processNo)}: finished screening highly damaged reads in {currentTime: .2f} minutes. Blacklisted {len(read_blacklist)} ({percent_blocked: .2f}%) possible highly damaged read and started variant calling."
         )
-    # Build 10x10x64x4 LR lookup matrix L for coverage/power calculation.
-    # Axis 0: top strand (F1R2) read count 0-9
-    # Axis 1: bottom strand (F2R1) read count 0-9
-    # Axis 2: trinuc context index 0-63
-    # Axis 3: converted (alt) base index 0-3 (A/T/C/G)
-    # Only ever populated (via simulate_power_grid, below) in coverage_only
-    # mode -- round-1/genotyping mode leaves this all-zero, which is fine
-    # since genotypeDSSnv treats it exactly like L=None (cov_mat stays 0,
-    # see prob.py) and round 1 doesn't write coverage.bed at all.
     coverage_only = params.get("coverage_only", False)
-    L = np.zeros([10, 10, 64, 4])
-
-    # Sample base quality distribution from the BAM regions -- only needed
-    # to feed simulate_power_grid below, so skip entirely outside
-    # coverage_only mode.
-    all_quals = []
-    if coverage_only:
-        reads_sampled = 0
-        max_qual_reads = 1000
-        for region in regions:
-            for read in tumorBam.fetch(*region):
-                if not read.is_unmapped and read.query_alignment_qualities is not None:
-                    quals = np.array(read.query_alignment_qualities, dtype=float)
-                    valid_quals = quals[quals >= params["minBq"]]
-                    all_quals.extend(valid_quals.tolist())
-                    reads_sampled += 1
-                    if reads_sampled >= max_qual_reads:
-                        break
-            if reads_sampled >= max_qual_reads:
-                break
-    if not all_quals:
-        all_quals = [30]
-    all_quals = np.array(all_quals, dtype=float)
-
-    prob_amp_mat_L = params["ampmat"]
-    prob_amp_mat_rev_L = params["ampmat_rev"]
-    prob_dmg_t_L = params["dmgmat_top"]
-    prob_dmg_rev_t_L = params["dmgmat_rev_top"]
-    prob_dmg_b_L = params["dmgmat_bot"]
-    prob_dmg_rev_b_L = params["dmgmat_rev_bot"]
-    trinuc_conv_np_L = params["trinuc_convert"]
-    N_SIM = 100
-    # Each simulate_power_grid call below derives its own RNG fresh from
-    # (params["seed"], threshold) via threshold_rng instead of sharing one
-    # live generator across every context/threshold this call processes --
-    # see threshold_rng's docstring for why a shared, order-dependent RNG
-    # broke reproducibility across different -p thread counts.
-    base_seed_L = params["seed"]
-
-    # Per-(trinuc context, alt base) SBS calling threshold: max(pcutoff,
-    # maxLR), where maxLR = log10(1-Pdmg_t) + log10(1-Pdmg_b)
-    # - log10(Pdmg_rev_t) - log10(Pdmg_rev_b) is the theoretical ceiling of
-    # LR_masked for that SBS type (same formula as genotypeDSSnv's
-    # LR_max/"LM" INFO field, here evaluated once per context instead of
-    # once per called family, since Pdmg_t/Pdmg_rev_t/Pdmg_b/Pdmg_rev_b
-    # only depend on context, never on read depth). Contexts t and
-    # (t+32)%64 with alt bases b and b^1 are always exact reverse
-    # complements (see build_trinuc64_order), and dmgmat_bot/
-    # dmgmat_rev_bot are themselves built from dmgmat_top/dmgmat_rev_top
-    # via that same reverse-complement mapping, so maxLR at an RC pair is
-    # always identical -- only the canonical (t<32) half needs computing;
-    # the other half is filled in by mirroring.
-    pcutoff_sbs = np.full((64, 4), pcut, dtype=float)
-    for t_ctx in range(32):
-        ref_base_idx_ctx = base2num[num2trinuc[t_ctx][1]]
-        for b_ctx in range(4):
-            if b_ctx == ref_base_idx_ctx:
-                continue
-            tc_ctx = int(trinuc_conv_np_L[t_ctx, b_ctx])
-            Pdmg_t_ctx = prob_dmg_t_L[tc_ctx, ref_base_idx_ctx]
-            Pdmg_rev_t_ctx = prob_dmg_rev_t_L[tc_ctx, ref_base_idx_ctx]
-            Pdmg_b_ctx = prob_dmg_b_L[tc_ctx, ref_base_idx_ctx]
-            Pdmg_rev_b_ctx = prob_dmg_rev_b_L[tc_ctx, ref_base_idx_ctx]
-            if Pdmg_t_ctx == 0:
-                Pdmg_t_ctx = 1e-9
-            if Pdmg_rev_t_ctx == 0:
-                Pdmg_rev_t_ctx = 1e-9
-            if Pdmg_b_ctx == 0:
-                Pdmg_b_ctx = 1e-9
-            if Pdmg_rev_b_ctx == 0:
-                Pdmg_rev_b_ctx = 1e-9
-            maxLR_ctx = (
-                np.log10(1 - Pdmg_t_ctx)
-                + np.log10(1 - Pdmg_b_ctx)
-                - np.log10(Pdmg_rev_t_ctx)
-                - np.log10(Pdmg_rev_b_ctx)
-            )
-            chosen_threshold = min(pcut, maxLR_ctx)
-            pcutoff_sbs[t_ctx, b_ctx] = chosen_threshold
-            pcutoff_sbs[t_ctx + 32, b_ctx ^ 1] = chosen_threshold
-    # Per-channel FDR-driven threshold overrides (Caller.py's post-hoc
-    # per-channel refinement), keyed by raw (trinuc, alt) index pairs --
-    # applied after the maxLR ceiling above so a rerun restricted to a
-    # handful of adjusted channels only touches L at those (t, b) cells,
-    # leaving every other cell's power table exactly as the full run built
-    # it. Absent (the normal, non-rerun path) for every other caller.
-    for (t_ov, b_ov), new_threshold in params.get("pcutoff_sbs_override", {}).items():
-        pcutoff_sbs[t_ov, b_ov] = new_threshold
-    params["pcutoff_sbs"] = pcutoff_sbs
-
-    if coverage_only:
-        for t in range(64):
-            ref_base_idx_L = base2num[num2trinuc[t][1]]
-            for b in range(4):
-                if b == ref_base_idx_L:
-                    # A base "changing" to itself isn't a mutation
-                    # opportunity; leave L[:, :, t, ref_base_idx_L] at its
-                    # zero-initialized value instead of simulating a
-                    # self-to-self detection power.
-                    continue
-                tc = int(trinuc_conv_np_L[t, b])
-                L[:, :, t, b] = simulate_power_grid(
-                    prob_amp_mat_L[tc, ref_base_idx_L],
-                    prob_amp_mat_rev_L[tc, ref_base_idx_L],
-                    prob_dmg_t_L[tc, ref_base_idx_L],
-                    prob_dmg_rev_t_L[tc, ref_base_idx_L],
-                    prob_dmg_b_L[tc, ref_base_idx_L],
-                    prob_dmg_rev_b_L[tc, ref_base_idx_L],
-                    pcutoff_sbs[t, b],
-                    all_quals,
-                    threshold_rng(base_seed_L, pcutoff_sbs[t, b]),
-                    N_SIM,
-                )
-
-    # Build indel detection-power tables, analogous to L above but for indel
-    # calling. genotypeDSIndel classifies each candidate indel by repeat
-    # context (hps: homopolymer run length; strs: STR bin 0-4, 0 = not a
-    # whole-unit slip of an STR) and indel length (idLen), then selects
-    # Pamp/Pdmg via indelErrorProbs.
-    # These tables simulate that same selection across every (top count,
-    # bottom count) combination and precompute the fraction of simulations
-    # that would clear indel calling's per-context pcutoffi threshold, so
-    # per-position indel coverage can be looked up by depth+context instead
-    # of re-simulated. Only built outside learn mode: ampmat_indel/
-    # dmgmat_indel (and pcutoffi-driven calling) aren't used in learn mode.
-    # Defaults for isLearn mode, where neither table is built below --
-    # kept as None (rather than omitted) so callBam's return signature is
-    # identical in both modes.
-    L_indel_1bp = None
-    L_indel_len = None
-    if not isLearn:
-        prob_amp_hp_L = params["ampmat_hp"]
-        prob_dmg_hp_L = params["dmgmat_hp"]
-        prob_amp_str_L = params["ampmat_str"]
-        prob_dmg_str_L = params["dmgmat_str"]
-        pcutoffi_L = params["pcutoffi"]
-        min_lr_L = params.get("minLR", 0.0)
-
-        def indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c):
-            # Uniform default cutoff, capped per-context by the theoretical
-            # ceiling of masked LR for that context (same formula as
-            # genotypeDSSnv's LR_max/"LM" field -- see indelMaxLR), mirroring
-            # pcutoff_sbs's min(pcut, maxLR_ctx) treatment above. Only used
-            # for the coverage pass's power tables, for contexts without a
-            # channel threshold, so it takes the same --minLR floor as
-            # Caller.py's calling cutoff for those contexts.
-            return max(
-                min_lr_L,
-                min(
-                    pcutoffi_L,
-                    float(indelMaxLR(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c)),
-                ),
-            )
-
-        def simulateIndelPowerGrid(
-            Pamp_c,
-            Pamp_rev_c,
-            Pdmg_c,
-            Pdmg_rev_c,
-            Pdmg_bot_c,
-            Pdmg_rev_bot_c,
-            threshold,
-        ):
-            return simulate_power_grid(
-                Pamp_c,
-                Pamp_rev_c,
-                Pdmg_c,
-                Pdmg_rev_c,
-                Pdmg_bot_c,
-                Pdmg_rev_bot_c,
-                threshold,
-                all_quals,
-                threshold_rng(base_seed_L, threshold),
-                N_SIM,
-            )
-
-        # 1bp indels (deletion/insertion of a homopolymer's repeat unit):
-        # axes are top count, bottom count, hps (0-11: run length, 11 = 11+;
-        # a deletion from an 11+ run reverts as 10+, one from a run of
-        # exactly 10 as 9 -- see _indel_error_cells), ref_allele
-        # (0-3), sign (0=deletion idLen=-1, 1=insertion idLen=+1).
-        # inserted_base is passed equal to ref_allele_c throughout -- this
-        # grid represents the true same-base homopolymer-extension
-        # opportunity at a position with this (hps, ref_allele) context
-        # (what genotypeDSIndel/depth_by_hpstr's base axis actually means),
-        # not an arbitrary mismatched-base scenario. A mismatched 1bp
-        # insertion (str.txt row 0) has no per-(hps, base) coverage grid of
-        # its own -- known gap, see funcs/call.py's indelErrorProbs
-        # docstring and Caller.py's channel job-building for the same
-        # scoping note; such candidates still get scored correctly by
-        # genotypeDSIndel, they just don't get an FDR-refined threshold.
-        L_indel_1bp = np.zeros([10, 10, 12, 4, 2])
-        indel_1bp_threshold_override = params.get("indel_1bp_threshold_override", {})
-        if coverage_only:
-            for hps_c in range(12):
-                for ref_allele_c in range(4):
-                    for sign_idx, idLen_c in enumerate((-1, 1)):
-                        (
-                            Pamp_c,
-                            Pamp_rev_c,
-                            Pdmg_c,
-                            Pdmg_rev_c,
-                            Pdmg_bot_c,
-                            Pdmg_rev_bot_c,
-                        ) = indelErrorProbs(
-                            hps_c,
-                            0,
-                            idLen_c,
-                            ref_allele_c,
-                            ref_allele_c,
-                            prob_amp_hp_L,
-                            prob_dmg_hp_L,
-                            prob_amp_str_L,
-                            prob_dmg_str_L,
-                        )
-                        # Per-(hp length, sign, base pool) FDR-driven
-                        # override, same idea as pcutoff_sbs_override
-                        # above; falls back to the per-context threshold
-                        # when absent. Pool ("C"=C/G, "T"=A/T) matches
-                        # Caller.py's raw_lr_hp accumulation -- base2num
-                        # order A,T,C,G, so ref_allele_c in (2,3) is "C".
-                        pool_c = "C" if ref_allele_c in (2, 3) else "T"
-                        # Channels stop at HP10 (10+).
-                        threshold = indel_1bp_threshold_override.get(
-                            (min(hps_c, 10), sign_idx, pool_c),
-                            indelContextThreshold(
-                                Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
-                            ),
-                        )
-                        L_indel_1bp[
-                            :, :, hps_c, ref_allele_c, sign_idx
-                        ] = simulateIndelPowerGrid(
-                            Pamp_c,
-                            Pamp_rev_c,
-                            Pdmg_c,
-                            Pdmg_rev_c,
-                            Pdmg_bot_c,
-                            Pdmg_rev_bot_c,
-                            threshold,
-                        )
-
-        # Length-bin indels (raw length 2/3/4/5+, either direction): axes
-        # are top count, bottom count, STR-length-bin row (0="0-1"/not a
-        # real repeat through 4="40+"), idLen+5. Always STR-context -- a
-        # length>=2 indel outside an annotated repeat is row 0, so this is
-        # a single loop over all 5 str.txt rows.
-        L_indel_len = np.zeros([10, 10, 5, 11])
-        len_idLens = (-5, -4, -3, -2, 2, 3, 4, 5)
-        indel_len_threshold_override = params.get("indel_len_threshold_override", {})
-        if coverage_only:
-            for strs_c in range(5):
-                for idLen_c in len_idLens:
-                    (
-                        Pamp_c,
-                        Pamp_rev_c,
-                        Pdmg_c,
-                        Pdmg_rev_c,
-                        Pdmg_bot_c,
-                        Pdmg_rev_bot_c,
-                    ) = indelErrorProbs(
-                        1,
-                        strs_c,
-                        idLen_c,
-                        0,
-                        0,
-                        prob_amp_hp_L,
-                        prob_dmg_hp_L,
-                        prob_amp_str_L,
-                        prob_dmg_str_L,
-                    )
-                    threshold = indel_len_threshold_override.get(
-                        (strs_c, idLen_c),
-                        indelContextThreshold(
-                            Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c
-                        ),
-                    )
-                    L_indel_len[:, :, strs_c, idLen_c + 5] = simulateIndelPowerGrid(
-                        Pamp_c,
-                        Pamp_rev_c,
-                        Pdmg_c,
-                        Pdmg_rev_c,
-                        Pdmg_bot_c,
-                        Pdmg_rev_bot_c,
-                        threshold,
-                    )
-            # Row 0 ("not a real repeat") at idLen=+1 specifically: the
-            # mismatched-insertion background scenario (str.txt row 0's
-            # only real column), needed below for the "Insertion A/T/C/G"
-            # coverage columns -- a *novel* insertion (next reference base
-            # != the inserted base, i.e. not a repeat extension; see that
-            # code's own comment), which is exactly the row-0/mismatch
-            # context, not the hp.txt/matching one L_indel_1bp represents.
-            # Not part of len_idLens above since every other +-1bp
-            # scenario is HP-context, handled by L_indel_1bp instead.
-            (
-                Pamp_c,
-                Pamp_rev_c,
-                Pdmg_c,
-                Pdmg_rev_c,
-                Pdmg_bot_c,
-                Pdmg_rev_bot_c,
-            ) = indelErrorProbs(
-                1,
-                0,
-                1,
-                0,
-                1,
-                prob_amp_hp_L,
-                prob_dmg_hp_L,
-                prob_amp_str_L,
-                prob_dmg_str_L,
-            )
-            threshold = indel_len_threshold_override.get(
-                (0, 1),
-                indelContextThreshold(Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c),
-            )
-            L_indel_len[:, :, 0, 6] = simulateIndelPowerGrid(
-                Pamp_c,
-                Pamp_rev_c,
-                Pdmg_c,
-                Pdmg_rev_c,
-                Pdmg_bot_c,
-                Pdmg_rev_bot_c,
-                threshold,
-            )
-
+    # --skipCoveragePass: round 1 tallies every coverage opportunity by its
+    # power-table index (PowerTally) instead of weighting it by power, and
+    # returns the tallies with this worker's quality sample; Caller.py
+    # contracts them with power tables built at the final thresholds.
+    power_tally = PowerTally() if params.get("power_tally", False) else None
+    all_quals = (
+        sample_power_quals(tumorBam, regions, params["minBq"])
+        if coverage_only or power_tally is not None
+        else None
+    )
+    pcutoff_sbs, L, L_indel_1bp, L_indel_len = build_power_tables(
+        params, all_quals, build=coverage_only
+    )
     # Families are keyed by label and require an exact reference_start match.
     currentReadDict = {}
     # rugged_reads_index/rugged_reads_pool: reroute a downstream mate whose
@@ -2197,9 +2348,7 @@ def callBam(params, processNo):
                                     )
                                     + "\n"
                                 )
-                                total_coverage += coverage[pos]
                                 total_coverage_indel_cat += coverage_indel_cat[pos]
-                                total_unmasked_coverage += unmasked_coverage[pos]
                                 total_unmasked_coverage_indel_cat += (
                                     unmasked_coverage_indel_cat[pos]
                                 )
@@ -2364,6 +2513,8 @@ def callBam(params, processNo):
                         unmasked_coverage_indel_cat,
                         neg_lr_sbs=neg_lr_sbs,
                         neg_lr_indel=neg_lr_indel,
+                        power_tally=power_tally,
+                        coverage_totals=coverage_totals,
                     ):
                         duplex_count += 1
             """
@@ -2560,9 +2711,7 @@ def callBam(params, processNo):
                             )
                             + "\n"
                         )
-                        total_coverage += coverage[pos]
                         total_coverage_indel_cat += coverage_indel_cat[pos]
-                        total_unmasked_coverage += unmasked_coverage[pos]
                         total_unmasked_coverage_indel_cat += (
                             unmasked_coverage_indel_cat[pos]
                         )
@@ -2709,6 +2858,8 @@ def callBam(params, processNo):
                 unmasked_coverage_indel_cat,
                 neg_lr_sbs=neg_lr_sbs,
                 neg_lr_indel=neg_lr_indel,
+                power_tally=power_tally,
+                coverage_totals=coverage_totals,
             ):
                 duplex_count += 1
     """
@@ -2864,6 +3015,10 @@ def callBam(params, processNo):
                     mut["filter"] = "normal_vaf"
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         mut_pass_filter.append(mut)
+    if power_tally is not None:
+        _early_deferred_depth(
+            muts, tumorBam, normalBams, params, extractDepthBatchSnv, indel=False
+        )
 
     ### Indel depth extraction, batched the same way, with the same
     ### round-1-PASS-only / round-2-deferred-set eligibility split as SNVs
@@ -2972,6 +3127,15 @@ def callBam(params, processNo):
                     continue
         mut["samples"] = [[ta, tr, tdp], [na, nr, ndp]]
         muts_indels_pass_filter.append(mut)
+    if power_tally is not None:
+        _early_deferred_depth(
+            muts_indels,
+            tumorBam,
+            normalBams,
+            params,
+            extractDepthBatchIndel,
+            indel=True,
+        )
 
     ### DBS depth extraction, batched the same way, and filtered under the
     ### same maxAF/minNdepth/normalVAF strategy as SNVs/indels above.
@@ -3104,9 +3268,7 @@ def callBam(params, processNo):
                 )
                 + "\n"
             )
-            total_coverage += coverage[pos]
             total_coverage_indel_cat += coverage_indel_cat[pos]
-            total_unmasked_coverage += unmasked_coverage[pos]
             total_unmasked_coverage_indel_cat += unmasked_coverage_indel_cat[pos]
 
     # Close the bed files
@@ -3129,7 +3291,7 @@ def callBam(params, processNo):
 
     return (
         mut_pass_filter,
-        total_coverage.sum(),
+        coverage_totals[0],
         recCount,
         duplex_count,
         duplex_read_num_dict,
@@ -3139,7 +3301,7 @@ def callBam(params, processNo):
         pass_read_num,
         FPs,
         RPs,
-        total_unmasked_coverage.sum(),
+        coverage_totals[1],
         total_coverage_indel_cat,
         total_unmasked_coverage_indel_cat,
         duplex_read_num_dict_indel,
@@ -3163,4 +3325,7 @@ def callBam(params, processNo):
         L_indel_len,
         [np.frombuffer(lrs, dtype=np.float32) for lrs in neg_lr_sbs],
         {k: np.frombuffer(v, dtype=np.float32) for k, v in neg_lr_indel.items()},
+        # --skipCoveragePass: this worker's power tallies and quality
+        # sample (PowerTally.summary), else None.
+        power_tally.summary(all_quals) if power_tally is not None else None,
     )

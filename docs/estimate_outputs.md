@@ -157,7 +157,7 @@ Two-panel figure (left: cumulative `min_group_size` curve, right: exact `group_s
 
 ## `{sample}_duplex_allele_counts.txt`
 
-Tab-separated table, one row per unique `PASS` mutation (SNV or indel) detected across all read families, used to assess clonal expansion and duplex depth at mutation sites. Written by `estimate` (not `call`), since it requires the merged `_coverage.bed.gz`.
+Tab-separated table, one row per unique `PASS` mutation (SNV or indel) detected across all read families, used to assess clonal expansion and duplex depth at mutation sites. Written by `estimate` (not `call`), since it requires the merged `_coverage.bed.gz`; not written for a call run with `--skipCoveragePass` (estimate prints "Skipping duplex allele count due to no coverage file.").
 
 | Column | Description |
 | --- | --- |
@@ -183,7 +183,7 @@ Plain-text run log: run timestamp, the exact command line invoked, and the fully
 
 ## `{sample}_gene_coverage.txt`
 
-**Condition:** only written when `-gb/--genebed` is provided (a BED file: chrom, start, end, and a 4th column of the form `GENE_exonN` — everything before the first `_` is taken as the gene name).
+**Condition:** only written when `-gb/--genebed` is provided (a BED file: chrom, start, end, and a 4th column of the form `GENE_exonN` — everything before the first `_` is taken as the gene name), and the call run wrote `_coverage.bed.gz` (not with `--skipCoveragePass`).
 
 Tab-separated, **with a header row**, one row per gene:
 

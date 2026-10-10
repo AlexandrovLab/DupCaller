@@ -10,12 +10,19 @@ All notable changes to DupCaller are recorded here, most recent first.
 - A channel with more sites than Eeff (an Eeff/site-set mismatch) is still reported and solved with Eeff raised to the site count. When every one of its opportunities is a strong site, the score stays positive up to mu = 1; mu is then set just below 1 (1 - 1e-12) and the threshold sits at the `--minLR` floor.
 - `call -a/--pseudocount` now only sets the SBS amplification-error (SRD) fit and the error-matrix smoothing; the mu solve no longer uses it. `estimate -a` and `learn -a` are unchanged.
 - Rate tables (`_sbs96_rate_n1.txt`, `_indel_rate_by_hp_str.txt`): `mutation_rate_mle` is the pseudocount-free rate and can be 0 for a channel with Eeff > 0.
+- `call -sc/--skipCoveragePass` now writes every output except the per-locus `coverage.bed.gz`: `_duplex_family_strand_composition.txt` and its heatmap, the three `_by_duplex_group.txt` files, and the `Unmasked Coverage` / `Per Read Family Coverage` lines of `_stats.txt`. Round 1 counts every coverage opportunity by its detection-power table index (`funcs/power_tally.py`); once the final thresholds are known, each worker's counts are multiplied by the power tables the coverage pass would have built for it (same thresholds, seed and base-quality sample). Masked candidates whose LR clears their channel's final threshold get the depth round 1 extracted for every masked candidate at or above `--minLR`, as the coverage pass would extract it. Previously these outputs were missing and such masked candidates had no depth, so `estimate` could not run on a `--skipCoveragePass` call.
+- `estimate` on a `--skipCoveragePass` call (read from `_call_params.log`) prints "Skipping duplex allele count due to no coverage file." instead of writing `_duplex_allele_counts.txt`, skips `-gb/--genebed` per-gene coverage the same way, and refuses `-rb/--reestimatebed`, all of which read `coverage.bed.gz`.
+- The coverage pass's power-table construction moved into `build_power_tables` / `sample_power_quals` (`funcs/call.py`), shared by `callBam` and the `--skipCoveragePass` contraction.
+
+### Fixed
+- `_stats.txt` `Unmasked Coverage` (and so `_sbs_burden.txt`'s `Unmasked burden`) left out positions without masked SNV or indel coverage, i.e. noise-masked-only positions, because it was summed while writing `coverage.bed.gz`, which skips such positions (40mM-72h chr22: 1.6% low). It and `Per Read Family Coverage` are now summed as each family's coverage is accumulated, the same totals the by-duplex-group tables and `--skipCoveragePass` use.
 
 ### Tests
 - mu-solve tests rewritten for the maximum-likelihood equation: equation residual, the single-site closed form (`mu = (r - Eeff) / (Eeff*(r - 1))`), mu = 0 when there is no root (including no sites), mu just below 1 when every opportunity is a strong site (threshold at the `--minLR` floor), and Eeff raised to the site count. The zero-pseudocount refusal test and the pseudocount-floor tests are removed.
+- `test_power_tally.py`: tallying positions by power-table index and contracting with random power tables reproduces the coverage pass's position-by-position SBS, unmasked, DBS and indel100 sums.
 
 ### Documentation
-- README, `call --help` and `docs/call_outputs.md` describe `-a/--pseudocount` and `mutation_rate_mle` for the new solve.
+- README, `call --help` and `docs/call_outputs.md` describe `-a/--pseudocount` and `mutation_rate_mle` for the new solve, and `--skipCoveragePass`'s outputs; `docs/estimate_outputs.md` notes which estimate outputs it skips.
 
 ## [1.2.11] - 2026-10-06
 

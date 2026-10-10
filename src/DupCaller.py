@@ -213,11 +213,10 @@ if __name__ == "__main__":
         "-sc",
         "--skipCoveragePass",
         action="store_true",
-        help="skip round 2 (the coverage-only pass): no duplex depth / per-locus coverage.bed.gz, "
-        "no duplex-family composition or by-duplex-group output files, and masked candidates "
-        "that only clear the final lFDR-refined threshold get no real depth. Only round 1 calling "
-        "and lFDR-threshold determination run; VCFs and a trimmed _stats.txt are still written. "
-        "Roughly halves total runtime.",
+        help="skip round 2 (the coverage-only pass), roughly halving total runtime: every output "
+        "except the per-locus coverage.bed.gz is still written, with coverage from round 1's "
+        "power tallies contracted at the final thresholds. estimate then skips the duplex allele "
+        "counts and per-gene coverage, and -rb/--reestimatebed is unavailable.",
         default=False,
     )
     call_parser.add_argument(

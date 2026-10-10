@@ -42,7 +42,7 @@ Same PASS/fail split, for dinucleotide substitutions (DBS) — two adjacent SBS 
 | Value | Meaning |
 | --- | --- |
 | `PASS` | All filters passed, including snp_mask/noise_mask (`SNPM`/`NOISEM` INFO fields both 0) — a fully unmasked call. |
-| `masked` | Blocked only by `snp_mask`/`noise_mask` (see `SNPM`/`NOISEM` INFO fields for which). Still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but not `PASS`. A masked candidate that never got real depth extracted (LR below the channel threshold, or `--skipCoveragePass`) is dropped entirely and never appears in `_fail.vcf` unless `--rescue` is set. |
+| `masked` | Blocked only by `snp_mask`/`noise_mask` (see `SNPM`/`NOISEM` INFO fields for which). Still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but not `PASS`. A masked candidate that never got real depth extracted (LR below the channel threshold) is dropped entirely and never appears in `_fail.vcf` unless `--rescue` is set. |
 | `underpowered` | Candidate with LR > 0 that failed the per-channel FDR-refined threshold (never below `--minLR`). |
 | `zero_LR` | Candidate with no evidence for the alt over the ref (log10 LR == 0; near-zero floating-point LRs are snapped to exactly 0). Reported for completeness, never PASS. A DBS inherits it from either of its own read family's SBS. |
 | `strand_independence` | SBS or indel call with a strand whose strand independence hypothesis p-value (INFO `MSP`) is <= `--p_threshold` (not corrected for the number of calls): the strand has more non-alt reads than read error explains, i.e. a mixed read family (early-cycle PCR error, or two molecules sharing a barcode). Tested on the final PASS SBS and indel calls (on the unrounded p, not the printed MSP); a strand with no non-alt read has p = 1 and never fails. A DBS fails if either of its own read family's SBS (same TAG1/TAG2/SP) fails, and then its other SBS gets this FILTER too, whatever its own MSP. Always written to the fail VCF. |
@@ -143,7 +143,7 @@ Plain-text run log: DupCaller version, run timestamp, the exact command line inv
 
 ## `{sample}_coverage.bed.gz`
 
-**Condition:** only written unless `--skipCoveragePass` is set.
+**Condition:** not written with `--skipCoveragePass`, the only call output that option drops.
 
 A bgzip-compressed, tabix-indexed BED file with per-position, per-alt-base, power-weighted duplex coverage — this is the "effective coverage" that accounts for how likely a real mutation at this depth/context would have been detected, not a raw read count. Only positions where at least one of the 20 coverage values below is nonzero are written; there is no header line.
 
@@ -239,4 +239,4 @@ Tab-separated key–value file (one metric per line) with library and calling st
 | Indel Base Coverage | *(appended by `estimate`)* | Indel opportunity coverage normalized to true per-base units (divided by the genome-wide `indel_locus_multiplier`) at `min_group_size=1` — same value as `_indel_burden.txt`'s `Duplex coverage` line. |
 | DBS Base Coverage | *(appended by `estimate`)* | DBS opportunity coverage (already per-locus, no further normalization needed) — same value as `_dbs_burden.txt`'s `Duplex coverage` line. |
 
-`Unmasked Coverage` and `Per Read Family Coverage` are both SNV-only and only written when the coverage pass ran (i.e. `--skipCoveragePass` was **not** set). There is no indel equivalent of `Unmasked Coverage`: unlike the SNV `/3` correction above, normalizing an indel-opportunity sum to true per-base units needs the genome-wide `indel_locus_multiplier`, which only exists once `estimate` has run — so a call-time "Unmasked Indel Coverage" field could only ever be raw, not-yet-comparable opportunity units, and isn't written. `_indel_burden.txt` correspondingly has no `Unmasked burden` row (see [`estimate_outputs.md`](estimate_outputs.md)).
+`Unmasked Coverage` and `Per Read Family Coverage` are both SNV-only; with `--skipCoveragePass` they come from round 1's power tallies. There is no indel equivalent of `Unmasked Coverage`: unlike the SNV `/3` correction above, normalizing an indel-opportunity sum to true per-base units needs the genome-wide `indel_locus_multiplier`, which only exists once `estimate` has run — so a call-time "Unmasked Indel Coverage" field could only ever be raw, not-yet-comparable opportunity units, and isn't written. `_indel_burden.txt` correspondingly has no `Unmasked burden` row (see [`estimate_outputs.md`](estimate_outputs.md)).

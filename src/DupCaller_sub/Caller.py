@@ -20,7 +20,7 @@ from matplotlib import pyplot as plt
 # from pysam import AlignmentFile as BAM
 
 from . import __version__
-from .funcs.call import callBam  # , output_masked_mutations
+from .funcs.call import callBam, contract_worker_tally  # , output_masked_mutations
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
 from .funcs.misc import init_refine_worker, refine_channel_task, mu_at_min_lr
@@ -749,6 +749,10 @@ def do_call(args):
         )
         return
 
+    # --skipCoveragePass: round 1 also tallies coverage opportunity by
+    # power-table index (funcs/power_tally.py), contracted below once the
+    # final thresholds are known, in place of round 2.
+    params["power_tally"] = bool(getattr(args, "skipCoveragePass", False))
     if args.threads == 1:
         """
         Single-thread execution
@@ -791,7 +795,10 @@ def do_call(args):
             L_indel_len,
             neg_lr_sbs,
             neg_lr_indel,
+            power_tally_single,
         ) = callBam(paramsNow, 0)
+        duplex_read_nums = [duplex_read_num_single]
+        power_tallies = [power_tally_single]
         muts_positions = [
             mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
         ]
@@ -953,6 +960,7 @@ def do_call(args):
         duplex_read_nums_indel = [_[14] for _ in results]
         dbs_muts = [_[15] for _ in results]
         duplex_read_nums_dbs = [_[16] for _ in results]
+        power_tallies = [_[24] for _ in results]
         depth_by_trinuc = sum(_[17] for _ in results)
         depth_by_hpstr = sum(_[18] for _ in results)
         # L/L_indel_1bp/L_indel_len are deterministic given params up to
@@ -1687,16 +1695,14 @@ def do_call(args):
 
     efficiency = duplex_num / rec_num if rec_num > 0 else 0.0
 
-    # --skipCoveragePass: only round 1 calling + FDR-threshold
-    # determination run. Round 2 (below) is what computes real,
-    # position-weighted duplex depth/coverage -- coverage.bed.gz, the
-    # duplex-family composition file/heatmap, and the three
-    # *_by_duplex_group.txt files all come from it, so skipping it means
-    # none of those get produced (and masked-but-now-qualifying
-    # candidates from the re-filter above get no real depth either,
-    # same as any other structurally-masked record). VCFs and _stats.txt
-    # (minus the coverage-derived lines) are unaffected -- both are
-    # sourced from round 1 + the re-filter, not round 2.
+    # --skipCoveragePass: round 2 (below) is what computes real,
+    # position-weighted duplex coverage and the per-locus coverage.bed.gz.
+    # Without it, round 1's power tallies (funcs/power_tally.py) are
+    # contracted with each worker's power tables at the final thresholds,
+    # which gives the same by-duplex-group/stats coverage, and the masked
+    # candidates that now clear their channel's threshold take the depth
+    # round 1 extracted for them (call.py's _early_deferred_depth). Only
+    # coverage.bed.gz is not written.
     coverage_pass_enabled = not args.skipCoveragePass
     if coverage_pass_enabled:
         # Round 2: coverage-only pass, reusing round 1's region split
@@ -1752,15 +1758,6 @@ def do_call(args):
             for m in r[6]
             if _mut_key(m) in deferred_depth_keys
         }
-        for mut in mutsAll:
-            key = _mut_key(mut)
-            if key in deferred_mut_updates:
-                mut["samples"], mut["filter"] = deferred_mut_updates[key]
-        for indel in indelsAll:
-            key = _mut_key(indel)
-            if key in deferred_indel_updates:
-                indel["samples"], indel["filter"] = deferred_indel_updates[key]
-
         # Everything below that needs real position-weighted coverage now
         # sources it from round2_results (final thresholds) instead of round
         # 1's results -- mirrors exactly how round 1's own results were merged
@@ -1773,158 +1770,192 @@ def do_call(args):
         unmasked_coverages_indels_cat = [_[13] for _ in round2_results]
         duplex_read_nums_indel = [_[14] for _ in round2_results]
         duplex_read_nums_dbs = [_[16] for _ in round2_results]
-
-        coverage = sum(coverages)
-        coverage_indel_cat = sum(coverages_indels_cat)
-        unmasked_coverage = sum(unmasked_coverages)
-        unmasked_coverage_indel_cat = sum(unmasked_coverages_indels_cat)
-
-        duplex_combinations = list(
-            set.union(*[set(d.keys()) for d in duplex_read_nums])
-        )
-        duplex_combinations.sort()
-        duplex_read_num = OrderedDict(
-            {
-                num: sum([d.get(num, [0, 0, 0])[0] for d in duplex_read_nums])
-                for num in duplex_combinations
-            }
-        )
-        duplex_coverage_by_group = OrderedDict(
-            {
-                num: sum([d.get(num, [0, 0, 0])[1] for d in duplex_read_nums])
-                for num in duplex_combinations
-            }
-        )
-        total_family_num = OrderedDict(
-            {
-                num: sum([d.get(num, [0, 0, 0])[2] for d in duplex_read_nums])
-                for num in duplex_combinations
-            }
-        )
-        duplex_read_num_trinuc = OrderedDict(
-            {
-                num: sum(
-                    [d.get(num, np.zeros((64, 4))) for d in duplex_read_nums_trinuc]
-                )
-                for num in duplex_combinations
-            }
-        )
-        duplex_read_num_indel = OrderedDict(
-            {
-                num: sum([d.get(num, np.zeros(100)) for d in duplex_read_nums_indel])
-                for num in duplex_combinations
-            }
-        )
-        duplex_read_num_dbs = OrderedDict(
-            {
-                num: sum([d.get(num, np.zeros(144)) for d in duplex_read_nums_dbs])
-                for num in duplex_combinations
-            }
-        )
-
-        # Build muts_by_duplex_group over all keys (including 0+n / n+0)
-        muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
-        for mut in mutsAll:
-            TC_total = int(mut["infos"]["F1R2"])
-            BC_total = int(mut["infos"]["F2R1"])
-            key_fwd = str(TC_total) + "+" + str(BC_total)
-            key_rev = str(BC_total) + "+" + str(TC_total)
-            if key_fwd in muts_by_duplex_group:
-                muts_by_duplex_group[key_fwd] += 1
-            elif key_rev in muts_by_duplex_group:
-                muts_by_duplex_group[key_rev] += 1
-
-        all_keys = sorted(
-            duplex_read_num.keys(),
-            key=lambda s: (int(s.split("+")[0]), int(s.split("+")[1])),
-        )
-        with open(args.output + "_duplex_family_strand_composition.txt", "w") as f:
-            f.write(
-                "duplex_group_strand_composition\tread_family_number\tduplex_group_number\teffective_coverage\n"
-            )
-            for read_num in all_keys:
-                f.write(
-                    f"{read_num}\t{total_family_num[read_num]}\t{duplex_read_num[read_num]}\t{duplex_coverage_by_group[read_num]}\n"
-                )
-
-        max_val = max(
-            (max(int(k.split("+")[0]), int(k.split("+")[1])) for k in all_keys),
-            default=0,
-        )
-        total_read_sets = sum(total_family_num.values())
-        n = 0
-        if total_read_sets > 0:
-            for candidate in range(max_val + 1):
-                outlier_count = sum(
-                    v
-                    for k, v in total_family_num.items()
-                    if max(int(k.split("+")[0]), int(k.split("+")[1])) > candidate
-                )
-                if outlier_count / total_read_sets < 0.01:
-                    n = candidate
-                    break
-            else:
-                n = max_val
-        heatmap_data = np.zeros((n + 1, n + 1), dtype=float)
-        for k in all_keys:
-            x, y = int(k.split("+")[0]), int(k.split("+")[1])
-            if x <= n and y <= n:
-                heatmap_data[y, x] = total_family_num[k] / total_read_sets
-        fig, ax = plt.subplots(figsize=(max(6, n + 2), max(5, n + 1)))
-        im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="YlOrRd")
-        ax.set_xlabel("F1R2 read count (top strand)")
-        ax.set_ylabel("F2R1 read count (bottom strand)")
-        ax.set_title("Proportion of read sets by duplex group composition")
-        ax.set_xticks(range(n + 1))
-        ax.set_yticks(range(n + 1))
-        plt.colorbar(im, ax=ax, label="Proportion of read sets")
-        plt.tight_layout()
-        fig.savefig(args.output + "_duplex_family_strand_composition_heatmap.pdf")
-        plt.close(fig)
-
-        non_zero_keys = [k for k in all_keys if duplex_read_num[k] != 0]
-        row_idx_192 = np.array(
-            [trinuc2num_64[label.split(">")[0]] for label in index_192]
-        )
-        col_idx_192 = np.array([base2num[label.split(">")[1]] for label in index_192])
-        duplex_read_num_trinuc = {_: duplex_read_num_trinuc[_] for _ in non_zero_keys}
-        data_192 = {
-            k: v[row_idx_192, col_idx_192] for k, v in duplex_read_num_trinuc.items()
-        }
-        trinuc_by_duplex_group = pd.DataFrame(data_192, index=index_192)
-        trinuc_by_duplex_group.to_csv(
-            os.path.join(sbs_dir, sample_name + "_trinuc_by_duplex_group.txt"),
-            sep="\t",
-            index=True,
-        )
-
-        _, index_indel100 = build_indel100_labels()
-        duplex_read_num_indel = {_: duplex_read_num_indel[_] for _ in non_zero_keys}
-        data_indel100 = {k: v for k, v in duplex_read_num_indel.items()}
-        indel_by_duplex_group = pd.DataFrame(data_indel100, index=index_indel100)
-        indel_by_duplex_group.to_csv(
-            os.path.join(indel_dir, sample_name + "_indel_by_duplex_group.txt"),
-            sep="\t",
-            index=True,
-        )
-
-        _, index_dbs144 = build_dbs_raw144_labels()
-        duplex_read_num_dbs = {_: duplex_read_num_dbs[_] for _ in non_zero_keys}
-        data_dbs144 = {k: v for k, v in duplex_read_num_dbs.items()}
-        dbs_by_duplex_group = pd.DataFrame(data_dbs144, index=index_dbs144)
-        dbs_by_duplex_group.to_csv(
-            os.path.join(dbs_dir, sample_name + "_dbs_by_duplex_group.txt"),
-            sep="\t",
-            index=True,
-        )
     else:
         print(
-            "..............Skipping coverage pass (round 2) -- duplex depth, "
-            "per-locus coverage.bed.gz, duplex-family composition, and "
-            "by-duplex-group output files will not be generated "
-            "(--skipCoveragePass).............."
+            "..............Skipping coverage pass (round 2): coverage from "
+            "round 1's power tallies; per-locus coverage.bed.gz will not be "
+            "generated (--skipCoveragePass).............."
         )
+        startTime3 = time.time()
+        params_final = params.copy()
+        params_final["isLearn"] = False
+        params_final["pcutoff_sbs_override"] = pcutoff_sbs_override
+        params_final["indel_1bp_threshold_override"] = indel_1bp_threshold_override
+        params_final["indel_len_threshold_override"] = indel_len_threshold_override
+        tally_pool = Pool(args.threads)
+        contracted = tally_pool.starmap(
+            contract_worker_tally, [(params_final, t) for t in power_tallies]
+        )
+        tally_pool.close()
+        tally_pool.terminate()
+        tally_pool.join()
+        print(
+            "..............Contracted round 1's power tallies in "
+            + str((time.time() - startTime3) / 60)
+            + " minutes................."
+        )
+        duplex_read_nums_trinuc = [c[0] for c in contracted]
+        duplex_read_nums_indel = [c[1] for c in contracted]
+        duplex_read_nums_dbs = [c[2] for c in contracted]
+        coverages = [c[3] for c in contracted]
+        unmasked_coverages = [c[4] for c in contracted]
+        deferred_mut_updates = {
+            _mut_key(m): m["deferred_depth"]
+            for m in mutsAll
+            if "deferred_depth" in m and _mut_key(m) in deferred_depth_keys
+        }
+        deferred_indel_updates = {
+            _mut_key(m): m["deferred_depth"]
+            for m in indelsAll
+            if "deferred_depth" in m and _mut_key(m) in deferred_depth_keys
+        }
+        for m in mutsAll + indelsAll:
+            m.pop("deferred_depth", None)
 
+    for mut in mutsAll:
+        key = _mut_key(mut)
+        if key in deferred_mut_updates:
+            mut["samples"], mut["filter"] = deferred_mut_updates[key]
+    for indel in indelsAll:
+        key = _mut_key(indel)
+        if key in deferred_indel_updates:
+            indel["samples"], indel["filter"] = deferred_indel_updates[key]
+
+    coverage = sum(coverages)
+    unmasked_coverage = sum(unmasked_coverages)
+
+    duplex_combinations = list(set.union(*[set(d.keys()) for d in duplex_read_nums]))
+    duplex_combinations.sort()
+    duplex_read_num = OrderedDict(
+        {
+            num: sum([d.get(num, [0, 0, 0])[0] for d in duplex_read_nums])
+            for num in duplex_combinations
+        }
+    )
+    duplex_coverage_by_group = OrderedDict(
+        {
+            num: sum([d.get(num, [0, 0, 0])[1] for d in duplex_read_nums])
+            for num in duplex_combinations
+        }
+    )
+    total_family_num = OrderedDict(
+        {
+            num: sum([d.get(num, [0, 0, 0])[2] for d in duplex_read_nums])
+            for num in duplex_combinations
+        }
+    )
+    duplex_read_num_trinuc = OrderedDict(
+        {
+            num: sum([d.get(num, np.zeros((64, 4))) for d in duplex_read_nums_trinuc])
+            for num in duplex_combinations
+        }
+    )
+    duplex_read_num_indel = OrderedDict(
+        {
+            num: sum([d.get(num, np.zeros(100)) for d in duplex_read_nums_indel])
+            for num in duplex_combinations
+        }
+    )
+    duplex_read_num_dbs = OrderedDict(
+        {
+            num: sum([d.get(num, np.zeros(144)) for d in duplex_read_nums_dbs])
+            for num in duplex_combinations
+        }
+    )
+
+    # Build muts_by_duplex_group over all keys (including 0+n / n+0)
+    muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
+    for mut in mutsAll:
+        TC_total = int(mut["infos"]["F1R2"])
+        BC_total = int(mut["infos"]["F2R1"])
+        key_fwd = str(TC_total) + "+" + str(BC_total)
+        key_rev = str(BC_total) + "+" + str(TC_total)
+        if key_fwd in muts_by_duplex_group:
+            muts_by_duplex_group[key_fwd] += 1
+        elif key_rev in muts_by_duplex_group:
+            muts_by_duplex_group[key_rev] += 1
+
+    all_keys = sorted(
+        duplex_read_num.keys(),
+        key=lambda s: (int(s.split("+")[0]), int(s.split("+")[1])),
+    )
+    with open(args.output + "_duplex_family_strand_composition.txt", "w") as f:
+        f.write(
+            "duplex_group_strand_composition\tread_family_number\tduplex_group_number\teffective_coverage\n"
+        )
+        for read_num in all_keys:
+            f.write(
+                f"{read_num}\t{total_family_num[read_num]}\t{duplex_read_num[read_num]}\t{duplex_coverage_by_group[read_num]}\n"
+            )
+
+    max_val = max(
+        (max(int(k.split("+")[0]), int(k.split("+")[1])) for k in all_keys),
+        default=0,
+    )
+    total_read_sets = sum(total_family_num.values())
+    n = 0
+    if total_read_sets > 0:
+        for candidate in range(max_val + 1):
+            outlier_count = sum(
+                v
+                for k, v in total_family_num.items()
+                if max(int(k.split("+")[0]), int(k.split("+")[1])) > candidate
+            )
+            if outlier_count / total_read_sets < 0.01:
+                n = candidate
+                break
+        else:
+            n = max_val
+    heatmap_data = np.zeros((n + 1, n + 1), dtype=float)
+    for k in all_keys:
+        x, y = int(k.split("+")[0]), int(k.split("+")[1])
+        if x <= n and y <= n:
+            heatmap_data[y, x] = total_family_num[k] / total_read_sets
+    fig, ax = plt.subplots(figsize=(max(6, n + 2), max(5, n + 1)))
+    im = ax.imshow(heatmap_data, aspect="auto", origin="lower", cmap="YlOrRd")
+    ax.set_xlabel("F1R2 read count (top strand)")
+    ax.set_ylabel("F2R1 read count (bottom strand)")
+    ax.set_title("Proportion of read sets by duplex group composition")
+    ax.set_xticks(range(n + 1))
+    ax.set_yticks(range(n + 1))
+    plt.colorbar(im, ax=ax, label="Proportion of read sets")
+    plt.tight_layout()
+    fig.savefig(args.output + "_duplex_family_strand_composition_heatmap.pdf")
+    plt.close(fig)
+
+    non_zero_keys = [k for k in all_keys if duplex_read_num[k] != 0]
+    row_idx_192 = np.array([trinuc2num_64[label.split(">")[0]] for label in index_192])
+    col_idx_192 = np.array([base2num[label.split(">")[1]] for label in index_192])
+    duplex_read_num_trinuc = {_: duplex_read_num_trinuc[_] for _ in non_zero_keys}
+    data_192 = {
+        k: v[row_idx_192, col_idx_192] for k, v in duplex_read_num_trinuc.items()
+    }
+    trinuc_by_duplex_group = pd.DataFrame(data_192, index=index_192)
+    trinuc_by_duplex_group.to_csv(
+        os.path.join(sbs_dir, sample_name + "_trinuc_by_duplex_group.txt"),
+        sep="\t",
+        index=True,
+    )
+
+    _, index_indel100 = build_indel100_labels()
+    duplex_read_num_indel = {_: duplex_read_num_indel[_] for _ in non_zero_keys}
+    data_indel100 = {k: v for k, v in duplex_read_num_indel.items()}
+    indel_by_duplex_group = pd.DataFrame(data_indel100, index=index_indel100)
+    indel_by_duplex_group.to_csv(
+        os.path.join(indel_dir, sample_name + "_indel_by_duplex_group.txt"),
+        sep="\t",
+        index=True,
+    )
+
+    _, index_dbs144 = build_dbs_raw144_labels()
+    duplex_read_num_dbs = {_: duplex_read_num_dbs[_] for _ in non_zero_keys}
+    data_dbs144 = {k: v for k, v in duplex_read_num_dbs.items()}
+    dbs_by_duplex_group = pd.DataFrame(data_dbs144, index=index_dbs144)
+    dbs_by_duplex_group.to_csv(
+        os.path.join(dbs_dir, sample_name + "_dbs_by_duplex_group.txt"),
+        sep="\t",
+        index=True,
+    )
     # Records tagged with one of these reject-reason filters cleared LR
     # (round 1 PASS, or a round-2 masked-deferred candidate) but real
     # depth-extraction then failed a post-hoc sanity check (see call.py's
@@ -2085,27 +2116,26 @@ def do_call(args):
         f.write(f"Number of Read Families\t{unique_read_num}\n")
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
-        if coverage_pass_enabled:
-            # DBS base coverage (opportunity coverage normalized by
-            # opportunity-per-genome) is written by the estimate step
-            # instead -- it needs dbs_cov_by_minread, which doesn't exist
-            # yet at call time. Unmasked Coverage/Per Read Family Coverage
-            # are SNV-only and already divided here by 3 (the fixed number
-            # of possible alt bases per locus, same normalization
-            # Estimate.py applies to trinuc_cov elsewhere), since that
-            # correction needs no reference-wide computation and doesn't
-            # have to wait for estimate.
-            #
-            # There is no indel equivalent: an indel-opportunity sum can't
-            # be normalized to true per-base units without
-            # indel_locus_multiplier, a reference-genome-wide ratio only
-            # estimate computes -- so an "Unmasked Indel Coverage" line
-            # here could only ever be raw, not-yet-comparable opportunity
-            # units, and was removed rather than kept misleading.
-            f.write(f"Unmasked Coverage\t{unmasked_coverage / 3}\n")
-            f.write(
-                f"Per Read Family Coverage \t{(coverage / 3) / duplex_num if duplex_num > 0 else 0.0}\n"
-            )
+        # DBS base coverage (opportunity coverage normalized by
+        # opportunity-per-genome) is written by the estimate step
+        # instead -- it needs dbs_cov_by_minread, which doesn't exist
+        # yet at call time. Unmasked Coverage/Per Read Family Coverage
+        # are SNV-only and already divided here by 3 (the fixed number
+        # of possible alt bases per locus, same normalization
+        # Estimate.py applies to trinuc_cov elsewhere), since that
+        # correction needs no reference-wide computation and doesn't
+        # have to wait for estimate.
+        #
+        # There is no indel equivalent: an indel-opportunity sum can't
+        # be normalized to true per-base units without
+        # indel_locus_multiplier, a reference-genome-wide ratio only
+        # estimate computes -- so an "Unmasked Indel Coverage" line
+        # here could only ever be raw, not-yet-comparable opportunity
+        # units, and was removed rather than kept misleading.
+        f.write(f"Unmasked Coverage\t{unmasked_coverage / 3}\n")
+        f.write(
+            f"Per Read Family Coverage \t{(coverage / 3) / duplex_num if duplex_num > 0 else 0.0}\n"
+        )
         f.write(
             f"Pass-filter Duplication Rate\t\
         {1-unique_read_num/pass_read_num if pass_read_num > 0 else 0.0}\n"
