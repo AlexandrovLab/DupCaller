@@ -319,6 +319,6 @@ def test_positions_before_a_read_start_are_not_counted_as_a():
     )
     # SRD counts: every covered base of every read, on both strands, and
     # each count appears twice after the reverse-complement fold. The first
-    # 15 positions have 2 reads per strand, the rest 4. Counting the
-    # later-starting reads as "A" there used to drop those 15 positions.
+    # 15 positions have 2 reads per strand, the rest 4; positions before a
+    # read's start are not counted as "A" for that read.
     assert out[0].sum() == 2 * 2 * (2 * 15 + 4 * 25)

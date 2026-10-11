@@ -1,19 +1,10 @@
-"""Regression test for funcs/learn.py's profileTriNucMismatches: a read's
-lone "mismatching" position being an N/deletion call (seq_mat sentinel 4)
-that happens to carry a non-zero base quality used to crash the function.
+"""profileTriNucMismatches with a read whose only "mismatch" is an N
+(seq_mat sentinel 4) carrying a non-zero base quality above minBq.
 
-seq_mat encodes A/T/C/G as 0-3 and uses 4 for anything else (N call,
-deletion, or off-read-span position). The per-read SBS loop treats any
-such 4 as a "mismatch" against the real (0-3) reference base regardless of
-quality. When that's the read's only mismatching position and its quality
-survived the earlier minBq zeroing (i.e. quality > minBq), the BQ-histogram
-accumulation indexed on seq_mat*96 lands outside the 4*96 ATCG range and
-np.bincount produces an array too long for the `.reshape([4, 96, NUM_BQ])`
-that follows -- unlike the sibling count-matrix computation, which
-explicitly slices to the valid range first. A quality-0 N never reaches
-this code (it's excluded by the `qual_masked > 0` filter), which is why
-this only shows up for reads whose N call was atypically given a non-zero
-quality.
+seq_mat encodes A/T/C/G as 0-3 and 4 for anything else. The per-read SBS
+loop treats a 4 as a mismatch; the BQ-histogram accumulation must keep it out
+of the 4*96 ATCG range so the `.reshape([4, 96, NUM_BQ])` succeeds.
+Quality-0 Ns never reach this code (`qual_masked > 0` filter).
 """
 import numpy as np
 import pysam

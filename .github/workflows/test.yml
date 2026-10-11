@@ -11,10 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # README.md claims python>=3.11 support (numpy==2.3.4/scipy==1.16.2
-        # in setup.py both require >=3.11 -- 3.10 has no matching wheels and
-        # pip install fails outright there); keep this matrix in sync with
-        # that claim rather than testing 3.12 alone.
+        # setup.py's numpy/scipy pins require python >= 3.11.
         python-version: ["3.11", "3.12"]
 
     steps:
@@ -35,10 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # README.md claims python>=3.11 support (numpy==2.3.4/scipy==1.16.2
-        # in setup.py both require >=3.11 -- 3.10 has no matching wheels and
-        # pip install fails outright there); keep this matrix in sync with
-        # that claim rather than testing 3.12 alone.
+        # setup.py's numpy/scipy pins require python >= 3.11.
         python-version: ["3.11", "3.12"]
 
     steps:
@@ -87,9 +81,7 @@ jobs:
       - name: Install DupCaller
         run: pip install .[test]
 
-      # test_mock_pipeline_nextflow.py runs in the dedicated
-      # mock-pipeline-nextflow job below, which installs nextflow and a
-      # container runtime; it would otherwise silently skip here.
+      # The nextflow test runs in the mock-pipeline-nextflow job below.
       - name: Run mock end-to-end pipeline test (direct CLI)
         run: |
           pytest tests/mock_pipeline/ -v \
@@ -113,36 +105,26 @@ jobs:
 
       - name: Install Nextflow
         env:
-          # Pinned so a Nextflow release change can't silently alter what
-          # this job validates; nextflow/nextflow.config only requires
-          # >=21.10.0, so bump this deliberately rather than floating it.
+          # Pinned; bump deliberately (nextflow.config requires >=21.10.0).
           NXF_VER: "24.10.4"
         run: |
-          # get.nextflow.io writes a file named "nextflow" into the
-          # current directory, which collides with this repo's own
-          # nextflow/ directory when run from the checkout root -- do
-          # the install in a scratch dir instead.
+          # The installer writes ./nextflow, which would collide with the
+          # repo's nextflow/ directory.
           mkdir -p "$RUNNER_TEMP/nextflow-install"
           cd "$RUNNER_TEMP/nextflow-install"
           curl -s https://get.nextflow.io | bash
           sudo mv nextflow /usr/local/bin/
           nextflow -version
 
-      # ubuntu-latest runners ship Docker with a running daemon already;
-      # this only verifies it, it doesn't install anything.
+      # ubuntu-latest already runs Docker; this only verifies it.
       - name: Verify Docker is available
         run: docker info
 
       - name: Install DupCaller
         run: pip install .[test]
 
-      # The test itself skips (rather than fails) when nextflow or a
-      # container runtime isn't on PATH, so that a laptop
-      # without those tools doesn't get a spurious failure. In CI all of
-      # them are guaranteed present by the steps above, so a skip here
-      # means the job's own setup is broken, not an expected outcome --
-      # treat it as a failure rather than letting the run go green on a
-      # skip.
+      # The test skips when nextflow or a container runtime is missing; in
+      # CI both are installed above, so treat a skip as a failure.
       - name: Run nextflow mock end-to-end pipeline test
         run: |
           set -o pipefail

@@ -1,6 +1,5 @@
-"""A base is usable iff BQ >= minBq, everywhere: the read matrices
-(genotyping and learning zero BQ < minBq), the indel median-BQ gate, and the
-pileup depth paths (pysam min_base_quality / samtools -Q keep >= minBq)."""
+"""A base is usable iff BQ >= minBq; these tests pin getIndelArr's indel
+median-BQ gate at that boundary."""
 
 import numpy as np
 import pysam

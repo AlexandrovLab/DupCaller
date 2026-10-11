@@ -2,10 +2,9 @@
 
 nextflow.enable.dsl=2
 
-// Defaults for params a config may not set (pipeline.config, or a -c file,
-// overrides any of these). skip_bwa_index defaults to true so a config
-// written before it existed never starts an unrequested bwa-mem2 index;
-// likewise skip_index for the DupCaller index (Step 1a).
+// Defaults for params a config may not set (pipeline.config or a -c file
+// overrides them). Both index steps default to skipped, i.e. pre-built
+// indexes next to params.reference.
 params.skip_index      = true
 params.skip_bwa_index  = true
 params.normal_bam      = null
@@ -25,7 +24,7 @@ if (params.estimate_clonal) {
     error "params.estimate_clonal was removed: DupCaller.py estimate has no clonal option"
 }
 
-// bwa-mem2 index files expected next to params.reference (bwa-mem2 index).
+// bwa-mem2 index files expected next to params.reference.
 def BWA_MEM2_INDEX_SUFFIXES = ['0123', 'amb', 'ann', 'bwt.2bit.64', 'pac']
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,13 +180,8 @@ process MARK_DUPLICATES {
           path("${sample_id}_${type}.mkdped.bam.bai")
 
     script:
-    // MarkDuplicates' external sort spills large intermediate chunks to
-    // disk once it exceeds its in-memory buffer -- without an explicit
-    // TMP_DIR it falls back to Java's default tmp dir, which is usually
-    // the compute node's small local /tmp, not sized for a real BAM's
-    // spill files ("No space left on device" on anything but a tiny
-    // input). Point it at the task's own work dir instead, which is
-    // always on whatever (large) filesystem -w points at.
+    // Spill MarkDuplicates' sort files to the task work dir rather than
+    // Java's default tmp dir (often a small node-local /tmp).
     def heap_gb = Math.max(1, (task.memory.toGiga() * 0.8) as int)
     """
     gatk --java-options "-Xmx${heap_gb}g -Djava.io.tmpdir=\$PWD" MarkDuplicates \
@@ -232,9 +226,8 @@ process CALL_VARIANTS {
     def noise_arg    = noise_mask_names ? "-m " + noise_mask_names.collect { "'${it}'" }.join(' ') : ""
     def target_arg   = isPlaceholder(target_bed)   ? "" : "-R ${target_bed}"
     def indel_arg    = isPlaceholder(indel_bed)    ? "" : "-id ${indel_bed}"
-    // Omitted by default (DupCaller.py call itself then generates a fresh
-    // random seed every run) -- set params.seed to pin it, e.g. to
-    // reproduce/compare against a specific prior run's exact seed.
+    // Omitted by default (DupCaller then picks and logs a random seed);
+    // set params.seed to reproduce a run.
     def seed_arg     = params.seed != null         ? "--seed ${params.seed}" : ""
     // Omitted by default (DupCaller.py call's own default, 0.05, applies).
     def pt_arg       = params.p_threshold != null  ? "-pt ${params.p_threshold}" : ""
@@ -366,9 +359,8 @@ workflow {
     indel_ch    = Channel.value(optionalIndexedResource(params.indel_bed,    'indel_bed',    'NO_INDEL_BED'))
     gene_ch     = Channel.value(optionalIndexedResource(params.gene_bed,     'gene_bed',     'NO_GENE_BED'))
 
-    // params.noise_mask may be a single path or a list of paths (DupCaller.py
-    // call's -m/--noise takes nargs="+" -- e.g. a SNP mask and a noise mask
-    // together, as the real benchmark runs do); normalize to a list.
+    // params.noise_mask may be a single path or a list (-m takes several,
+    // e.g. a SNP mask and a noise mask); normalize to a list.
     noise_mask_list = params.noise_mask
         ? (params.noise_mask instanceof List ? params.noise_mask : [params.noise_mask])
         : []
@@ -415,11 +407,8 @@ workflow {
         .map    { sid, _type, bam, bai -> [sid, bam, bai] }
 
     if (params.normal_bam) {
-        // A single already-aligned, already-indexed normal BAM shared across
-        // every sample_id in the map (e.g. one matched normal reused across
-        // many tumor-only mock/benchmark samples) -- skip trim/align/markdup
-        // for it entirely rather than reprocessing the same normal reads
-        // once per tumor sample.
+        // One pre-aligned, indexed normal BAM shared by every sample_id;
+        // trim/align/markdup are skipped for it.
         normal_bam_file = file(params.normal_bam, checkIfExists: true)
         normal_bai_file = file("${params.normal_bam}.bai", checkIfExists: true)
         call_input_ch = tumor_md.map { sid, bam, bai ->

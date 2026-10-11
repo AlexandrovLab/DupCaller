@@ -9,25 +9,12 @@ from .funcs.misc import INDEX_SCHEMA_VERSION
 
 
 def _iter_repeat_tsv_by_chrom(path):
-    """Stream a PERF-format repeat tsv (chrom, start, end, motif, length,
-    strand, num_units, motif_repeat), grouped by chromosome, yielding
-    (chrom, rows) with rows a list of (start, end, unit_len, repeat_count)
-    tuples in file order.
+    """Stream a PERF-format repeat tsv, yielding (chrom, rows) per chromosome
+    with rows = [(start, end, unit_len, repeat_count), ...] in file order.
 
-    Relies on same-chromosome rows being contiguous in the file — true of
-    PERF's own output, since it processes and concatenates one FASTA record
-    at a time (see PERF/rep_utils.py's fasta_ssrs) — so this only needs a
-    single forward pass, no sorting or indexing. A chromosome with zero
-    repeats simply contributes no rows and is never yielded; do_index's
-    merge loop below handles that by treating a non-matching/absent
-    chromosome as "no STR annotation here" rather than erroring.
-
-    unit_len is read directly from len(motif) and repeat_count directly
-    from the num_units column — no span/unit_len division involved, since
-    PERF already reports the exact count.
-    Entries with unit_len==1 (homopolymers) are skipped entirely: those are
-    self-derived from the reference sequence instead (see
-    homopolymer_run_and_cut below), never taken from this tsv.
+    Assumes same-chromosome rows are contiguous (true of PERF output).
+    unit_len = len(motif), repeat_count = num_units. Homopolymer rows
+    (unit_len 1) are skipped; those are derived from the reference instead.
     """
     handle = gzip.open(path, "rt") if path.endswith(".gz") else open(path)
     try:
@@ -55,15 +42,9 @@ def _iter_repeat_tsv_by_chrom(path):
 
 
 def _dinuc_int_for_chrom(reference_int, sentinel=16):
-    """Per-position raw dinucleotide class (0-15 = 4*base_at_i +
-    base_at_i+1, over the same A/T/C/G->0-3 encoding ref.h5 uses),
-    pairing every position with its successor — mirrors
-    Estimate.py's calculate_ref_dbs exactly (same `4*base1+base2`,
-    same "either base >3 (N/ambiguous) is invalid" rule), just
-    materialized per-position instead of summed into an aggregate
-    count. The last position in a chromosome has no successor and gets
-    `sentinel` (16, one past the valid 0-15 range), matching how
-    Index.py's trinuc index uses a boundary "N" at contig edges.
+    """Per-position dinucleotide class 4*base[i] + base[i+1] (0-15, ref.h5
+    encoding), same rule as Estimate.py's calculate_ref_dbs. Pairs with an
+    N/ambiguous base and the last position get `sentinel`.
     """
     n = reference_int.shape[0]
     dinuc_int = np.full(n, sentinel, dtype=np.uint8)
@@ -76,15 +57,9 @@ def _dinuc_int_for_chrom(reference_int, sentinel=16):
 
 
 def do_index_dbs(args):
-    """Add a .dbs.h5 (per-position raw-16 reference dinucleotide class)
-    to an already-indexed reference, derived read-only from its existing
-    .ref.h5 — does not open .ref.h5/.tn.h5/.hp.h5/.str.h5 for writing and
-    never touches them. Safe to run against a reference other `call`/
-    `estimate` jobs currently have open, unlike re-running the full
-    `index` command (which rewrites all four files and would race any
-    live reader — see Caller.py's do_call comments on this exact hazard).
-    Same per-position encoding do_index's main loop below also now
-    produces for any *new* full index build (`_dinuc_int_for_chrom`).
+    """Add a .dbs.h5 to an already-indexed reference, derived read-only from
+    its .ref.h5. Unlike a full `index` rerun, this never rewrites the other
+    index files, so it is safe while other jobs have them open.
     """
     ref_h5_path = args.reference + ".ref.h5"
     if not os.path.exists(ref_h5_path):
@@ -110,12 +85,10 @@ def resolve_str_overlaps(rows):
     repeat_count) sorted by start.
 
     PERF scans each unit length separately, so its tracts can overlap
-    ((AGGA)2 and (AGG)2 in AGGAGGAGG). Painted in file order, a later tract
-    overwrote an earlier one's unit/count but both kept their start flag,
-    so a flagged start could carry another tract's values. Tracts are kept
-    longest first (ties: shorter unit, then leftmost) and one overlapping an
-    already-kept tract is dropped, so every position belongs to at most one
-    tract and every tract has exactly one start flag.
+    ((AGGA)2 and (AGG)2 in AGGAGGAGG). Tracts are kept longest first (ties:
+    shorter unit, then leftmost) and any overlapping an already-kept tract
+    is dropped, so each position belongs to at most one tract and each
+    tract has exactly one start flag.
 
     PERF's span can run past start + num_units*unit_len at the trailing
     boundary; true_end clamps it so the extra bases aren't painted."""
@@ -139,9 +112,7 @@ def resolve_str_overlaps(rows):
 
 
 def _iter_fasta_records(path):
-    """Stream FASTA records one at a time instead of loading every contig
-    into memory up front (SeqIO.to_dict keeps the whole genome resident for
-    the life of the process)."""
+    """Stream FASTA records one at a time to avoid holding the genome in memory."""
     handle = gzip.open(path, "rt") if path.endswith(".gz") else open(path)
     try:
         yield from SeqIO.parse(handle, "fasta")
@@ -198,13 +169,8 @@ def do_index(args):
             trinuc_order += 1
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3, "a": 0, "t": 1, "c": 2, "g": 3}
 
-    # Whole-genome lookup tables, built once: O(1) numpy fancy-indexing for
-    # per-base/per-trinuc encoding, avoiding a per-base Python string list
-    # (a new 3-character str object allocated for every base in the
-    # chromosome) or a np.vectorize call (a disguised per-base Python
-    # loop). Any byte combination not explicitly set below keeps the
-    # table's default, matching dict.get(key, default) fallback semantics
-    # — including for ambiguity codes other than "N".
+    # Byte-indexed lookup tables for vectorized base/trinuc encoding. Unset
+    # entries (any non-ACGT byte) keep the default code (4 / 96).
     base2num_lut = np.full(256, 4, dtype=np.uint8)
     for base, code in base2num.items():
         base2num_lut[ord(base)] = code
@@ -230,22 +196,12 @@ def do_index(args):
         except StopIteration:
             return None
 
-    # One item of lookahead: (chrom, rows) for whichever chromosome the tsv
-    # stream is currently sitting on, or None once the tsv is exhausted.
+    # One-item lookahead into the tsv stream; None once exhausted.
     pending_tsv_chrom = _next_or_none(repeat_tsv_iter)
 
     def homopolymer_run_and_cut(reference_int):
-        """Self-derive per-position homopolymer run length and run-start
-        markers directly from the reference sequence — no BED input
-        involved. cut[i] marks the start of every maximal run of identical
-        bases. run_id[i] is a running count of run starts up to and
-        including i, so every position in the same run shares one id;
-        bincount over run_id then gives each run's length, indexed by that
-        id. Clipping run_len to the uint8 range before the final gather
-        (hp = run_len[run_id]) is equivalent to computing the full-width
-        run length and clipping afterward — clip is elementwise and
-        commutes with a gather — but avoids ever materializing a
-        chromosome-length int64 array."""
+        """Per-position homopolymer run length (capped at 127) and run-start
+        flags (cut), derived from the reference sequence."""
         n = reference_int.shape[0]
         cut = np.ones(n, dtype=bool)
         cut[1:] = reference_int[1:] != reference_int[:-1]
@@ -288,26 +244,19 @@ def do_index(args):
         str_unit_len = np.zeros(ref_len, dtype=np.uint8)
         str_hp = np.zeros(ref_len, dtype=np.uint8)
         str_cut = np.zeros(ref_len, dtype=np.uint8)
-        # Paint every (start, end, unit_len, count) row PERF found for this
-        # chromosome directly onto the whole-chromosome arrays — unit_len
-        # and count are taken as-is from the tsv (no span/unit_len
-        # division), and PERF's own num_units is trusted exactly rather
-        # than re-derived. If the tsv's next chromosome doesn't match this
-        # one, it means PERF found zero repeats here (see
-        # _iter_repeat_tsv_by_chrom's docstring) — leave the arrays at 0
-        # and don't advance the tsv stream.
+        # If the tsv's next chromosome isn't this one, PERF found no repeats
+        # here: leave the arrays at 0 and don't advance the stream.
         if pending_tsv_chrom is not None and pending_tsv_chrom[0] == chrom:
             for start, true_end, unit_length, count in resolve_str_overlaps(
                 pending_tsv_chrom[1]
             ):
                 str_unit_len[start:true_end] = unit_length
                 str_cut[start] = 1
-                # Clipped to the array's uint8 range.
+                # Capped at 127, like hp run length.
                 str_hp[start:true_end] = min(count, 127)
             pending_tsv_chrom = _next_or_none(repeat_tsv_iter)
-        # str_lens rows: 0 = repeat unit length, 1 = number of times the
-        # repeat unit repeats (constant across the whole repeat interval),
-        # 2 = cut (start-of-repeat bool)
+        # str_lens rows: 0 = unit length, 1 = repeat count (constant across
+        # the tract), 2 = cut (tract start)
         str_lens = np.vstack((str_unit_len, str_hp, str_cut)).astype(
             np.uint8, copy=False
         )

@@ -1,11 +1,10 @@
 """Indel coordinate consistency between learning and calling.
 
-- left_align_indel must never shift an anchor left of reference_start
-  (it used to return reference_start - 1 at the window's left edge).
-- profileTriNucMismatches (learn) and genotypeDSIndel (call) must apply
-  the same locus mask (learn used to test the base BEFORE the anchor) and
-  classify the same STR context (call used to look at the base AFTER a
-  deletion, learn at the first deleted base).
+- left_align_indel never shifts an anchor left of reference_start.
+- profileTriNucMismatches (learn) and genotypeDSIndel (call) apply the same
+  locus mask (anchor through the last deleted base, not the base before the
+  anchor) and classify the same STR/HP context (the first deleted base, not
+  the base after a deletion).
 """
 import numpy as np
 import pysam
@@ -106,7 +105,7 @@ def test_context_index_is_first_base_after_anchor():
 # Window 100..129: G C [A T A T] G C G G ... ; (AT)x2 annotated as an STR
 # at 102..105. A 4bp deletion of ATAT is anchored at 101 ("101:-4"): its
 # first deleted base (102) is inside the STR, the base after it (106) is
-# not -- the case where the old call-side anchor disagreed with learn.
+# not, so learn and call must both use the first deleted base.
 REF = "GC" + "ATAT" + "GCGGCCGCGGCCGCGGCCGCGGCC"
 STR_START, STR_END = 102, 106
 DEL_POS, DEL_LEN = 101, 4
@@ -236,8 +235,7 @@ def test_learn_and_call_agree_on_mask_and_str_bin(masked, admitted, monkeypatch)
 
 def test_learn_and_call_agree_on_hp_length(monkeypatch):
     # G A A A A A [C] C G T: deleting the C at 106 is anchored at the last A
-    # (105). Its own run is CC (length 2); the old call-side max over
-    # pos..pos+2 picked up the neighbouring A-run (length 5) instead.
+    # (105). Its own run is CC (length 2), not the neighbouring A-run (5).
     ref = "G" + "A" * 5 + "CC" + "GT" * 11
     kw = {"ref": ref, "del_pos": 105, "del_len": 1}
     family = _family(**kw)

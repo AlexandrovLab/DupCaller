@@ -1,13 +1,7 @@
-"""Regression test for funcs/depth.py's prepareAlignMask: the per-read NM
-tag must be indel-corrected (indel bases backed out, one mismatch-
-equivalent credited per indel event -- same correction as
-funcs/call.py's read-blacklist NM_no_id) before it's averaged into the
-NM/AS-XS alignment mask. A prior regression left the CIGAR loop that
-computes this correction dead (id_length/id_num were initialized but
-never incremented, and the block that referenced them didn't even run --
-it raised NameError on any real read), so NM_no_id silently fell back to
-the raw NM tag, inflating the apparent mismatch count for any
-indel-containing read and risking over-masking real loci.
+"""funcs/depth.py's prepareAlignMask averages an indel-corrected NM into the
+NM/AS-XS alignment mask: indel bases are backed out and one
+mismatch-equivalent is credited per indel event (the same NM_no_id
+correction as funcs/call.py's read blacklist).
 """
 import pysam
 
@@ -71,10 +65,9 @@ def _build_bam(path, fwd_cigar, fwd_nm, rev_cigar, rev_nm):
 
 
 def test_indel_correction_prevents_over_masking(tmp_path):
-    """A perfect-match forward mate plus a reverse mate whose only edit
-    is one DELETION_LEN-bp deletion (no real mismatches): raw NM tag
-    equals DELETION_LEN, but the correct NM_no_id is exactly 1. With
-    MAX_NM/2 == 2, the corrected value must NOT mask; the raw value
+    """A perfect-match forward mate plus a reverse mate whose only edit is
+    one DELETION_LEN-bp deletion: raw NM is DELETION_LEN, NM_no_id is 1.
+    With MAX_NM/2 == 2 the corrected value does not mask; the raw one
     would."""
     bam_path = tmp_path / "test.bam"
     _build_bam(
@@ -96,11 +89,8 @@ def test_indel_correction_prevents_over_masking(tmp_path):
 
 
 def test_real_mismatches_without_indels_still_mask(tmp_path):
-    """Sanity check that the indel correction doesn't neuter ordinary
-    mismatch-based masking: a reverse mate with DELETION_LEN real
-    mismatches and NO indels has NM_no_id == raw NM == DELETION_LEN
-    (id_length/id_num both 0, so the correction is a no-op), which must
-    still clear the mask at MAX_NM/2."""
+    """A reverse mate with DELETION_LEN real mismatches and no indels has
+    NM_no_id == raw NM == DELETION_LEN, which still masks at MAX_NM/2."""
     bam_path = tmp_path / "test_mismatch.bam"
     _build_bam(
         bam_path,

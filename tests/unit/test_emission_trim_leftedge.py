@@ -1,11 +1,11 @@
-"""N1: read emission in calculateSSPosterior is conditioned on the read
-showing one of the two modelled alleles -- P(other allele) =
-(e/3)/(1 - 2e/3), P(true allele) = 1 minus that -- with the Pseq == 0
-sentinel exactly uninformative.
-N6: trim_mask with right == 0 trims nothing (a bare mask[-0:] masked the
-whole family).
-N5: an indel anchored at the window's first base is uncallable in both
-learning and calling (left-alignment can't see past the window start)."""
+"""Read emission, trim_mask, and indels at the window start.
+
+- calculateSSPosterior's read emission is conditioned on the read showing
+  one of the two modelled alleles: P(other allele) = (e/3)/(1 - 2e/3),
+  P(true allele) = 1 minus that; the Pseq == 0 sentinel is uninformative.
+- trim_mask with right == 0 trims nothing on the right.
+- An indel anchored at the window's first base is uncallable in both learning
+  and calling (left-alignment can't see past the window start)."""
 
 import numpy as np
 import pysam
@@ -21,7 +21,7 @@ from DupCaller_sub.funcs.misc import (
 from DupCaller_sub.funcs.prob import calculateSSPosterior, genotypeDSIndel
 
 
-# ------------------------------------------------------------------ N1
+# ------------------------------------------------------- read emission
 
 
 def _p_other(q):
@@ -69,7 +69,7 @@ def test_emission_sentinel_is_uninformative_and_input_untouched():
     np.testing.assert_array_equal(pseq, before)
 
 
-# ------------------------------------------------------------------ N6
+# ------------------------------------------------------------ trim_mask
 
 
 def test_trim_mask_right_zero_trims_nothing():
@@ -82,7 +82,7 @@ def test_trim_mask_left_and_right():
     np.testing.assert_array_equal(np.nonzero(trim_mask(10, 2, 3))[0], [0, 1, 7, 8, 9])
 
 
-# ------------------------------------------------------------------ N5
+# ----------------------------------------- indels at the window start
 
 HEADER = pysam.AlignmentHeader.from_dict(
     {"HD": {"VN": "1.6"}, "SQ": [{"SN": "chr1", "LN": 1000}]}

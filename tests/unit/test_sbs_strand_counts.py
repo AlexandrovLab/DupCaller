@@ -1,5 +1,5 @@
 """_sbs_strand_counts (one bincount over all of a strand's reads) gives the
-same SBS amp tallies as the per-read loop it replaced."""
+same SBS amp tallies as a per-read reference loop."""
 
 import numpy as np
 import pytest

@@ -1,23 +1,12 @@
-"""Regression test for Caller.py's merge_and_combine_coverage_files: an
-overflow-extended `next_region` file (bamIterateMultipleRegionWithOverflow,
-funcs/misc.py, lets a worker's coverage flush reach arbitrarily far past its
-own nominal region_end to correctly attribute a boundary-crossing duplex
-family) used to break the plain chunk-order concatenation this function
-relied on, since the following worker's own main coverage file could start
-at a position *lower* than wherever the overflow reached -- producing an
-unsorted final bed file that crashed `tabix -f -p bed` indexing (observed on
-16/17 real production PD samples' full-genome runs: "Unsorted positions on
-sequence #2: 15864109 followed by 15863937").
+"""Caller.merge_and_combine_coverage_files with overflow-extended
+next_region files.
 
-The fix: peel any leading rows of the following worker's main file that fall
-at or below the overflow reach into the same sum-on-matching-position merge
-already used for the small next_region/prev_region overlap, instead of
-assuming a plain concatenation is already sorted. Positions appearing in
-both the overflow-extended next_region file and the peeled main-file rows
-represent genuinely different, non-overlapping families (the complementary
-"later worker skips reads whose mate precedes its own region start" rule
-only excludes specific reads, not everything at that position) -- so they
-must be *summed*, not deduplicated or last-write-wins overwritten.
+bamIterateMultipleRegionWithOverflow lets a worker's coverage reach past its
+nominal region_end, so the next worker's main file can start below where that
+overflow reached. Leading rows of the next main file at or below the overflow
+reach are merged with the next_region rows by position, keeping the output
+sorted for tabix. Rows at the same position come from different families and
+are summed, not deduplicated.
 """
 import os
 
@@ -63,11 +52,9 @@ def test_overflow_extended_overlap_is_sorted_and_summed(tmp_path):
         [("chr1", 300, 301, [2, 0, 0, 0]), ("chr1", 350, 351, [1, 0, 0, 0])],
     )
     _write_bed(os.path.join(tmp, f"{sample}_1_coverage_prev_region.tmp.bed.gz"), [])
-    # Worker 1's own main file starts at its nominal region_start (300),
-    # including a row at the SAME position (300) as the overflow row --
-    # from an unrelated family -- to verify summation, plus a row (320)
-    # inside the overflow's reach with no matching next_region row (must
-    # survive untouched), plus a row (400) safely past the reach.
+    # Worker 1's main file: a row at 300 (same position as an overflow row,
+    # different family, so summed), a row at 320 inside the overflow reach
+    # with no matching next_region row, and a row at 400 past the reach.
     _write_bed(
         os.path.join(tmp, f"{sample}_1_coverage.bed.gz"),
         [
@@ -90,20 +77,17 @@ def test_overflow_extended_overlap_is_sorted_and_summed(tmp_path):
     by_pos = {r[1]: r[3][0] for r in rows}
     assert by_pos[100] == 5.0
     assert by_pos[200] == 3.0
-    # Overflow row (2) + worker 1's own unrelated-family row (4) at the same
-    # position must be summed, not deduplicated/overwritten.
+    # Overflow row (2) + worker 1's row (4) at the same position are summed.
     assert by_pos[300] == 6.0
-    # Inside the overflow's reach but no matching next_region row -- must
-    # survive the peel untouched.
+    # Inside the overflow reach with no matching next_region row: unchanged.
     assert by_pos[320] == 7.0
     assert by_pos[350] == 1.0
     assert by_pos[400] == 9.0
 
 
 def test_no_overflow_matches_prior_plain_concatenation_behavior(tmp_path):
-    """The common case (no overflow ever occurred, next_region/prev_region
-    empty) must behave exactly as the original plain-concatenation code
-    did: each worker's main file untouched and simply stitched together."""
+    """With empty next_region/prev_region files, the workers' main files are
+    concatenated unchanged."""
     sample = "BASE"
     tmp = str(tmp_path)
 

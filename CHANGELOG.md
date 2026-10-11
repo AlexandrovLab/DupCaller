@@ -2,7 +2,7 @@
 
 All notable changes to DupCaller are recorded here, most recent first.
 
-## [1.2.12] - 2026-10-09
+## [1.2.12] - 2026-10-11
 
 ### Changed
 - Per-channel mutation rate (mu) is the maximum-likelihood estimate with no pseudocount: the root of `mu*Eeff = sum of site posteriors`, i.e. of the log-likelihood's derivative `sum((r-1)/(1-mu+mu*r)) - (Eeff-n)/(1-mu)`, which has at most one root between 0 and 1. The 1.2.11 symmetric prior (`a` = 0.5 pseudo-mutations and pseudo-reference sites, `mu*(Eeff+2a) = sum + a`) pulled mu toward about 0.5/Eeff in channels with little opportunity, lowering their thresholds.
@@ -23,6 +23,12 @@ All notable changes to DupCaller are recorded here, most recent first.
 - `_stats.txt` `Unmasked Coverage` (and so `_sbs_burden.txt`'s `Unmasked burden`) left out positions without masked SNV or indel coverage, i.e. noise-masked-only positions, because it was summed while writing `coverage.bed.gz`, which skips such positions (40mM-72h chr22: 1.6% low). It and `Per Read Family Coverage` are now summed as each family's coverage is accumulated, the same totals the by-duplex-group tables and `--skipCoveragePass` use (so they also include coverage the bed flush drops after a backward window re-init, and no longer equal coverage.bed.gz's sum exactly).
 - Per-channel mu solve: brentq runs with a relative tolerance only (its default absolute tolerance, 2e-12, would leave roots near 1e-12 up to 3x off without the pseudocount floor). A non-finite LR among a channel's mu sites raises instead of silently giving mu just below 1.
 - A pre-1.2.12 STR error profile at the default `ERROR/` prefix is relearned; one given with `-E` is refused up front with a message to relearn.
+- `call`: when combining the per-worker coverage files or indexing them with tabix failed, the warning was followed by a `FileNotFoundError` crash when moving the missing `coverage.bed.gz`. The move is now skipped with a warning (per-worker files stay in `tmp/`), and a missing `tabix` binary is handled the same way.
+- `_stats.txt` `Pass-filter Duplication Rate` had 8 spaces after the tab (a backslash continuation inside an f-string); the same applied to the matched-normal message printed at startup.
+- `estimate -rb/--reestimatebed` with `-d/--dilute` crashed with a `NameError` writing `_sbs_flt.vcf`. The dilute filter still applies to the re-estimate counts; no filtered VCF is written there. The main estimate path now closes `_sbs_flt.vcf` explicitly.
+- `estimate -gb/--genebed` per-gene depth counted each BED exon one base too long (`end - start + 1` on half-open BED intervals), so depths were slightly low.
+- `summarize` stripped the leading `/` from absolute sample folders, so their files were not found.
+- pysam pileup calls in `funcs/depth.py` passed `truncated=` / `maxdepth=`, which pysam silently ignores; they now pass `truncate=` / `max_depth=` (no change in results, fewer columns iterated).
 
 ### Tests
 - mu-solve tests rewritten for the maximum-likelihood equation: equation residual, the single-site closed form (`mu = (r - Eeff) / (Eeff*(r - 1))`), mu = 1/(Eeff+1) when there is no root (including no sites; 0 with Eeff 0 too) and its threshold above every site of the channel, mu just below 1 when every opportunity is a strong site (threshold at the `--minLR` floor), and Eeff raised to the site count. The zero-pseudocount refusal test and the pseudocount-floor tests are removed.
@@ -31,6 +37,7 @@ All notable changes to DupCaller are recorded here, most recent first.
 - `test_power_tally.py`: tallying positions by power-table index and contracting with random power tables reproduces the coverage pass's position-by-position SBS, unmasked, DBS and indel100 sums.
 
 ### Documentation
+- Source and test comments trimmed: development history, run-specific notes and commented-out code removed, long docstrings condensed, comments that contradicted the code corrected.
 - README, `call --help` and `docs/call_outputs.md` describe `-a/--pseudocount` and `mutation_rate_mle` for the new solve, and `--skipCoveragePass`'s outputs; `docs/estimate_outputs.md` notes which estimate outputs it skips.
 
 ## [1.2.11] - 2026-10-06

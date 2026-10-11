@@ -1,25 +1,14 @@
-"""How profileTriNucMismatches treats N/off-read bases within a read
-family, per the current (intentional) design:
+"""How profileTriNucMismatches treats N bases within a read family.
 
-1. There is NO EXPLICIT family-wide antimask veto for a position just
-   because one member read has an N there (that broader, direct veto --
-   `F1R2_antimask[(F1R2_seq_mat == 4).any(axis=0)] = False` -- has been
-   deliberately left disabled since commit ba964c4, which scoped the
-   N-handling fix to a narrower per-read exclusion instead of
-   re-enabling the family-wide one).
-2. BUT an N can still indirectly mask a position for the WHOLE group:
-   F1R2_count_mat only counts real ATCG bases (`for nn in range(4):
-   F1R2_count_mat[nn] = (F1R2_seq_mat == nn).sum(...)`), never N. So
-   `F1R2_antimask[F1R2_count_sum < min_depth] = False` silently drops a
-   position for every read in the group whenever too few reads have a
-   real base there -- if the family is small enough (at or near
-   min_depth), a single read's N is enough to trip this.
-3. When the group's depth stays comfortably above min_depth despite one
-   read's N, that read's OTHER positions still contribute normally; only
-   the N position itself is excluded on that one read
-   (`valid = (qual_masked > 0) & (seq_masked < 4)`), not vetoed for the
-   whole group. This holds regardless of how many N's/mismatches a read
-   carries -- there is no per-read mismatch-count gate any more.
+1. There is no family-wide veto of a position because one member read has an
+   N there.
+2. N can still mask a position for the whole group indirectly: the per-strand
+   count matrix only counts ATCG, so `F1R2_antimask[F1R2_count_sum <
+   min_depth] = False` drops the position for every read when the N pushes
+   the real-base depth below min_depth.
+3. Otherwise only the N position on that one read is excluded
+   (`valid = (qual_masked > 0) & (seq_masked < 4)`); its other positions
+   contribute normally, and there is no per-read mismatch-count gate.
 """
 import numpy as np
 import pysam
@@ -83,10 +72,8 @@ REF_READ = "C" * READ_LEN  # every position matches reference ("ACA"'s ref base)
 
 
 def test_single_n_excludes_only_that_read_at_that_position():
-    """Family well above min_depth (4 clean reads + 1 with an N), so the
-    N can't drop group depth below the floor -- isolates the pure
-    per-read exclusion (point 3 above) from the depth-interaction
-    (point 2), which the next test covers separately."""
+    """Family well above min_depth (4 clean reads + 1 with an N): only the
+    per-read exclusion (point 3) applies."""
     one_n_at_5 = "CCCCCNCCCC"  # exactly one N, at index 5
     f1r2 = [
         one_n_at_5,
@@ -111,13 +98,8 @@ def test_single_n_excludes_only_that_read_at_that_position():
 
 
 def test_n_can_indirectly_mask_the_whole_group_at_low_depth():
-    """Family sitting exactly at min_depth=3: F1R2_count_mat never counts
-    N, so one read's N drops the group's real-base depth at that
-    position to 2 (< min_depth), tripping `F1R2_antimask[F1R2_count_sum <
-    min_depth] = False` for ALL THREE F1R2 reads at that position -- not
-    just the one with the N. This is a real, currently-live side effect,
-    distinct from the (deliberately disabled) direct per-position N
-    veto."""
+    """Family exactly at min_depth=3: one read's N drops the real-base depth
+    at that position to 2, masking it for all three F1R2 reads (point 2)."""
     one_n_at_5 = "CCCCCNCCCC"
     f1r2 = [one_n_at_5, REF_READ, REF_READ]  # exactly 3 = min_depth
     f2r1 = [REF_READ, REF_READ, REF_READ]
@@ -130,8 +112,7 @@ def test_n_can_indirectly_mask_the_whole_group_at_low_depth():
     # F1R2: position 5 is masked for the whole group (depth drops to 2
     # there) -> all 3 F1R2 reads lose that one position -> 3*9=27.
     # F2R1: untouched (its own depth stays 3 throughout) -> 3*10=30.
-    # Total 57 -- NOT 59 (what you'd get if only the N-bearing read's own
-    # position were excluded, per the previous test's family size).
+    # Total 57, not 59 (which per-read exclusion alone would give).
     assert n_counted == 57
     assert ref_count == 57
 

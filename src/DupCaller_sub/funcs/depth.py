@@ -6,22 +6,10 @@ from .misc import getAlignmentObject as BAM
 from .misc import get_duplex_barcode
 from .misc import family_fragment_starts, fragment_start  # noqa: F401
 
-# Candidates on the same chromosome farther apart than this start a new
-# pileup() scan in extractDepthBatchSnv/extractDepthBatchIndel, rather than
-# being folded into one scan that would otherwise burn time walking through
-# a mostly-empty span. htslib's pileup engine has to parse every read
-# overlapping ANY column in a merged span, wanted or not, so merging two
-# distant candidates can force parsing of reads that are irrelevant to
-# either one. Benchmarked under adversarial uniform 20x coverage (i.e. the
-# merged span is never actually empty): batching is still a ~1.7x win at
-# this gap, break-even lands around ~2800bp, and it becomes a ~3x
-# regression by 10000bp. 500bp keeps solid margin below that cliff and is
-# close to typical short-read length — candidates within about one read
-# length of each other already share most of the same overlapping reads
-# regardless of whether they're queried together, so merging them is
-# nearly free; farther apart than that, the shared-read assumption breaks
-# down and the merge starts paying for reads that don't matter to either
-# candidate.
+# Candidates farther apart than this start a new pileup() scan. A merged
+# scan parses every read overlapping the span, wanted or not; at ~one read
+# length apart candidates share most reads so merging is nearly free, while
+# at uniform 20x merging breaks even around 2.8kb and costs ~3x by 10kb.
 _DEPTH_BATCH_MAX_GAP = 500
 
 
@@ -41,21 +29,16 @@ def _cluster_positions(positions, max_gap):
 
 
 def _read_family_id(aln, params):
-    """(bc1, bc2, |template_length|, fragment start) of aln -- the
-    founding-family identifier matched against call_barcodes by
-    _family_id_matches."""
+    """Founding-family identifier of aln: (bc1, bc2, |TL|, fragment start)."""
     read_bc1, read_bc2 = get_duplex_barcode(aln, params)
     return read_bc1, read_bc2, abs(aln.template_length), fragment_start(aln)
 
 
 def _family_id_matches(family_ids, read_bc1, read_bc2, read_tl, read_fs):
-    """True if the read's duplex barcode pair (either orientation),
-    absolute template length AND fragment start match one of family_ids'
-    (bc1, bc2, |TL|, fragment start). Absolute value because a family's
-    leftmost reads carry +TL and their mates -TL (see
-    misc._compute_read_label), and either mate can be the read covering a
-    pileup column; the fragment start separates two molecules that share
-    barcodes and template length."""
+    """True if (bc1, bc2, |TL|, fragment start), with the barcode pair in
+    either orientation, is in family_ids. |TL| because either mate may
+    cover the column; fragment start separates molecules that share
+    barcodes and TL."""
     return (read_bc1, read_bc2, read_tl, read_fs) in family_ids or (
         read_bc2,
         read_bc1,
@@ -81,46 +64,22 @@ def extractDepthBatchSnv(
     max_gap=_DEPTH_BATCH_MAX_GAP,
     call_barcodes=None,
 ):
-    """Batched equivalent of extractDepthSnv: resolves many (chrom, pos,
-    ref, alt) candidates with one sequential pileup() scan per cluster of
-    nearby positions (see _cluster_positions), instead of one
-    random-access pileup() call per candidate. Per-read filtering and
-    per-candidate accounting exactly mirror extractDepthSnv, just shared
-    across every candidate a given pileup column covers.
+    """Batched extractDepthSnv: one sequential pileup() per cluster of
+    nearby positions instead of one random-access pileup() per candidate,
+    with the same per-read filtering and accounting.
 
-    candidates: iterable of (chrom, pos, ref, alt) — 1-based pos, matching
-    extractDepthSnv's convention.
-    Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
-    Candidates with zero pileup coverage are simply absent from the
-    result — same information as extractDepthSnv returning all zeros.
+    candidates: iterable of (chrom, pos, ref, alt), 1-based pos.
+    Returns {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)};
+    candidates with no coverage are absent.
 
-    call_barcodes, when given, is
-    {(chrom, pos, ref, alt): {(bc1, bc2, abs_template_length,
-    fragment_start), ...}} -- the duplex barcode pair, absolute template
-    length and fragment start (see fragment_start) of every family that
-    itself supports that
-    candidate (used for the tumor BAM: a candidate can be supported by more
-    than one duplex family). This switches on barcode-aware base-quality
-    handling: the pileup itself only requires BQ>0 (min_base_quality=1)
-    instead of minbq, and a primary read whose own duplex barcode pair
-    (either orientation), |template_length| and fragment start match one of
-    a candidate's call_barcodes counts
-    toward that candidate's depth regardless of its base quality, since
-    it's one of the founding reads of the call being verified -- every
-    other read is still held to minbq, checked manually per read since
-    pysam's pileup only supports one global threshold. Deletions have no
-    base quality to check at all, so (as when call_barcodes is None) they
-    always count.
-
-    Mapping quality is handled the same way: the pileup takes every MAPQ
-    (min_mapping_quality=0) and the --mapq cut is applied per read. With
-    call_barcodes, a read below --mapq still counts toward a candidate whose
-    founding family (barcode pair + |template_length| + fragment start) it
-    belongs to; any
-    other read needs MAPQ >= --mapq. A low-MAPQ read that belongs to no
-    founding family at the column is skipped without claiming its query
-    name, so its mate can still be counted. Without call_barcodes (normal
-    BAMs) every read needs MAPQ >= --mapq, as before.
+    call_barcodes (tumor BAM): {(chrom, pos, ref, alt): {(bc1, bc2, |TL|,
+    fragment_start), ...}} of the families supporting each candidate. A
+    read from one of a candidate's founding families counts toward it
+    regardless of BQ (< minbq) or MAPQ (< --mapq); every other read must
+    pass both, checked per read since pileup takes one global threshold.
+    A low-MAPQ read matching no founding family is skipped without
+    claiming its query name, so its mate can still count. Deletions have
+    no BQ and always count.
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
@@ -138,7 +97,7 @@ def extractDepthBatchSnv(
                 cluster[-1],
                 min_base_quality=pileup_minbq,
                 min_mapping_quality=0,
-                truncated=True,
+                truncate=True,
                 max_depth=params["maxDepth"],
             ):
                 pos = pileupcolumn.pos + 1
@@ -228,9 +187,8 @@ def extractDepthBatchIndel(
     max_gap=_DEPTH_BATCH_MAX_GAP,
     call_barcodes=None,
 ):
-    """Batched equivalent of extractDepthIndel — see extractDepthBatchSnv,
-    including the call_barcodes founding-family exemption from minbq and
-    --mapq.
+    """Batched extractDepthIndel; see extractDepthBatchSnv, including the
+    call_barcodes founding-family exemption from minbq and --mapq.
 
     candidates: iterable of (chrom, pos, ref, alt).
     Returns: {(chrom, pos, ref, alt): (altCount, refCount, otherIndelCount, depth)}
@@ -335,41 +293,16 @@ def extractDepthBatchDbs(
     max_gap=_DEPTH_BATCH_MAX_GAP,
     call_barcodes=None,
 ):
-    """Batched DBS depth extraction: for each (chrom, pos, ref, alt)
-    candidate (pos = 1-based position of the dinucleotide's FIRST base;
-    ref/alt are 2-character dinucleotide strings, matching
-    _detect_dbs_pairs' convention), counts reads by what they show at
-    BOTH positions TOGETHER on the SAME read — not two independently
-    tallied single-base pileups. A DBS is defined as both bases changing
-    simultaneously on one physical molecule, so a read only counts toward
-    alt if it carries alt[0] at pos AND alt[1] at pos+1 on that same read;
-    similarly for ref. Anything else observed at both positions (neither
-    the exact ref nor exact alt dinucleotide, or an indel at either
-    position) counts as "other" and contributes to depth but not
-    alt/ref — indelCount is the subset of "other" specifically caused by
-    an indel at either position.
+    """Batched DBS depth: pos is the 1-based first base, ref/alt are
+    dinucleotides. Reads are correlated by name across the two columns, so
+    alt/ref need both bases on the SAME read; anything else spanning both
+    positions is "other" (counted in depth), and indelCount is the part of
+    "other" with an indel at either position.
 
-    Unlike extractDepthBatchSnv/Indel (one pileup column per candidate),
-    this needs both of a candidate's adjacent columns correlated by read
-    name, since the two single-column tallies alone can't tell whether
-    the SAME read carried both alt bases together.
-
-    Returns: {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)}
-    Candidates with zero reads spanning both positions are simply absent
-    from the result.
-
-    call_barcodes, when given, is the same barcode-aware base-quality
-    switch as extractDepthBatchSnv/Indel: both columns are pileup'd at
-    BQ>0 (min_base_quality=1) instead of minbq, and a read whose own
-    duplex barcode pair (either orientation), |template_length| and
-    fragment start match one of a candidate's call_barcodes counts toward that candidate's depth regardless
-    of its base quality at either position; otherwise it still needs
-    BOTH of its bases to individually meet minbq (matching what the
-    single shared min_base_quality=minbq pileup filter used to enforce
-    per column). Deletions have no base quality to check, same as
-    extractDepthBatchSnv/Indel. The same exemption covers --mapq: with
-    call_barcodes a read below --mapq counts only for a candidate whose
-    founding family it belongs to (see extractDepthBatchSnv).
+    Returns {(chrom, pos, ref, alt): (altCount, refCount, indelCount, depth)};
+    candidates with no read spanning both positions are absent.
+    call_barcodes: same founding-family BQ/MAPQ exemption as
+    extractDepthBatchSnv; non-founding reads need both bases >= minbq.
     """
     barcode_aware = call_barcodes is not None
     pileup_minbq = 1 if barcode_aware else minbq
@@ -380,21 +313,16 @@ def extractDepthBatchDbs(
 
     for chrom, pos_to_specs in by_chrom.items():
         for cluster in _cluster_positions(list(pos_to_specs.keys()), max_gap):
-            # Every candidate needs its own pair of adjacent columns
-            # (pos, pos+1), so the wanted set spans one past the usual
-            # cluster range too.
+            # Each candidate needs columns pos and pos+1.
             wanted_cols = set()
             for p in cluster:
                 wanted_cols.add(p)
                 wanted_cols.add(p + 1)
-            # 1-based pos -> {read_name: entry}. entry is base-or-None
-            # (indel) when call_barcodes is None (unchanged); with
-            # call_barcodes it's (base_or_None, ok, family_id), where ok
-            # means the base passes minbq and the read passes --mapq, so
-            # the correlation step below can apply the barcode-match
-            # exemption per candidate, since the same column can serve as
-            # candidate A's own position and candidate B's pos+1, each
-            # with its own call_barcodes.
+            # 1-based pos -> {read_name: entry}; entry is the base (None for
+            # an indel), or with call_barcodes (base, ok, family_id), ok =
+            # passes minbq and --mapq. The barcode exemption is applied per
+            # candidate at correlation time, since one column can be one
+            # candidate's pos and another's pos+1.
             col_bases = {}
             for pileupcolumn in bam.pileup(
                 chrom,
@@ -402,7 +330,7 @@ def extractDepthBatchDbs(
                 cluster[-1] + 1,
                 min_base_quality=pileup_minbq,
                 min_mapping_quality=0,
-                truncated=True,
+                truncate=True,
                 max_depth=params["maxDepth"],
             ):
                 pos = pileupcolumn.pos + 1
@@ -449,19 +377,12 @@ def extractDepthBatchDbs(
                         else aln.query_sequence[pileupread.query_position]
                     )
                     if barcode_aware:
-                        # ok: this column's base passes minbq and the read
-                        # passes mapq; otherwise the read counts only for a
-                        # candidate whose founding family it belongs to.
                         ok = mapq_ok and (
                             pileupread.query_position is None
                             or aln.query_qualities[pileupread.query_position] >= minbq
                         )
-                        # Barcode lookup deferred to only the reads that
-                        # actually need it -- mirrors extractDepthBatchSnv/
-                        # Indel's per-read gating. A read whose OTHER
-                        # column needs its barcode but this one doesn't
-                        # still gets it from that other column at
-                        # correlation time below.
+                        # Look up the family only when needed; if only the
+                        # read's other column needs it, it comes from there.
                         if not ok and fam_id is None:
                             fam_id = _read_family_id(aln, params)
                         reads[aln.query_name] = (base, ok, fam_id)
@@ -487,10 +408,8 @@ def extractDepthBatchDbs(
                             b0, q0_ok, fam_id0 = bases0[rn]
                             b1, q1_ok, fam_id1 = bases1[rn]
                             if not (q0_ok and q1_ok):
-                                # At least one column has ok False,
-                                # so at least one of these ids was
-                                # actually computed (non-None) -- prefer
-                                # col0's, fall back to col1's.
+                                # At least one column has ok False, so at
+                                # least one id was computed.
                                 fam_id = fam_id0 if fam_id0 is not None else fam_id1
                                 if not _family_id_matches(bc_pairs, *fam_id):
                                     continue
@@ -527,7 +446,7 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):
         pos - 1,
         pos,
         min_base_quality=minbq,
-        truncated=True,
+        truncate=True,
         max_depth=params["maxDepth"],
     ):
         if pileupcolumn.pos == pos - 1:
@@ -544,7 +463,6 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):
                 processed_read_names[pileupread.alignment.query_name] = 1
                 if pileupread.alignment.is_duplicate:
                     continue
-                # if pileupread.alignment.query_name
                 if pileupread.is_del or pileupread.indel != 0:
                     indelAlleleCount += 1
                     otherAlleleCount += 1
@@ -561,7 +479,6 @@ def extractDepthSnv(bam, chrom, pos, ref, alt, params, minbq=18):
                 else:
                     otherAlleleCount += 1
     depth = refAlleleCount + altAlleleCount + otherAlleleCount
-    # print(f"calculate depth time:{(time.time()-start_time)/60}")
     return altAlleleCount, refAlleleCount, indelAlleleCount, depth
 
 
@@ -587,7 +504,6 @@ def extractDepthIndel(bam, chrom, pos, ref, alt, params, minbq=18):
                     or pileupread.is_refskip
                     or pileupread.alignment.is_secondary
                     or pileupread.alignment.is_supplementary
-                    # or pileupread.alignment.is_duplicate
                     or processed_read_names.get(pileupread.alignment.query_name)
                     or pileupread.alignment.has_tag("DT")
                     or pileupread.alignment.mapping_quality < params["mapq"]
@@ -613,17 +529,9 @@ _MPILEUP_BASE_COL = {"A": 0, "T": 1, "C": 2, "G": 3}
 
 
 def _parse_mpileup_bases(ref_base, bases_str):
-    """Parse one samtools mpileup read-bases column (already quality/mapq
-    filtered by the -Q/-q flags the caller passed to pysam.mpileup, so
-    this is just accounting, no further filtering) into (a, t, c, g)
-    counts. `.`/`,` mean "matches ref_base" (forward/reverse), a bare
-    ACGTacgt is an explicit mismatch call, `^X` marks a read start (X is
-    a mapping-quality char to skip, not a base), `$` marks a read end,
-    and `+N<seq>`/`-N<seq>` is an insertion/deletion attached to the
-    current position's read (the N inserted/deleted bases themselves
-    aren't a call at this column, so both notation and bases are
-    skipped). `*` (mid-deletion placeholder) and N/n are counted in
-    neither ref nor alt."""
+    """Count A/T/C/G in one samtools mpileup read-bases column (already
+    BQ/MAPQ filtered by mpileup). `.`/`,` = ref_base; `^X` (X = MAPQ char),
+    `$` and `+N<seq>`/`-N<seq>` are skipped; `*` and N are not counted."""
     counts = [0, 0, 0, 0]
     ref_col = _MPILEUP_BASE_COL.get(ref_base)
     i = 0
@@ -656,14 +564,9 @@ def _parse_mpileup_bases(ref_base, bases_str):
 
 
 def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
-    """count_alleles=True additionally tallies, from the exact same
-    mpileup scan (no second pass), a per-position (end-start, 4) A/T/C/G
-    count matrix -- letting any later candidate's ref/alt count at a
-    position in this region be read directly out of the matrix instead
-    of needing its own separate extractDepthBatchSnv/Indel re-scan of
-    the same bam region. Only the caller that actually needs it pays for
-    the extra per-line parsing; existing callers (coverage-threshold-only,
-    e.g. the tumor maxAF<1 branch) are unaffected."""
+    """Per-position mpileup depth over [start, end). count_alleles=True also
+    returns an (end - start, 4) A/T/C/G count matrix from the same scan,
+    so candidates in the region need no separate depth re-scan."""
     depth = np.zeros(end - start)
     mapq = params["mapq"]
     max_depth = int(params["maxDepth"])
@@ -699,46 +602,10 @@ def extractDepthRegion(bam, chrom, start, end, params, count_alleles=False):
 
 
 def prepareAlignMask(bam, chrom, start, end, params):
-    """
-    sum_nm = np.zeros(end - start)
-    count_nm = np.zeros(end - start,dtype=int)
-    bam=BAM(bam,"rb")
-    for rec in bam.fetch(chrom,start,end):
-        if (
-            rec.is_supplementary
-            or rec.is_secondary
-            or rec.is_duplicate
-            or not rec.is_proper_pair
-            or rec.is_qcfail
-        ):
-            continue
-        # If 5 prime is soft clipped
-        if (rec.is_forward and rec.cigartuples[0][0] == 4) or (
-            rec.is_reverse and rec.cigartuples[-1][0] == 4
-        ):
-            continue
-        #if rec.mapq <=40 : continue
-        #if rec.mapping_quality <= params["mapq"]: continue
-        id_length = 0
-        id_num = 0
-        for cigar in rec.cigartuples:
-            if cigar[0] == 1 or cigar[0] == 2:
-                id_length += cigar[1]
-                id_num += 1
-        NM_no_id = rec.get_tag("NM") - id_length + id_num
-        sum_nm[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += NM_no_id
-        count_nm[max(rec.reference_start - start,0):min(rec.reference_end - start,end-start)] += 1
-
-
-    sum_nm[count_nm == 0] = 200
-    count_nm[count_nm == 0] = -1
-
-    avg_nm = sum_nm/count_nm
-    avg_nm[avg_nm < 0] = np.inf
-    for nn in range(avg_nm.size):
-        if avg_nm[nn] != np.inf:
-            print(avg_nm[nn],nn+start)
-    """
+    """Alignment-quality mask over [start, end): True where either strand's
+    mean indel-corrected NM reaches maxNM/2 or its mean AS-XS is at most
+    minMeanASXS. Each strand's worst read is dropped from its mean;
+    uncovered positions are masked."""
     sum_nm_f = np.zeros(end - start)
     count_f = np.zeros(end - start, dtype=int)
     sum_nm_r = np.zeros(end - start)
@@ -762,15 +629,13 @@ def prepareAlignMask(bam, chrom, start, end, params):
             or rec.is_qcfail
         ):
             continue
+        # Skip reads soft-clipped at their 5' end.
         if (rec.is_forward and rec.cigartuples[0][0] == 4) or (
             rec.is_reverse and rec.cigartuples[-1][0] == 4
         ):
             continue
-        ##NM average, indel-corrected: NM includes indel bases (each
-        ## inserted/deleted base counts individually against NM), so back
-        ## those out and credit exactly one mismatch-equivalent per indel
-        ## event instead -- same correction as funcs/call.py's
-        ## read-blacklist NM_no_id.
+        # Indel-corrected NM: one mismatch-equivalent per indel event instead
+        # of one per indel base (same as call.py's read blacklist).
         id_length = 0
         id_num = 0
         for cigar in rec.cigartuples:
@@ -900,10 +765,10 @@ def detectOverlapDiscord(
         pos - 1,
         pos,
         min_base_quality=0,
-        truncated=True,
+        truncate=True,
         stepper="samtools",
         flag_filter=3852,
-        maxdepth=100000,
+        max_depth=100000,
         ignore_overlaps=False,
     ):
         if pileupcolumn.pos == pos - 1:

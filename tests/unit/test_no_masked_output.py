@@ -23,7 +23,7 @@ def test_call_flag_set_reads_resolved_values(tmp_path):
 def test_call_flag_unset_or_missing(tmp_path):
     _write_params(tmp_path, ["  doNotOutputMaskedSite: False\n"])
     assert not call_flag_set(str(tmp_path), "s", "doNotOutputMaskedSite")
-    # A call run from before the option has no line for it.
+    # A params log with no line for the option.
     _write_params(tmp_path, ["  skipCoveragePass: True\n"])
     assert not call_flag_set(str(tmp_path), "s", "doNotOutputMaskedSite")
     assert call_skipped_coverage_pass(str(tmp_path), "s")

@@ -65,22 +65,13 @@ AMBIGUOUS = ""
 
 
 def match_barcode(seq, start, barcodes, max_mismatch):
-    """Match the read bases from `start` against every listed barcode at
-    once, walking one position at a time.
+    """Match the read bases from `start` against all listed barcodes in one
+    position-by-position walk, dropping a barcode once its mismatches exceed
+    max_mismatch. Fewest mismatches wins, then shortest; a remaining tie is
+    AMBIGUOUS. Returns (barcode, length), (NO_MATCH, 0) or (AMBIGUOUS, 0).
 
-    Each barcode still in the running is compared with the read base at the
-    current position and its mismatch count updated; it is dropped once that
-    count exceeds max_mismatch, and finishes when the walk reaches its
-    length (provided the read is long enough). The walk stops when no
-    barcode is left running. Of the finished barcodes the one with the
-    fewest mismatches wins, then the shortest; two different barcodes still
-    tied after that make the read AMBIGUOUS. Returns (barcode, length),
-    (NO_MATCH, 0) or (AMBIGUOUS, 0).
-
-    Cost: at most len(barcodes) * max barcode length base comparisons per
-    read, whatever max_mismatch is (dropping only makes it cheaper). Used
-    for max_mismatch > 1; below that, match_barcode_indexed gives the same
-    result from lookup tables.
+    Used for max_mismatch > 1; match_barcode_indexed is the table-based
+    equivalent for smaller values.
     """
     lens = [len(b) for b in barcodes]
     alive = range(len(barcodes))
@@ -167,12 +158,10 @@ HASH_MAX_MISMATCH = 1
 
 
 def build_barcode_index(barcodes, max_mismatch):
-    """Lookup tables for max_mismatch <= HASH_MAX_MISMATCH: for each
-    barcode length, every listed barcode and (if max_mismatch == 1) every
-    1-mismatch variant of it, mapped to the (mismatches, barcode) entries it
-    is within max_mismatch of. Size is about len(barcodes) * length * 3,
-    linear in the list (variants within m mismatches grow exponentially in
-    m, hence the walk above HASH_MAX_MISMATCH)."""
+    """Per-length lookup tables mapping each listed barcode and (if
+    max_mismatch == 1) each 1-mismatch variant to its (mismatches, barcode)
+    entries. Variant count grows exponentially with max_mismatch, hence the
+    HASH_MAX_MISMATCH cap."""
     assert max_mismatch <= HASH_MAX_MISMATCH
     by_len = {}
     for bc in barcodes:
@@ -268,7 +257,6 @@ def trim_listed(readPair, pattern, matcher):
 
 
 def do_trim(args):
-    # Check if input files exist
     if not os.path.exists(args.fq):
         raise FileNotFoundError(f"Input fastq file not found: {args.fq}")
     if not os.path.exists(args.fq2):

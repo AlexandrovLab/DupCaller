@@ -21,17 +21,10 @@ from .indels import STR_NCOL, STR_UNIT_GROUPS
 # Generic / file / progress utilities
 # ======================================================================
 def _ensure_type_subdirs(prefix):
-    """Per-mutation-type output subfolders under a sample's prefix
-    directory — SBS/, INDEL/, DBS/ — created (if missing). Every
-    SBS/indel/DBS-specific output (VCFs, corrected tables, burden files,
-    plots, by-read-group breakdowns, and each type's own
-    _*_by_duplex_group.txt coverage file) lives under the matching
-    subfolder; only genuinely whole-sample, type-agnostic files
-    (_stats.txt, _coverage.bed.gz, _duplex_allele_counts.txt, learned
-    error matrices under ERROR/, etc.) stay at the top level of prefix.
-    Shared by Caller.py (writer of the VCFs) and Estimate.py (writer of
-    everything else, and reader of the VCFs) so both agree on the exact
-    same subfolder layout.
+    """Create (if missing) the SBS/, INDEL/, DBS/ output subfolders under
+    prefix. Type-specific outputs go in these; whole-sample files
+    (_stats.txt, _coverage.bed.gz, ERROR/, ...) stay at the top level.
+    Shared by Caller.py and Estimate.py so both use the same layout.
 
     Returns (sbs_dir, indel_dir, dbs_dir).
     """
@@ -44,22 +37,13 @@ def _ensure_type_subdirs(prefix):
 
 
 def log_progress(state, label, index, total=None, extra="", interval=5.0):
-    """Print a throttled "clock" progress line — elapsed time, item
-    count, and percent-complete when the total is known — while iterating
-    a long-running loop (mutation filtering, VCF streaming, per-chromosome
-    reference composition, etc). Printed at most once every `interval`
-    seconds (always on the final item when `total` is known, so loops
-    that finish quickly still get a 100% line), so it doesn't spam logs
-    for large inputs.
+    """Print a progress line (count, percent, elapsed) at most once every
+    `interval` seconds, plus always on the final item when `total` is known.
 
-    state: a dict the caller keeps around across the whole loop —
-        {"start": <loop start time>, "last": <time of last print>}.
-    total: item count if known upfront (e.g. len(some_list)), enabling a
-        "i/total (pct%)" display. Pass None for loops with no cheap total
-        (e.g. streaming a VCF record-by-record) to fall back to a plain
-        running count instead; pass 0 to no-op (nothing to iterate).
-    extra: optional short string identifying the current item (e.g.
-        "chr1:12345" or a chromosome name), appended to the line.
+    state: {"start": <loop start time>, "last": <time of last print>},
+        kept by the caller across the loop.
+    total: item count if known; None prints a running count; 0 is a no-op.
+    extra: optional short string appended to the line.
     """
     if total == 0:
         return
@@ -77,27 +61,19 @@ def log_progress(state, label, index, total=None, extra="", interval=5.0):
     state["last"] = now
 
 
-# Labels for the 14 power-weighted indel coverage categories, in the same
-# order as the trailing 14 columns of the coverage bed file (after the 4
-# SBS columns) and the "Effective/Unmasked Indel Coverage (<label>)" lines
-# in _stats.txt. Shared between Caller.py (writer) and Estimate.py/
-# Summarize.py (readers) so the label strings can't drift out of sync.
+# Labels for the 16 power-weighted indel coverage categories, in the order
+# of the trailing indel columns of the coverage bed file (after the 4 SBS
+# columns) and the "Effective/Unmasked Indel Coverage (<label>)" lines in
+# _stats.txt. Shared by Caller.py (writer) and Estimate.py/Summarize.py
+# (readers).
 #
-# Deletion Length 2-5+ and Insertion Length 2-5+ are always computed at a
-# fixed homopolymer-length-1 context (microhomology-style for deletion;
-# "novel repeat unit" / rep0 for insertion, mirroring
-# the no-repeat case of an indel_len>=2 event), not the position's
-# actual repeat context — Insertion Length columns are further restricted
-# to is_hp positions, since only there can no-repeat-yet even apply.
+# Deletion/Insertion Length 2-5+ use a fixed no-repeat context, not the
+# position's actual repeat context.
 #
-# Insertion A/T/C/G are the per-inserted-base rep0 opportunity for a 1bp
-# insertion: each uses the L-table power for inserting *that* base
-# specifically (fixed hps=1 context) at every position, except positions
-# where the immediately following reference base already equals that
-# base — there, the value is 0, since inserting that base would extend an
-# existing run rather than start a new one. This has nothing to do with
-# the position's own reference base (see funcs/misc.py's
-# indel100_reference_bucket_indices / classify_indel_channel).
+# Insertion A/T/C/G: rep0 opportunity to insert that base (fixed hps=1
+# context), 0 where the following reference base already equals it (that
+# insertion would extend a run, not start one). Independent of the
+# position's own base.
 INDEL_COVERAGE_CATEGORY_LABELS = [
     "Deletion of Repeat Unit",
     "Insertion of Repeat Unit",
@@ -113,22 +89,13 @@ INDEL_COVERAGE_CATEGORY_LABELS = [
     "Insertion Length 3",
     "Insertion Length 4",
     "Insertion Length 5+",
-    # Columns 0/1 ("...of Repeat Unit") are STR-only now -- opportunity to
-    # delete/insert exactly one copy of THIS position's own annotated STR
-    # unit, 0 wherever no real STR is annotated (unit_len<2). The
-    # 1bp-homopolymer-slip opportunity, which exists everywhere regardless
-    # of STR status (genotypeDSIndel always scores a +-1bp event via the
-    # HP table, never the STR one -- see funcs/prob.py's indelErrorProbs),
-    # lives entirely here instead: unconditional L_indel_1bp coverage
-    # using the position's true self-derived homopolymer run (hp_raw_np).
-    # Splitting it out this way -- rather than merging it into columns
-    # 0/1 via is_hp, as those used to do -- keeps every column
-    # non-overlapping, so summing across all 16 (e.g. indel_cov_total)
-    # gives a real total instead of double-counting the 1bp opportunity
-    # at every non-STR position. Matches
-    # indel100_reference_bucket_indices' own convention (funcs/misc.py):
-    # unconditional HP-bucket credit, real_str-gated STR-bucket credit,
-    # no other overlap. See call.py's cov_mat_indel[:, 14]/[:, 15].
+    # Columns 0/1 ("...of Repeat Unit") are STR-only: one copy of the
+    # position's annotated STR unit, 0 where unit_len < 2. The +-1bp
+    # homopolymer-slip opportunity (always scored via the HP table, even
+    # inside STRs; see prob.py's indelErrorProbs) lives in these last two
+    # columns, from the self-derived homopolymer run, independent of STR
+    # status. Keeping the columns non-overlapping lets them be summed
+    # (e.g. indel_cov_total) without double-counting.
     "Deletion of Homopolymer",
     "Insertion of Homopolymer",
 ]
@@ -136,9 +103,8 @@ INDEL_COVERAGE_CATEGORY_LABELS = [
 
 def parse_stats_file(path):
     """Parse a DupCaller _stats.txt file into a {label: value_string} dict,
-    keyed by the text before the first tab on each line. Label-based lookup
-    avoids the fragility of reading by fixed line number, which breaks
-    silently if a line is ever added/removed/reordered upstream."""
+    keyed by the text before the first tab on each line (so readers don't
+    depend on line order)."""
     stats = {}
     with open(path) as f:
         for line in f:
@@ -151,28 +117,20 @@ def parse_stats_file(path):
 
 
 # Bump whenever the on-disk layout of .ref.h5/.tn.h5/.hp.h5/.str.h5 changes
-# in a way that ndim/shape checks alone can't detect — e.g. version 1's
-# hp.h5 was a single 3-row (unit_len, is_start, repeat_count) file built
-# from --repeatBed/--strbed for both homopolymers and STRs; version 2 (this
-# one) splits that into hp.h5 (2 rows: hp, cut — self-derived directly from
-# the reference sequence, homopolymers only) and a new str.h5 (3 rows:
-# unit_len, hp, cut — still built from --repeatBed/--strbed, restricted to
-# unit_len>=2). See Index.py's do_index and funcs/misc.py's
-# load_repeat_context. Version 3 resolves overlapping PERF tracts in str.h5
-# (Index.py's resolve_str_overlaps), so every flagged start carries its own
-# tract's unit/count. `DupCaller.py index` (Index.py) stamps this onto
-# each h5 file's root attrs; check_h5_usable below verifies it.
+# in a way ndim/shape checks can't detect. Current layout: hp.h5 has 2 rows
+# (hp, cut; self-derived from the reference, homopolymers only); str.h5 has
+# 3 rows (unit_len, hp, cut; from --repeatBed/--strbed, unit_len >= 2, with
+# overlapping tracts resolved so each flagged start carries its own tract's
+# unit/count). Index.py stamps this onto each h5 file's root attrs;
+# check_h5_usable verifies it.
 INDEX_SCHEMA_VERSION = 3
 
 
 def check_h5_usable(h5_path, expected_ndim=None):
     """Try to open and read from an h5 file; return (ok, error_message).
 
-    Checks the index_schema_version file attribute first: its absence means
-    the file predates version stamping entirely (an outdated index built by
-    an old `DupCaller.py index`), and a mismatched value means it was built
-    by a version of DupCaller with a different on-disk layout — neither of
-    which the ndim/shape checks below can catch on their own.
+    A missing or mismatched index_schema_version attribute means the index
+    has a different on-disk layout, which ndim/shape checks can't catch.
     """
     try:
         with h5py.File(h5_path, "r") as f:
@@ -211,11 +169,9 @@ def check_h5_usable(h5_path, expected_ndim=None):
 def build_trinuc64_order():
     """Canonical order of the 64 real trinucleotide contexts (32 C/T-ref
     followed by 32 G/A-ref), matching Index.py's .tn.h5 trinuc_int encoding
-    for indices 0-63. Index i (i<32) and i+32 are always exact reverse
-    complements of each other, by construction of these two loops (verified
-    by direct execution, not incidental). Returns (trinuc2num, num2trinuc).
-    Shared by call.py, Caller.py, and Estimate.py so this ordering can't
-    drift out of sync between the writer and readers of trinuc-indexed data.
+    for indices 0-63. Index i (i<32) and i+32 are reverse complements of
+    each other. Returns (trinuc2num, num2trinuc). Shared by every writer and
+    reader of trinuc-indexed data.
     """
     num2trinuc = []
     for minus_base in ["A", "T", "C", "G"]:
@@ -233,11 +189,9 @@ def build_trinuc64_order():
 def build_trinuc192_labels(num2trinuc):
     """192 raw (unfolded) mutation-class labels: for each of the 64
     trinucleotide contexts, its 3 non-reference alt bases in "ATCG" order,
-    formatted "{trinuc}>{alt}". No reverse-complement folding — a context's
-    own reference base is skipped entirely rather than included as a
-    self-mutation class. Returns (label2num, labels); this order is the
-    contract between Caller.py (writer of _trinuc_by_duplex_group.txt) and
-    Estimate.py (reader) and must not be built independently in either.
+    formatted "{trinuc}>{alt}", no reverse-complement folding. Returns
+    (label2num, labels); this order is the contract between Caller.py
+    (writer of _trinuc_by_duplex_group.txt) and Estimate.py (reader).
     """
     labels = []
     label2num = {}
@@ -278,10 +232,7 @@ TRINUCSBS2NUM_96, NUM2TRINUCSBS_96 = _build_sbs96_labels()
 def combine_raw192_to_sbs96(values_192, label2num_192):
     """Combine the 192 raw (un-folded) (trinuc, alt) mutation classes into
     the 96 canonical pyrimidine-convention SBS96 classes, by summing each
-    canonical class with its reverse-complement partner from the other half
-    of the 64-context space. This is the single point where reverse-
-    complement pairs get folded together, deferred to estimation time
-    rather than done at raw accumulation time.
+    canonical class with its reverse-complement partner.
 
     values_192   : array shaped (192,) or (192, n_groups).
     label2num_192: {"{trinuc}>{alt}": row_index} for values_192's rows.
@@ -302,12 +253,8 @@ def combine_raw192_to_sbs96(values_192, label2num_192):
 
 
 def _safe_rate(mut, cov):
-    """np.where(cov > 0, mut / cov, 0), without the RuntimeWarning:
-    np.where evaluates BOTH branches in full before selecting, so
-    `mut / cov` still runs — and warns — at every position where cov==0,
-    even though the result there is thrown away in favor of the literal
-    0. The final values are identical either way; this just silences the
-    warning for a divide-by-zero that was always going to be discarded."""
+    """np.where(cov > 0, mut / cov, 0) without the divide-by-zero
+    RuntimeWarning (np.where evaluates both branches)."""
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(cov > 0, mut / cov, 0)
 
@@ -326,10 +273,8 @@ _DBS_BASES = ["A", "T", "C", "G"]
 
 
 def _dbs_alt_choices(ref):
-    """The 9 possible alt dinucleotides for a reference dinucleotide: each
-    of the 2 positions independently becomes one of its 3 non-reference
-    bases (a DBS event changes both positions simultaneously — if only
-    one changed it would be a plain SBS, not a DBS)."""
+    """The 9 possible alt dinucleotides for a reference dinucleotide (both
+    positions must change)."""
     return [
         b1 + b2
         for b1 in _DBS_BASES
@@ -340,15 +285,10 @@ def _dbs_alt_choices(ref):
 
 
 def build_dbs_raw144_labels():
-    """The 144 raw (un-folded) "REF>ALT" DBS labels — all 16 raw
-    reference dinucleotides x their 9 alts each — the same role for DBS
-    that build_trinuc192_labels plays for SBS: a label space wide enough
-    to hold any observed/raw event before folding down to the 78 canonical
-    DBS78 channels (Estimate.py's combine_raw_dbs_to_dbs78). Shared by
-    call.py/Caller.py (writer of _dbs_by_duplex_group.txt) and Estimate.py
-    (reader, and genome-wide reference-composition folding) so this order
-    can't drift out of sync between them — same contract as
-    build_trinuc192_labels/build_indel100_labels.
+    """The 144 raw (un-folded) "REF>ALT" DBS labels (16 reference
+    dinucleotides x 9 alts), the DBS analogue of build_trinuc192_labels;
+    folded to DBS78 by Estimate.py's combine_raw_dbs_to_dbs78. Shared by
+    the writer (_dbs_by_duplex_group.txt) and Estimate.py.
     """
     label2num = {}
     labels = []
@@ -363,15 +303,10 @@ def build_dbs_raw144_labels():
 
 
 def build_dbs_raw144_index_grid():
-    """[4,4,4,4] int lookup grid mapping (ref1_num, ref2_num, alt1_num,
-    alt2_num) -- all in "ATCG"-order 0-3 encoding, the same convention
-    call.py's ref_int/alt_int arrays already use (funcs/call.py:64,459) --
-    directly to a row index into the 144-raw-class DBS opportunity space
-    (build_dbs_raw144_labels), for cheap vectorized accumulation in
-    call.py's per-family hot loop without building label strings per
-    position pair. Entries where alt1==ref1 or alt2==ref2 (not a valid DBS
-    event -- both positions must actually change) are left at -1, a
-    sentinel the caller filters out before np.bincount.
+    """[4,4,4,4] lookup grid mapping (ref1, ref2, alt1, alt2), "ATCG"-order
+    0-3 encoding, to a build_dbs_raw144_labels row index, for vectorized
+    accumulation. Entries with alt1==ref1 or alt2==ref2 (not a DBS) are -1,
+    which the caller filters out before np.bincount.
     """
     label2num, _ = build_dbs_raw144_labels()
     n2b = "ATCG"
@@ -390,10 +325,6 @@ def build_dbs_raw144_index_grid():
     return grid
 
 
-# [4,4,4,4] (ref1_num, ref2_num, alt1_num, alt2_num) -> row index into
-# the 144-raw-class DBS opportunity space -- built once at import time
-# (cheap: 144 valid entries out of 256) rather than per-call, and reused
-# by every duplex-group DBS-opportunity accumulation below.
 _DBS_RAW144_IDX_GRID = build_dbs_raw144_index_grid()
 
 
@@ -414,31 +345,17 @@ def _detect_dbs_pairs(
     num2base,
     reads,
 ):
-    """Detect DBS (dinucleotide substitution) events within one duplex
-    read group's SNV candidate list: two positions changing
-    SIMULTANEOUSLY in the SAME physical molecule, not two independent
-    SNVs that happen to sit next to each other in the genome. Because
-    mut_positions/muts_ind/ref_int/alt_int all come from THIS one read
-    group's own consensus calling, a genomically-adjacent pair found here
-    is, by construction, supported by the same underlying reads — unlike
-    scanning the already-written SNV VCF after the fact, which has no way
-    to tell same-molecule adjacency from coincidence.
+    """Detect DBS events within one duplex family's SNV candidates: two
+    adjacent positions changed in the same molecule (the inputs all come
+    from this family's own consensus calling). A pair is called only if
+    both SNVs are PASS, decided from pass_bool/LR_pass_bool/flt_rs the
+    same way as the caller's per-position SNV filter.
 
-    Only pairs where BOTH constituent SNVs individually reach full PASS
-    status are called as a DBS (recomputed here from pass_bool/
-    LR_pass_bool/flt_rs — the same three inputs the existing per-position
-    loop above already uses to decide flt — rather than threading a new
-    list through that loop, so this can be added without touching any of
-    its existing lines).
+    reads: the family's reads; their fragment starts (FS) go on every DBS
+    record for the depth-extraction founding-family exemption.
 
-    reads: the read group's reads; their fragment starts (FS, see
-    family_fragment_starts) go on every DBS record for the depth-
-    extraction founding-family exemption.
-
-    Returns a list of DBS mut dicts (ref/alt are 2-character
-    dinucleotides), in the same shape as the SNV mut dict built above,
-    minus the SNV-only INFO fields (LR/LM/TC/BC/TN/HP/STR) that don't
-    apply to a 2-base event.
+    Returns a list of DBS mut dicts (2-base ref/alt), shaped like the SNV
+    mut dicts minus the SNV-only INFO fields.
     """
 
     def _flt(i):
@@ -475,15 +392,8 @@ def _detect_dbs_pairs(
                     "FS": fragment_starts,
                 },
                 "formats": ["AC", "RC", "DP"],
-                # No independent raw-BAM depth re-verification for DBS
-                # yet (mirroring extractDepthSnv/extractDepthBatchSnv for
-                # SNVs) — both constituent bases already passed full
-                # duplex-consensus LR calling, which is a strong
-                # signal on its own, but there's currently no equivalent
-                # of the SNV/indel maxAF / normal-VAF post-processing
-                # check for DBS. Placeholder AC=1/RC=0/DP=1 (tumor),
-                # 0/0/0 (normal) so downstream VCF writing has values to
-                # write; a real depth-extraction pass would replace this.
+                # Placeholder AC/RC/DP (tumor 1/0/1, normal 0/0/0): DBS has
+                # no raw-BAM depth extraction like SNVs/indels do.
                 "samples": [[1, 0, 1], [0, 0, 0]],
             }
         )
@@ -491,25 +401,17 @@ def _detect_dbs_pairs(
 
 
 def _compute_dbs_opportunity(cov_mat, ref_int, pass_bool):
-    """Per-duplex-group DBS opportunity contribution from one family's
-    window: for every pair of directly ADJACENT in-window positions
-    (i, i+1) that both individually pass calling (pass_bool[i] and
-    pass_bool[i+1]) and have a valid A/T/C/G reference base at both,
-    opportunity is coverage(alt1 at i) * coverage(alt2 at i+1) summed over
-    all 9 non-ref (alt1, alt2) combinations -- the same product-of-
-    coverages approximation Estimate.py's calculate_dbs_opportunity uses
-    genome-wide from the coverage bed, just computed here per-family (so
-    it can be attributed to that family's own duplex_no) from the same
-    cov_mat/ref_int/pass_bool the trinuc accumulator right after this
-    function's call site already uses -- window-local arrays, aligned the
-    same way.
+    """DBS opportunity from one family's window: for each adjacent pair
+    (i, i+1) with both positions in pass_bool and ACGT reference bases,
+    add coverage(alt1 at i) * coverage(alt2 at i+1) for each of the 9
+    non-ref (alt1, alt2) combinations. Same product-of-coverages
+    approximation as Estimate.py's calculate_dbs_opportunity, but per
+    family so it can be attributed to its duplex group.
 
     cov_mat  : (window_len, 4) L-weighted per-alt-base coverage.
     ref_int  : (window_len,) reference base, 0-3=A/T/C/G, 4=N/invalid.
     pass_bool: (window_len,) bool, calling-eligible positions.
-    Returns a (144,) raw-DBS-class contribution vector (funcs/misc.py's
-    build_dbs_raw144_labels order), zero wherever no adjacent pass_bool
-    pair with valid reference bases exists.
+    Returns a (144,) vector in build_dbs_raw144_labels order.
     """
     contribution = np.zeros(144)
     if cov_mat.shape[0] < 2:
@@ -538,25 +440,16 @@ def _compute_dbs_opportunity(cov_mat, ref_int, pass_bool):
 # Indel classification (indel100 / ID83)
 # ======================================================================
 # Bucket boundaries for the 100-class raw indel scheme (build_indel100_labels).
-# Deletion length/count bins start at 1 (you need an existing run of at
-# least 1 to delete from); insertion STR/count bins start at 0 (you can
-# insert into a context with no existing repeat at all). A repeat_count of
-# 0 or 1 is "not really a repeat" (see funcs/call.py's classification
-# code): for deletion both fold into bucket "1"; for STR insertion both
-# are counted under *both* bucket "0" and bucket "1".
+# Deletion bins start at 1 (there must be a run to delete from); insertion
+# STR bins start at 0 (insertion into a non-repeat context). For STR
+# insertion, repeat_count 1 is credited to both bucket "0" and bucket "1".
 INDEL_DEL_HP_LEN_BINS = ["1", "2", "3", "4", "5", "6+"]
-# Homopolymer-insertion length bins at ID83 (output) resolution — includes
-# "0" (rep0: inserting into a context with no existing repeat), since
-# Cinshp0/Tinshp0 are real COSMIC ID83 channels. Used only by
-# build_indel83_labels; NOT by the raw100/indel76 pipeline below (see
-# INDEL100_INS_HP_LEN_BINS) since the hp.h5-annotation-based rep0
-# opportunity computed at that resolution is always discarded and
-# replaced by the exact next-base computation in
-# Estimate.py's override_inshp0_with_next_base_opportunity.
+# ID83-resolution homopolymer-insertion bins (build_indel83_labels only),
+# including the rep0 "0" bin (Cinshp0/Tinshp0).
 INDEL_INS_HP_LEN_BINS = ["0", "1", "2", "3", "4", "5+"]
-# Same, but for the raw100/indel76 pipeline, which never computes a real
-# rep0 opportunity for homopolymer insertion at all (see above) — so
-# there's no "0" bin to carry through here.
+# Raw100 homopolymer-insertion bins: no "0" bin, since rep0 opportunity
+# comes from the 1bpins{base} columns instead (Estimate.py's
+# override_inshp0_with_next_base_opportunity).
 INDEL100_INS_HP_LEN_BINS = ["1", "2", "3", "4", "5+"]
 INDEL_STR_UNIT_BINS = ["2", "3", "4", "5+"]
 INDEL_DEL_STR_COUNT_BINS = ["1", "2", "3", "4", "5", "6+"]
@@ -565,30 +458,16 @@ INDEL_MH_DEL_LEN_BINS = ["2", "3", "4", "5+"]
 
 
 def build_indel100_labels():
-    """100 raw indel classification labels (fine resolution; the "100"
-    name predates the 4 1bpins{base} columns at the end, mirroring how
-    "indel76"/"indel83" elsewhere are also historical rather than renamed
-    on every change): base-specific homopolymer deletion (4 bases x 6
-    length bins = 24), base-specific homopolymer insertion (4 bases x 5
-    length bins = 20 — no "0"/rep0 bin here, see INDEL100_INS_HP_LEN_BINS;
-    that opportunity is always thrown away and replaced anyway, computed
-    instead from the 1bpins{base} columns below), unit-size/repeat-count
-    specific STR deletion/insertion (4 unit-size buckets x 6 count bins =
-    24 each), microhomology deletion length (4 bins), and 4 additional
-    fixed-context "rep0 opportunity for inserting exactly this base"
-    columns (see indel100_reference_bucket_indices and funcs/call.py's
-    matching per-family accumulation) — used to compute the rep0 ("no
-    repeat existed yet") bin of the ID83 Cinshp/Tinshp channels correctly
-    (Estimate.py's override_inshp0_with_next_base_opportunity). Each
-    1bpins{base} column represents the opportunity/power to insert *that
-    specific base* with no pre-existing repeat: every position counts,
-    EXCEPT where the immediately following reference base already equals
-    that base (there it's 0/excluded, since inserting it would extend an
-    existing run rather than start a new one) — independent of the
-    position's own reference base or any repeat annotation.
-    24+20+24+24+4+4 = 100. Deterministic order, shared by the writer
-    (Caller.py) and any future reader — must not be built independently
-    elsewhere.
+    """100 raw indel classification labels, in order:
+      - homopolymer deletion, 4 bases x 6 length bins (24)
+      - homopolymer insertion, 4 bases x 5 length bins, no rep0 bin (20)
+      - STR deletion / insertion, 4 unit sizes x 6 count bins (24 + 24)
+      - microhomology deletion length (4)
+      - 1bpins{base} (4): rep0 opportunity to insert that base, i.e. every
+        position whose following reference base differs from it; feeds the
+        ID83 Cinshp0/Tinshp0 bins (Estimate.py's
+        override_inshp0_with_next_base_opportunity).
+    Returns (label2num, labels); shared by writer and readers.
     """
     labels = []
     label2num = {}
@@ -631,92 +510,41 @@ def indel100_reference_bucket_indices(
     hp_cut_arr=None,
     str_cut_arr=None,
 ):
-    """Genome-wide "opportunity" bucket contributions for the indel100
-    scheme (build_indel100_labels above), given whole-chromosome repeat-
-    context arrays read directly from the .hp.h5/.str.h5/.ref.h5 index
-    files: hp_run_arr = hp.h5 row 0 (self-derived homopolymer run length,
-    always valid, unconditional on any STR annotation), str_unit_len_arr/
-    str_repeat_count_arr = str.h5 rows 0/1 (BED-derived STR annotation,
-    unit_len==0 wherever no STR is annotated), ref_base_arr = ref.h5 (all
-    base2num-encoded: A=0,T=1,C=2,G=3). Every position contributes weight
-    1 to each column it's eligible for.
+    """Genome-wide indel100 opportunity counts (build_indel100_labels order)
+    from whole-chromosome index arrays: hp_run_arr = hp.h5 row 0
+    (self-derived homopolymer run length), str_unit_len_arr/
+    str_repeat_count_arr = str.h5 rows 0/1 (unit_len 0 where no STR is
+    annotated), ref_base_arr = ref.h5 (A=0,T=1,C=2,G=3). Each eligible
+    position adds 1 to each column it qualifies for.
 
-    hp and STR opportunity are computed independently here, deliberately
-    NOT merged with STR taking priority (unlike load_repeat_context, used
-    elsewhere for indel *calling*'s classification, where a position can
-    only be one category at a time): a position inside an annotated STR
-    interval that also starts an embedded run of identical bases (e.g.
-    the "AA" in a (AAT)n repeat) contributes to BOTH the homopolymer and
-    the STR opportunity columns.
-
-    Real STR opportunity (an annotated tract's own unit_len/repeat_count)
-    is read straight off str.h5, cut-gated, no re-scanning. Positions
-    str.h5 doesn't annotate additionally get a flat, uniform rep1
-    (deletion) / rep0+rep1 (insertion) credit for every unit size — every
-    such position is a candidate for an arbitrary, non-repeating U-bp
-    indel, but discovering whether a *longer* run coincidentally exists
-    there would require rescanning the reference, which this deliberately
-    doesn't do. That flat credit is a straight per-position count here
-    (this function has no read-depth/family concept), and call.py's
-    matching per-family credit is the analogous fixed-context L-table
-    lookup (see cov_mat_indel's del_2..del_5plus / "Insertion Length
-    2..5+" columns) — both scan-free, so this side and the coverage side
-    agree by construction rather than by two independent approximations
-    happening to line up.
+    HP and STR opportunity are credited independently (unlike
+    load_repeat_context, where STR wins): an embedded homopolymer inside an
+    STR counts toward both. Every position also gets a flat, scan-free
+    rep1 (deletion) / rep0+rep1 (insertion) credit for each STR unit size,
+    matching call.py's fixed-context coverage credit.
 
     hp_cut_arr, str_cut_arr (optional): hp.h5 row 1 / str.h5 row 2
-    (start-of-run booleans). A real, annotated repeat tract is one
-    molecular locus, not one-opportunity-per-base-it-spans — a slippage
-    event there is always reported at a single canonical (left-aligned)
-    anchor, no matter how long the tract is. Crediting every base of a
-    length-L tract as an independent opportunity (the old, unconditional
-    behavior) makes a bucket's aggregate opportunity scale with L, and
-    since coverage/mappability degrades with L too (see funcs/call.py's
-    nm_mask), that L-weighting amplifies exactly the loci most likely to
-    be under-covered — inflating correction_ratio well beyond what the
-    coverage gap alone would cause. Passing these arrays restricts
-    homopolymer/STR opportunity to cut==1 positions only, one credit per
-    tract regardless of its length. If omitted, every position is
-    credited as before (backward compatible with older callers).
+    (start-of-run flags). A repeat tract is one locus (slippage is reported
+    at one left-aligned anchor), so these restrict HP/STR credit to one per
+    tract; otherwise long tracts, which are also the worst covered, would
+    be over-weighted. If omitted, every position is credited.
 
-    next_ref_base_arr (optional): ref_base_arr shifted by one position —
-    next_ref_base_arr[i] is the reference base immediately following
-    position i (base2num-encoded; use an out-of-range sentinel, e.g. -1,
-    for positions with no valid next base, such as a chromosome's last
-    base). Feeds the 4 "1bpins{base}" columns (96-99, base2num order
-    A/T/C/G): column 96+b counts every position where the *following*
-    base differs from b — the rep0 opportunity to insert base b there —
-    independent of unit_len/repeat_count or the position's own base. If
-    omitted, those 4 columns get no contribution (backward compatible
-    with older callers).
+    next_ref_base_arr (optional): reference base following each position
+    (out-of-range sentinel, e.g. -1, where there is none). Feeds the
+    1bpins{base} columns 96-99 (A/T/C/G): 96+b counts positions whose next
+    base differs from b. If omitted, those columns stay 0.
 
-    This mirrors — but does not share code with — the L-table-weighted
-    per-position classification in funcs/call.py's per-window indel
-    coverage loop (search that file for "Fine-grained 100-class raw indel
-    classification"); the two independently derive the same anchor
-    convention (a position P is "opportunity for a 1bp/unit event whose
-    VCF-reported anchor would be P-1"), which is also why
-    Estimate.py's indel context lookups use rec.pos
-    directly (VCF's 1-based anchor position numerically equals P in
-    0-based terms). Keep bucket boundaries here in sync with both if
-    build_indel100_labels ever changes.
+    Anchor convention (shared with call.py's indel100 accumulation):
+    position P is opportunity for an event whose VCF anchor is P-1, so a
+    VCF's 1-based rec.pos equals P in 0-based terms.
 
-    Returns the (100,) accumulated opportunity-count array directly: each
-    contribution is folded straight into the running (100,) total as it's
-    computed -- a scalar increment for columns shared by every masked
-    position, or a small per-call np.bincount for columns that vary
-    per-position. Every contribution has weight exactly 1, so this avoids
-    keeping up to ~20 separate whole-chromosome-length index/weight array
-    pairs alive simultaneously for one final concatenate, which for a real
-    chromosome would be the dominant memory cost of computing
-    reference-genome indel composition (see calculate_ref_indel100).
+    Returns the (100,) count array. Contributions are accumulated in place
+    rather than concatenated, to avoid many chromosome-length temporaries.
     """
     n = hp_run_arr.shape[0]
-    # N (or other non-ACGT) reference positions are never opportunity: the
-    # coverage side drops them via noise_mask (call.py), and
-    # reference_base_number (Estimate.py) excludes them too, so every
-    # column below is restricted to valid_base and the flat credits use
-    # n_valid instead of n.
+    # Non-ACGT reference positions are never opportunity (the coverage side
+    # masks them too), so every column is restricted to valid_base and the
+    # flat credits use n_valid.
     valid_base = (ref_base_arr >= 0) & (ref_base_arr <= 3)
     n_valid = int(np.count_nonzero(valid_base))
     ref_base_safe = np.where(valid_base, ref_base_arr, 0)
@@ -744,85 +572,49 @@ def indel100_reference_bucket_indices(
         if np.any(mask):
             out[:] += np.bincount(np.asarray(col_idx)[mask], minlength=100)
 
-    # 1-4: homopolymer deletion opportunity (cols 0-23) — one credit per
-    # tract (hp_cut==1), not one per base spanned. hp_run==1 ("delrep1",
-    # an isolated, non-repeated base) is unaffected either way: a
-    # length-1 run's single position is always its own cut by
-    # definition, so gating never excludes it.
+    # Homopolymer deletion (cols 0-23), one credit per run. A length-1 run
+    # is always its own cut, so isolated bases are always credited.
     del_bucket = np.clip(hp_run_arr, 1, 6) - 1
     add_varying(base_cgta * 6 + del_bucket, hp_cut)
 
-    # 5-8: homopolymer insertion opportunity (cols 24-43) — length bins
-    # 1..5+ only, one credit per tract (hp_cut==1). repeat_count 0 (rep0:
-    # no existing repeat at all) is deliberately NOT credited here: the
-    # hp.h5-annotation-based opportunity for that bin is always thrown
-    # away and replaced by the exact next-base computation in the
-    # 1bpins{base} columns below (see Estimate.py's
-    # override_inshp0_with_next_base_opportunity), so there's no point
-    # computing it here at all.
+    # Homopolymer insertion (cols 24-43), length bins 1..5+, one credit per
+    # run. rep0 comes from the 1bpins{base} columns instead.
     ins_bucket = np.clip(hp_run_arr, 1, 5) - 1
     add_varying(24 + base_cgta * 5 + ins_bucket, (hp_run_arr >= 1) & hp_cut)
 
-    # 9: STR deletion opportunity (cols 44-67) — real part: gated by
-    # real_str (str_unit_len_arr>=2) AND str_cut==1, one credit per
-    # annotated tract, not one per base it spans.
+    # STR deletion (cols 44-67), annotated tracts: one credit per tract.
     unit_bucket = np.clip(str_unit_len_arr, 2, 5) - 2
     count_bucket_del = np.clip(str_repeat_count_arr, 1, 6) - 1
     add_varying(44 + unit_bucket * 6 + count_bucket_del, real_str & str_cut)
 
-    # Flat rep1 opportunity: every position is a candidate for an
-    # arbitrary, non-repeating U-bp deletion (repeat_count=1) for each
-    # unit size 2/3/4/5 — a fixed, uniform credit, NOT an attempt to
-    # discover a true higher count that might coincidentally exist there
-    # (that would need rescanning the reference, which is exactly what
-    # call.py's matching per-family credit deliberately doesn't do either
-    # — see its own comment). Kept deterministic and scan-free so this
-    # side and the coverage side (call.py's cov_mat_indel/indel100
-    # accumulation) agree by construction rather than by two
-    # independently-approximated scans happening to line up.
-    #
-    # Deliberately NOT gated by ~real_str (unlike an earlier version of
-    # this function): a hypothetical, non-matching U-bp deletion is a
-    # real, independent opportunity even at a position that also has a
-    # real, different-unit STR annotation -- e.g. inside ATGATGATG (a
-    # real unit=3 tract), an arbitrary 2bp deletion that doesn't match
-    # the ATG unit is still a genuine "delSTR2_rep1"-type event. real_str
-    # positions already get their own unit's real credit above; this
-    # flat credit is for every *other* hypothetical unit size,
-    # independently, at every position (including real_str ones).
+    # Flat rep1 credit: every position is a candidate for a non-repeating
+    # U-bp deletion for each unit size 2-5+. Not gated by ~real_str: inside
+    # a unit-3 tract, a 2bp deletion is still an independent delSTR2_rep1
+    # opportunity. Scan-free, matching call.py's coverage-side credit.
     for u_idx in range(4):
         out[44 + u_idx * 6] += n_valid
 
-    # 10: STR insertion opportunity (cols 68-91) — real part: one credit
-    # per annotated tract (real_str & str_cut), with the same rep-count
-    # 0/1 ambiguity hedge as the homopolymer deletion case above (STR
-    # insertion still has a real "0" bin, unlike homopolymer insertion).
+    # STR insertion (cols 68-91), annotated tracts: one credit per tract;
+    # repeat_count 1 is also credited to the "0" bucket.
     real_str_cut = real_str & str_cut
     count_bucket_ins = np.clip(str_repeat_count_arr, 0, 5)
     add_varying(68 + unit_bucket * 6 + count_bucket_ins, real_str_cut)
     is_rep1 = str_repeat_count_arr == 1
     add_varying(68 + unit_bucket * 6 + 0, real_str_cut & is_rep1)
 
-    # Flat rep0/rep1 opportunity ("what if a U-bp unit were inserted
-    # here"): same uniform, scan-free credit as the deletion case above,
-    # into both the "0" (novel, no repeat yet) and "1" (first extension)
-    # buckets for every unit size, at every position -- deliberately not
-    # gated by ~real_str, same reasoning as the deletion case above.
+    # Flat rep0 + rep1 insertion credit for every unit size, same
+    # reasoning as the deletion case.
     for u_idx in range(4):
         base_col = 68 + u_idx * 6
         out[base_col] += n_valid
         out[base_col + 1] += n_valid
 
-    # 11: microhomology deletion opportunity (cols 92-95) — every non-N
-    # position, fixed context, independent of actual repeat annotation.
+    # Microhomology deletion (cols 92-95): every valid position.
     for k in range(4):
         out[92 + k] += n_valid
 
-    # 12: 1bp-insertion "next base" opportunity (cols 96-99) — a position
-    # is opportunity for "insert base N here, rep0" purely if its own
-    # following base isn't N; independent of unit_len/repeat_count/the
-    # position's own base entirely, per classify_indel_channel's rep0
-    # definition (funcs/misc.py).
+    # 1bpins{base} (cols 96-99): rep0 opportunity to insert base b where
+    # the following base isn't b (classify_indel_channel's rep0 rule).
     if next_ref_base_arr is not None:
         next_base_valid = (next_ref_base_arr >= 0) & (next_ref_base_arr <= 3)
         for b in range(4):
@@ -832,34 +624,18 @@ def indel100_reference_bucket_indices(
 
 
 def load_repeat_context(hp_dataset, str_dataset, start=None, end=None):
-    """Merge the self-derived homopolymer index (hp.h5: 2 rows, hp/cut —
-    see Index.py's do_index) and the BED-derived STR repeat index (str.h5:
-    3 rows, unit_len/hp/cut, unit_len>=2 only) for one chromosome (or a
-    start:end slice of it) into the single 3-row (unit_len, cut,
-    repeat_count) layout every consumer already expects from the old
-    combined hp.h5 (unit_len=row0, is_start/cut=row1, repeat_count=row2) —
-    so nothing downstream of this needs to know the index is now split
-    across two files.
+    """Merge hp.h5 (rows hp, cut) and str.h5 (rows unit_len, hp, cut;
+    unit_len >= 2 only) for one chromosome, or a start:end slice, into a
+    single 3-row (unit_len, cut, repeat_count) array. Inside an annotated
+    STR (unit_len >= 2) the STR annotation wins; elsewhere the homopolymer
+    run is used with unit_len 1.
 
-    Wherever a position falls inside an annotated STR interval (str
-    unit_len >= 2), the STR annotation wins; everywhere else this falls
-    back to the self-derived homopolymer run (unit_len implicitly 1) --
-    safe because an annotated STR interval always describes an actual
-    repeat, with no separate "background" source to conflict with.
-
-    hp_dataset, str_dataset: h5py Datasets for one chromosome from hp.h5
-        and str.h5 respectively (e.g. hp_h5[chrom], str_h5[chrom]).
+    hp_dataset, str_dataset: h5py Datasets for one chromosome.
     start, end: optional slice bounds; defaults to the whole chromosome.
 
-    Returns a (3, L) int16 array: row0=unit_len, row1=cut, row2=repeat_count.
-    Values never exceed 127 (Index.py clips them before writing), so int16
-    is already generous — it's only used instead of int8/uint8 to leave
-    headroom for downstream arithmetic (e.g. subtracting a small constant)
-    without any risk of silent unsigned wraparound, while avoiding the 8x
-    widening a plain `int` (numpy int64) would cost on the on-disk uint8
-    data -- several GB of unnecessary temporary allocation for a whole
-    chromosome (the common case for Estimate.py's genome-composition
-    calls, as opposed to call.py's windowed calls).
+    Returns a (3, L) int16 array. Values are <= 127 (clipped by Index.py);
+    int16 avoids unsigned wraparound in downstream arithmetic without the
+    memory cost of int64 on whole chromosomes.
     """
     sl = slice(start, end)
     hp_run = hp_dataset[0, sl]
@@ -892,14 +668,10 @@ def _count_tandem_copies(seq, unit, from_end=False):
 
 
 def classify_indel_channel(indel_seq, ref_before, ref_after, indel_len):
-    """Resolve a single observed indel call to its ID83 channel label
-    (internal syntax, see Estimate.py's build_indel83_labels; mapped to
-    COSMIC strings by INDEL83_TO_SIGPROFILER_LABELS), using the same rules
-    as SigProfilerMatrixGenerator (catalogue_generator_INDEL_single in
-    SPMG 1.3.6's MutationMatrixGenerator.py, default limited_indel=True).
-    Classification is purely from reference sequence; it does not read
-    hp.h5/str.h5, so it is independent of how the opportunity side
-    (call.py, indel100_reference_bucket_indices) annotates repeats.
+    """Resolve a single indel call to its ID83 channel label (internal
+    syntax, see Estimate.py's build_indel83_labels), using the same rules
+    as SigProfilerMatrixGenerator 1.3.6 (catalogue_generator_INDEL_single,
+    limited_indel=True). Uses reference sequence only, not hp.h5/str.h5.
 
     indel_seq: the deleted or inserted bases (uppercase, length
         abs(indel_len)).
@@ -970,24 +742,12 @@ def classify_indel_channel(indel_seq, ref_before, ref_after, indel_len):
 
 
 def indel_coverage_category_index(indel_seq, ref_after, indel_len):
-    """Map a single observed indel event to its one matching column index
-    (0-15) into coverage.bed.gz's 16 power-weighted indel opportunity
-    columns, i.e. INDEL_COVERAGE_CATEGORY_LABELS above -- the exact
-    channel this specific mutation's own detection power was screened/
-    thresholded against (call.py's cov_mat_indel columns, same order),
-    not an average across all 16 unrelated categories.
-
-    Only the 1bp insertion case looks at sequence (does the inserted base
-    extend the following base?) -- deletions and insertions of length >=2
-    are bucketed by length alone here, regardless of true-STR vs
-    microhomology, since that finer distinction only exists in the
-    83-channel scheme (classify_indel_channel).
-
-    Every +-1bp repeat-matching event lands on the homopolymer columns
-    (14/15), never 0/1 (STR-only, one copy of a real annotated repeat
-    unit -- a multi-bp concept a 1bp event never satisfies): matches
-    genotypeDSIndel, which always scores a +-1bp event via the HP table
-    regardless of STR membership (see funcs/prob.py's indelErrorProbs).
+    """Column index (0-15) into INDEL_COVERAGE_CATEGORY_LABELS for one
+    indel event. Only the 1bp insertion looks at sequence (does the
+    inserted base match the following base?); longer indels are bucketed
+    by length alone. 1bp deletions and repeat-extending 1bp insertions go
+    to the homopolymer columns 14/15, never the STR-only columns 0/1,
+    matching genotypeDSIndel's HP-table scoring of +-1bp events.
 
     indel_seq/ref_after/indel_len: same arguments as classify_indel_channel.
     """
@@ -1062,11 +822,7 @@ def bamReadCount(bam, chrom, start, end, ref, regionFile=None):
     if not regionFile:
         count = getAlignmentObject(bam, "rb", ref).count(chrom, start, end)
     else:
-        # -R restricts calling to the bed file's regions, so windows with
-        # no overlap contribute nothing and can skip the bam.count() call
-        # entirely -- otherwise splitBamRegions ends up counting reads
-        # across the whole genome even when -R covers only a small
-        # fraction of it.
+        # With -R, count only reads inside the bed intervals.
         regionBed = BED(regionFile)
         count = 0
         if chrom in regionBed.contigs:
@@ -1080,16 +836,11 @@ def bamReadCount(bam, chrom, start, end, ref, regionFile=None):
 
 
 def drop_empty_regions(regionSequence, bamObject):
-    """Filter out any region tuple spanning zero real bases: a
-    (contig, start, end) tuple with start>=end, or the open-ended
-    (contig, start) "rest of this contig" tail once start already sits
-    at (or past) that contig's actual length. Both can arise from
-    splitBamRegions's cut sites landing exactly at a contig boundary
-    (see its own comments) -- a benign edge case at high thread counts
-    or on small/sparse inputs, but an empty region reaching callBam would
-    otherwise, for the 3-tuple case, write a zero-width coverage.bed.gz
-    interval that breaks tabix's sort-order requirement, and for the
-    2-tuple case fetch an inverted/out-of-range range.
+    """Drop regions spanning zero bases: (contig, start, end) with
+    start >= end, or an open-ended (contig, start) at or past the contig
+    end. These can come from cut sites at contig boundaries; an empty
+    region would write a zero-width coverage.bed.gz interval (breaking
+    tabix sort order) or fetch an out-of-range span.
     """
     filtered = []
     for region in regionSequence:
@@ -1116,12 +867,6 @@ def splitBamRegions(
     contigs_sorted = [_ for _ in bamObject.references if _ in contigs]
 
     total_read_num = 0
-    # for bam in bams:
-    # for stat in BAM(bam,"rb").get_index_statistics():
-    # if stat.contig in contigs:
-    # total_read_num += stat.total
-    # chunkSize = math.ceil(total_read_num / num)
-    # tidList = [bamObject.get_tid(c) for c in contigs_sorted]
 
     cutSite = [(0, 0)]
     break_flag = 0
@@ -1130,11 +875,7 @@ def splitBamRegions(
     window_nums = np.ceil(contig_lens / step).astype(int)
     window_nums_cumulative = np.cumsum(window_nums)
     total_reads_by_windows = np.zeros(window_nums_cumulative[-1])
-    # One pool, sized to the requested thread count and reused across every
-    # contig/bam below, instead of spinning up a fresh (unbounded, defaulting
-    # to os.cpu_count()) Pool() per num-window chunk -- for a chromosome with
-    # hundreds of windows that was hundreds of pool start/teardown cycles for
-    # what is, per chunk, only `num` worth of work.
+    # One pool of `num` workers reused for every contig/bam.
     with Pool(num) as pool:
         for bam in bams:
             current_window = 0
@@ -1167,18 +908,13 @@ def splitBamRegions(
         np.arange(1, num) * chunkSize,
     )
     cut_contigs = np.searchsorted(window_nums_cumulative, cut_inds)
-    # Interpolate the cut position within its window by the fraction of
-    # that window's reads needed to reach the target read count, instead
-    # of always snapping to the window's start (window_index * step) --
-    # a window with a disproportionate read count can otherwise absorb
-    # more than one of the np.arange(1, num) * chunkSize targets at the
-    # same window_index, producing duplicate/zero-length cut sites.
+    # Interpolate each cut within its window by the fraction of the
+    # window's reads needed to reach the target, so one read-dense window
+    # can hold several distinct cuts.
     targets = np.arange(1, num) * chunkSize
-    # An oversaturated -p (see the clamp below) can pin cut_inds at
-    # total_reads_by_windows.size, one past its last valid index --
-    # cap it here so the indexing below stays in bounds; the clamp on
-    # cut_pos already handles putting the resulting site back on the
-    # contig regardless of what frac comes out to.
+    # When -p exceeds what the reads can fill, cut_inds can equal
+    # total_reads_by_windows.size; cap for indexing (cut_pos is clamped
+    # below).
     cut_inds_capped = np.minimum(cut_inds, total_reads_by_windows.size - 1)
     window_start_reads = np.concatenate([[0], total_reads_by_windows_cumulative])[
         cut_inds_capped
@@ -1194,20 +930,8 @@ def splitBamRegions(
         (cut_inds - np.concatenate([[0], window_nums_cumulative])[cut_contigs]) * step
         + frac * step
     ).astype(int)
-    # window_nums's last window per contig is a partial window whenever
-    # contig_len isn't an exact multiple of step, so the interpolated
-    # position above can overshoot that contig's real length. That only
-    # actually happens when cut_inds saturates at
-    # window_nums_cumulative[-1] (i.e. a requested thread count -p asks
-    # for more chunks than there's read data to fill -- the trailing
-    # targets exceed the total read count and searchsorted pins them at
-    # the very last window index). Left unclamped this produces a cut
-    # site past the chromosome end, which downstream becomes a region
-    # with start > end (or start beyond the contig) and crashes when
-    # that range is fetched. Clamping to the contig's real length
-    # instead collapses those trailing, over-saturated cut sites onto
-    # the legitimate end-of-contig boundary, where the dedup below then
-    # merges them into one.
+    # A contig's last window is usually partial, so cut_pos can overshoot
+    # the contig end; clamp it so no region starts past the contig end.
     cut_pos = np.minimum(cut_pos, contig_lens[cut_contigs])
     for nn in range(cut_inds.size):
         candidate = (int(cut_contigs[nn]), int(cut_pos[nn]))
@@ -1218,19 +942,8 @@ def splitBamRegions(
             or contig_lens[chrom_idx] - pos < min_chunk_length
         ):
             continue
-        # At high thread counts (small chunkSize) a single window whose
-        # read count exceeds chunkSize can have more than one of the
-        # np.arange(1, num) * chunkSize thresholds land inside it, so
-        # searchsorted returns the same index for consecutive nn --
-        # duplicating the previous cut site here. cutSite entries become
-        # (contig, start, end) region boundaries downstream (see the
-        # cutSites[1:] consuming loops in Caller.py/Learn.py), so a
-        # duplicate produces a zero-width start==end region, which in
-        # turn writes a zero-width coverage.bed.gz interval and breaks
-        # its sort order for tabix. Skipping the duplicate just means
-        # this run ends up with one fewer real parallel chunk than -p
-        # requested for this contig boundary; callers already tolerate
-        # fewer chunks than threads.
+        # Skip duplicate cuts: they would become zero-width regions
+        # downstream. Callers tolerate fewer chunks than threads.
         if candidate == cutSite[-1]:
             continue
         cutSite.append(candidate)
@@ -1251,12 +964,9 @@ def parse_barcode_option(value):
     """Parse the --barcode/-bc "TAG,NORMALIZE,SEP" option string into a dict
     of {"tag", "normalize", "sep"}.
 
-    TAG is the read tag holding the molecular/duplex barcode. NORMALIZE is
-    "1" if TAG holds an unnormalized "bc1<SEP>bc2" pair that still needs
-    read-orientation-based reordering to group both strand-copies of a
-    duplex molecule together (DupCaller's own DB tag behaves this way), or
-    "0" if TAG already holds a single orientation-independent duplex-family
-    barcode, so SEP is unused and grouping relies solely on read flags.
+    NORMALIZE "1": TAG holds a "bc1<SEP>bc2" pair to be reordered by read
+    orientation (like DupCaller's DB tag). "0": TAG already holds an
+    orientation-independent family barcode and SEP is unused.
     """
     parts = value.split(",")
     if len(parts) != 3:
@@ -1274,17 +984,11 @@ def parse_barcode_option(value):
 
 
 def get_duplex_barcode(rec, params):
-    """Return the (bc1, bc2) duplex barcode pair for an aligned read.
-
-    Reads params["barcodeTag"] (default "DB", DupCaller trim's own tag). If
-    params["barcodeNormalize"] (default True), the tag is treated as an
-    unnormalized "bc1<SEP>bc2" pair (SEP = params["barcodeSep"], default
-    "-") and returned as (bc1, bc2) for the caller to reorder by read
-    orientation. If barcodeNormalize is False, the tag already holds a
-    single orientation-independent duplex-family barcode, so it is returned
-    unsplit as (value, value) -- reordering by orientation then becomes a
-    no-op, and strand-of-origin (F1R2 vs F2R1) is tracked solely from read
-    flags elsewhere.
+    """Return the (bc1, bc2) duplex barcode pair for an aligned read, from
+    params["barcodeTag"] (default "DB"). With barcodeNormalize (default
+    True) the tag is split on barcodeSep (default "-"); otherwise it is
+    returned as (value, value), so orientation reordering is a no-op and
+    strand is tracked from read flags only.
     """
     raw = rec.get_tag(params.get("barcodeTag", "DB"))
     if not params.get("barcodeNormalize", True):
@@ -1318,14 +1022,10 @@ def bamIterateMultipleRegion(bam, regions, ref, regionFile=None):
                         continue
                 yield rec, region
     else:
-        # -R restricts calling to the bed file's regions, so only fetch
-        # reads inside the bed intervals that overlap this worker's chunk
-        # region, instead of every read across the whole chunk. A read can
-        # overlap more than one bed interval within the same chunk (e.g.
-        # adjacent/nearby targets), so dedup on (query_name, is_read1,
-        # reference_start) within the chunk; cross-chunk dedup still relies
-        # on the same reference_start >= region[1] rule used above, which
-        # is unaffected by which bed interval a read was fetched through.
+        # With -R, fetch only reads in bed intervals overlapping the region.
+        # A read can overlap several intervals, so dedup within the region;
+        # cross-region dedup uses the same reference_start >= region[1]
+        # rule as above.
         regionBed = BED(regionFile)
         for region in regions:
             chrom = region[0]
@@ -1373,7 +1073,7 @@ def determineTrimLength(seq, params, processed_flag):
         right_read = params["trim3"]
         right = max(right_frag, right_read)
     else:
-        ### Mask overlap of reverse read
+        # Mask overlap of reverse read
         if processed_flag:
             mate_reference_length = _cigar_ref_consumed(seq.get_tag("MC"))
             overlap = max(
@@ -1426,22 +1126,11 @@ def get_bed_file_for_position(
 def _filter_reason_label(
     ncov_flag, nm_flag, trim_flag, extra_flag=None, extra_label=None
 ):
-    """Pick a single, specific filter label naming the mask that's
-    actually blocking a --rescue-eligible candidate that reached the
-    masked-rescue fallback (snp_mask/noise_mask no longer block calling at
-    all -- see the unmasked_pass_bool/unmasked_antimask switch below --
-    and include_mask is never rescuable, so by construction whatever's
-    left blocking this candidate is one or more of: n_cov_mask, nm_mask,
-    trim, and -- indel side only -- indel_mask). The label names the
-    reason the candidate is filtered, not the fact that --rescue is what
-    made it visible -- that's already implied by it only ever reaching the
-    fail vcf when --rescue is on. Args are booleans or boolean arrays
-    covering the candidate's own position(s); a plain scalar bool works
-    too since np.any() accepts one. extra_flag/extra_label covers
-    indel_mask, which has no SNV analogue. Checked in a fixed priority
-    order so a position blocked by more than one mask still gets exactly
-    one label rather than silently picking whichever happened to be
-    checked last.
+    """Filter label for a --rescue candidate naming the mask that blocks
+    it: n_cov_mask, nm_mask, trim, or (indel only, via extra_flag/
+    extra_label) indel_mask. Args are bools or bool arrays over the
+    candidate's position(s). Checked in fixed priority order so exactly one
+    label is returned.
     """
     if extra_flag is not None and np.any(extra_flag):
         return extra_label
@@ -1486,30 +1175,17 @@ def _place_read_in_dict(rec, label, currentReadDict):
 
 def _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool):
     """For each upstream-anchor family (template_length > 0) whose members
-    disagree on next_reference_start, point every read whose mate is not
-    at the LARGEST mate position there via rugged_reads_index, and pre-open
-    its rugged_reads_pool bucket.
+    disagree on next_reference_start, redirect (via rugged_reads_index)
+    every read whose mate is not at the LARGEST mate position, and pre-open
+    that position's rugged_reads_pool bucket.
 
-    This is deliberately the largest coordinate, not the most common one:
-    the BAM is streamed in coordinate order and a pool bucket is drained
-    (popped) as soon as the scan reaches its position, so the bucket must
-    sit at or after every member's own arrival. With mates at
-    [1300, 1300, 1310] a bucket at the mode (1300) would already be gone
-    when the 1310 mate arrives. Which position is chosen affects only when
-    the family is processed, not its coordinates: callBam derives
-    rs_reference_start/rs_reference_end from the reads themselves.
+    The largest position, not the mode: the BAM is streamed in coordinate
+    order and a bucket is drained when the scan reaches it, so it must sit
+    at or after every member's arrival. This affects only when the family
+    is processed, not its coordinates.
 
-    Pool/index keys are (chrom, position), not bare position: a redirect
-    queued here isn't guaranteed to ever be drained (e.g. the downstream
-    mate never turns up in this process's region -- filtered upstream, or
-    mapped outside the assigned span). An orphaned bare-position key would
-    silently collide with an unrelated position on a *later* chromosome
-    (every chromosome restarts its own coordinate numbering near 0),
-    merging a stale read from one chromosome into another chromosome's
-    batch -- which corrupts reference_mat_chrom for that flush and writes
-    a non-contiguous chromosome block into the coverage bed file (fatal
-    for tabix indexing). Qualifying by chromosome makes a stale entry
-    inert instead of a silent cross-chromosome misattribution.
+    Keys are (chrom, position) so a bucket that is never drained can't
+    collide with the same position on a later chromosome.
     """
     for group in currentReadDict.values():
         group_seqs = group["seqs"]
@@ -1558,14 +1234,10 @@ def _eligible_overflow_read(rec):
 
 
 def check_mate_cigar_tags(bam_path, reference=None, sample_size=100_000):
-    """Verify reads the MC-tag chunk-boundary overflow machinery relies on
-    (see _eligible_overflow_read) actually carry an MC tag.
-
-    Checks only the first `sample_size` fetched records (default
-    100,000), not the whole file -- a missing-MC-tag pipeline shows up
-    immediately in the first eligible reads, so a bounded sample is
-    enough; it can only miss MC tags absent deep in a later lane/
-    read-group of a merged BAM.
+    """Exit with an error if a proper-pair read (see _eligible_overflow_read)
+    lacks the MC tag that chunk-boundary overflow relies on. Checks only
+    the first `sample_size` records, so MC tags missing only deep in a
+    merged BAM can go undetected.
     """
     print(
         f"Checking MC (mate CIGAR) tags on proper pairs in {bam_path} "
@@ -1603,29 +1275,22 @@ def previous_region_coverage_start(bam, previous_regions, ref=None, region_file=
 
 
 def _mate_reference_end(rec):
-    """Mate's reference_end, computed from rec's own MC tag (mate CIGAR)
-    plus rec.next_reference_start -- without a random-access mate()
-    lookup. Returns None if rec has no MC tag (e.g. produced by an older
-    aligner/pipeline stage that doesn't write one)."""
+    """Mate's reference_end from rec's MC tag and next_reference_start (no
+    mate() lookup). None if rec has no MC tag."""
     if not rec.has_tag("MC"):
         return None
     return rec.next_reference_start + _cigar_ref_consumed(rec.get_tag("MC"))
 
 
 def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
-    """Like bamIterateMultipleRegion, but if this worker's assigned span
-    has an explicit end (regions[-1] is a full (chrom, start, end) tuple
-    -- i.e. there's a following worker to hand off to), also yields an
-    "overflow" continuation past that end for any read whose downstream
-    mate crosses the boundary (computed from the MC tag, not a fixed
-    buffer), so a duplex family split across a chunk boundary can still
-    be fully reconstructed by the worker that saw its upstream anchor.
+    """Like bamIterateMultipleRegion, but if regions[-1] has an explicit
+    end, also yields an overflow continuation past it, up to the furthest
+    mate end (from MC tags) of reads crossing the boundary, so the worker
+    that saw a family's upstream anchor can reconstruct the whole family.
 
-    Kept exactly-once (no double-count) by a matching check on the
-    RECEIVING side: callBam's main loop skips any read whose mate starts
-    before its own region's start (see the prev_boundary check in
-    callBam) -- that read is this function's overflow pass's
-    responsibility, not the next worker's own normal scan.
+    Exactly-once: the overflow pass yields only reads whose mate starts
+    before the boundary, and callBam's prev_boundary check makes the next
+    worker skip those same reads.
     """
     boundary_chrom = None
     boundary_pos = None
@@ -1653,11 +1318,7 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
             bam, [overflow_region], ref, region_file
         ):
             if rec.next_reference_start >= boundary_pos:
-                # Not a continuation of a family whose anchor was in this
-                # worker's own normal region -- belongs to whatever the
-                # next worker independently discovers in its own normal
-                # scan (or is simply unrelated to any boundary-crossing
-                # family). Skip it here rather than risk double-counting.
+                # Belongs to the next worker's normal scan.
                 continue
             yield rec, region
 
@@ -1668,23 +1329,14 @@ def bamIterateMultipleRegionWithOverflow(bam, regions, ref, region_file=None):
 def _normalize_indel_hp_mat(mat, pseudocount, fallback=None):
     """Normalize a raw (10, 12) hp.txt count matrix (rows hp run length
     1-10+, columns ref_allele*3+(idLen+1) for idLen in {-1,0,1}) into
-    per-context probabilities: within each base's own 3-column group
-    (ref/del/ins counts for that base), each row is Dirichlet-smoothed by
-    `pseudocount` on the counts and divided by its own (smoothed) sum, so
-    the three probabilities for a given (hp_len, base) add to 1.
+    probabilities: each (hp_len, base) 3-column group is Dirichlet-smoothed
+    by `pseudocount` and divided by its sum.
 
-    `fallback` (the bundled fallback_latest hp.txt counts, same shape and
-    smoothing) covers unobserved error categories: in an (hp_len, base)
-    context with fewer than FALLBACK_MIN_SITES raw observations (that
-    base's own 3-column group only), a del/ins entry whose own count is 0
-    takes the fallback rate, raised to the
-    previous hp_len row's rate if that is higher -- the rate actually used
-    for that previous row (itself possibly fallback-derived or floored),
-    not its observed rate. The first row (hp_len 1) has no previous row and
-    takes the fallback as-is. Every other entry keeps the monotonic
-    non-decrease rule (row n >= row n-1 elementwise, against the previous
-    row's used rate), independently per base group. Without `fallback`, an
-    all-zero row copies the previous row's rate instead.
+    `fallback` (bundled fallback_latest hp.txt counts): in a group with
+    fewer than FALLBACK_MIN_SITES observations, a zero-count del/ins entry
+    takes the fallback rate. Rows are then made non-decreasing in hp_len
+    (row n >= row n-1 elementwise, using row n-1's final rates), per base
+    group. Without `fallback`, an all-zero row copies the previous row.
     """
     mat_new = np.zeros_like(mat, dtype=float)
     for g in range(4):
@@ -1696,9 +1348,7 @@ def _normalize_indel_hp_mat(mat, pseudocount, fallback=None):
             fb_new = (fb_block + pseudocount) / (
                 fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
             )
-            # Site total for the fallback gate: this (hp_len, base) context
-            # alone, so a zero-count base group is never left at the flat
-            # pseudocount rate just because other bases are well sampled.
+            # Gate on this (hp_len, base) group's own site total.
             use_fb = (block == 0) & (row_sum < FALLBACK_MIN_SITES)
             # del (col 0) / ins (col 2) only; col 1 is the opportunity.
             use_fb[:, 1] = False
@@ -1720,26 +1370,18 @@ def _normalize_indel_hp_mat(mat, pseudocount, fallback=None):
 
 def _normalize_indel_str_mat(mat, pseudocount, fallback=None):
     """Normalize a raw (5, 15) str.txt count matrix (rows STR-length bin
-    0="0-1"/not a real repeat through 4="40+", columns a (deletion,
+    0 = not a real repeat through 4 = "40+", columns a (deletion,
     reference, insertion) triple per repeat-unit group u1-u5+) into
-    per-context probabilities: within each row's unit group, the three
-    counts are Dirichlet-smoothed by `pseudocount` and divided by their own
-    (smoothed) sum, so a group's deletion/reference/insertion add to 1.
+    probabilities: each (row, unit group) triple is Dirichlet-smoothed by
+    `pseudocount` and divided by its sum.
 
-    `fallback` (the bundled fallback_latest str.txt counts, same shape and
-    smoothing) covers unobserved error categories: in a (row, unit group)
-    with fewer than FALLBACK_MIN_SITES raw observations, a deletion or
-    insertion entry whose own count is 0 takes the fallback rate. For
-    real-STR rows 2-4 it is then raised to the previous (shorter) real-STR
-    row's rate for that group if higher -- the rate actually used for that
-    row (itself possibly fallback-derived), not its observed rate. Rows 0
-    (not a real repeat) and 1 (shortest real-STR bin) have no previous
-    real-STR row and take the fallback as-is; so does a group whose
-    previous row has no opportunity in the fallback (u1 in every real-STR
-    row, u5+ in 2-9bp: no such tracts exist), whose smoothed rate is just
-    the pseudocount's 1/3. Without `fallback`, an all-zero group in
-    real-STR rows 2-4 copies the previous row's rates if that row has any
-    (observed or copied).
+    `fallback` (bundled fallback_latest str.txt counts): in a group with
+    fewer than FALLBACK_MIN_SITES observations, a zero-count deletion/
+    insertion entry takes the fallback rate; in rows 2-4 it is raised to
+    the previous row's final rate if higher, unless that previous row has
+    no fallback opportunity (its rate would be the flat pseudocount 1/3).
+    Without `fallback`, an all-zero group in rows 2-4 copies the previous
+    row's rates if that row has any.
     """
     if mat.shape != (5, STR_NCOL):
         raise ValueError(
@@ -1759,8 +1401,6 @@ def _normalize_indel_str_mat(mat, pseudocount, fallback=None):
                 fb_block.sum(axis=1, keepdims=True) + 3 * pseudocount
             )
             use_fb = (block == 0) & (row_sum < FALLBACK_MIN_SITES)
-            # deletion (col 0) / insertion (col 2) only; col 1 is the
-            # opportunity.
             use_fb[:, 1] = False
             for r in range(5):
                 fb_cols = use_fb[r]
@@ -1784,16 +1424,14 @@ def _normalize_indel_str_mat(mat, pseudocount, fallback=None):
 
 def str_profile_is_current(path):
     """True if an .amp/.dmg.str.txt profile has the per-repeat-unit layout
-    (STR_NCOL columns, DupCaller >= 1.2.12); older profiles have 11."""
+    (STR_NCOL data columns); older profiles have 11."""
     with open(path) as fh:
         return len(fh.readline().rstrip("\n").split("\t")) - 1 == STR_NCOL
 
 
-# In a context (trinuc row, hp_len x base group, or STR row) with fewer
-# total observations than this, a zero-count error category is treated as
-# under-sampled rather than a true zero rate; its rate comes from the
-# bundled fallback_latest.* profile instead (see
-# apply_sbs_low_coverage_fallback and the indel normalizers above).
+# In a context with fewer observations than this, a zero-count error
+# category is treated as under-sampled and takes the bundled
+# fallback_latest.* rate instead.
 FALLBACK_MIN_SITES = 1000
 
 
@@ -1851,15 +1489,11 @@ def apply_sbs_low_coverage_fallback(
 
 def ref_conditional_error_rates(rates, ref_col, fallback_rates):
     """Turn a per-context error-rate matrix into the binary-model rates the
-    genotyper consumes: P(read shows this error | read shows this error or
-    the reference).
+    genotyper consumes: P(error | error or reference).
 
-    Per row, the reference rate is recomputed as 1 - sum(every other entry
-    in the row). A row whose reference rate comes out negative (its error
-    rates, after fallback substitution/monotonicity, sum past 1) is
-    replaced wholesale by that row of `fallback_rates` and recomputed the
-    same way. Each non-reference entry P then becomes P / (Pref + P); the
-    reference column holds Pref itself.
+    Per row, Pref = 1 - sum(other entries). A row with Pref < 0 is replaced
+    by that row of `fallback_rates` and recomputed. Each non-reference
+    entry P becomes P / (Pref + P); the reference column holds Pref.
 
     rates/fallback_rates: (rows, cols); ref_col: scalar or per-row column
     index of the reference entry.
@@ -1923,19 +1557,15 @@ def _str_ref_conditional(rates, fallback_counts, pseudocount):
 
 def load_error_matrices(params):
     """Load and regularize the SBS (amperr/dmgerr) and indel
-    (amperri/dmgerri) error-rate matrices from the files named in params,
-    populating params in place with ampmat/ampmat_rev/dmgmat_top/
-    dmgmat_rev_top/dmgmat_bot/dmgmat_rev_bot/ampmat_hp/dmgmat_hp/
-    ampmat_str/dmgmat_str/trinuc_convert/
-    trinuc2num_dict/num2trinuc_list -- exactly the fields callBam needs to
-    build its L/L_indel_1bp/L_indel_len power tables. Factored out (rather
-    than left inlined in callBam) so Caller.py's post-hoc per-channel FDR
-    threshold refinement -- re-simulating a single context's detection
-    power at a new, stricter LR threshold -- can load the identical
-    matrices without re-running callBam/rescanning the bam.
+    (amperri/dmgerri) error-rate matrices named in params, populating
+    params in place with ampmat/ampmat_rev/dmgmat_top/dmgmat_rev_top/
+    dmgmat_bot/dmgmat_rev_bot/ampmat_hp/dmgmat_hp/ampmat_str/dmgmat_str/
+    trinuc_convert/trinuc2num_dict/num2trinuc_list (the inputs to callBam's
+    power tables). Also used by Caller.py to re-simulate detection power
+    without rescanning the BAM.
 
-    isLearn is read from params (defaulting False); in learn mode the amp/
-    dmg matrices are left as zeros (they're not used for calling there).
+    With params["isLearn"] (default False) the amp matrices are zeros and
+    dmg is uniform; neither is used for calling there.
     """
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
     isLearn = params.get("isLearn", False)
@@ -1954,28 +1584,19 @@ def load_error_matrices(params):
     params["trinuc_convert"] = trinuc_convert_np
     params["trinuc2num_dict"] = trinuc2num
     params["num2trinuc_list"] = num2trinuc
-    ### Load amp error matrix
+    # Load amp error matrix
     if isLearn:
         ampmat = np.zeros([64, 4])
     else:
-        # amperr_file now points at a Learn.py/Caller.py-auto-learn-
-        # produced SRD (single-read-damage) rate matrix
-        # (funcs/learn.py's estimate_sbs_srd_rates) -- already a
-        # per-row probability distribution (p/p_b1/p_b2/p_b3 summing to
-        # 1, EM-fit directly against the per-read base-quality
-        # distribution) rather than raw mismatch counts, so no row-sum
-        # normalization here any more: the old in-situ "divide raw
-        # amp.tn.txt counts by their row sum" step now happens once at
-        # learn time instead of on every call-time load.
+        # amperr_file is an SRD rate matrix (learn.py's
+        # estimate_sbs_srd_rates): rows are already smoothed probability
+        # distributions, so no row-sum normalization here.
         ampmat = (
             pd.read_csv(params["amperr_file"], sep="\t", index_col=0)
             .to_numpy()
             .astype(float)
         )
-    # ampmat_avg_error = (1 - ampmat.max(axis=1,keepdims=True))/3
-    # No further regularization here -- estimate_sbs_srd_rates already
-    # returns the fully pseudocount-smoothed rate. Convert to the binary
-    # model's P(error | error or ref), see ref_conditional_error_rates.
+    # Convert to the binary model's P(error | error or ref).
     if not isLearn:
         ampmat = ref_conditional_error_rates(
             ampmat, _sbs_ref_cols(), _read_fallback_counts(".amp.tn.srd.txt")
@@ -1991,7 +1612,6 @@ def load_error_matrices(params):
             ampmat_rev[trinuc2num[trinuc], nn] = ampmat[
                 trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
             ]
-    # ampmat_rev_avg_error = (1 - ampmat_rev.max(axis=1,keepdims=True))/3
     ampmat_rev_min_error = ampmat_rev.min(axis=1, keepdims=True)
     ampmat_rev = np.concatenate([ampmat_rev, ampmat_rev_min_error], axis=1)
     params["ampmat_rev"] = ampmat_rev
@@ -2000,8 +1620,7 @@ def load_error_matrices(params):
         params["ampmat_hp"] = np.zeros([10, 12])
         params["ampmat_str"] = np.zeros([5, STR_NCOL])
     else:
-        # amperri_file's prefix, split into the two files funcs/learn.py
-        # writes (see Caller.py/Learn.py's write-out).
+        # The indel profile is stored as separate .hp.txt/.str.txt files.
         amperri_hp_file = params["amperri_file"].replace(".amp.id.txt", ".amp.hp.txt")
         amperri_str_file = params["amperri_file"].replace(".amp.id.txt", ".amp.str.txt")
         ampmat_hp = pd.read_csv(amperri_hp_file, sep="\t", index_col=0).to_numpy(
@@ -2021,10 +1640,7 @@ def load_error_matrices(params):
         ampmat_str = _str_ref_conditional(ampmat_str, amp_str_fb, pseudocount)
         params["ampmat_str"] = ampmat_str
 
-    # params["ampmat_indel_mean"] = np.mean(ampmat_indel,axis=1)
-    # params["ampmat_indel_rev_mean"] = np.mean(ampmat_indel_rev,axis=1)
-
-    ### Load damage matrix
+    # Load damage matrix
     if isLearn:
         dmgmat = np.zeros([64, 4])
     else:
@@ -2033,9 +1649,7 @@ def load_error_matrices(params):
             .to_numpy()
             .astype(float)
         )
-        # dmgmat += 1
 
-    # dmgmat += 0.5
     # Dirichlet-smoothed on the counts: a zero-observation context lands
     # at the uniform 1/4.
     pseudocount = params.get("pseudocount", 0.5)
@@ -2052,7 +1666,6 @@ def load_error_matrices(params):
         )
         dmgmat = apply_sbs_low_coverage_fallback(dmgmat, dmgmat_counts, fallback_rates)
         dmgmat = ref_conditional_error_rates(dmgmat, _sbs_ref_cols(), fallback_rates)
-    # dmgmat_ref_error = 1 -  dmgmat.max(axis=1, keepdims=True)
     dmgmat_ref_error = dmgmat.min(axis=1, keepdims=True)
     dmgmat = np.concatenate([dmgmat, dmgmat_ref_error], axis=1)
 
@@ -2067,13 +1680,11 @@ def load_error_matrices(params):
             dmgmat_rev[trinuc2num[trinuc], nn] = dmgmat[
                 trinuc2num[trinuc[0] + altbase + trinuc[2]], base2num[refbase]
             ]
-    # dmgmat_rev_ref_error = 1 -  dmgmat_rev.max(axis=1, keepdims=True)
     dmgmat_rev_ref_error = dmgmat_rev.min(axis=1, keepdims=True)
     dmgmat_rev = np.concatenate([dmgmat_rev, dmgmat_rev_ref_error], axis=1)
     params["dmgmat_rev_top"] = dmgmat_rev
 
     dmgmat_b = np.vstack((dmgmat[32:64, [1, 0, 3, 2]], dmgmat[:32, [1, 0, 3, 2]]))
-    # dmgmat_b_ref_error = 1 - dmgmat_b.max(axis=1, keepdims=True)
     dmgmat_b_ref_error = dmgmat_b.min(axis=1, keepdims=True)
     dmgmat_rev_b = np.vstack(
         (dmgmat_rev[32:64, [1, 0, 3, 2]], dmgmat_rev[:32, [1, 0, 3, 2]])
@@ -2111,32 +1722,14 @@ def load_error_matrices(params):
 # FDR / detection-power calibration
 # ======================================================================
 def threshold_rng(base_seed, threshold):
-    """Deterministic, order-independent RNG for one simulate_power_grid
-    Monte Carlo draw at a specific LR `threshold`.
+    """RNG for one simulate_power_grid draw at LR `threshold`, seeded from
+    (base_seed, threshold) so results don't depend on worker count or
+    scheduling order.
 
-    Deriving a fresh seed from (base_seed, threshold) means the same
-    threshold always gets the same seed -- and thus the same simulated
-    grid -- no matter which process/thread computes it or in what order.
-    Results are therefore reproducible across both repeated runs (given
-    the same base_seed) and different -p values: a shared per-worker RNG
-    would instead make results depend on which worker happens to process
-    which threshold, which itself depends on how many -p workers exist.
-
-    Seeded from base_seed plus the threshold's first 5 significant digits
-    (threshold values here are LR thresholds, typically single- to
-    low-double-digit floats) -- np.random.default_rng mixes a sequence of
-    ints via SeedSequence, so combining the two this way (rather than
-    concatenating/adding them by hand) avoids accidental seed collisions
-    between different (base_seed, threshold) pairs.
-
-    threshold == +-inf (_refine_channel's deliberate "this channel has no
-    mutation-rate evidence, reject every LR" sentinel for a zero-coverage
-    channel) can't be scaled into a finite digit string -- but which seed
-    gets used doesn't matter in that case anyway: simulate_power_grid's
-    `(LL_B1 - LL_B2) >= threshold` comparison is already deterministically
-    False (or True, for -inf) for every possible draw once threshold is
-    infinite, regardless of which quality values got sampled. A fixed
-    sentinel digit string is therefore exact, not an approximation.
+    The threshold enters as round(|threshold| * 1e4) mod 1e5 (4 decimals,
+    one integer digit), mixed with base_seed via SeedSequence. An infinite
+    threshold (_refine_channel's reject-all sentinel) uses a fixed value;
+    the seed is irrelevant there since the grid comparison is constant.
     """
     if np.isfinite(threshold):
         threshold_digits = int(round(abs(threshold) * 10000)) % 100000
@@ -2163,11 +1756,9 @@ def simulate_power_grid(
     ratio (LL_B1 - LL_B2) clears `threshold`, given this single context's
     fixed amplification/damage probabilities.
 
-    Shared by callBam's L (SBS) and L_indel_1bp/L_indel_len (indel)
-    power-table construction below, and reused as-is by Caller.py to
-    re-simulate one channel's grid at a new, FDR-controlled threshold
-    without rescanning the bam -- both need bit-identical math, just at a
-    different threshold.
+    Shared by callBam's power tables (L, L_indel_1bp, L_indel_len) and
+    Caller.py's re-simulation at a refined threshold, so both use
+    identical math.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -2278,9 +1869,9 @@ def indel_eeff_site_masks(
     site needs the anchor and the context base unmasked (antimask_indel, the
     indel masks, no snp_mask), an ACGT context base and an anchor that isn't
     the window's first base (indel_has_context); a deletion of k also needs
-    all k deleted bases unmasked and inside the window, and the base after
-    them to differ from the anchor (otherwise it left-aligns further), the
-    same span as indel_mask_span.
+    all k deleted bases unmasked and inside the window (the same span as
+    indel_mask_span), and its last deleted base to differ from the anchor
+    (otherwise it left-aligns further).
 
     HP: one site per run, its first base, skipping runs cut by the window
     edge (hp_repeat_valid). STR(+-u): tract starts of repeat unit u (any
@@ -2320,7 +1911,8 @@ def indel_eeff_site_masks(
             str0_by_len[-k] = del_ok
             str0_by_len[k] = site_ok
             continue
-        # The base after a k-deletion at p, compared with the anchor.
+        # Last deleted base of a k-deletion at p (ref_int[p + k - 1]),
+        # compared with the anchor.
         after = np.full(n, -1)
         m = max(n - k, 0)
         after[1 : 1 + m] = ref_int[k : k + m]
@@ -2376,14 +1968,9 @@ _REFINE_WORKER_CTX = {}
 
 
 def init_refine_worker(depth_by_trinuc, depth_by_hpstr):
-    """Pool initializer for the per-channel FDR-threshold refinement pool
-    (refine_channel_task below): stashes the read-only context every
-    channel's Eeff lookup needs as worker-global state once per process,
-    instead of re-pickling it into each of the ~200 per-channel tasks
-    Caller.py's do_call dispatches. _channel_eeff_at_threshold's Eeff is a
-    raw (unweighted) depth sum with no per-threshold simulation, so it
-    only ever reads depth_by_trinuc/depth_by_hpstr/n1_mask -- no
-    amp/dmg matrices, quality histogram, or seed needed here at all.
+    """Pool initializer for refine_channel_task: stores the read-only depth
+    matrices once per worker instead of pickling them into every
+    per-channel task.
     """
     global _REFINE_WORKER_CTX
     _REFINE_WORKER_CTX = dict(
@@ -2394,13 +1981,9 @@ def init_refine_worker(depth_by_trinuc, depth_by_hpstr):
 
 
 def _channel_eeff_at_threshold(kind, ctx_key):
-    """Raw opportunity (Eeff) for one channel: total real-duplex depth in
-    this channel's context, summed with no detection-power weighting --
-    every covered base counts equally regardless of this channel's actual
-    amp/damage error rates or the calling threshold. Picklable top-level
-    dispatch on channel kind, so one per-channel worker task
-    (refine_channel_task) can call this instead of needing a different
-    closure per kind -- closures aren't picklable across a Pool.
+    """Raw opportunity (Eeff) for one channel: duplex depth (both strands
+    present) in the channel's context, with no detection-power weighting.
+    Reads the worker context set by init_refine_worker.
     """
     c = _REFINE_WORKER_CTX
     if kind == "sbs96":
@@ -2445,38 +2028,19 @@ def mu_at_min_lr(fdr_thr, min_log10_lr):
 
 
 def _refine_channel(mu0, threshold0, fdr_thr, min_log10_lr=0.0):
-    """Non-iterative FDR-controlled threshold for one channel.
+    """FDR-controlled log10 LR threshold for one channel, taking mu0 as the
+    channel's mutation rate: the LR where the local fdr
+    (1-mu0)/(LR*mu0+1-mu0) equals fdr_thr, i.e.
+    LR = (1-fdr_thr)*(1-mu0)/(fdr_thr*mu0).
 
-    mu0 (this channel's round-1 MLE mixture weight, from the direct
-    brentq solve in refine_channel_task) is taken as the channel's
-    mutation rate outright -- no re-simulation/re-MLE step-up loop. The LR
-    threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals fdr_thr is
-    solved for directly (LR = (1-fdr_thr)*(1-mu0)/(fdr_thr*mu0)); mu0 itself is also what
-    every PASS call's own local FDR is computed against downstream
-    (Caller.py's per-call FDR stamping).
+    Floored at min_log10_lr (--minLR): mu includes the channel's own
+    candidates, so in a low-coverage channel one call could otherwise
+    raise mu enough to pass itself. Also floored at threshold0, since
+    round 1 never records candidates below it. The same threshold drives
+    the coverage pass's power simulation.
 
-    Clamped to never go below min_log10_lr (--minLR): a channel's mu
-    includes its own candidates, so in a channel with little effective
-    coverage a single call can raise mu enough to pass itself; the floor
-    keeps such self-supported weak calls out. The same final threshold
-    drives the coverage pass's detection-power simulation, so calling and
-    the burden's sensitivity correction use the same cutoff.
-
-    Clamped to never go below threshold0: round 1's bam scan only ever
-    records a candidate whose LR clears threshold0 in the first place
-    (funcs/call.py's LR_pass_bool gate, evaluated long before any
-    per-channel refinement exists) -- a candidate below threshold0 isn't
-    filtered out, it's never written into mutsAll/indelsAll at all, so
-    round 2's post-hoc re-filter (no bam rescan) could never recover it
-    even if mu0 alone would justify a looser threshold here.
-
-    mu0 == 0 (a channel with no effective coverage and no sites, see
-    refine_channel_task, or a -mr table entry of 0) makes
-    the local-fdr formula's implied LR threshold a division by zero
-    (mu0/(1-mu0) == 0). There is no mutation-rate evidence for this
-    channel, so instead of solving for a finite cutoff, report
-    nothing as PASS in round 2 for it: a threshold of +inf fails every
-    finite LR in Caller.py's LR < threshold re-filter.
+    mu0 == 0 (no coverage and no sites, or a -mr entry of 0) returns +inf,
+    so nothing in the channel passes.
     """
     if mu0 == 0:
         return float("inf")
@@ -2490,49 +2054,27 @@ MU0_UPPER_GAP = 1e-12
 
 
 def refine_channel_task(job):
-    """One independent unit of work for the FDR-threshold pool: computes
-    this channel's raw (unweighted) Eeff, then either takes mu0 from
-    Caller.py's -mr/--muterateprefix override (mu0_override, if not None)
-    or solves directly for this channel's own mixture weight (mu0)
-    from raw_lr_list/Eeff0 -- either way, the LR threshold at which its
-    local fdr (using mu0) equals fdr_thr is then solved for, clamped to
-    never go below threshold0 or min_log10_lr -- see _refine_channel. Channels (each SBS96
-    class / each HP-length x indel-length / STR-bin x indel-length combo,
-    ~200 total) are fully independent -- own raw_lr list, own Eeff formula
-    -- so do_call dispatches these across a Pool (one task per channel)
-    instead of running them one at a time in the main process.
+    """Per-channel worker task: compute the channel's raw Eeff, take mu0
+    from mu0_override (-mr/--muterateprefix) or solve for it, and return
+    the refined threshold (_refine_channel). Eeff0 is always computed from
+    this run's coverage, even with an override.
 
-    Eeff0 is always computed fresh from this run's own real coverage
-    (cheap, no Monte Carlo) even when mu0_override is supplied -- it still
-    feeds this run's own diagnostic rate-table output (mutnum/Eeff
-    columns) and the FDR-at-mu0 threshold solve below, which should use
-    this run's own opportunity even when its mutation-rate estimate comes
-    from elsewhere.
+    raw_lr_list: raw (10**LR) LRs of the channel's LR >= 0 sites;
+    neg_log_lr: log10 LRs (float32) of its LR < 0 sites.
 
-    raw_lr_list holds the raw (10**LR) LRs of the channel's LR >= 0 sites;
-    neg_log_lr the log10 LRs (float32) of its LR < 0 sites, which callBam
-    keeps as bare numbers rather than records. Both enter raw_lr below.
-
-    Without an override, mu0 is the maximum-likelihood mixture weight
-    (no pseudocount):
-        mu * Eeff0 = sum(post_i),   post_i = mu*r_i/(1-mu+mu*r_i)
-    i.e. the root of the log-likelihood's derivative
+    Without an override, mu0 is the maximum-likelihood mixture weight, the
+    root of the log-likelihood derivative
         score(mu) = sum((r_i-1)/(1-mu+mu*r_i)) - (Eeff0-n)/(1-mu),
-    which is strictly decreasing (concave log-likelihood), so there is at
-    most one root in (0, 1). score(0) = sum(r_i) - Eeff0: when the sites'
-    LRs sum to no more than the channel's opportunity, their evidence is
-    no more than noise alone gives on average (E[LR] = 1 under the null),
-    the likelihood peaks at mu = 0, and mu0 falls back to 1/(Eeff0+1).
-    Its threshold, log10(Eeff0*(1-f)/f), sits above every site's LR when
-    f < 0.5 (each r_i <= sum(r_i) <= Eeff0), so the channel still has no
-    PASS calls but gets finite detection power in the coverage pass. A
-    channel with no effective coverage and no sites gets mu0 = 0
-    (threshold +inf). Each
-    site is one covered family-position, so n <= Eeff0 by construction; a
-    channel that breaks this (an Eeff/site-set mismatch) is reported and
-    solved with Eeff0 raised to n. With n == Eeff0 the score at mu -> 1 is
-    finite and can stay positive (every opportunity is a strong site);
-    mu0 then takes the bracket's upper end, just below 1.
+    which is strictly decreasing (at most one root in (0, 1)).
+    score(0) = sum(r_i) - Eeff0; if that is <= 0 (no more evidence than
+    noise, since E[LR] = 1 under the null) the likelihood peaks at 0 and
+    mu0 = 1/(Eeff0+1) instead. Its threshold log10(Eeff0*(1-f)/f) exceeds
+    every site's LR when f < 0.5, so there are still no PASS calls but the
+    coverage pass gets finite power. No coverage and no sites gives
+    mu0 = 0 (threshold +inf). n <= Eeff0 should hold (each site is one
+    covered family-position); if not, a warning is printed and Eeff0 is
+    raised to n. If score stays positive up to the bracket end (possible
+    when n == Eeff0), mu0 is just below 1.
     """
     (
         name,
@@ -2590,23 +2132,15 @@ def refine_channel_task(job):
 # ======================================================================
 def _accumulate_depth_matrix(depth_mat, n_top, n_bot, category, valid, n_cat):
     """
-    Add one count per valid position to depth_mat[n_top, n_bot, category],
-    via a single bincount instead of a Python loop.
+    Add one count per valid position to depth_mat[n_top, n_bot, category]
+    via a single bincount.
 
     depth_mat: (10, 10, n_cat) running total, updated in place.
-    n_top, n_bot: (window_len,) read-family top/bottom-strand counts,
-        already capped at 9 (matching the L-table convention used
-        elsewhere in this module).
-    category: (window_len,) context bucket index in [0, n_cat) -- e.g.
-        trinuc (0-63), hp/str bucket (0 to DEPTH_HPSTR_NCAT-1), or dinuc
-        (0-15).
-        Entries outside [0, n_cat) are fine as long as they're excluded
-        by `valid` (this function never reads them).
-    valid: (window_len,) bool mask of positions to actually count.
-
-    This only ever touches the small, fixed-size aggregate total -- no
-    per-locus record is kept, so there is nothing to carry across window
-    boundaries and nothing to merge across worker processes' regions.
+    n_top, n_bot: (window_len,) family top/bottom-strand read counts,
+        already capped at 9.
+    category: (window_len,) context bucket in [0, n_cat); out-of-range
+        entries are fine where `valid` is False.
+    valid: (window_len,) bool mask of positions to count.
     """
     if not np.any(valid):
         return

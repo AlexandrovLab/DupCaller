@@ -14,13 +14,10 @@ import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 
-# import pysam
 from matplotlib import pyplot as plt
 
-# from pysam import AlignmentFile as BAM
-
 from . import __version__
-from .funcs.call import callBam, contract_worker_tally  # , output_masked_mutations
+from .funcs.call import callBam, contract_worker_tally
 from .funcs.learn import NUM_BQ, estimate_sbs_srd_rates
 from .funcs.misc import simulate_power_grid, load_error_matrices
 from .funcs.misc import init_refine_worker, refine_channel_task, mu_at_min_lr
@@ -46,44 +43,24 @@ from .funcs.misc import parse_barcode_option
 from pysam import TabixFile as BED
 import pysam
 
-# from heapq import nlargest
-# refine_channel_task/init_refine_worker (the per-channel FDR-refinement
-# Pool it and _refine_channel run inside of) live in funcs/call.py -- see
-# below in do_call.
 
-
-# Written to every row of _indel_rate_by_hp_str.txt ("eeff_sites" column):
-# what the HP/STR Eeff counts, so -mr refuses a table whose mu is on another
-# scale. "per_run": one site per homopolymer run / STR tract (2026-09-30);
-# older tables (no column) counted every base of a run, about 1/L the mu.
-# "per_run_signed" (2026-10-01): deletion/insertion sites counted
-# separately, STR slips by str_slip_tract, str.h5 schema 3.
-# "per_unit_signed" (2026-10-10, 1.2.12): STR channels per repeat unit
-# (STR{bin}_u{U}_{del|ins}) instead of per indel length.
+# Written to every row of _indel_rate_by_hp_str.txt ("eeff_sites" column) to
+# identify the HP/STR Eeff site set, so -mr refuses a table whose mu is on a
+# different scale: one site per homopolymer run / STR tract, deletion and
+# insertion sites counted separately, STR channels per repeat unit
+# (STR{bin}_u{U}_{del|ins}).
 INDEL_EEFF_SITE_SET = "per_unit_signed"
 
 
 def _load_mutation_rate_override(prefix):
-    """Load a previously-computed per-channel mutation-rate table pair --
-    {prefix}_sbs96_rate_n1.txt and {prefix}_indel_rate_by_hp_str.txt, the
-    exact two files do_call's own refine step writes out every run (see
-    sbs96_rate_n1/indel_rate_by_hp_str below) -- into one
-    {channel_name: mutation_rate_mle} dict, keyed by the same job-name
-    strings used throughout do_call (sbs_jobs/indel_jobs, channel_
-    final_mu, channel_thresholds). Used by -mr/--muterateprefix so a call
-    over a small region (e.g. --rescue debugging of a single locus) can
-    reuse a full genome-wide run's own per-channel mutation-rate (mu0)
-    estimates instead of re-deriving noisy ones from just the small
-    region's own tiny candidate count/coverage -- see refine_channel_task
-    (funcs/misc.py) for where the override value is actually substituted.
+    """Load {prefix}_sbs96_rate_n1.txt and {prefix}_indel_rate_by_hp_str.txt
+    (as written by do_call's refine step) into a {channel_name: mu0} dict
+    keyed by do_call's channel job names, for -mr/--muterateprefix: a
+    small-region call can reuse a genome-wide run's mu0 estimates.
 
-    The SBS table's own "context" column already IS the job-name string
-    (e.g. "SBS96:A[C>A]A"). The indel table's "context"/"indel_length"
-    columns don't carry the full name directly -- reconstructed here from
-    the exact same naming convention indel_jobs below builds it with
-    ("HP{hp_len}_len{id_len}_{pool}" for homopolymer channels; for STR
-    channels the context "STR{str_bin}_u{U}" plus the signed unit/length,
-    see funcs/misc.py's str_channel_name).
+    SBS "context" is already the job name; indel names are rebuilt from
+    "context"/"indel_length" ("HP{hp_len}_len{id_len}_{pool}", or
+    str_channel_name for STR).
     """
     sbs_table = pd.read_csv(prefix + "_sbs96_rate_n1.txt", sep="\t")
     indel_table = pd.read_csv(prefix + "_indel_rate_by_hp_str.txt", sep="\t")
@@ -120,8 +97,7 @@ def _load_mutation_rate_override(prefix):
 
 def _sbs_family_key(mut):
     """(chrom, pos, TAG1, TAG2, SP, TL): one read family's call at one
-    position. Several families (molecules) can call the same position. TL
-    (template length) is part of the family label: a fragment no longer
+    position. TL is part of the family label because a fragment no longer
     than the read makes two families with the same barcodes and start."""
     infos = mut["infos"]
     return (
@@ -217,19 +193,15 @@ def _fail_dbs_of_failed_sbs(dbsAll, sbs_records, failed_sbs):
 
 
 def check_input_files_exist(args):
-    """
-    Check if all required input files exist and exit gracefully if not.
-    """
+    """Exit with an error message if any required input file is missing."""
     missing_files = []
 
-    # Required files
     if not os.path.exists(args.bam):
         missing_files.append(f"Tumor BAM file: {args.bam}")
 
     if not os.path.exists(args.reference):
         missing_files.append(f"Reference genome: {args.reference}")
 
-    # Check for associated reference files (h5 files)
     ref_base = os.path.splitext(args.reference)[0]
     ref_h5_files = [f"{ref_base}.h5", f"{args.reference}.ref.h5"]
     tn_h5_files = [f"{ref_base}.tn.h5", f"{args.reference}.tn.h5"]
@@ -263,7 +235,6 @@ def check_input_files_exist(args):
         )
         sys.exit(1)
 
-    # Optional files that should be checked if provided
     if args.normalBams:
         for normal_bam in args.normalBams:
             if not os.path.exists(normal_bam):
@@ -283,7 +254,6 @@ def check_input_files_exist(args):
     if args.indelbed and not os.path.exists(args.indelbed):
         missing_files.append(f"Indel BED file: {args.indelbed}")
 
-    # Check optional error profile files
     if args.errprefix:
         for suffix, label in [
             (".amp.tn.srd.txt", "Amplification SBS error file (SRD rate matrix)"),
@@ -302,7 +272,6 @@ def check_input_files_exist(args):
                     f"relearn it with this version: {path}"
                 )
 
-    # Check optional mutation-rate override table pair
     if args.muterateprefix:
         for suffix, label in [
             ("_sbs96_rate_n1.txt", "SBS96 mutation-rate table"),
@@ -312,7 +281,6 @@ def check_input_files_exist(args):
             if not os.path.exists(path):
                 missing_files.append(f"{label} (from -mr): {path}")
 
-    # If any files are missing, print error and exit
     if missing_files:
         print("ERROR: The following required input files are missing:")
         for missing_file in missing_files:
@@ -321,27 +289,21 @@ def check_input_files_exist(args):
         sys.exit(1)
 
 
-# if __name__ == "__main__":
 def do_call(args):
-    # Defensive defaults for a bare/older args namespace.
+    # Defaults for args namespaces built without these options.
     if not hasattr(args, "minChunkLength"):
         args.minChunkLength = 10000
     if not hasattr(args, "srdMinRead"):
         args.srdMinRead = 3
     if not hasattr(args, "ssmMinRead"):
         args.ssmMinRead = 3
-    # Check if all input files exist before proceeding
     check_input_files_exist(args)
     # -p 1 has no chunk boundaries to reconcile via MC tags.
     if args.threads != 1:
         check_mate_cigar_tags(args.bam, args.reference)
     coverage_starts = [None]
-    # Resolve the Monte Carlo base seed once, up front: if the user didn't
-    # pass --seed, generate one now and write it back onto args so it (a)
-    # gets threaded through params below and (b) shows up in the
-    # _call_params.log's "resolved values" dump (sourced from vars(args))
-    # for later reuse -- reproducing a run with no explicit --seed still
-    # requires knowing what seed it actually used.
+    # Resolve the Monte Carlo seed up front and write it back onto args so
+    # it reaches params and is logged in _call_params.log for reproduction.
     if args.seed is None:
         args.seed = int(np.random.SeedSequence().generate_state(1)[0])
     try:
@@ -353,9 +315,7 @@ def do_call(args):
     sample_name = os.path.basename(args.output)
     os.makedirs(output_dir, exist_ok=True)
     args.output = os.path.join(output_dir, sample_name)
-    # Learned error matrices (.amp/.dmg .tn/.hp/.str.txt) get their own
-    # ERROR/ subfolder, same idea as SBS/INDEL/DBS -- keeps the sample's
-    # top level to just the shared, whole-sample outputs.
+    # Learned error matrices go in their own ERROR/ subfolder.
     error_dir = os.path.join(output_dir, "ERROR")
     os.makedirs(error_dir, exist_ok=True)
     error_prefix = os.path.join(error_dir, sample_name)
@@ -368,16 +328,12 @@ def do_call(args):
         "regions": args.regions,
         "region_file": args.regionfile,
         "threads": args.threads,
-        # "amperr": args.amperrs,
-        # "amperri": args.amperri,
         "amperr_file": error_prefix + ".amp.tn.srd.txt",
         "amperri_file": error_prefix + ".amp.id.txt",
         "dmgerr_file": error_prefix + ".dmg.tn.txt",
         "dmgerri_file": error_prefix + ".dmg.id.txt",
-        # ts/ti removed: every candidate with LR>0 is treated as a
-        # candidate mutation (see the >0 gates in funcs/call.py); FDR
-        # refinement (-fdr) is the only thing that can raise this baseline
-        # per-channel afterward.
+        # Every candidate with LR > 0 is a candidate mutation; per-channel
+        # FDR refinement is what raises the threshold afterward.
         "pcutoff": 0,
         "pcutoffi": 0,
         "minLR": args.minLR,
@@ -409,7 +365,6 @@ def do_call(args):
         params["dmgerr_file"] = args.errprefix + ".dmg.tn.txt"
         params["dmgerri_file"] = args.errprefix + ".dmg.id.txt"
 
-    # Write parameter log to the results folder
     log_path = args.output + "_call_params.log"
     with open(log_path, "w") as log:
         log.write(f"DupCaller call — parameter log\n")
@@ -461,15 +416,11 @@ def do_call(args):
         "ssmMinRead": args.ssmMinRead,
         "isLearn": True,
         "rescue": False,
-        # Round 0 (error-rate learning) shares callBam with rounds 1/2,
-        # which requires params["seed"] (funcs/call.py's threshold_rng-based
-        # Monte Carlo seeding). Same base seed as params so a single -seed
-        # value seeds the whole run reproducibly, not just rounds 1/2.
+        # callBam requires a seed in every round; one base seed makes the
+        # whole run reproducible.
         "seed": args.seed,
-        # _compute_read_label (funcs/call.py) is shared unconditionally
-        # across all rounds and reads params["barcodeTag"]/["barcodeNormalize"]/
-        # ["barcodeSep"]; without these keys here, a --barcode run would fall
-        # back to DupCaller's own DB-tag defaults during round 0.
+        # Read labelling is shared by all rounds; without these, round 0
+        # would fall back to the default DB-tag barcode parsing.
         "barcodeTag": barcode_spec["tag"],
         "barcodeNormalize": barcode_spec["normalize"],
         "barcodeSep": barcode_spec["sep"],
@@ -480,19 +431,17 @@ def do_call(args):
         same_regions_flag = True
     if not params["normalBams"]:
         print(
-            f"A matched normal is not used. \
-            The maximum allele fraction to call a somatic mutation is set to be {args.maxAF}"
+            "A matched normal is not used. The maximum allele fraction to call "
+            f"a somatic mutation is set to be {args.maxAF}"
         )
     else:
         print(
-            f"Matched normal: {args.normalBams}. \
-            The maximum allele fraction to call a somatic mutation is set to be {args.maxAF}"
+            f"Matched normal: {args.normalBams}. The maximum allele fraction to "
+            f"call a somatic mutation is set to be {args.maxAF}"
         )
     """
     Initialze run
     """
-    # print("..............Loading reference genome.....................")
-    # fasta = SeqIO.to_dict(SeqIO.parse(args.reference, "fasta"))
     startTime = time.time()
     results_dir = os.path.dirname(args.output)
     tmp_dir = os.path.join(results_dir, "tmp")
@@ -529,8 +478,8 @@ def do_call(args):
         str_profile_is_current(amperri_str_file)
         and str_profile_is_current(dmgerri_str_file)
     ):
-        # A profile left by an earlier version at the default prefix (-E
-        # ones are refused above): relearn rather than fail.
+        # Outdated profile at the default prefix (-E ones are refused in
+        # check_input_files_exist): relearn rather than fail.
         print(
             "..........STR error profiles at "
             + amperri_str_file.rsplit(".amp.", 1)[0]
@@ -544,10 +493,7 @@ def do_call(args):
             Single-thread execution
             """
             print(".........Starting estimating error rates..............")
-            # contigs = [(r.strip('\n'),) for r in open(args.regions,'r').readlines()] # Only process contigs in region file
             paramsNow = params_learn
-            # paramsNow["reference"] = fasta
-            # paramsNow["isLearn"] = True
             regions = params_learn["regions"]
             paramsNow["regions"] = [
                 (chrom, 0, bamObject.get_reference_length(chrom)) for chrom in regions
@@ -561,8 +507,6 @@ def do_call(args):
                 str_dmg_profile,
                 sbs_alt_bq_hist,
             ) = callBam(paramsNow, 0)
-            # Match Learn.py's single-thread branch and this file's own
-            # multi-thread branch dtype.
             mismatch_profile = mismatch_profile.astype(int)
             hp_alt_profile = hp_alt_profile.astype(int)
             str_alt_profile = str_alt_profile.astype(int)
@@ -582,8 +526,6 @@ def do_call(args):
             print(
                 "...........Spliting genomic regions for parallel execution (error estimation)................"
             )
-            # print(args.threads)
-            # if args.normalBam:
             cutSites, chunkSize, contigs = splitBamRegions(
                 [args.bam],
                 args.threads,
@@ -593,11 +535,6 @@ def do_call(args):
                 params_learn["region_file"],
                 min_chunk_length=args.minChunkLength,
             )
-            # else:
-            # cutSites, chunkSize, contigs = splitBamRegions(
-            # [args.bam], args.threads, contigs, args.windowSize
-            # )
-            # print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
             regionSequence = []
             currentContigIndex = 0
             usedTime = (time.time() - startTime) / 60
@@ -646,22 +583,16 @@ def do_call(args):
                         regions.append(regionSequence.pop(0))
                         break
                 if len(regions) == 0:
-                    # Fewer real chunks than -p requested (regionSequence
-                    # already ran out) -- just use fewer effective
-                    # parallel chunks for this pass instead of handing
-                    # callBam an empty regions list, which it can't index
-                    # into (regions[0]).
+                    # Fewer chunks than -p: callBam can't take an empty
+                    # region list.
                     continue
                 chroms = [region[0] for region in regions]
                 paramsNow = params_learn.copy()
                 paramsNow["regions"] = regions
-                # paramsNow["isLearn"] = True
                 callArgument = (paramsNow, nn)
                 callArguments.append(callArgument)
                 regions = []
-            results = pool.starmap(
-                callBam, callArguments
-            )  # each result return three list: number of duplex reads, effective lengths, list of mutations
+            results = pool.starmap(callBam, callArguments)
             print(
                 "..............Completed bam calling in "
                 + str((time.time() - startTime2) / 60)
@@ -702,19 +633,13 @@ def do_call(args):
         dmg_tn_pd = pd.DataFrame(
             mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
         )
-        # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
         amp_tn_pd.to_csv(error_prefix + ".amp.tn.txt", sep="\t")
         dmg_tn_pd.to_csv(error_prefix + ".dmg.tn.txt", sep="\t")
-        # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
 
-        # Indel hp/str: see funcs/learn.py's profileTriNucMismatches for
-        # the amp/dmg accumulation and funcs/prob.py's indelErrorProbs for
-        # the matching call-time selection. hp.txt: 10 rows (HP1..HP9,
-        # HP10+), 12 columns (base x idLen in {-1,0,1}, idLen=0 the
-        # reference/opportunity count). str.txt: 5 rows (STR-length bin
-        # "0-1"=not a real repeat through "40+"), 15 columns (a deletion/
-        # reference/insertion triple per repeat-unit group u1-u5+, each
-        # reference the group's opportunity count).
+        # hp.txt: rows HP1..HP9, HP10+; columns base x idLen in {-1,0,1},
+        # idLen=0 being the opportunity count. str.txt: rows are STR-length
+        # bins ("0-1" = not a real repeat); columns are a del/ref/ins triple
+        # per repeat-unit group u1-u5+, ref being the opportunity count.
         hp_row_labels = [f"HP{i}" for i in range(1, 10)] + ["HP10+"]
         hp_col_labels = [f"{b}_{d}" for b in ["A", "T", "C", "G"] for d in (-1, 0, 1)]
         str_row_labels = ["0-1", "2-9", "10-24", "25-39", "40+"]
@@ -736,9 +661,7 @@ def do_call(args):
         amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
         dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
 
-        # QC diagnostic, not a deliverable, so it goes to tmp_dir rather than
-        # the final ERROR/ output dir. Saved as .npz (not CSV) since it's a
-        # 3D histogram; row/col/BQ axis labels are stored alongside the counts.
+        # QC diagnostic (3D histogram with axis labels), kept in tmp_dir.
         bq_values = np.arange(NUM_BQ)
         np.savez(
             os.path.join(params["tmp_dir"], sample_name + ".amp.tn.bqhist.npz"),
@@ -749,8 +672,7 @@ def do_call(args):
         )
 
         # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
-        # histogram above; this is what params["amperr_file"] points at and
-        # load_error_matrices (funcs/misc.py) reads directly for calling.
+        # histogram; this is the params["amperr_file"] used for calling.
         srd_mat = estimate_sbs_srd_rates(
             sbs_alt_bq_hist, args.pseudocount, fallback=True
         )
@@ -762,7 +684,6 @@ def do_call(args):
             + " minutes..............."
         )
 
-    # Older installed launchers may not yet expose this option.
     if getattr(args, "learnOnly", False):
         print(
             "..............--learnOnly set: stopping after error-rate estimation, "
@@ -783,15 +704,12 @@ def do_call(args):
         """
         print(".........Starting variant calling..............")
         paramsNow = params
-        # paramsNow["reference"] = fasta
         regions = params["regions"]
         paramsNow["regions"] = [
             (chrom, 0, bamObject.get_reference_length(chrom)) for chrom in regions
         ]
-        # Single "worker" region list, so round 2 below (always dispatched
-        # via Pool.starmap over regions_list) works the same way regardless
-        # of thread count -- Pool with one task is just a slightly less
-        # direct callBam(..., 0) call.
+        # Single worker region list so round 2 (Pool.starmap over
+        # regions_list) is the same for any thread count.
         regions_list = [paramsNow["regions"]]
         (
             mutsAll,
@@ -806,7 +724,6 @@ def do_call(args):
             FPAll,
             RPAll,
             unmasked_coverage,
-            # unmasked_duplex_read_num_dict_trinuc,
             coverage_indel_cat,
             unmasked_coverage_indel_cat,
             duplex_read_num_indel_single,
@@ -859,7 +776,6 @@ def do_call(args):
         """
         Multi-thread execution
         """
-        # args.threads = args.threads - 1
         regions_list = list()
         regionSequence = []
         if (not same_regions_flag) or (not learn_flag):
@@ -894,7 +810,6 @@ def do_call(args):
         """
         Determine regions for each process
         """
-        # print(cutSites)
         for nn, site in enumerate(cutSites[1:]):
             pSite = cutSites[nn]
             if site[0] == pSite[0]:
@@ -927,17 +842,13 @@ def do_call(args):
                 else:
                     regions.append(regionSequence.pop(0))
                     break
-            # print(regions)
             if len(regions) == 0:
                 if nn == 0:
                     raise Exception(
                         f"Window size {args.windowSize} is proabably too large. Change -w to a smaller value. An ideal value will be targetSize/(threads * 100)"
                     )
-                # Fewer real chunks than -p requested -- e.g. splitBamRegions
-                # skipped a duplicate chunk boundary (see its own comment),
-                # or the target region just doesn't have enough distinct
-                # windows for this many threads. Neither is an error: just
-                # continue with fewer effective parallel chunks.
+                # Fewer chunks than -p (duplicate chunk boundary skipped, or
+                # too few windows in the target): not an error.
                 print(
                     f"....Only {nn} parallel chunk(s) available (requested -p "
                     f"{args.threads}); continuing with fewer effective threads "
@@ -946,7 +857,6 @@ def do_call(args):
                 break
             paramsNow = params.copy()
             regions_list.append(regions)
-            # paramsNow["reference"] = fastaNow
             paramsNow["regions"] = regions
             callArgument = (paramsNow, nn)
             callArguments.append(callArgument)
@@ -987,10 +897,8 @@ def do_call(args):
         power_tallies = [_[24] for _ in results]
         depth_by_trinuc = sum(_[17] for _ in results)
         depth_by_hpstr = sum(_[18] for _ in results)
-        # L/L_indel_1bp/L_indel_len are deterministic given params up to
-        # Monte Carlo noise (each process re-simulates its own copy from
-        # the same ampmat/dmgmat_indel); averaging across processes just
-        # reduces that noise, it isn't combining different information.
+        # Each worker simulates the same power tables independently;
+        # averaging only reduces Monte Carlo noise.
         L_power = np.mean(np.stack([_[19] for _ in results]), axis=0)
         L_indel_1bp = np.mean(np.stack([_[20] for _ in results]), axis=0)
         L_indel_len = np.mean(np.stack([_[21] for _ in results]), axis=0)
@@ -1030,24 +938,17 @@ def do_call(args):
             for indel in indelsAll
         ]
 
-        # duplex_combinations/duplex_read_num/duplex_coverage_by_group/
-        # total_family_num/duplex_read_num_trinuc/_indel/_dbs are real,
-        # position-weighted coverage data (cov_mat-derived) that round 1 no
-        # longer computes (coverage_only gating in call.py) -- rebuilt
-        # further down from round 2's results, once final thresholds are
-        # known.
+        # Per-duplex-group coverage tables (duplex_read_num*, etc.) are not
+        # computed in round 1; they are built from round 2's results below.
         FPAll = sum(FPs, [])
         RPAll = sum(RPs, [])
 
     tBam = BAM(args.bam, "rb", args.reference)
     contigs = tBam.references
-    # print(contigs)
     chromDict = {contig: tBam.get_reference_length(contig) for contig in contigs}
     infoDict = {
         "F1R2": [1, "Integer", "Number of F1R2 read(s) in the read bundle"],
         "F2R1": [1, "Integer", "Number of F2R1 read(s) in the read bundle"],
-        # "TLR": [1, "Float", "Alt/Ref log likelihood ratio of top strand"],
-        # "BLR": [1, "Float", "Alt/Ref log likelihood ratio of bottom strand"],
         "LR": [
             1,
             "Float",
@@ -1133,56 +1034,34 @@ def do_call(args):
         "strand_independence": "SBS or indel call with a strand whose strand independence hypothesis p-value (INFO MSP) is <= --p_threshold: more non-alt reads than read error explains, i.e. a mixed read family. A DBS containing such an SBS (same read family) fails too, and so does that DBS's other SBS",
     }
 
-    # Each mutation type gets its own SBS/INDEL/DBS subfolder (matching
-    # where Estimate.py writes every downstream per-type output) rather
-    # than the sample's top-level output directory. VCF writing itself
-    # (PASS-only + new _fail.vcf) happens once, at the very end, after the
-    # re-filter step and round 2's deferred depth-extraction have both
-    # landed -- no need for the early draft-then-conditionally-rewrite
-    # dance the single-pass architecture used to need.
+    # Per-type SBS/INDEL/DBS subfolders (same layout Estimate.py uses).
+    # VCFs are written once, at the end, after refinement and round 2's
+    # depth extraction.
     sbs_dir, indel_dir, dbs_dir = _ensure_type_subdirs(output_dir)
 
-    # muts_by_duplex_group/all_keys/duplex_family_strand_composition.txt/
-    # the composition heatmap/non_zero_keys all depend on duplex_read_num*
-    # (real coverage data) -- moved to after round 2, below.
     # duplex_read_num_trinuc[key] is a raw (64, 4) matrix: 64 trinuc contexts
-    # (un-folded by reverse complement) x 4 alt bases, with the context's own
-    # reference-base column always 0 (see call.py's L-table self-skip).
-    # Select the 192 valid (context, alt) cells, in the same order the
-    # labels are built in, rather than flattening all 256.
+    # (not RC-folded) x 4 alt bases, the reference-base column always 0.
+    # index_192 selects the 192 valid (context, alt) cells in label order.
     trinuc2num_64, num2trinuc_64 = build_trinuc64_order()
     label2num_192, index_192 = build_trinuc192_labels(num2trinuc_64)
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3}
 
-    # load_error_matrices(params) sets ampmat/dmgmat_top/etc/trinuc_convert
-    # on params, read directly by _indel_ctx_threshold below (threshold0
-    # solve) and by round 1/2 calling itself (funcs/call.py).
+    # Sets ampmat/dmgmat_*/trinuc_convert on params, used by
+    # _indel_ctx_threshold and by round 1/2 calling.
     load_error_matrices(params)
 
     def _indel_ctx_threshold(hps_c, strs_c, id_len, pool=None):
-        # Uniform default cutoff, capped per-context by the theoretical
-        # ceiling of masked LR (same formula real calling now uses -- see
-        # indelContextThreshold in call.py / indelMaxLR). For id_len +-1
-        # with no STR annotation, Pdmg is also ref_allele-dependent (see
-        # indelErrorProbs); pool ("C"=C/G, "T"=A/T, matching
-        # classify_indel_channel's own base pooling) restricts this to
-        # the 2 bases real calls in that specific HP channel span, so the
-        # min across just those 2 (not all 4) is this channel's
-        # representative (most restrictive) threshold -- matching this
-        # same min-across-bases approximation _channel_eeff_at_threshold's
-        # HP-channel Eeff also uses (funcs/call.py). hps_c==0 (never a
-        # real hp length, which always starts at 1) is a sentinel for the
-        # mismatched-insertion background channel (str.txt row 0) -- no
-        # base axis there, so just force the mismatch branch once instead
-        # of looping bases.
+        # Default cutoff capped by the context's LR ceiling (indelMaxLR).
+        # For +-1bp non-STR indels Pdmg depends on the base, so take the min
+        # over the channel's pooled bases (pool "C"=C/G, "T"=A/T), the same
+        # approximation the HP-channel Eeff uses. hps_c == 0 (real HP
+        # lengths start at 1) is the sentinel for the mismatched-insertion
+        # background channel (str.txt row 0), which has no base axis.
         pcutoffi = params["pcutoffi"]
 
         def _maxlr(ref_allele, inserted_base):
-            # inserted_base=ref_allele forces the genuine same-base
-            # homopolymer-matching scenario (mirrors
-            # _channel_eeff_at_threshold's "hp" kind and the L_indel_1bp
-            # coverage grid); a distinct inserted_base forces the row-0
-            # mismatch scenario instead.
+            # inserted_base == ref_allele: same-base homopolymer scenario;
+            # a different inserted_base: row-0 mismatch scenario.
             _, _, Pdmg_c, Pdmg_rev_c, Pdmg_bot_c, Pdmg_rev_bot_c = indelErrorProbs(
                 hps_c,
                 strs_c,
@@ -1207,27 +1086,9 @@ def do_call(args):
             maxLR_ctx = _maxlr(0, 0)
         return min(pcutoffi, maxLR_ctx)
 
-    # _channel_eeff_at_threshold (funcs/misc.py) is a single, picklable,
-    # top-level dispatch on channel kind, callable from inside the
-    # per-channel refinement Pool below -- a closure over depth_by_trinuc/
-    # depth_by_hpstr couldn't be pickled across a Pool, so each per-channel
-    # Eeff/refine step can run in parallel here.
-
-    # trinuc_by_duplex_group.txt (row_idx_192/col_idx_192/duplex_read_num_
-    # trinuc-derived) also moved to after round 2, alongside the other
-    # duplex-group report files.
-
-    # -mr/--muterateprefix: reuse a previously-computed per-channel
-    # mutation-rate (mu0) table instead of solving mu0 fresh from this
-    # run's own round-1 candidates/coverage below -- see
-    # _load_mutation_rate_override's own docstring for why (small-region
-    # runs, e.g. --rescue debugging of a single locus, otherwise get a
-    # noisy, run-specific mu0 that can flip a PASS/underpowered verdict
-    # relative to a full genome-wide production run over the same
-    # locus/evidence). validate_override below fails loudly if the
-    # supplied table is missing any channel this run's own job list
-    # expects, rather than silently falling back to a fresh solve for
-    # just that channel.
+    # -mr/--muterateprefix: reuse a genome-wide run's mu0 table instead of
+    # a noisy small-region solve. A channel missing from the table is an
+    # error, not a silent fallback to a fresh solve.
     mu0_override_table = (
         _load_mutation_rate_override(args.muterateprefix)
         if args.muterateprefix
@@ -1237,10 +1098,6 @@ def do_call(args):
     def _mu0_for(name):
         return mu0_override_table.get(name) if mu0_override_table is not None else None
 
-    # SBS-96 mutation rate per channel (n_sites/Eeff/mutation_rate_mle),
-    # written out below alongside indel_rate_by_hp_str once sbs_results is
-    # available -- same columns/source (the per-channel brentq
-    # solve in refine_channel_task) as the indel table, for consistency.
     startTime_refine = time.time()
     # The mu solve uses every unmasked site that passes all other filters,
     # whatever the sign of its LR: round-1 PASS records (raw LRs) plus the
@@ -1261,14 +1118,9 @@ def do_call(args):
         if lrs.size:
             label = f"{num2trinuc_64[k // 4]}>{'ATCG'[k % 4]}"
             neg_lr_192_n1[label2num_192[label]] = lrs
-    # Same raw-192 -> canonical-96 reverse-complement pairing as
-    # combine_raw192_to_sbs96 (misc.py), applied here to lists of raw LR
-    # values instead of scalar counts, so each of the 96 canonical classes
-    # gets the pooled raw LR list of both RC-paired raw-192 classes. Eeff/
-    # mutation_rate_mle per channel are filled in below, after the
-    # refinement pool dispatch -- building the (name, kind, ctx_key,
-    # raw_lr, threshold0, fdr) job spec here is all that's cheap enough to
-    # do inline.
+    # Pool each canonical SBS-96 class's raw LRs with its RC-paired raw-192
+    # class (as combine_raw192_to_sbs96 does for counts) and build the
+    # per-channel refinement job specs.
     _, sbs96_labels_for_rc = _build_sbs96_labels()
     raw_lr_96_n1 = []
     neg_lr_96_n1 = []
@@ -1310,45 +1162,26 @@ def do_call(args):
             )
         )
 
-    # HP/STR indel mutation rate, analogous to the SBS-96 block above. The
-    # rawLR list per (hp length 1-10+, indel length) and (STR bin 0-4,
-    # indel length) channel comes from PASS candidates plus the LR < 0
-    # ones in neg_lr_indel; Eeff for the same channel is a raw depth sum from
-    # depth_by_hpstr (one site per homopolymer run / STR tract start, every
-    # position for STR0, both strands required; see funcs/misc.py's
-    # indel_eeff_site_masks and _channel_eeff_at_threshold).
-    # Summing a context's Eeff/rawLR over all 4 hp bases is what "pools
-    # reverse complementary bases" (A<->T, C<->G) amounts to here: the
-    # output grid has no base axis, so forward and RC-partner base
-    # contributions are always combined, not just for indel length +1.
-    # HP channels only ever exist for id_len in {-1, 1} now -- there's no
-    # hp.txt column for multi-bp lengths, so a length>=2 indel is always
-    # STR-context (4 real bins, 1="2-9" through 4="40+"). Bin 0 ("not a
-    # real repeat") gets its own channel too, but only for id_len=1 --
-    # only a mismatched insertion can land there (a deletion always
-    # matches its own homopolymer, so it's never a row-0 event); its
-    # per-candidate routing uses the "HM" VCF field (0/1, set by
-    # genotypeDSIndel/funcs/call.py at call time) rather than
-    # re-deriving the match check here, since Caller.py only has the
-    # final mutation record, not the reference array indelErrorProbs
-    # compared against.
+    # HP/STR indel channels, analogous to SBS-96. rawLRs come from PASS
+    # candidates plus neg_lr_indel; Eeff is a depth sum from depth_by_hpstr
+    # (one site per homopolymer run / STR tract; see indel_eeff_site_masks).
+    # HP channels exist only for id_len +-1 (hp.txt has no multi-bp
+    # columns); longer indels are STR context. The mismatched-insertion
+    # background channel (STR0_u1_ins) is routed by the call-time "HM"
+    # INFO field, since only the record, not the reference, is available
+    # here.
     hp_indel_lengths = [-1, 1]
     # STR channels: signed repeat unit 2-5+ in bins 1-4 (any whole number
     # of units), signed indel length 2-5+ in STR0 (str_channel_name).
     str_indel_lengths = [-5, -4, -3, -2, 2, 3, 4, 5]
-    # Pool an HP channel's 1bp events by ref/alt base -- "C" for C/G,
-    # "T" for A/T -- the same two-way split classify_indel_channel/ID83
-    # labeling already uses for HP indels (Cinshp/Tinshp vs Cdelhp/
-    # Tdelhp), matching the fact that the underlying learned error
-    # matrices (ampmat_hp/dmgmat_hp) are indexed per-base (ref_allele*3+
-    # ...) rather than pooled.
+    # HP channels pool 1bp events by base: "C" for C/G, "T" for A/T (the
+    # same split as ID83's C/T homopolymer classes).
     _HP_POOL_BASES = {"C": (2, 3), "T": (0, 1)}  # base2num order A,T,C,G
 
     def _indel_channel(indel):
-        # The mu-solve/threshold channel of an indel record (None if it has
-        # none), routed by indel_mu_channel exactly as call.py routes LR < 0
-        # candidates. id_len < 0 (deletion): ref is anchor+deleted bases, so
-        # the deleted base is ref[1]; otherwise alt[1] is the inserted base.
+        # Channel of an indel record (None if none), routed exactly as
+        # call.py routes LR < 0 candidates. Deletion: ref is anchor+deleted
+        # bases, so ref[1] is the deleted base; insertion: alt[1].
         id_len = len(indel["alt"]) - len(indel["ref"])
         if id_len == 0:
             return None
@@ -1391,10 +1224,8 @@ def do_call(args):
     indelsAll = [m for m in indelsAll if m["infos"]["LR"] >= 0]
     mutsAll = [m for m in mutsAll if m["infos"]["LR"] >= 0]
 
-    # threshold0 is cheap (indelErrorProbs + indelMaxLR, no Monte Carlo) --
-    # computed here in the main process, same as always. Only the Eeff
-    # simulation (simulate_power_grid) and the refinement loop itself move
-    # into the pool below.
+    # threshold0 is cheap (no Monte Carlo) so it is computed here; the Eeff
+    # simulation and refinement run in the pool below.
     str0_ins1 = str_channel_name(0, 1)
     indel_jobs = [
         (
@@ -1444,26 +1275,14 @@ def do_call(args):
                 )
             )
 
-    # Per-channel FDR control: for every channel above (96 SBS96 classes +
-    # 90 HP combos + 24 STR combos, ~210 total), mu0 (this channel's MLE
-    # mixture weight at its default threshold0, from a direct brentq solve
-    # with no pseudocount) is taken as the channel's mutation
-    # rate outright, with no iterative re-simulation/re-MLE step-up. The LR
-    # threshold whose local fdr (1-mu0)/(LR*mu0+1-mu0) equals args.lfdrThreshold is
-    # solved for directly and used unconditionally as this channel's round
-    # 2 calling threshold -- see funcs/call.py's _refine_channel. A channel
-    # whose likelihood has no root in (0, 1) gets mu0 = 1/(Eeff+1), whose
-    # threshold no site of its own can reach (no PASS calls), so there is
-    # no exclusion case to handle here.
-    #
-    # Each channel's Eeff0/mu0/threshold solve is independent of every
-    # other channel's, and each Eeff evaluation is a Monte Carlo
-    # simulate_power_grid call -- the dominant cost of this phase. One task
-    # per channel is dispatched across a worker Pool
-    # (refine_channel_task/init_refine_worker, funcs/call.py), capped at
-    # args.threads to match what -p promises the user (same as round 1/
-    # round 2's pools -- all four Pool() calls in this file are capped at
-    # args.threads rather than left to default to os.cpu_count()).
+    # Per-channel FDR control (96 SBS96 + 40 HP + 40 STR + STR0_u1_ins):
+    # mu0 is the channel's MLE mixture weight at threshold0 (direct brentq
+    # solve), and the round-2 threshold is the LR whose local fdr
+    # (1-mu0)/(LR*mu0+1-mu0) equals args.lfdrThreshold (_refine_channel).
+    # A channel with no root in (0, 1) gets mu0 = 1/(Eeff+1), whose
+    # threshold none of its own sites can reach.
+    # Channels are independent and each Eeff is a Monte Carlo simulation,
+    # so one task per channel runs in a Pool capped at args.threads.
     if mu0_override_table is not None:
         all_job_names = {job[0] for job in sbs_jobs + indel_jobs}
         missing = sorted(all_job_names - mu0_override_table.keys())
@@ -1487,15 +1306,11 @@ def do_call(args):
     indel_results = refine_results[len(sbs_jobs) :]
 
     channel_thresholds = {}
-    # Every channel's mu for the per-call local FDR and the per-type "Total
-    # FDR" stats.txt lines: mu0 capped at the rate whose threshold is
-    # --minLR (mu_at_min_lr), i.e. the rate that matches the channel's
-    # actual threshold. The rate tables keep the uncapped mu0.
+    # mu for the per-call local FDR and stats.txt "Total FDR": mu0 capped
+    # at the rate whose threshold is --minLR, matching the channel's actual
+    # threshold. The rate tables keep the uncapped mu0.
     channel_final_mu = {}
     mu_fdr_cap = mu_at_min_lr(args.lfdrThreshold, args.minLR)
-    # Every channel gets a real new_threshold from _refine_channel's direct
-    # FDR-at-mu0 solve; round 2 re-simulates calling from real per-position
-    # data at that threshold.
 
     sbs96_rate_rows = []
     for k, (name, kind, ctx_key, Eeff0, mu0, new_threshold) in enumerate(sbs_results):
@@ -1521,8 +1336,7 @@ def do_call(args):
 
     indel_rate_rows = []
     indel_results_iter = iter(indel_results)
-    # STR0_u1_ins (mismatched-insertion background) was prepended first in
-    # indel_jobs above -- consume it here, in the same order.
+    # Consume results in indel_jobs order (STR0_u1_ins first).
     name, kind, ctx_key, Eeff0, mu0, new_threshold = next(indel_results_iter)
     indel_rate_rows.append(
         {
@@ -1586,17 +1400,10 @@ def do_call(args):
         + " minutes,filtering calls................."
     )
 
-    # indel_by_duplex_group.txt/dbs_by_duplex_group.txt/_stats.txt's
-    # coverage-derived lines/coverage.bed.gz itself all need real
-    # (round-2) coverage too -- moved down, after round 2 runs.
     sample_name = os.path.basename(args.output)
     sample_dir = params["tmp_dir"]
 
-    # Build the final per-channel threshold override dicts, covering every
-    # channel _refine_channel processed (not just ones that needed
-    # raising) -- every channel now gets its own FDR-at-mu0-derived
-    # threshold applied unconditionally for round 2, always defined
-    # (possibly empty) so round 2 below works uniformly.
+    # Per-channel round-2 threshold overrides, covering every channel.
     pcutoff_sbs_override = {}
     indel_1bp_threshold_override = {}
     indel_len_threshold_override = {}
@@ -1612,51 +1419,24 @@ def do_call(args):
             pcutoff_sbs_override[(t_fwd, b_fwd)] = new_threshold
             pcutoff_sbs_override[(t_rc, b_rc)] = new_threshold
         elif name.startswith("HP"):
-            # HP jobs only ever have id_len in {-1, 1} (see
-            # hp_indel_lengths above), so this is always a 1bp override.
-            # Name is "HP{hp_len}_len{id_len}_{pool}" -- pool ("C"/"T")
-            # is the base-pool axis.
+            # "HP{hp_len}_len{id_len}_{pool}", id_len always +-1.
             hp_len_str, rest = name[2:].split("_len")
             id_len_str, pool = rest.split("_")
             hp_len, id_len = int(hp_len_str), int(id_len_str)
             sign_idx = 1 if id_len == 1 else 0
             indel_1bp_threshold_override[(hp_len, sign_idx, pool)] = new_threshold
         elif name.startswith("STR"):
-            # Row = str_bin directly (0-4, matching L_indel_len's row
-            # axis) -- no more "9+" offset now that STR has its own
-            # dedicated 5-row table instead of sharing rows with hp.txt.
+            # Row = str_bin (0-4), matching L_indel_len's row axis.
             str_bin, id_len = parse_str_channel_name(name)
             indel_len_threshold_override[(str_bin, id_len)] = new_threshold
 
-    # SBS/ID/DBS re-filter: a candidate's LR is a property of the observed
-    # reads, not the calling threshold, so this is pure reclassification
-    # against each channel's final threshold, no rescan needed.
-    # _refine_channel clamps its FDR-at-mu0 solve to max(threshold0, ...),
-    # so the final threshold is still guaranteed >= threshold0 -- never
-    # lower -- same invariant the old iterative step-up loop preserved,
-    # just for a different reason now (round 1's bam scan only ever
-    # records a candidate whose LR already clears threshold0, so nothing
-    # below it exists in mutsAll/indelsAll to newly promote here). A
-    # record already failing the default threshold can therefore never
-    # newly clear a higher one -- only currently-PASS records are eligible
-    # to flip, and they flip down to "underpowered" (distinct from
-    # structural "masked") rather than being relabeled "masked" outright.
-    # Structurally-masked candidates (antimask-failed, never LR-gated to
-    # begin with) get a separate check: if their raw LR clears this
-    # channel's final threshold, they're flagged here for depth-extraction
-    # in round 2 below (still reported filter="masked", just with real
-    # depth instead of none, never promoted to PASS). filter=="masked" is
-    # only ever set by call.py for candidates blocked solely by snp_mask/
-    # noise_mask (see call.py's unmasked_pass_bool branch), so SNPM or
-    # NOISEM is always set on every record reaching this check -- the
-    # eligibility rule is purely LR>=threshold and (SNPM or NOISEM),
-    # independent of --rescue. --rescue is a separate, earlier concern in
-    # call.py: it only controls whether cov_mask/nm_mask/trim_mask/
-    # indel_mask/other_mask-labeled records (a different filter value
-    # entirely, for candidates blocked by n_cov/nm/trim/indel_mask) are
-    # emitted into the output VCF at all -- those never get real depth
-    # either way, regardless of rescue, per rescue's own "no depth"
-    # semantics.
+    # Re-filter against each channel's final threshold. LR does not depend
+    # on the threshold, so no rescan is needed. The final threshold is
+    # >= threshold0, so only PASS records can flip (to "underpowered").
+    # "masked" records (blocked only by snp_mask/noise_mask) whose LR clears
+    # the threshold are deferred for real depth extraction in round 2; they
+    # stay "masked" and are never promoted to PASS. Other mask labels
+    # (--rescue only) never get depth.
     def _mut_key(m):
         return (m["chrom"], m["pos"], m["ref"], m["alt"])
 
@@ -1708,14 +1488,9 @@ def do_call(args):
         ):
             deferred_depth_keys.add(_mut_key(indel))
 
-    # A DBS call requires both constituent SNVs to individually PASS (see
-    # _detect_dbs_pairs in call.py); if either flipped above, the DBS call
-    # needs re-validating too. DBS is never "masked" by construction (only
-    # ever "PASS" or dropped entirely), so only the downgrade path applies
-    # -- no deferred set for DBS.
-    # Keyed by read family (_sbs_family_key), so a DBS only ever looks at
-    # its own family's two SBS records, not another molecule's call at the
-    # same position.
+    # A DBS requires both of its SNVs (same read family) to PASS, so
+    # revalidate after the SBS re-filter. DBS is never "masked", so there
+    # is no deferred set for DBS.
     pass_keys = {
         _sbs_family_key(mut) for mut in mutsAll if mut.get("filter", "PASS") == "PASS"
     }
@@ -1742,23 +1517,16 @@ def do_call(args):
 
     efficiency = duplex_num / rec_num if rec_num > 0 else 0.0
 
-    # --skipCoveragePass: round 2 (below) is what computes real,
-    # position-weighted duplex coverage and the per-locus coverage.bed.gz.
-    # Without it, round 1's power tallies (funcs/power_tally.py) are
-    # contracted with each worker's power tables at the final thresholds,
-    # which gives the same by-duplex-group/stats coverage, and the masked
-    # candidates that now clear their channel's threshold take the depth
-    # round 1 extracted for them (call.py's _early_deferred_depth). Only
-    # coverage.bed.gz is not written.
+    # Round 2 computes position-weighted duplex coverage and coverage.bed.gz.
+    # Under --skipCoveragePass it is skipped: round 1's power tallies are
+    # contracted at the final thresholds (same by-duplex-group/stats
+    # coverage), deferred masked candidates take the depth round 1
+    # extracted for them, and coverage.bed.gz is not written.
     coverage_pass_enabled = not args.skipCoveragePass
     if coverage_pass_enabled:
-        # Round 2: coverage-only pass, reusing round 1's region split
-        # (regions_list) directly instead of recomputing it, with every
-        # channel's final threshold baked in as the actual calling threshold
-        # this time -- not layered as an override on top of round 1's uniform
-        # default. Builds L/L_indel_1bp/L_indel_len and real coverage.bed
-        # once more, and performs the deferred depth-extraction for the
-        # masked-but-now-qualifying set identified above.
+        # Round 2: coverage-only pass over round 1's region split with the
+        # final per-channel thresholds; also does the deferred depth
+        # extraction for qualifying masked candidates.
         print("..............Starting coverage pass (round 2)..............")
         startTime3 = time.time()
         round2_args = []
@@ -1784,15 +1552,9 @@ def do_call(args):
             + " minutes,merging results................."
         )
 
-        # Merge round 2's deferred depth-extraction (a small subset -- only
-        # masked candidates whose LR now clears their channel's final
-        # threshold) back into round 1's mutsAll/indelsAll, by position key.
-        # Carries filter along with samples: call.py relabels a deferred
-        # candidate to a reject-reason filter (duplex_vaf/normal_vaf/
-        # n_cov_mask) when real depth fails a post-hoc sanity
-        # check, or leaves it "masked" (with real depth) when it clears
-        # everything -- either way the region-local round-2 record is the
-        # source of truth, since round 1 never saw real depth for these.
+        # Merge deferred depth back by position key. The filter comes along:
+        # call.py may relabel a deferred candidate to a reject reason when
+        # its real depth fails a sanity check, else it stays "masked".
         deferred_mut_updates = {
             _mut_key(m): (m["samples"], m["filter"])
             for r in round2_results
@@ -1805,10 +1567,7 @@ def do_call(args):
             for m in r[6]
             if _mut_key(m) in deferred_depth_keys
         }
-        # Everything below that needs real position-weighted coverage now
-        # sources it from round2_results (final thresholds) instead of round
-        # 1's results -- mirrors exactly how round 1's own results were merged
-        # near the top of this function.
+        # Coverage below comes from round 2 (final thresholds).
         coverages = [_[1] for _ in round2_results]
         duplex_read_nums = [_[4] for _ in round2_results]
         duplex_read_nums_trinuc = [_[5] for _ in round2_results]
@@ -1849,8 +1608,8 @@ def do_call(args):
 
         def _deferred_entry(m):
             # The entry extracted with exactly the families clearing the
-            # key's final threshold (the smallest cut at or above it):
-            # round 2's founding families. Indel entries have cut -inf.
+            # key's final threshold (smallest cut at or above it), matching
+            # round 2. Indel entries have cut -inf.
             final = deferred_thresholds.get(_mut_key(m), -np.inf)
             entries = [e for e in m["deferred_depth"] if e[0] >= final]
             return min(entries, key=lambda e: e[0])[1] if entries else None
@@ -1920,7 +1679,7 @@ def do_call(args):
         }
     )
 
-    # Build muts_by_duplex_group over all keys (including 0+n / n+0)
+    # Includes the 0+n / n+0 keys.
     muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
     for mut in mutsAll:
         TC_total = int(mut["infos"]["F1R2"])
@@ -2013,25 +1772,10 @@ def do_call(args):
         sep="\t",
         index=True,
     )
-    # Records tagged with one of these reject-reason filters cleared LR
-    # (round 1 PASS, or a round-2 masked-deferred candidate) but real
-    # depth-extraction then failed a post-hoc sanity check (see call.py's
-    # SNV/indel filtering loops). They're only worth reporting under
-    # --rescue's "junk mutations that may carry real biological signal"
-    # opt-in; otherwise drop them here so they never reach either VCF, same
-    # as any other non-rescued reject. This is the single, centralized
-    # keep/drop decision for these labels -- call.py itself never drops
-    # them, since a round-2 record is only a region-local copy that feeds
-    # the merge above, not the final mutsAll/indelsAll directly.
-    #
-    # "no_good_alt_read" (zero tumor alt-supporting reads, ta==0): even
-    # though tumor depth-extraction now counts a candidate's own
-    # founding-family reads toward depth regardless of base quality (see
-    # extractDepthBatchSnv's call_barcodes), a real ta==0 still means the
-    # independent pileup re-verification found no alt-supporting read at
-    # all -- kept as a labeled reject reason (real AC/RC/DP attached) so
-    # it's only reported under --rescue, same as every other post-hoc
-    # sanity-check failure here.
+    # Records that cleared LR but failed a post-hoc depth sanity check are
+    # reported only under --rescue. This is the single keep/drop decision
+    # for these labels (call.py never drops them). no_good_alt_read (ta==0)
+    # means the pileup re-check found no alt-supporting read at all.
     if not params["rescue"]:
         _reject_reasons = {"no_good_alt_read", "duplex_vaf", "normal_vaf", "n_cov_mask"}
         mutsAll = [m for m in mutsAll if m.get("filter", "PASS") not in _reject_reasons]
@@ -2040,18 +1784,10 @@ def do_call(args):
         ]
         dbsAll = [m for m in dbsAll if m.get("filter", "PASS") not in _reject_reasons]
 
-    # "masked" (SNPM/NOISEM-blocked) records that never went through the
-    # deferred depth-extraction (round 2's, or round 1's under
-    # --skipCoveragePass) -- raw LR below the channel's final refined
-    # threshold -- still carry
-    # round 1's zero-depth placeholder in "samples". A masked record that
-    # *did* get real depth can never land back here with an all-zero
-    # tumor triple: call.py's eligible branch relabels ta==0 to
-    # "no_good_alt_read" instead of leaving it "masked" (see its
-    # eligible-branch comment). So filter=="masked" + all-zero samples
-    # unambiguously means "never depth-extracted", and those shouldn't
-    # reach the fail vcf without --rescue -- same opt-in as every other
-    # no-real-depth reason above.
+    # "masked" + all-zero samples unambiguously means never depth-extracted
+    # (LR below the final threshold): a masked record that did get depth
+    # with ta==0 is relabelled no_good_alt_read by call.py. Drop these
+    # unless --rescue.
     if not params["rescue"]:
 
         def _masked_no_depth(m):
@@ -2067,10 +1803,9 @@ def do_call(args):
         mutsAll = [m for m in mutsAll if m.get("filter") != "masked"]
         indelsAll = [m for m in indelsAll if m.get("filter") != "masked"]
 
-    # Strand independence filter: MSP for the final PASS SBS and indel calls
-    # from their _strand inputs (every other record keeps "."); calls with a
-    # strand p <= --p_threshold fail. A DBS fails with either of its own
-    # family's SBS, and takes the other SBS down with it.
+    # Strand independence filter on final PASS SBS/indel calls (MSP stamped
+    # only on these). A DBS fails with either of its family's SBS, and takes
+    # the other SBS down with it.
     pass_sbs = [m for m in mutsAll if m.get("filter", "PASS") == "PASS"]
     failed_sbs = _apply_strand_filter(pass_sbs, strand_pvalue, args.p_threshold)
     pass_indels = [m for m in indelsAll if m.get("filter", "PASS") == "PASS"]
@@ -2087,23 +1822,11 @@ def do_call(args):
             f"calls failed..............."
         )
 
-    # Per-call FDR: the same local-fdr formula every channel already uses
-    # internally ((1-mu)/(rawLR*mu+1-mu), mu being that call's own
-    # channel's mu0 capped at mu_at_min_lr -- see _refine_channel). Computed and
-    # stamped onto every SBS/indel record's own "FDR" INFO field (not
-    # just PASS -- a fail.vcf record's own FDR is exactly what explains
-    # why it didn't clear its channel), and separately averaged over just
-    # the PASS population per type for the "Total X FDR" stats.txt lines
-    # below. channel_final_mu has an entry (mu0) for every channel
-    # _refine_channel processed, so this is a straight per-call lookup, no
-    # extra Monte Carlo. A DBS call's own FDR isn't
-    # independently modeled -- it's derived from its two constituent SNVs
-    # (call.py's _detect_dbs_pairs) -- so its local fdr is the probability
-    # at least one of those two is wrong, 1-(1-fdr_pos1)*(1-fdr_pos2),
-    # reusing the per-position fdrs already computed for SBS just below.
-    # Records whose channel has no determinable mu (indels with no HP/STR
-    # channel at all, hp_len==0 and not STR) get FDR=1.0 -- "not modeled",
-    # not a claim of zero confidence.
+    # Per-call local FDR, (1-mu)/(rawLR*mu+1-mu) with the channel's capped
+    # mu, stamped on every record (not just PASS) and averaged over PASS
+    # calls for the stats.txt "Total FDR" lines. A DBS's FDR is the chance
+    # at least one of its two SNVs is wrong, 1-(1-fdr1)*(1-fdr2). Records
+    # with no channel mu get FDR=1.0 ("not modeled").
     def _sbs_channel_name(trinuc, alt):
         ref = trinuc[1]
         if ref in ("C", "T"):
@@ -2113,9 +1836,8 @@ def do_call(args):
         return f"SBS96:{rc_trinuc[0]}[{rc_trinuc[1]}>{rc_alt}]{rc_trinuc[2]}"
 
     def _local_fdr(log10_lr, mu):
-        """(1-mu)/(rawLR*mu+1-mu) -- must stay the same formula
-        _refine_channel (funcs/misc.py) solves for its LR threshold, so a
-        future change to one has to be mirrored in the other."""
+        """(1-mu)/(rawLR*mu+1-mu); must match the formula _refine_channel
+        (funcs/misc.py) inverts for its LR threshold."""
         return (1.0 - mu) / ((10**log10_lr) * mu + (1.0 - mu))
 
     sbs_local_fdrs = []
@@ -2158,10 +1880,9 @@ def do_call(args):
             dbs_local_fdrs.append(local_fdr)
     total_dbs_fdr = float(np.mean(dbs_local_fdrs)) if dbs_local_fdrs else float("nan")
 
-    # SBS and DBS are mutually exclusive event classes: a PASS DBS's two
-    # bases (same read family) leave the SBS set as dbs_member. Done after
-    # the strand filter (which needs PASS members to propagate failures) and
-    # after the DBS FDR (built from the members' local FDRs).
+    # SBS and DBS are mutually exclusive: a PASS DBS's two bases become
+    # dbs_member. Must run after the strand filter (needs PASS members to
+    # propagate failures) and the DBS FDR (built from the members' FDRs).
     n_dbs_member = _relabel_dbs_members(mutsAll, dbsAll)
     if n_dbs_member:
         print(f"{n_dbs_member} SBS reported as part of a PASS DBS (dbs_member)")
@@ -2178,23 +1899,10 @@ def do_call(args):
         f.write(f"Number of Read Families\t{unique_read_num}\n")
         f.write(f"Number of Pass-filter Reads\t{pass_read_num}\n")
         f.write(f"Number of Effective Read Families\t{duplex_num}\n")
-        # DBS base coverage (opportunity coverage normalized by
-        # opportunity-per-genome) is written by the estimate step
-        # instead -- it needs dbs_cov_by_minread, which doesn't exist
-        # yet at call time. Unmasked Coverage/Per Read Family Coverage
-        # are SNV-only and already divided here by 3 (the fixed number
-        # of possible alt bases per locus, same normalization
-        # Estimate.py applies to trinuc_cov elsewhere), since that
-        # correction needs no reference-wide computation and doesn't
-        # have to wait for estimate.
-        #
-        # There is no indel equivalent: an indel-opportunity sum can't
-        # be normalized to true per-base units without
-        # indel_locus_multiplier, a reference-genome-wide ratio only
-        # estimate computes -- so an "Unmasked Indel Coverage" line
-        # here could only ever be raw, not-yet-comparable opportunity
-        # units, and was removed rather than kept misleading.
-        # N/A under --doNotOutputMaskedSite, like estimate's Unmasked burden.
+        # SNV coverage is divided by 3 (possible alt bases per locus), as
+        # Estimate.py does for trinuc_cov. DBS and indel coverage need
+        # reference-wide normalization, so the estimate step writes them.
+        # Unmasked Coverage is N/A under --doNotOutputMaskedSite.
         if params["no_masked_output"]:
             f.write("Unmasked Coverage\tN/A\n")
         else:
@@ -2203,8 +1911,8 @@ def do_call(args):
             f"Per Read Family Coverage \t{(coverage / 3) / duplex_num if duplex_num > 0 else 0.0}\n"
         )
         f.write(
-            f"Pass-filter Duplication Rate\t\
-        {1-unique_read_num/pass_read_num if pass_read_num > 0 else 0.0}\n"
+            "Pass-filter Duplication Rate\t"
+            f"{1-unique_read_num/pass_read_num if pass_read_num > 0 else 0.0}\n"
         )
         f.write(f"Efficiency\t{efficiency}\n")
         f.write(f"Total SBS FDR\t{total_sbs_fdr}\n")
@@ -2212,30 +1920,25 @@ def do_call(args):
         f.write(f"Total DBS FDR\t{total_dbs_fdr}\n")
 
     if coverage_pass_enabled:
-        # Merge and combine round 2's per-worker coverage.bed.gz files (same
-        # naming/numbering as round 1's, since round 2 reused regions_list --
-        # round 2's real data simply overwrote round 1's empty placeholders at
-        # the same paths) into the final args.output + "_coverage.bed.gz".
-        # Round 2 is always a fresh whole-region write, not a partial-region
-        # patch.
-        # Use the actual number of dispatched chunks, not args.threads --
-        # regionSequence can legitimately run out before -p chunks are
-        # filled (empty/duplicate-boundary chunks dropped upstream), in
-        # which case fewer real *_<n>_coverage*.tmp.bed.gz files exist
-        # than -p would imply.
-        merge_and_combine_coverage_files(sample_name, sample_dir, len(regions_list))
-        os.replace(
-            os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz"),
-            args.output + "_coverage.bed.gz",
-        )
-        os.replace(
-            os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz.tbi"),
-            args.output + "_coverage.bed.gz.tbi",
-        )
+        # Combine round 2's per-worker coverage files. Use the number of
+        # dispatched chunks, which can be fewer than -p.
+        if merge_and_combine_coverage_files(sample_name, sample_dir, len(regions_list)):
+            os.replace(
+                os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz"),
+                args.output + "_coverage.bed.gz",
+            )
+            os.replace(
+                os.path.join(sample_dir, f"{sample_name}_coverage.bed.gz.tbi"),
+                args.output + "_coverage.bed.gz.tbi",
+            )
+        else:
+            print(
+                f"Warning: {args.output}_coverage.bed.gz was not written; "
+                f"per-worker coverage files are in {sample_dir}.",
+                file=sys.stderr,
+            )
 
-    # Final VCF write, once: PASS-only in the main per-type files,
-    # everything else (masked/underpowered/any rescue-reason label) in a
-    # parallel _fail.vcf per type.
+    # PASS calls in the main per-type VCFs, everything else in _fail.vcf.
     pass_mutsAll = [m for m in mutsAll if m.get("filter", "PASS") == "PASS"]
     fail_mutsAll = [m for m in mutsAll if m.get("filter", "PASS") != "PASS"]
     pass_indelsAll = [m for m in indelsAll if m.get("filter", "PASS") == "PASS"]
@@ -2325,9 +2028,10 @@ def _split_bed_by_start(path, cutoff, below_path, above_path):
 
 
 def _main_bed_overlaps(path, extent):
-    """New workers route this prefix to prev_region; inspect only the first row.
+    """True if the main file's first row falls within the boundary extent.
 
-    Older worker files may still need the compatibility split below.
+    Workers normally route overlap rows to prev_region, so only the first
+    row needs checking; if it overlaps, the caller splits the file.
     """
     with bgzf.open(path, "rt") as source:
         for line in source:
@@ -2338,19 +2042,21 @@ def _main_bed_overlaps(path, extent):
 
 
 def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
-    """
-    1. Sum adjacent next_region/prev_region files at matching positions.
-       New workers route the overlap there before writing. Older files
-       with overlap still in main coverage use the compatibility split.
-    2. Concatenate compressed BGZF blocks. This preserves order when overflow stays in
-       the following worker's chunk; minimum chunk lengths reduce the
-       chance of overflow reaching beyond that worker.
+    """Combine per-worker coverage files into {sample_name}_coverage.bed.gz.
+
+    1. Sum adjacent next_region/prev_region files at matching positions
+       (plus any overlapping rows split off the following main file).
+    2. Concatenate BGZF blocks in order. Order holds as long as overflow
+       stays within the following worker's chunk (minimum chunk lengths
+       make that likely).
+
+    Returns True if the combined file and its tabix index were written,
+    False (per-worker files left in place) otherwise.
     """
     print("Merging adjacent region files and combining coverage files...")
 
-    # Step 1: Merge the boundary files. Track, per worker whose main file
-    # got peeled, the path to its remainder (rows not folded into the
-    # overlap merge) to use in step 2 instead of the original main file.
+    # Step 1: merge boundary files. A main file whose leading rows were
+    # folded into an overlap is replaced by its remainder in step 2.
     remainder_files = {}
     try:
         for n in range(nprocess - 1):
@@ -2391,21 +2097,18 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
             for f in extra_files:
                 os.remove(f)
     except Exception as e:
-        # Same shield as the combine/tabix steps below.
         print(
             f"Warning: could not merge boundary coverage files (worker pair "
             f"{n}/{n+1}): {e}. Per-worker coverage files were left in place "
             "for diagnosis/retry.",
             file=sys.stderr,
         )
-        return
+        return False
 
-    # Step 2: Create list of files in the correct order
+    # Step 2: list files in genomic order.
     files_to_combine = []
 
     for n in range(nprocess):
-        # Use the peeled remainder in place of the original main file for
-        # any worker whose leading rows were folded into an overlap merge.
         main_file = remainder_files.get(
             n, os.path.join(sample_dir, f"{sample_name}_{n}_coverage.bed.gz")
         )
@@ -2413,7 +2116,6 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
             raise FileNotFoundError(f"Expected coverage file not found: {main_file}")
         files_to_combine.append(main_file)
 
-        # Add overlap file (except for the last process)
         if n < nprocess - 1:
             overlap_file = os.path.join(
                 sample_dir, f"{sample_name}_{n}_{n+1}_overlap_coverage.tmp.bed.gz"
@@ -2435,23 +2137,24 @@ def merge_and_combine_coverage_files(sample_name, sample_dir, nprocess):
             "Per-worker coverage files were left in place for diagnosis/retry.",
             file=sys.stderr,
         )
-        return
+        return False
     # Keep worker files if indexing fails, so the output can be diagnosed/retried.
     try:
         subprocess.run(["tabix", "-f", "-p", "bed", final_output], check=True)
         print(f"Tabix index created for: {final_output}")
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, OSError) as e:
         print(
             f"Warning: could not create tabix index for {final_output}: {e}. "
             "The combined coverage file exists but is not indexed; per-worker "
             "files were left in place for diagnosis/retry.",
             file=sys.stderr,
         )
-        return
+        return False
     cleanup_temp_files(sample_name, sample_dir, nprocess)
     for remainder_file in remainder_files.values():
         if os.path.exists(remainder_file):
             os.remove(remainder_file)
+    return True
 
 
 def _concatenate_bgzf_files(paths, output):
@@ -2476,14 +2179,9 @@ def _concatenate_bgzf_files(paths, output):
 
 
 def merge_adjacent_bed_files(next_file, prev_file, output_file, extra_files=None):
-    """
-    Merge adjacent-boundary bed files -- plus any extra sources (e.g. a
-    following worker's main-coverage rows peeled off because an overflow-
-    extended `next_file` reaches past them, see merge_and_combine_coverage_
-    files) -- by summing every numeric column (everything after chrom/
-    start/end) for matching positions. Column count is read from the data
-    rather than hardcoded, so this stays correct as the coverage bed schema
-    grows (currently: cov_A/T/C/G and 6 indel category coverage columns).
+    """Merge boundary bed files (and any extra_files) by summing every
+    column after chrom/start/end at matching positions. The column count
+    is taken from the data, not hardcoded.
     """
     coverage_dict = {}
 
@@ -2514,9 +2212,7 @@ def merge_adjacent_bed_files(next_file, prev_file, output_file, extra_files=None
     for path in extra_files or []:
         accumulate(path)
 
-    # Write merged result only if there's data. Sort numerically (start/end
-    # are strings at this point) -- a lexicographic sort would misorder
-    # e.g. "100000" before "99999".
+    # Sort start/end numerically (they are strings here).
     with bgzf.open(output_file, "wt") as f:
         for (chrom, start, end), values in sorted(
             coverage_dict.items(),
@@ -2526,9 +2222,7 @@ def merge_adjacent_bed_files(next_file, prev_file, output_file, extra_files=None
 
 
 def cleanup_temp_files(sample_name, sample_dir, nprocess):
-    """
-    Clean up temporary files
-    """
+    """Remove per-worker coverage temp files."""
     for n in range(nprocess):
         temp_files = [
             os.path.join(

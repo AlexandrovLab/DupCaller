@@ -44,16 +44,10 @@ def log(mat):
 
 
 def _logsumexp4(terms):
-    """Numerically stable log(sum(exp(terms), axis=0)) for a fixed 4-row
-    stack — equivalent to scipy.special.logsumexp(terms, axis=0), but
-    calculateDSPosterior calls this on tiny arrays hundreds of thousands
-    of times (both per-family and while precomputing the indel power grid
-    in call.py), and scipy's generic array-API dispatch/dtype-promotion
-    layer (xp_promote/isdtype/_preprocess_dtype) dominates cost at that
-    call volume. Since the input is always exactly 4 rows, a direct
-    numpy implementation of the same max-subtraction trick skips that
-    overhead entirely while returning bit-for-bit the same values,
-    including scipy's -inf (not nan) result when every row is -inf.
+    """log(sum(exp(terms), axis=0)) for a 4-row stack; same values as
+    scipy.special.logsumexp (including -inf when every row is -inf) without
+    scipy's per-call dispatch overhead, which dominates on these tiny,
+    very frequent calls.
     """
     m = np.max(terms, axis=0)
     finite_m = np.where(np.isfinite(m), m, 0)
@@ -72,8 +66,6 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
     PB_Bt = PBt + log(1 - P_rev_t)
     PB_Bb = PBb + log(1 - P_rev_b)
 
-    # ll1 = log10(power10(PA_At+PA_Ab) + power10(PA_Bt+PA_Ab) + power10(PA_At+PA_Bb) + power10(PA_Bt+PA_Bb))
-    # ll2 = log10(power10(PB_At+PB_Ab) + power10(PB_Bt+PB_Ab) + power10(PB_At+PB_Bb) + power10(PB_Bt+PB_Bb))
     ll1 = _logsumexp4(
         np.vstack((PA_At + PA_Ab, PA_Bt + PA_Ab, PA_At + PA_Bb, PA_Bt + PA_Bb))
     ) / np.log(10)
@@ -83,7 +75,7 @@ def calculateDSPosterior(Pt, P_rev_t, Pb, P_rev_b, PAt, PAb, PBt, PBb):
     return ll1, ll2
 
 
-def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2):
+def calculateSSPosterior(P, P_rev, bin_seq, Pseq):
     # Pseq is ln(e), e = 10^(-BQ/10). The read emission is conditioned on
     # the read showing one of the two modelled alleles: P(the other
     # allele) = (e/3) / (1 - 2e/3), P(the true allele) = 1 minus that.
@@ -93,22 +85,22 @@ def calculateSSPosterior(P, P_rev, bin_seq, Pseq):  # countb1, countb2, Pb1, Pb2
     expP = (e / 3) / (1 - 2 * e / 3)
     expP = np.where(Pseq == 0, 0.5, expP)
 
-    # precompute the two mixture terms
+    # Per-read likelihood of the read's allele under each molecule allele.
     A = (1 - P) * (1 - expP) + P * expP
     B = (1 - P) * expP + P * (1 - expP)
     A_rev = (1 - P_rev) * (1 - expP) + P_rev * expP
     B_rev = (1 - P_rev) * expP + P_rev * (1 - expP)
-    # precompute logs
     logA = np.log(A)
     logB = np.log(B)
     logA_rev = np.log(A_rev)
     logB_rev = np.log(B_rev)
 
-    # precompute exp
+    # Start from "every read shows the alt" and swap in the non-alt term
+    # for reads that don't (sparse).
     delta_fwd = logA - logB
     delta_rev = logB_rev - logA_rev
 
-    mask0 = ~bin_seq  # sparse
+    mask0 = ~bin_seq
 
     rows, cols = np.nonzero(mask0)
 
@@ -209,16 +201,15 @@ def genotypeDSSnv(
         if (seq.is_read2 and seq.is_forward) or (seq.is_read1 and seq.is_reverse):
             F2R1.append(seq)
 
-    ### Determine match length
     m_F1R2 = len(F1R2)
     m_F2R1 = len(F2R1)
 
     ### Prepare sequence matrix and quality matrix for each strand
     n = len(reference_int)
     base2num = {"A": 0, "T": 1, "C": 2, "G": 3, "N": 4}
-    F1R2_seq_mat = np.zeros([m_F1R2, n], dtype=int)  # Base(ATCG) x reads x pos
+    F1R2_seq_mat = np.zeros([m_F1R2, n], dtype=int)  # reads x pos
     F1R2_qual_mat = np.zeros([m_F1R2, n])
-    F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # Base(ATCG) x reads x pos
+    F2R1_seq_mat = np.zeros([m_F2R1, n], dtype=int)  # reads x pos
     F2R1_qual_mat = np.zeros([m_F2R1, n])
     for mm, seq in enumerate(F1R2):
         qualities = seq.query_alignment_qualities
@@ -244,7 +235,6 @@ def genotypeDSSnv(
             elif ct[0] == 2:
                 F1R2_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F1R2_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
@@ -274,7 +264,6 @@ def genotypeDSSnv(
             elif ct[0] == 2:
                 F2R1_seq_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 4
                 F2R1_qual_mat[mm, current_mat_ind : current_mat_ind + ct[1]] = 0
-                # antimask[reference_ind : reference_ind + ct[1]] = False
                 reference_ind += ct[1]
                 current_mat_ind += ct[1]
                 ref_length_plus_del += ct[1]
@@ -322,7 +311,7 @@ def genotypeDSSnv(
         n_alt_alleles >= 1, np.argmax(alt_count_mat, axis=0), reference_int
     )
     base2_int = reference_int.copy()
-    # Empirical duplex coverage matrix [n, 4]: L lookup per unmasked position per alt base
+    # Duplex coverage [n, 4]: power-table L lookup per unmasked position.
     cov_mat = np.zeros([n, 4])
     if L is not None:
         n_top_L = np.minimum(F1R2_count_mat.sum(axis=0), 9).astype(int)
@@ -464,7 +453,7 @@ def genotypeDSSnv(
 
 
 _RC = [1, 0, 3, 2]
-# str.txt row 0 u1 cells: the mismatched 1bp insertion and its deletion.
+# str.txt row 0 u1 cells: 1bp insertion and 1bp deletion.
 _STR0_INS1 = str_col(1, 1)
 _STR0_DEL1 = str_col(1, -1)
 
@@ -472,32 +461,17 @@ _STR0_DEL1 = str_col(1, -1)
 def _indel_error_cells(
     hps, strs, idLen, ref_allele, inserted_base, strs_mut=None, unit_len=0
 ):
-    """Matrix cells of the two amplification/damage events that matter for
-    a candidate indel, each as (matrix, row, col, col_bot) with matrix
-    "hp" or "str" and col_bot the bottom-strand (base-complemented) column:
-
-    reversion: alt->ref, the event that undoes the indel in the mutant
-        molecule's own context.
-    forward: ref->alt, the indel itself in the reference context.
-
-    hp rows are run length 1-10+ (rows cap at 10; hps is the uncapped run
-    length, so the mutant run of a deletion from an 11+ run is still
-    10+), columns base*3 + (idLen + 1); str rows are STR bins, columns a
-    (deletion, reference, insertion) triple per unit group (str_event_col:
-    the tract's repeat unit unit_len in rows 1-4, the indel length in row
-    0).
-      1bp deletion from a run of L: forward = -1 in a run of L; reversion
-        = +1 in a run of L-1, or str row 0 u1 insertion when L == 1 (no
-        run left).
-      Run-extending 1bp insertion into a run of L: forward = +1 in a run
-        of L; reversion = -1 in a run of L+1.
-      Mismatched 1bp insertion of base x: forward = str row 0 u1
-        insertion; reversion = -1 of x as a run of 1 (str row 0 u1
-        deletion if x is not ACGT).
-      Longer indels: forward = the indel's sign in the reference tract's
-        bin (strs); reversion = the opposite sign in the mutant tract's bin
-        (strs_mut, default strs when the tract length isn't known, e.g.
-        per-context tables).
+    """(reversion, forward) error cells of a candidate indel, each as
+    (matrix "hp"|"str", row, col, col_bot); col_bot is the base-complemented
+    bottom-strand column. reversion = alt->ref in the mutant context,
+    forward = ref->alt in the reference context. hps is the uncapped run
+    length (hp rows cap at 10+).
+      1bp del from run L: fwd -1 @ L; rev +1 @ L-1 (str row 0 u1 ins if L == 1)
+      run-extending 1bp ins into run L: fwd +1 @ L; rev -1 @ L+1
+      mismatched 1bp ins of x: fwd str row 0 u1 ins; rev -1 of x @ run 1
+        (str row 0 u1 del if x is not ACGT)
+      >=2bp: fwd in strs' bin, rev (opposite sign) in strs_mut's bin
+        (strs_mut defaults to strs)
     """
     if abs(idLen) >= 2:
         if strs_mut is None:
@@ -547,17 +521,13 @@ def indelErrorProbs(
     strs_mut=None,
     unit_len=0,
 ):
-    """Amplification and damage rates for a candidate indel, in the slots
-    calculateSSPosterior/calculateDSPosterior expect (same convention as
-    genotypeDSSnv): Pamp/Pdmg/Pdmg_bot are alt->ref (the reversion in the
-    mutant context), Pamp_rev/Pdmg_rev/Pdmg_rev_bot are ref->alt (the
-    indel in the reference context). See _indel_error_cells.
+    """Amp/damage rates of a candidate indel in genotypeDSSnv's slot
+    convention: Pamp/Pdmg/Pdmg_bot = alt->ref (reversion), Pamp_rev/
+    Pdmg_rev/Pdmg_rev_bot = ref->alt (forward); see _indel_error_cells.
 
-    ref_allele is the reference base at indel_context_index; for 1bp
-    insertions, inserted_base == ref_allele selects the run-extending
-    (hp) case, anything else the mismatched (str row 0) case. unit_len is
-    the repeat unit of the tract a >=2bp indel is a slip of (needed when
-    strs >= 1; per-context tables pass the 1-unit slip's |idLen|).
+    ref_allele: reference base at indel_context_index; a 1bp insertion with
+    inserted_base == ref_allele is run-extending (hp), else mismatched (str
+    row 0). unit_len: repeat unit of the slipped tract (required if strs >= 1).
     """
     if idLen == 0:
         raise ValueError("idLen must be nonzero")
@@ -586,10 +556,9 @@ def indelReversionRate(
     strs_mut=None,
     unit_len=0,
 ):
-    """Per-read probability that a read from a molecule carrying this indel
-    shows the reference: the amplification reversion of _indel_error_cells
-    (indelErrorProbs' Pamp without its zero floor). NaN when the matrices
-    aren't loaded."""
+    """Per-read probability that a mutant molecule's read shows REF: the
+    amp reversion rate (indelErrorProbs' Pamp without its zero floor). NaN
+    when the matrices aren't loaded."""
     if prob_amp_hp is None or prob_amp_str is None:
         return np.nan
     reversion, _ = _indel_error_cells(
@@ -599,12 +568,9 @@ def indelReversionRate(
 
 
 def indelMaxLR(Pdmg, Pdmg_rev, Pdmg_bot, Pdmg_rev_bot):
-    """Theoretical ceiling of masked LR for an indel context: log10(1-Pdmg)
-    + log10(1-Pdmg_bot) - log10(Pdmg_rev) - log10(Pdmg_rev_bot). Same shape
-    as genotypeDSSnv's LR_max/"LM" field; depends only on context (hps/
-    strs/idLen/ref_allele via indelErrorProbs), never on read depth, so it
-    doubles as the per-context calling-threshold ceiling in call.py/
-    Caller.py.
+    """Maximum attainable LR for an indel context (genotypeDSSnv's LR_max
+    analogue). Depends only on context, not depth, so it also caps the
+    per-context calling threshold.
     """
     return log10(1 - Pdmg) + log10(1 - Pdmg_bot) - log10(Pdmg_rev) - log10(Pdmg_rev_bot)
 
@@ -635,7 +601,7 @@ def genotypeDSIndel(
     start = reference_start
     end = reference_end
     indels = set()
-    ### Geonotype indel for all found indels
+    ### Genotype every indel found in the family
     for seq in F1R2:
         indels.update(
             left_align_indel(i, reference_int, reference_start) for i in findIndels(seq)
@@ -644,7 +610,6 @@ def genotypeDSIndel(
         indels.update(
             left_align_indel(i, reference_int, reference_start) for i in findIndels(seq)
         )
-    # start = seqs[0].reference_start
     indels = list(indels)
     indels_masked = list()
     pos_masked = list()
@@ -679,7 +644,7 @@ def genotypeDSIndel(
         indelLen_masked[indelLen_masked < -5] = -5
 
     m = len(indels_masked)
-    if m == 0:  # or m >= 2:
+    if m == 0:
         return [np.zeros(0)] * 12
     n_f1r2 = len(F1R2)
     n_f2r1 = len(F2R1)
@@ -733,21 +698,19 @@ def genotypeDSIndel(
     # the call's channel.
     hp_match_arr = np.ones(pos_masked.size, dtype=bool)
     for nn in range(pos_masked.size):
-        # HP and STR context, read independently at indel_context_index
-        # (same position as learning).
+        # HP and STR context, read independently at the same position as
+        # learning.
         anchor = indel_context_index(pos_masked[nn] - start)
         # Uncapped run length for the error cells (a deletion from an 11+
         # run leaves a 10+ run); hps (the HP INFO field / channel) caps at 10.
         hp_run = int(hp_raw[0, anchor])
         hps[nn] = min(hp_run, 10)
-        # STR bins (str.txt rows): 0 = not a repeat, 1 = 2-9bp,
-        # 2 = 10-24bp, 3 = 25-39bp, 4 = 40+bp.
         idLen = indelLen_masked[nn]
         pos = pos_masked[nn]
         indel_parts = indels_masked[nn].split(":")
         raw_len = int(indel_parts[1])
-        # A >=2bp indel that isn't a slip of the tract at its context base
-        # (str_slip_tract) is STR0 ("not a repeat").
+        # STR bin (str.txt row, str_length_bin); a >=2bp indel that isn't a
+        # slip of the tract at its context base is STR0 ("not a repeat").
         slip = str_slip_tract(
             raw_len,
             indel_parts[2] if raw_len > 0 else "",
@@ -814,16 +777,12 @@ def genotypeDSIndel(
     F1R2_alt_prob, F1R2_ref_prob = calculateSSPosterior(
         Pamp,
         Pamp_rev,
-        # f1r2_alt_count,
-        # f1r2_ref_count,
         f1r2_seq,
         f1r2_prob * ln10,
     )
     F2R1_alt_prob, F2R1_ref_prob = calculateSSPosterior(
         Pamp,
         Pamp_rev,
-        # f1r2_alt_count,
-        # f1r2_ref_count,
         f2r1_seq,
         f2r1_prob * ln10,
     )

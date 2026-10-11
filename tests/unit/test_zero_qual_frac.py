@@ -1,6 +1,6 @@
-"""genotypeDSSnv no longer masks a position by the fraction of the
-family's reads with no usable base there (--maxZeroQualFrac was removed):
-reads without a usable base simply don't contribute to the LR."""
+"""genotypeDSSnv does not mask a position by the fraction of the family's
+reads with no usable base there: such reads simply don't contribute to the
+LR."""
 
 from types import SimpleNamespace
 

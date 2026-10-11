@@ -6,10 +6,7 @@ import pandas as pd
 from .funcs.learn import estimate_sbs_srd_rates
 from .funcs.misc import build_trinuc64_order
 
-# File suffixes written by DupCaller.py call/learn under
-# {folder}/ERROR/{basename(folder)}<suffix> -- see Caller.py's
-# amp_tn_pd/dmg_tn_pd/amperri_hp_file etc. write-out for the source of
-# truth on this naming.
+# Count tables written by call/learn as {folder}/ERROR/{basename(folder)}<suffix>.
 _PROFILE_SUFFIXES = [
     ".amp.tn.txt",
     ".dmg.tn.txt",
@@ -26,15 +23,8 @@ def do_aggregate(args):
     if not args.output:
         raise ValueError("-o/--output must be provided")
 
-    # -i/--input takes DupCallerCall *output folders*, whose error files
-    # live at {folder}/ERROR/{basename(folder)}{suffix} (see Caller.py/
-    # Learn.py's error_prefix -- named after the folder's own basename,
-    # not its full path). -f/--input-file instead takes lines that are
-    # already the full error-file *prefix* (folder + "/ERROR/" +
-    # basename, ready to have suffix appended directly), per its own
-    # help text -- so the two inputs are normalized into one list of
-    # prefixes here rather than reusing a single (folder-shaped) path
-    # formula for both.
+    # -i gives call output folders; -f gives error-file prefixes
+    # ({folder}/ERROR/{sample}) directly. Normalize both to prefixes.
     prefixes = []
     if args.input:
         for folder in args.input:
@@ -56,22 +46,9 @@ def do_aggregate(args):
         aggregated = sum(profiles)
         aggregated.to_csv(args.output + suffix, sep="\t")
 
-    # SBS SRD (single-read-damage) rate matrix: not a simple sum-of-tables
-    # like the legacy profiles above, since it's an EM fit rather than a
-    # raw count. Its sufficient statistic -- the per-trinuc-context,
-    # per-base-quality BQ histogram of raw amp-error observations
-    # (sbs_alt_bq_hist, see funcs/learn.py's profileTriNucMismatches/
-    # estimate_sbs_srd_rates) -- IS additive across samples, so the
-    # correct way to combine multiple samples' SRD estimates is to sum
-    # their raw histograms first and re-run the EM fit once on the sum,
-    # not to average/combine the samples' already-fit (64,4) rate
-    # matrices directly.
-    #
-    # The histogram is saved by Learn.py/Caller.py as a QC diagnostic
-    # under {folder}/tmp/{sample_name}.amp.tn.bqhist.npz (tmp/, a sibling
-    # of ERROR/ -- not under the ERROR/-based ${prefix} used above), so
-    # its path has to be re-derived from each ${prefix} rather than just
-    # appending a new suffix.
+    # The SRD matrix is an EM fit, so it can't be summed directly; instead
+    # sum the per-sample BQ histograms (additive) and refit once. The
+    # histograms live in {folder}/tmp/, a sibling of ERROR/.
     hist_sum = None
     for prefix in prefixes:
         error_dir, sample_name = os.path.split(prefix)

@@ -37,7 +37,6 @@ def p_threshold_value(value):
     return value
 
 
-# from Estimate import do_estimate
 if __name__ == "__main__":
     """
     Parse Arguments
@@ -660,9 +659,7 @@ if __name__ == "__main__":
     elif args.command == "summarize":
         do_summarize(args)
     elif args.command == "estimate":
-        # Deferred import: Estimate.py pulls in matplotlib + sigProfilerPlotting,
-        # which every other subcommand (call, index, etc.) would otherwise pay
-        # the import cost for on every invocation despite never using them.
+        # Deferred: Estimate.py imports sigProfilerPlotting.
         from DupCaller_sub.Estimate import do_estimate
 
         do_estimate(args)
@@ -675,8 +672,6 @@ if __name__ == "__main__":
     elif args.command == "learn":
         do_learn(args)
     else:
-        # No subcommand given (args.command is None) -- argparse's own
-        # "invalid choice" error already rejects anything else before
-        # reaching here, so this only fires on a bare `DupCaller.py`.
+        # No subcommand given.
         master_parser.print_help()
         sys.exit(1)

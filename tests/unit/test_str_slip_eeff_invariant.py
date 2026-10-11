@@ -1,8 +1,7 @@
 """STR slips are classified by sequence (str_slip_tract), str.h5 keeps one
 tract per position (resolve_str_overlaps), and every indel candidate that
 calling would keep sits in its own channel's Eeff site set
-(indel_eeff_site_masks) -- the invariant whose break made STR3 Eeff 9 sites
-against 819 candidates in rerun 6."""
+(indel_eeff_site_masks)."""
 
 import itertools
 
@@ -94,9 +93,9 @@ def test_slip_rule_by_sequence():
 
 
 def test_overlapping_tracts_keep_the_longest():
-    # chr22:20000006 (AGGA)2 and (AGG)2 overlap; (AGGA)2 is longer.
+    # (AGGA)2 and (AGG)2 overlap; (AGGA)2 is longer.
     assert resolve_str_overlaps([(6, 14, 4, 2), (10, 16, 3, 2)]) == [(6, 14, 4, 2)]
-    # chr22:20122723 (TG)20, (GTG)2 at 37-42 and (GT)2 at 40-43.
+    # (TG)20, (GTG)2 at 37-42 and (GT)2 at 40-43.
     rows = [(0, 40, 2, 20), (37, 43, 3, 2), (40, 44, 2, 2)]
     assert resolve_str_overlaps(rows) == [(0, 40, 2, 20), (40, 44, 2, 2)]
     # Abutting tracts both stay; PERF's overextended span is clamped.

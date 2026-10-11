@@ -16,19 +16,15 @@ def base_codes(seq):
 
 
 def str_unit_multiple(indel_len, unit_len):
-    """True iff an indel of indel_len (signed, uncapped) is a whole number
-    of repeat units of an STR with this unit length. 1bp indels always
-    count (they're routed by homopolymer context, not STR bin)."""
+    """True iff indel_len is a whole number of repeat units; 1bp indels
+    always count (they're routed by homopolymer context)."""
     return abs(indel_len) < 2 or abs(indel_len) % unit_len == 0
 
 
-# str.txt columns: five repeat-unit groups u1, u2, u3, u4, u5+, each a
-# (deletion, reference, insertion) triple. In STR rows 1-4 the group is the
-# tract's repeat unit and a slip of any whole number of units counts in its
-# unit's deletion/insertion column; u1 stays empty there (1bp slips are
-# homopolymer events, hp.txt). In row 0 (not a slip) the group is the indel
-# length; u1 holds the mismatched 1bp insertion. Each group's reference
-# column is its own opportunity count.
+# str.txt columns: repeat-unit groups u1-u4, u5+, each a (del, ref, ins)
+# triple; the ref column is that group's opportunity. Rows 1-4: group = the
+# tract's unit (u1 empty; 1bp slips go to hp.txt). Row 0 (not a slip):
+# group = indel length; u1 holds the mismatched 1bp insertion.
 STR_UNIT_GROUPS = 5
 STR_NCOL = STR_UNIT_GROUPS * 3
 STR_COL_LABELS = [
@@ -75,17 +71,12 @@ def str_length_bin(unit_len, total_len):
 
 def str_slip_tract(indel_len, inserted_seq, ctx, reference_int, str_raw):
     """(unit_len, total_len) of the STR tract a >=2bp indel is a slip of, or
-    None if it isn't a slip (an STR0 event).
+    None (an STR0 event). A slip is a whole number of units at the tract
+    start, made of the tract itself: a deletion staying inside it, or an
+    in-phase insertion of its unit ("GG" into (AC)n is not a slip).
 
-    A slip is a whole number of the tract's units, at the tract start (a
-    left-aligned slip always lands there), and made of the tract itself: a
-    deletion that stays inside the tract, or an insertion of copies of the
-    tract's unit in phase. "GG" inserted into (AC)n, or a deletion running
-    out of the tract, has the right length but is not a slip.
-
-    ctx: indel_context_index of the indel; reference_int and str_raw (unit,
-    repeat count, start flag rows) share its local frame. Shared by learning
-    and calling."""
+    ctx: indel_context_index of the indel, in the local frame shared by
+    reference_int and str_raw (unit, repeat count, start-flag rows)."""
     if abs(indel_len) < 2 or ctx >= str_raw.shape[1]:
         return None
     unit_len = int(str_raw[0, ctx])
@@ -106,18 +97,13 @@ def str_slip_tract(indel_len, inserted_seq, ctx, reference_int, str_raw):
 
 def left_align_indel(indel, reference_int, reference_start):
     """Shift a raw findIndels indel to its leftmost equivalent position
-    (the bcftools norm convention), so reads reporting the same event at
-    different places inside a repeat agree on one string.
+    (bcftools norm convention), rotating an insertion's sequence as it
+    shifts; stops at the edges of reference_int.
 
-    A deletion shifts left while ref[anchor] == ref[anchor + del_len]; an
-    insertion shifts left while ref[anchor] == its last inserted base,
-    rotating the inserted sequence by one base per shift. Shifting stops
-    at the edges of reference_int.
-
-    indel: "{pos}:{len}:{seq}" (insertion) or "{pos}:-{len}" (deletion);
-        pos is the 0-based anchor (last reference base before the event).
-    reference_int: base2num-encoded reference (A=0,T=1,C=2,G=3, other=4)
-        starting at reference_start.
+    indel: "{pos}:{len}:{seq}" (insertion) or "{pos}:-{len}" (deletion),
+        pos the 0-based anchor (last reference base before the event).
+    reference_int: encoded reference (ATCG = 0-3, other 4) from
+        reference_start.
     """
     parts = indel.split(":")
     pos = int(parts[0])
@@ -152,12 +138,9 @@ def left_align_indel(indel, reference_int, reference_start):
 
 def indel_mask_span(local_pos, indel_len):
     """[lo, hi) local interval that must be unmasked for an indel anchored
-    at local_pos (0-based, relative to the window's antimask): the anchor,
-    plus every deleted base for a deletion or the context base (the first
-    base after the insertion point) for an insertion -- the same bases the
-    Eeff site masks require (funcs/misc.py's indel_eeff_site_masks). Shared
-    by learning (funcs/learn.py) and calling (funcs/prob.py, funcs/call.py)
-    so both apply the identical locus mask."""
+    at local_pos: the anchor plus every deleted base (deletion) or the
+    context base after the insertion point (insertion). Must match the Eeff
+    site masks (misc.indel_eeff_site_masks); shared by learning and calling."""
     return local_pos, local_pos + max(-indel_len, 1) + 1
 
 
@@ -172,21 +155,18 @@ def indel_passes_mask(antimask, local_pos, indel_len):
 
 
 def indel_context_index(local_pos):
-    """Local index whose hp_raw/str_raw/reference_int value classifies an
-    indel's HP/STR context: anchor + 1, i.e. the first deleted base of a
-    deletion or the first reference base after an insertion. hp.h5 and
-    str.h5 store the whole run's/tract's values at every position in it,
-    and for a left-aligned event anchor + 1 is the run/tract start, where
-    learning credits the opportunity. Shared by learning and calling."""
+    """Local index classifying an indel's HP/STR context: anchor + 1 (first
+    deleted base, or first reference base after an insertion). For a
+    left-aligned event this is the run/tract start, where learning credits
+    the opportunity."""
     return local_pos + 1
 
 
 def indel_context_fits_window(indel, local_pos, reference_int, hp_raw, str_raw):
-    """True iff the homopolymer run (1bp indels routed to hp.txt) or STR
-    tract (a slip, str_slip_tract) an indel is scored in ends inside the
-    window, the base after it included -- the runs/tracts the Eeff site
-    masks count (hp_repeat_valid, str_tract_valid). Reads cut inside the
-    run/tract can't show its length. Other indels (STR0) always fit.
+    """True iff the HP run (1bp indels routed to hp.txt) or STR tract (a
+    slip) an indel is scored in ends inside the window, the base after it
+    included, as the Eeff site masks require; reads cut inside a run can't
+    show its length. Other indels (STR0) always fit.
 
     indel: left-aligned "{pos}:{len}[:{seq}]"; local_pos: its anchor in
     the window frame shared by reference_int, hp_raw and str_raw."""

@@ -21,7 +21,6 @@ from .funcs.misc import getAlignmentObject as BAM
 from .funcs.misc import check_mate_cigar_tags
 
 
-# if __name__ == "__main__":
 def do_learn(args):
     params = {
         "tumorBam": args.bam,
@@ -32,12 +31,7 @@ def do_learn(args):
         "regions": args.regions,
         "region_file": None,
         "threads": args.threads,
-        # callBam's isLearn path shares the round-0/round-1/round-2 code
-        # with call.py (funcs/call.py's threshold_rng Monte Carlo seeding,
-        # _compute_read_label's barcode-tag lookup) -- both keys are read
-        # unconditionally regardless of isLearn, so they must be present
-        # even though a standalone `learn` run has no call-specific CLI
-        # flags for them.
+        # callBam reads seed and the barcode keys even when isLearn is set.
         "seed": int(np.random.SeedSequence().generate_state(1)[0]),
         "barcodeTag": "DB",
         "barcodeNormalize": True,
@@ -82,8 +76,7 @@ def do_learn(args):
     tmp_dir = os.path.join(params["output"], "tmp")
     params["tmp_dir"] = tmp_dir
     os.makedirs(tmp_dir, exist_ok=True)
-    # Learned error matrices get their own ERROR/ subfolder, matching
-    # Caller.py's internal auto-learn convention.
+    # Same ERROR/ layout as Caller.py's auto-learn.
     error_dir = os.path.join(params["output"], "ERROR")
     os.makedirs(error_dir, exist_ok=True)
     error_prefix = os.path.join(error_dir, args.output)
@@ -92,10 +85,8 @@ def do_learn(args):
     """
     Execulte variant calling
     """
-    # Only the multi-thread path hands reads off across chunk boundaries
-    # via MC tags (see funcs/misc.py's bamIterateMultipleRegionWithOverflow),
-    # same as do_call in Caller.py -- a single-threaded run has no
-    # boundaries to reconcile.
+    # Only the multi-thread path needs MC tags to hand reads across chunk
+    # boundaries.
     if args.threads > 2:
         check_mate_cigar_tags(args.bam, args.reference)
     if args.threads <= 2:
@@ -103,9 +94,7 @@ def do_learn(args):
         Single-thread execution
         """
         print(".........Starting variant calling..............")
-        # contigs = [(r.strip('\n'),) for r in open(args.regions,'r').readlines()] # Only process contigs in region file
         paramsNow = params
-        # paramsNow["reference"] = fasta
         paramsNow["isLearn"] = True
         regions = params["regions"]
         paramsNow["regions"] = [
@@ -120,7 +109,6 @@ def do_learn(args):
             str_dmg_profile,
             sbs_alt_bq_hist,
         ) = callBam(paramsNow, 0)
-        # Match the multi-thread branch's dtype below.
         mismatch_profile = mismatch_profile.astype(int)
         hp_alt_profile = hp_alt_profile.astype(int)
         str_alt_profile = str_alt_profile.astype(int)
@@ -133,14 +121,11 @@ def do_learn(args):
         Multi-thread execution
         """
         args.threads = args.threads - 1
-        # contigs = [r.strip('\n') for r in open(args.regions,'r').readlines()] # Only process contigs in region file
         contigs = args.regions
         contigLengths = [bamObject.get_reference_length(contig) for contig in contigs]
         print(
             "...........Spliting genomic regions for parallel execution................"
         )
-        # print(args.threads)
-        # if args.normalBam:
         cutSites, chunkSize, contigs = splitBamRegions(
             [args.bam],
             args.threads,
@@ -148,11 +133,6 @@ def do_learn(args):
             args.windowSize,
             min_chunk_length=getattr(args, "minChunkLength", 10000),
         )
-        # else:
-        # cutSites, chunkSize, contigs = splitBamRegions(
-        # [args.bam], args.threads, contigs, args.windowSize
-        # )
-        # print(cutSites,chunkSize,contigs)# Split the whole genome for parallel execution
         regionSequence = []
         currentContigIndex = 0
         usedTime = (time.time() - startTime) / 60
@@ -201,11 +181,7 @@ def do_learn(args):
                     regions.append(regionSequence.pop(0))
                     break
             if len(regions) == 0:
-                # Fewer real chunks than -p requested (regionSequence
-                # already ran out) -- just use fewer effective parallel
-                # chunks for this pass instead of handing callBam an
-                # empty regions list, which it can't index into
-                # (regions[0]).
+                # Fewer chunks than workers; callBam can't take an empty list.
                 continue
             chroms = [region[0] for region in regions]
             paramsNow = params.copy()
@@ -214,9 +190,7 @@ def do_learn(args):
             callArgument = (paramsNow, nn)
             callArguments.append(callArgument)
             regions = []
-        results = pool.starmap(
-            callBam, callArguments
-        )  # each result return three list: number of duplex reads, effective lengths, list of mutations
+        results = pool.starmap(callBam, callArguments)
         print(
             "..............Completed bam calling in "
             + str((time.time() - startTime2) / 60)
@@ -257,13 +231,10 @@ def do_learn(args):
     dmg_tn_pd = pd.DataFrame(
         mismatch_dmg_profile, columns=["A", "T", "C", "G"], index=num2trinuc
     )
-    # np.savetxt(params["output"] + "/" + args.output + ".amp.tn.txt",np.hstack([trinuc_cols[0:32],mismatch_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
     amp_tn_pd.to_csv(error_prefix + ".amp.tn.txt", sep="\t")
     dmg_tn_pd.to_csv(error_prefix + ".dmg.tn.txt", sep="\t")
-    # np.savetxt(params["output"] + "/" + args.output + ".dmg.tn.txt",np.hstack([trinuc_cols,mismatch_dmg_profile]),delimiter="\t",header=" \tA\tT\tC\tG\n")
 
-    # Indel hp/str: see Caller.py's internal auto-learn write-out for the
-    # column/row convention (same one here).
+    # Indel hp/str row/column labels match Caller.py's auto-learn output.
     hp_row_labels = [f"HP{i}" for i in range(1, 10)] + ["HP10+"]
     hp_col_labels = [f"{b}_{d}" for b in ["A", "T", "C", "G"] for d in (-1, 0, 1)]
     str_row_labels = ["0-1", "2-9", "10-24", "25-39", "40+"]
@@ -281,17 +252,9 @@ def do_learn(args):
     amp_str_pd.to_csv(error_prefix + ".amp.str.txt", sep="\t")
     dmg_str_pd.to_csv(error_prefix + ".dmg.str.txt", sep="\t")
 
-    # Amp-error base-quality histogram (SBS only): not weighted by BQ
-    # like mismatch_profile above -- instead records, per error-matrix
-    # cell, how many raw amp-error observations were seen at each base
-    # quality. Too large to flatten sensibly into a 2D CSV (64x4x
-    # {NUM_BQ}), so saved as .npz with the row/column/BQ axis labels
-    # alongside the counts -- bq_values (0..{NUM_BQ}-1) doubles as both
-    # the BQ axis labels and, since a bin's index equals its BQ value,
-    # the histogram's per-slice BQ values. A debugging/QC diagnostic, not
-    # a deliverable, so it goes to tmp_dir rather than the final ERROR/
-    # output dir -- same split as Caller.py's _indel_rate_by_hp_str.txt/
-    # _sbs96_rate_by_trinuc.txt.
+    # SBS amp-error counts per error-matrix cell per base quality
+    # (64 x 4 x NUM_BQ; bin index == BQ). QC diagnostic, so it goes to
+    # tmp_dir rather than ERROR/.
     bq_values = np.arange(NUM_BQ)
     np.savez(
         os.path.join(tmp_dir, os.path.basename(args.output) + ".amp.tn.bqhist.npz"),
@@ -301,11 +264,8 @@ def do_learn(args):
         bq_values=bq_values,
     )
 
-    # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
-    # histogram above -- this, not amp.tn.txt's raw counts, is what
-    # params["amperr_file"] now points at and load_error_matrices
-    # (funcs/misc.py) reads directly for calling, replacing the old
-    # in-situ row-normalization of raw counts.
+    # SBS SRD rate matrix, EM-estimated from the BQ histogram; this (not
+    # amp.tn.txt's raw counts) is what calling loads as the amp error.
     srd_mat = estimate_sbs_srd_rates(
         sbs_alt_bq_hist, params["pseudocount"], fallback=True
     )

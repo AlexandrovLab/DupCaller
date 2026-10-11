@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # run_dupcaller_sample.sh -- Run nextflow/DupCaller.nf end-to-end (fastq ->
-# results) for one tumor/normal sample. Platform-agnostic: makes no
-# assumptions about a scheduler. Works standing alone on a laptop/
-# workstation with Docker installed, or on any HPC node with Docker or
-# Singularity available. For cluster resource requests (SLURM/SGE/PBS
-# etc.), wrap this script in your scheduler's own submission script and
-# pass through whatever CPU count it grants you via -p -- see
-# run_sample.slurm.sh for a SLURM example.
+# results) for one tumor/normal sample. Scheduler-agnostic: runs on a
+# workstation or HPC node with Docker or Singularity. On a cluster, wrap it
+# in a submission script and pass the granted CPU count via -p (see
+# run_sample.slurm.sh).
 #
 # Requires: nextflow, and either Docker (running) or Singularity, on PATH.
 # The reference must already have a samtools faidx index (.fai), a
-# bwa-mem2 index (.0123/.amb/.ann/.bwt.2bit.64/.pac, from `bwa-mem2 index`)
-# and a DupCaller.py index (.ref.h5/.tn.h5/.hp.h5/.str.h5/.dbs.h5)
-# alongside it.
+# bwa-mem2 index (.0123/.amb/.ann/.bwt.2bit.64/.pac) and a DupCaller.py
+# index (.ref.h5/.tn.h5/.hp.h5/.str.h5/.dbs.h5) alongside it.
 #
 # Usage:
 #   run_dupcaller_sample.sh -s SAMPLE_ID \
@@ -31,10 +27,9 @@
 #       [-R REPO_ROOT]
 #
 # Required:  -s -1 -2 -f, plus either (-3 and -4) or -B
-# -B NORMAL_BAM: reuse an already-aligned, already-indexed (.bai) normal
-#   BAM instead of aligning -3/-4 -- e.g. one matched normal shared across
-#   many tumor-only benchmark/mock samples. Skips trim/align/markdup for
-#   the normal entirely. -3/-4 are ignored (and not required) when set.
+# -B NORMAL_BAM: reuse an already-aligned, indexed (.bai) normal BAM
+#   instead of aligning -3/-4 (skips trim/align/markdup for the normal).
+#   -3/-4 are ignored and not required when set.
 # -M MAX_MEMORY: cap every task's memory request (Nextflow memory string,
 #   e.g. 24.GB); default pipeline.config's 96.GB. Lower it on smaller
 #   machines -- the local executor refuses tasks that ask for more than
@@ -42,16 +37,11 @@
 # Defaults:  -p $(nproc), -o ./results/SAMPLE_ID, -P docker,local,
 #            -r (DupCaller.py's own default: chr1-22,chrX),
 #            -b pipeline.config's default (NNNXXXX) -- CHECK THIS MATCHES
-#               YOUR ACTUAL BARCODE SCHEME (N=barcode base, X=skipped
-#               constant base) before trusting results; a mismatch here
-#               corrupts barcode extraction and every read's sequence
-#               offset, silently collapsing duplex family formation
-#               without erroring. Verify by comparing a raw fastq read's
-#               length to its aligned length in an existing BAM from the
-#               same data (the difference is the true total pattern
-#               length) -- a barcode tag's own length (e.g. DB:Z:xxx-yyy)
-#               only reveals the N-count, not any trailing skipped bases,
-#               and checking that alone is NOT sufficient,
+#               YOUR BARCODE SCHEME (N=barcode base, X=skipped base); a
+#               wrong pattern silently breaks duplex family formation.
+#               Compare a raw fastq read's length with its aligned length
+#               in an existing BAM (the difference is the full pattern
+#               length); the DB tag alone shows only the N count,
 #            -R this script's own repo checkout
 set -euo pipefail
 
@@ -105,9 +95,7 @@ OUTDIR="${OUTDIR:-$(pwd)/results/${SAMPLE_ID}}"
 mkdir -p "$OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)"   # absolute, nextflow work/publishDir dislike relative paths across -resume
 
-# DupCaller.py call/estimate's own default region set when -r is omitted
-# entirely -- DupCaller.nf always passes -r explicitly, so spell it out
-# unless the caller overrides it.
+# DupCaller.nf always passes -r, so spell out DupCaller.py's default.
 if [ -z "$REGIONS" ]; then
     REGIONS="$(printf 'chr%d ' $(seq 1 22))chrX"
 fi
@@ -126,12 +114,8 @@ else
     germline_literal="null"
 fi
 
-# nextflow's -resume history (.nextflow/cache, .nextflow.log) is keyed to
-# the launch directory, not to -w's work dir -- a fresh mktemp dir here
-# would give every invocation a clean launch dir with no prior session to
-# resume from, silently turning -resume into a full rerun. Reuse a stable,
-# per-sample launch dir under OUTDIR instead so a retry after a failure
-# actually resumes.
+# -resume history is keyed to the launch directory, so use a stable
+# per-sample launch dir for retries to actually resume.
 WORKDIR="${OUTDIR}/.nextflow_launch"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -144,12 +128,9 @@ else
         "$SAMPLE_ID" "$TUMOR_FASTQ_1" "$TUMOR_FASTQ_2" "$NORMAL_FASTQ_1" "$NORMAL_FASTQ_2" > sample.map
 fi
 
-# Only overrides pipeline.config's placeholders that must be per-run --
-# every calling-parameter default already in pipeline.config (-maf, -gaf,
-# -d, -tt, -tr, -mq) matches DupCaller.py's own CLI defaults, so it's
-# inherited unchanged from there. barcode_pattern is only written here if
-# -b was actually passed, so omitting -b still falls through to
-# pipeline.config's own default rather than an empty string.
+# Override only per-run settings; calling parameters come from
+# pipeline.config. Optional lines are written only when their flag is given,
+# so pipeline.config's defaults otherwise apply.
 barcode_config_line=""
 if [ -n "$BARCODE_PATTERN" ]; then
     barcode_config_line="    barcode_pattern = \"${BARCODE_PATTERN}\""

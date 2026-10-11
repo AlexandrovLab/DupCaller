@@ -41,12 +41,11 @@ from .funcs.misc import (
 
 
 def calculate_ref_trinuc(args):
-    """Reference-genome trinucleotide composition at full 64-context
-    resolution (un-folded by reverse complement). Reverse-complement pairs
-    are only combined at estimation time, inside estimate_96.
+    """Reference trinucleotide counts over the 64 raw (un-folded) contexts;
+    reverse-complement folding happens in estimate_96.
 
-    -ft/--refTrinuc loads a table previously written by -ot/--outTrinuc
-    instead of rescanning .tn.h5; -ot/--outTrinuc writes the table used.
+    -ft/--refTrinuc loads a table written by -ot/--outTrinuc instead of
+    rescanning .tn.h5; -ot/--outTrinuc writes the table used.
     """
     _, num2trinuc = build_trinuc64_order()
     if getattr(args, "refTrinuc", None):
@@ -95,32 +94,26 @@ def _scan_ref_trinuc(args):
     return trinuc_count[0:64]
 
 
-# base2num convention shared with Index.py/funcs/call.py's nums2str
-# (A=0,T=1,C=2,G=3); anything outside 0-3 (N bases, contig edges) decodes
-# to "N", which simply never matches in classify_indel_channel's sequence
-# comparisons.
+# base2num convention (A=0,T=1,C=2,G=3); values outside 0-3 decode to "N",
+# which never matches in classify_indel_channel's sequence comparisons.
 _NUM2BASE = "ATCG"
 
 
 def _decode_ref_seq(int_arr):
-    """Decode a ref.h5 base2num-encoded integer array into an uppercase
-    base string, for classify_indel_channel (funcs/misc.py), which needs
-    actual sequence rather than pre-computed repeat annotation."""
+    """Decode a ref.h5 base2num-encoded array into an uppercase base string."""
     return "".join(_NUM2BASE[b] if 0 <= b <= 3 else "N" for b in int_arr)
 
 
-# Minimum reference flank fetched on each side of an indel to resolve its
-# ID83 channel (classify_indel_channel). The flank is widened to 6 event
-# lengths when that is longer, so the repeat-count scan always reaches the
-# capped 5+/6+ bins.
+# Minimum reference flank on each side of an indel for ID83 classification;
+# widened to 6 event lengths when longer, so the repeat-count scan always
+# reaches the capped 5+/6+ bins.
 INDEL_CONTEXT_WINDOW = 50
 
 
 def _indel83_record_label(ref_h5, rec):
-    """ID83 channel (internal label) of one indel VCF record, plus the
-    (indel_seq, ref_after, indel_len) it was resolved from. rec.pos
-    (1-based anchor) is the 0-based index of the base after the anchor, so
-    ref_before = [.., anchor] ends at rec.pos - 1."""
+    """ID83 label of one indel VCF record, plus the (indel_seq, ref_after,
+    indel_len) it was resolved from. rec.pos (1-based anchor) is the 0-based
+    index of the base after the anchor, so ref_before ends at rec.pos - 1."""
     indel_len = len(rec.alts[0]) - len(rec.ref)
     chrom_ref = ref_h5[rec.chrom]
     chrom_len = chrom_ref.shape[0]
@@ -140,17 +133,13 @@ def _indel83_record_label(ref_h5, rec):
 
 
 def calculate_ref_indel100(args):
-    """Genome-wide indel100 "opportunity" composition (unweighted position
-    counts, one contribution per eligible position per category — mirrors
-    indel100_reference_bucket_indices' overlap conventions), analogous to
-    calculate_ref_trinuc for SBS. Read directly from the
-    .hp.h5/.str.h5/.ref.h5 index files rather than the coverage bed, since
-    this is genome composition, not observed coverage.
+    """Genome-wide indel100 reference opportunity (unweighted position
+    counts per category, per indel100_reference_bucket_indices), the indel
+    analogue of calculate_ref_trinuc.
 
-    Reads hp.h5 and str.h5 raw (not through load_repeat_context's merged,
-    STR-priority view) so homopolymer and STR opportunity stay
-    independent — see indel100_reference_bucket_indices' docstring for
-    why a position can validly contribute to both.
+    hp.h5 and str.h5 are read raw (not via load_repeat_context's
+    STR-priority merge) so homopolymer and STR opportunity stay independent;
+    a position can validly contribute to both.
     """
     hp_h5 = h5py.File(args.reference + ".hp.h5", "r")
     str_h5 = h5py.File(args.reference + ".str.h5", "r")
@@ -171,12 +160,9 @@ def calculate_ref_indel100(args):
         str_unit_len_arr = str_h5[chrom][0, :]
         str_repeat_count_arr = str_h5[chrom][1, :]
         str_cut_arr = str_h5[chrom][2, :]
-        # ref.h5 is already uint8 on disk (base2num-encoded); no need to
-        # widen it just to compute a shifted copy.
         ref_base_arr = ref_h5[chrom][:]
-        # Reference base immediately following each position — the last
-        # position in the chromosome has no valid "next" base, hence -1
-        # (needs a signed dtype for that sentinel, unlike ref_base_arr).
+        # Next reference base per position; -1 sentinel for the last
+        # position (hence the signed dtype).
         next_ref_base_arr = np.empty(ref_base_arr.shape[0], dtype=np.int16)
         next_ref_base_arr[:-1] = ref_base_arr[1:]
         next_ref_base_arr[-1] = -1
@@ -195,50 +181,23 @@ def calculate_ref_indel100(args):
 def redistribute_indel_cov16_to_100(
     cov16_row, hp_run, str_unit_len, str_repeat_count, ref_base, label2num_100, out100
 ):
-    """Redistribute one locus's 16 coverage.bed.gz opportunity values
-    (INDEL_COVERAGE_CATEGORY_LABELS order, funcs/misc.py -- same column
-    order as funcs/call.py's cov_mat_indel) into their indel100
-    (build_indel100_labels) destination bin(s), using this locus's own
-    hp.h5/str.h5 annotation to pick which bin(s) apply -- the re-estimate-
-    from-bed path's way of reaching indel100 resolution without the by-
-    duplex-group indel100 file (never read by this region-restricted
-    path). Every one of coverage.bed.gz's 16 values is already gated
-    exactly the way funcs/call.py's cov_mat_indel/indel100 accumulation
-    gates it (antimask_indel-only for flat/hypothetical credit,
-    str_cut/hp_cut tract-start for real credit -- see cov_mat_indel and
-    funcs/misc.py's indel100_reference_bucket_indices), so redistributing
-    by this locus's own annotation, with no extra eligibility check here,
-    reproduces the same per-locus indel100 contribution the main pipeline
-    would have accumulated directly at this same position.
+    """Add one locus's 16 coverage.bed.gz indel opportunity values
+    (INDEL_COVERAGE_CATEGORY_LABELS order) into their indel100 bin(s),
+    chosen by this locus's own hp.h5/str.h5/ref.h5 annotation. The stored
+    values are already gated as in the main pipeline, so no eligibility
+    check is needed here. Used by the -rb/--reestimatebed path.
 
-    Column-by-column destination (0-indexed, matching
-    INDEL_COVERAGE_CATEGORY_LABELS/cov_mat_indel exactly):
-      0  del_unit  -> delSTR{unit}_rep{count} (unit/count read off this
-         locus's own str.h5; a harmless no-op wherever this isn't a real
-         STR tract start, since the value is already 0 there)
-      1  ins_unit  -> insSTR{unit}_rep{count}, PLUS insSTR{unit}_rep0 if
-         count==1 -- the same rep1/rep0 ambiguity hedge
-         indel100_reference_bucket_indices applies to real STR-insertion
-         credit
-      2-5  del_2/3/4/5+ -> BOTH delMH_len{2,3,4,5+} AND delSTR{2,3,4,5+}_
-         rep1: both are unconditional (antimask_indel-only), scan-free,
-         identical-value credits on the main-pipeline side now (see
-         indel100_reference_bucket_indices' "Deliberately NOT gated by
-         ~real_str" comment), so this one stored value validly backs
-         both destinations at once
-      6-9  ins_A/T/C/G -> 1bpins{A,T,C,G}, single destination, exact 1:1
-      10-13  ins_len2/3/4/5+ -> BOTH insSTR{2,3,4,5+}_rep0 AND _rep1 --
-         same unconditional dual-crediting as
-         indel100_reference_bucket_indices' own flat STR-insertion credit
-      14  del_hp -> del{base}_hp{length}, base = this locus's own
-         reference base, length = this locus's own hp.h5 run length
-      15  ins_hp -> ins{base}_hp{length} (length capped at 5+; indel100
-         has no ins_hp0 bin -- see override_inshp0_with_next_base_
-         opportunity)
+    Column -> destination:
+      0      del_unit       -> delSTR{unit}_rep{count}
+      1      ins_unit       -> insSTR{unit}_rep{count}, plus _rep0 if count==1
+      2-5    del_2..5+      -> both delMH_len{L} and delSTR{L}_rep1
+      6-9    ins_A/T/C/G    -> 1bpins{base}
+      10-13  ins_len2..5+   -> both insSTR{L}_rep0 and _rep1
+      14     del_hp         -> del{ref_base}_hp{run}
+      15     ins_hp         -> ins{ref_base}_hp{run} (capped 5+, no hp0 bin)
 
-    hp_run, str_unit_len, str_repeat_count, ref_base: this locus's own
-    hp.h5 row0 / str.h5 rows 0,1 / ref.h5 value (all plain ints).
-    Mutates out100 (100,) in place; returns nothing.
+    hp_run, str_unit_len, str_repeat_count, ref_base: plain ints from
+    hp.h5 row 0, str.h5 rows 0/1, ref.h5. Mutates out100 (100,) in place.
     """
     (
         del_unit,
@@ -272,9 +231,8 @@ def redistribute_indel_cov16_to_100(
     if str_repeat_count == 1:
         out100[label2num_100[f"insSTR{unit_label}_rep0"]] += ins_unit
 
-    # INDEL_STR_UNIT_BINS and INDEL_MH_DEL_LEN_BINS are the same
-    # ["2","3","4","5+"] list (unit size vs. deletion length happen to
-    # share bin edges) -- one zip covers both destinations.
+    # INDEL_STR_UNIT_BINS and INDEL_MH_DEL_LEN_BINS share the same
+    # ["2","3","4","5+"] bins, so one zip covers both destinations.
     for unit, v in zip(INDEL_STR_UNIT_BINS, (del2, del3, del4, del5p)):
         out100[label2num_100[f"delMH_len{unit}"]] += v
         out100[label2num_100[f"delSTR{unit}_rep1"]] += v
@@ -295,47 +253,19 @@ def redistribute_indel_cov16_to_100(
 
 
 def fay_feuer_confint(mut_counts, correction_ratio, cov, alpha=0.05):
-    """Fay-Feuer confidence interval (Fay & Feuer 1997) for a correction-
-    ratio-weighted ("corrected") mutation burden. A correction-ratio-
-    weighted sum of per-channel counts isn't itself Poisson-distributed
-    (channels are weighted unevenly), so a closed-form Poisson interval
-    isn't directly valid there -- but passing correction_ratio=1 (a scalar,
-    or an array of ones) recovers the *exact* classic Poisson/chi-square
-    interval as a special case (see the derivation below), so this one
-    function covers both the corrected burden's CI and the plain
-    "uncorrected"/unweighted one -- callers just pass mut_counts=k (the
-    total observed count, scalar or array) and correction_ratio=1.0.
+    """Fay-Feuer (1997) gamma CI for a correction-ratio-weighted burden.
 
-    Treats each channel's observed count as its own Poisson MLE (mean ==
-    variance == observed count), so the weighted sum Y = sum(w_i*count_i)
-    has mean y = sum(w_i*count_i) and variance v = sum(w_i^2*count_i); a
-    gamma(shape=y^2/v, scale=v/y) distribution matches those first two
-    moments -- the standard method behind age-standardized-rate CIs (e.g.
-    SEER*Stat), applied here with correction_ratio as the weights instead
-    of population-standardization weights. Fay & Feuer's upper-bound
-    correction (one hypothetical extra event in the largest-weight channel:
-    y* = y + w_max, v* = v + w_max^2) keeps the upper bound well-defined
-    and non-degenerate even at y == 0 -- unlike a Poisson(0)-based
-    parametric bootstrap, which is a point mass at 0 and can't produce a
-    nonzero upper bound there without ad hoc special-casing.
+    Each channel count is its own Poisson MLE, so Y = sum(w_i*count_i) has
+    mean y = sum(w*count) and variance v = sum(w^2*count); the bounds come
+    from gamma(shape=y^2/v, scale=v/y), with the upper bound using one extra
+    event in the largest-weight channel (y+w_max, v+w_max^2) so it stays
+    nonzero at y == 0. With all weights 1 this reduces exactly to the
+    classic chi-square Poisson interval, so callers pass (k, 1.0, cov) for
+    an unweighted burden.
 
-    With correction_ratio == 1 everywhere: y = v = k (all weights 1), so
-    the gamma(shape=y, scale=1) lower bound is exactly
-    chi2.ppf(alpha/2, 2k)/2 (a chi-square with 2k degrees of freedom is
-    2*Gamma(shape=k, scale=1)), and the upper bound (y*=v*=k+1) is exactly
-    chi2.ppf(1-alpha/2, 2*(k+1))/2 -- bit-for-bit the classic Clopper-
-    Pearson-style exact Poisson confidence interval, including its usual
-    k==0 convention (handled here by the y>0/y_star>0 guards below, since
-    gamma.ppf(alpha/2, a=0, ...) isn't well-defined).
-
-    mut_counts: (n_channels,) observed per-channel mutation counts, or a
-        scalar total count k (with correction_ratio=1.0) for a plain
-        (unweighted) Poisson-equivalent interval.
-    correction_ratio: (n_channels,) fixed per-channel correction ratio (the
-        weights), or the scalar 1.0 for an unweighted burden.
-    cov: scalar coverage denominator (same one the point estimate divides
-        by), e.g. trinuc_cov.sum()/3 for SBS, indel_cov.sum() for indel --
-        the returned bounds are pre-divided by it.
+    mut_counts: (n_channels,) counts, or a scalar total k.
+    correction_ratio: (n_channels,) weights, or scalar 1.0.
+    cov: coverage denominator of the point estimate; bounds are divided by it.
     """
     if cov <= 0:
         return float("nan"), float("nan")
@@ -359,8 +289,7 @@ def fay_feuer_confint(mut_counts, correction_ratio, cov, alpha=0.05):
 
 
 def _dinuc_num(dinuc):
-    """Encode a 2-base string as an int 0-15: 4*base2num[dinuc[0]] +
-    base2num[dinuc[1]] (A=0,T=1,C=2,G=3, same convention as ref.h5)."""
+    """Encode a 2-base string as 4*base2num[b0] + base2num[b1] (A=0,T=1,C=2,G=3)."""
     b2n = {"A": 0, "T": 1, "C": 2, "G": 3}
     return 4 * b2n[dinuc[0]] + b2n[dinuc[1]]
 
@@ -369,21 +298,14 @@ def _dinuc_revcomp(dinuc):
     return _REVCOMP[dinuc[1]] + _REVCOMP[dinuc[0]]
 
 
-# The 10 canonical DBS78 reference dinucleotides. Not derivable from a
-# simple rule (e.g. NOT "alphabetically smaller of {ref, RC(ref)}" — the
-# AA/TT pair's representative is "TT", not "AA") — this is a fixed,
-# external convention (COSMIC/SigProfiler), extracted from
-# SigProfilerPlotting's plotDBS (sigProfilerPlotting.py:10444-10455,
-# LabelEncoder over these 10 strings, already alphabetically sorted) so
-# our labels line up with the same palette plot_dbs78 uses.
+# The 10 canonical DBS78 reference dinucleotides: a fixed COSMIC/
+# SigProfiler convention, not derivable from a simple rule (e.g. the AA/TT
+# pair's representative is "TT").
 DBS_CANONICAL_REFS = ["AC", "AT", "CC", "CG", "CT", "GC", "TA", "TC", "TG", "TT"]
 
 
 def _build_dbs_raw_to_canonical_ref():
-    """All 16 raw dinucleotides -> their canonical-ref representative.
-    The 6 non-canonical raw refs are each some canonical ref's reverse
-    complement; derived here rather than hardcoded so it can't drift out
-    of sync with DBS_CANONICAL_REFS."""
+    """All 16 raw dinucleotides -> their canonical-ref representative."""
     mapping = {}
     for ref in DBS_CANONICAL_REFS:
         mapping[ref] = ref
@@ -394,17 +316,10 @@ def _build_dbs_raw_to_canonical_ref():
 
 DBS_RAW_TO_CANONICAL_REF = _build_dbs_raw_to_canonical_ref()
 
-# For each self-complementary ref (AT, TA, CG, GC — see build_dbs78_labels'
-# docstring), which 6 of its 9 raw alts are the canonical-direction
-# representative. Not derivable from a simple rule (e.g. not "the
-# alphabetically smaller of {alt, RC(alt)}" — for AT, "CA" is kept over its
-# partner "TG" despite "CA" > "TG"... sorted the other way for other pairs
-# too), so this is taken verbatim from SigProfilerPlotting's plotDBS
-# (sigProfilerPlotting.py:10330-10409, the `dinucs` literal), which is
-# itself just the fixed COSMIC DBS78 reference catalog — matching it
-# exactly (rather than picking an internally-consistent but arbitrary
-# direction) is what makes our DBS78 channel labels interoperable with
-# COSMIC/SigProfiler DBS signature references.
+# For each self-complementary ref (AT, TA, CG, GC), the 6 of its 9 raw alts
+# that are the canonical representatives. Taken verbatim from the COSMIC
+# DBS78 catalog (as used by SigProfilerPlotting); there is no simple rule,
+# and matching it keeps our labels interoperable with COSMIC signatures.
 _DBS78_SELFCOMP_CANONICAL_ALTS = {
     "AT": ["CA", "CC", "CG", "GA", "GC", "TA"],
     "TA": ["AT", "CG", "CT", "GC", "GG", "GT"],
@@ -414,43 +329,23 @@ _DBS78_SELFCOMP_CANONICAL_ALTS = {
 
 
 def build_dbs78_labels():
-    """78 canonical DBS labels "REF>ALT", deterministic order, plus the
-    raw-alt -> canonical-alt map needed to fold observed/raw events onto
-    them.
+    """78 canonical DBS labels "REF>ALT" (deterministic order), plus the
+    (canonical_ref, raw_alt) -> canonical_alt map.
 
-    Why 78 and not 10*9=90: dinucleotide contexts (unlike trinucleotide
-    ones) can be their OWN reverse complement — AT, TA, CG, and GC each
-    satisfy RC(ref)==ref (e.g. RC("AT") = comp("T")+comp("A") = "A"+"T" =
-    "AT"). This is impossible for odd-length contexts like trinucleotides
-    (the middle base would have to equal its own complement, and no base
-    does), so it doesn't show up anywhere in the SBS96/ID83 folding logic
-    above — DBS is the first place this matters. For those 4
-    "self-complementary" refs, the ref doesn't change identity under
-    reverse-complementing, but its 9 alts still pair up among
-    THEMSELVES: e.g. for ref="AT", observing alt="CA" and observing
-    alt="TG" are the same physical event viewed from opposite strands
-    (RC("AT","CA") = ("AT","TG")), so they must be folded into one
-    channel. Working this out per self-complementary ref leaves 6 distinct
-    alt channels (3 self-complementary alts that don't pair with anything
-    + 3 merged pairs), not 9 — 4 refs * 6 + 6 refs * 9 = 24 + 54 = 78,
-    matching the standard COSMIC DBS78 scheme. Which member of each merged
-    pair is the "canonical" direction is an external convention with no
-    derivable rule, taken from _DBS78_SELFCOMP_CANONICAL_ALTS.
+    78 rather than 10*9: AT, TA, CG and GC are their own reverse complement,
+    so their 9 alts pair up among themselves (e.g. AT>CA == AT>TG viewed
+    from the other strand), leaving 3 self-inverse + 3 merged = 6 channels
+    each: 4*6 + 6*9 = 78 (COSMIC DBS78).
     """
     label2num = {}
     labels = []
-    # (canonical_ref, raw_alt) -> canonical_alt, for every raw alt of
-    # every canonical ref — used by dbs_raw_event_to_label below.
     alt_canonical = {}
 
     for ref in DBS_CANONICAL_REFS:
         alts = _dbs_alt_choices(ref)
         if _dinuc_revcomp(ref) == ref:
-            # Self-complementary ref: each alt is either already one of
-            # the 6 official canonical alts, or its RC is (exactly one of
-            # the two always holds, since the 3 self-inverse alts are
-            # trivially canonical and the remaining 6 form 3 RC-pairs with
-            # exactly one representative each in the official set).
+            # Self-complementary ref: exactly one of alt / RC(alt) is in
+            # the canonical set.
             canonical_alts = _DBS78_SELFCOMP_CANONICAL_ALTS[ref]
             canonical_set = set(canonical_alts)
             for alt in alts:
@@ -479,11 +374,8 @@ DBS78_LABEL2NUM, DBS78_LABELS, _DBS78_ALT_CANONICAL = build_dbs78_labels()
 
 
 def dbs_raw_event_to_label(raw_ref, raw_alt):
-    """Fold one observed (raw_ref, raw_alt) dinucleotide substitution —
-    as actually read off the reference/alt strand, no canonicalization
-    applied yet — onto its DBS78 channel label. Mirrors how SBS defers
-    reverse-complement folding to estimation time (combine_raw192_to_sbs96)
-    rather than canonicalizing at call time."""
+    """Fold one raw (reference-strand) dinucleotide substitution onto its
+    DBS78 label."""
     canonical_ref = DBS_RAW_TO_CANONICAL_REF[raw_ref]
     eff_alt = raw_alt if canonical_ref == raw_ref else _dinuc_revcomp(raw_alt)
     canonical_alt = _DBS78_ALT_CANONICAL[(canonical_ref, eff_alt)]
@@ -494,15 +386,10 @@ DBS_RAW144_LABEL2NUM, DBS_RAW144_LABELS = build_dbs_raw144_labels()
 
 
 def combine_raw_dbs_to_dbs78(values_144, label2num_144):
-    """Fold a raw-144-space DBS array down to the 78 canonical DBS78
-    classes, by summing each canonical class with whatever raw (ref,alt)
-    combination(s) map onto it via dbs_raw_event_to_label — unlike SBS96's
-    uniform 2-raw-classes-per-canonical-class fold, this varies (2 for the
-    54 channels belonging to non-self-complementary refs, but the 24
-    channels belonging to the 4 self-complementary refs can fold from
-    either a same-ref alt-pair or a different-ref mirror pair depending on
-    the raw event), so this looks up the mapping per raw label rather than
-    assuming a fixed pairing.
+    """Fold a raw-144 DBS array to the 78 DBS78 classes, summing each raw
+    (ref,alt) row into dbs_raw_event_to_label's class. The number of raw
+    rows per class varies (self-complementary refs), hence the per-label
+    lookup.
 
     values_144   : array shaped (144,) or (144, n_groups).
     label2num_144: {"{ref}>{alt}": row_index} for values_144's rows.
@@ -518,16 +405,9 @@ def combine_raw_dbs_to_dbs78(values_144, label2num_144):
 
 
 def calculate_ref_dbs(args):
-    """Genome-wide reference dinucleotide composition, raw (un-folded, 16
-    contexts) resolution — analogous to calculate_ref_trinuc for SBS.
-    Folding to the 78 canonical DBS78 channels is deferred to estimation
-    time (_dbs78_ref_weighted below), mirroring how calculate_ref_trinuc's
-    64 raw contexts only get folded to 32 inside estimate_96.
-
-    Derived on the fly from ref.h5 by pairing each position with its
-    successor (same trick as calculate_ref_indel100's next_ref_base_arr)
-    — there's no separate dinuc.h5 index file, since this is cheap enough
-    to compute per chromosome at estimate time.
+    """Genome-wide reference dinucleotide counts (16 raw contexts), computed
+    from ref.h5 by pairing each position with its successor. Folding to
+    DBS78 happens in _dbs78_ref_weighted.
     """
     ref_h5 = h5py.File(args.reference + ".ref.h5", "r")
     dinuc_count = np.zeros(16)
@@ -546,9 +426,7 @@ def calculate_ref_dbs(args):
             continue
         base1 = ref_base_arr[:-1]
         base2 = ref_base_arr[1:]
-        # Exclude any pair touching an N/out-of-range base (base2num
-        # encodes those as 4) — same convention as calculate_ref_indel100's
-        # ref_base_safe and indel100_reference_bucket_indices.
+        # Exclude any pair touching an N/out-of-range base (encoded as 4).
         valid = (base1 <= 3) & (base2 <= 3)
         dinuc_idx = 4 * base1[valid] + base2[valid]
         dinuc_count += np.bincount(dinuc_idx, minlength=16)
@@ -556,44 +434,14 @@ def calculate_ref_dbs(args):
 
 
 def calculate_dbs_opportunity(coverage_bed_path, ref_h5, regions):
-    """Genome-wide observed DBS78 opportunity (raw-144 resolution — fold
-    with combine_raw_dbs_to_dbs78 for the 78 canonical channels), derived
-    from the existing per-locus SBS coverage bed.
+    """Raw-144 DBS opportunity approximated from the per-locus SBS coverage
+    bed. Not used by do_estimate (which reads _dbs_by_duplex_group.txt);
+    kept as a standalone cross-check.
 
-    NOT called by do_estimate's main path anymore — it now sums
-    _dbs_by_duplex_group.txt instead (call.py's _compute_dbs_opportunity),
-    which gives true per-duplex-group resolution instead of this
-    function's single-base-independence approximation, and enables the
-    group-size-stratified DBS burden breakdown (estimate_dbs78_by_group).
-    Kept here as a working, self-contained alternative (needs no call.py
-    output beyond the coverage bed) in case it's useful for
-    cross-checking or a bed file predating _dbs_by_duplex_group.txt.
-
-    For every pair of directly ADJACENT covered positions (start,
-    start+1) with a valid A/T/C/G reference base at both, and for each of
-    the 9 possible simultaneous-both-positions alt combinations,
-    opportunity is approximated as coverage(alt1 at position 1) *
-    coverage(alt2 at position 2) — treating the two positions' single-base
-    calling processes as independent. This is a simplifying approximation
-    (adjacent positions' error/damage processes aren't always
-    independent — correlated adjacent damage, e.g. UV-induced CC>TT, is
-    part of what a real DBS signature captures), but it's the standard
-    way to approximate DBS opportunity from per-base coverage alone, and
-    it automatically inherits every mask (SNP/noise/coverage/mapq/trim)
-    already baked into the SBS coverage bed's columns.
-
-    For every pair of directly ADJACENT covered positions (start,
-    start+1) with a valid A/T/C/G reference base at both, and for each of
-    the 9 possible simultaneous-both-positions alt combinations,
-    opportunity is approximated as coverage(alt1 at position 1) *
-    coverage(alt2 at position 2) — treating the two positions' single-base
-    calling processes as independent. This is a simplifying approximation
-    (adjacent positions' error/damage processes aren't always
-    independent — correlated adjacent damage, e.g. UV-induced CC>TT, is
-    part of what a real DBS signature captures), but it's the standard
-    way to approximate DBS opportunity from per-base coverage alone, and
-    it automatically inherits every mask (SNP/noise/coverage/mapq/trim)
-    already baked into the SBS coverage bed's columns.
+    For each adjacent covered pair (start, start+1) with A/T/C/G reference
+    at both, opportunity for alt pair (b1, b2) is cov(b1 at pos1) *
+    cov(b2 at pos2), i.e. assumes the two positions are independent. Masks
+    baked into the coverage bed are inherited.
 
     coverage_bed_path: path to {sample}_coverage.bed.gz.
     ref_h5: open h5py.File for {reference}.ref.h5.
@@ -641,11 +489,8 @@ def calculate_dbs_opportunity(coverage_bed_path, ref_h5, regions):
         cov1 = covs[:-1][adjacent]  # (k, 4)
         cov2 = covs[1:][adjacent]  # (k, 4)
 
-        # 4x4 reference-base combos (N/out-of-range ref bases encode as 4,
-        # so they're automatically excluded — ref1_num/ref2_num only ever
-        # range 0-3 here) x their 9 non-ref alt combos each: every
-        # combination is a vectorized sum over the whole chromosome's
-        # adjacent-pair arrays, not a per-position Python loop.
+        # 4x4 ref combos (N, encoded as 4, never matches) x 9 alt combos,
+        # each vectorized over all adjacent pairs on the chromosome.
         for ref1_num in range(4):
             m1 = ref1 == ref1_num
             if not np.any(m1):
@@ -674,23 +519,14 @@ _INDEL_HP_BASE_POOLS = (("CG", ("C", "G")), ("AT", ("A", "T")))
 
 
 def build_indel76_labels():
-    """74 canonical (strand-symmetry-folded) indel classification labels,
-    the estimation-time counterpart of build_indel100_labels (misc.py),
-    mirroring how SBS folds 192 raw classes to 96 via combine_raw192_to_sbs96.
-    (Name kept as "indel76" despite the actual count, same historical
-    convention as "indel100"/"indel83" — see build_indel100_labels.)
+    """74 strand-folded indel labels (the name "indel76" is historical),
+    the folded counterpart of build_indel100_labels.
 
-    A homopolymer run of Cs on the reference strand is the same physical
-    locus as a run of Gs read from the complementary strand, so
-    delC_hp{n}/delG_hp{n} are one mutational process, not two — same logic
-    pairs A with T. Homopolymer deletion and insertion are pooled this way
-    (4 bases x N length bins -> 2 pooled bases x N length bins, for each of
-    del/ins — deletion has 6 length bins, insertion only 5: no "0"/rep0 bin
-    here, see INDEL100_INS_HP_LEN_BINS). STR deletion/insertion (unit size
-    has no base identity to pool) and microhomology deletion pass through
-    unchanged.
-    6+6 (del CG/AT) + 5+5 (ins CG/AT) + 24 (STR del) + 24 (STR ins) + 4 (MH)
-    = 74. Deterministic order, must not be built independently elsewhere.
+    Homopolymer channels pool C+G and A+T (a C run on one strand is a G run
+    on the other); STR and microhomology channels pass through. Insertion
+    hp has no rep0 bin (INDEL100_INS_HP_LEN_BINS).
+    6+6 (del hp) + 5+5 (ins hp) + 24 (STR del) + 24 (STR ins) + 4 (MH) = 74.
+    Deterministic order; must not be built independently elsewhere.
     """
     labels = []
     label2num = {}
@@ -718,13 +554,8 @@ def build_indel76_labels():
 
 
 def combine_indel100_to_indel76(values_100, label2num_100):
-    """Fold the 100 raw indel classes (build_indel100_labels) into the 74
-    canonical indel76 classes (build_indel76_labels above), by summing the
-    strand-symmetric homopolymer base pairs (C+G, A+T) for deletion and
-    insertion; STR and microhomology classes pass through unchanged. This
-    is the single point where base-pooling happens, deferred to estimation
-    time rather than folded at raw accumulation time — mirrors
-    combine_raw192_to_sbs96 for SBS.
+    """Fold the 100 raw indel classes into the 74 indel76 classes by
+    summing homopolymer C+G / A+T pairs; STR and MH pass through.
 
     values_100    : array shaped (100,) or (100, n_groups).
     label2num_100 : {"label": row_index} for values_100's rows, as written
@@ -762,17 +593,10 @@ def combine_indel100_to_indel76(values_100, label2num_100):
 
 
 def _safe_correction_ratio(ref_counts, obs_counts):
-    """(ref_counts/ref_counts.sum()) / (obs_counts/obs_counts.sum()), i.e.
-    how much to scale up each class's mutation count to correct for that
-    class being under/over-represented in observed coverage relative to
-    the reference genome — but any class with zero observed coverage gets
-    ratio 0 instead of Inf/NaN. There's no data to correct for an
-    unobserved class, and its mutation count is necessarily 0 too (you
-    can't observe a mutation with no coverage), so 0 * 0 = 0 correctly
-    contributes nothing to a corrected-burden sum — whereas the unguarded
-    division produces Inf there, and Inf * 0 is NaN under IEEE754, which
-    poisons the whole sum for a single unobserved class. If the whole
-    stratum has zero observed coverage, every class gets ratio 0."""
+    """Per-class (ref fraction) / (observed coverage fraction). Classes with
+    zero observed coverage get 0 rather than Inf, since Inf * 0 mutations
+    would be NaN and poison the corrected-burden sum; an all-zero stratum
+    gets all zeros."""
     obs_sum = obs_counts.sum()
     if obs_sum <= 0:
         return np.zeros_like(obs_counts, dtype=float)
@@ -785,25 +609,21 @@ def _safe_correction_ratio(ref_counts, obs_counts):
 def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
     """Estimate SBS96 mutation rates with per-class correction ratios.
 
-    trinuc_cov_96_by_rf : (96, n_groups) — per-SBS96-class L-weighted
-        coverage, already combined from the 192 raw (un-folded) classes via
-        combine_raw192_to_sbs96.
-    trinuc_mut_by_rf : (96, n_groups) — observed mutation counts per SBS96 class.
-    ref_trinuc_64    : (64,) — trinucleotide counts in the reference genome,
-        raw (un-folded) resolution; folded to the 32 canonical contexts here
-        via the i/i+32 reverse-complement pairing.
+    trinuc_cov_96_by_rf : (96, n_groups) L-weighted coverage per SBS96 class.
+    trinuc_mut_by_rf : (96, n_groups) observed mutation counts per SBS96 class.
+    ref_trinuc_64    : (64,) raw reference trinucleotide counts; folded to 32
+        contexts here via the i/i+32 reverse-complement pairing.
 
-    Returns burden curves both cumulative ("at least this group size",
-    nmin>=1..5, the original behavior) and exact ("at exactly this group
-    size", nmin==1..4 plus a pooled nmin>=5 bin) -- see the _exact-suffixed
-    return values.
+    Returns burden curves both cumulative (nmin >= 1..5) and exact
+    (nmin == 1..4, plus pooled nmin >= 5; the _exact return values), where
+    nmin = min(F1R2, F2R1) of the duplex group.
     """
     print("........Estimating mutation rate for each trinucleotide context.......")
     ref_trinuc_32 = ref_trinuc_64[:32] + ref_trinuc_64[32:64]
 
     ref_trinuc_96 = np.repeat(
         ref_trinuc_32, 3
-    )  # (96,) — same ref count for 3 alts of each trinuc
+    )  # (96,) same ref count for the 3 alts of each trinuc
 
     n1 = np.array([int(_.split("+")[0]) for _ in n])
     n2 = np.array([int(_.split("+")[1]) for _ in n])
@@ -821,7 +641,7 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
     trinuc_mut = trinuc_mut_by_rf[:, nmin >= 5].sum(axis=1)  # (96,)
     trinuc_cov = trinuc_cov_96_by_rf[:, nmin >= 5].sum(
         axis=1
-    )  # (96,) — alt-base-specific
+    )  # (96,) alt-base-specific
     mutnum = trinuc_mut.sum()
     cov = trinuc_cov.sum() / 3  # divide by 3 to get per-locus-equivalent coverage
     burden_uncorrected[4] = mutnum / cov if cov > 0 else 0.0
@@ -829,7 +649,6 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
         mutnum, 1.0, cov
     )
     trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov)
-    # Alt-base-specific correction: each of the 96 classes gets its own ratio
     correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov)
     mutnum_corrected = correction_ratio * trinuc_mut
     burden_corrected[4] = mutnum_corrected.sum() / cov if cov > 0 else 0.0
@@ -860,12 +679,8 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
         ) = fay_feuer_confint(trinuc_mut, correction_ratio, cov)
         hap_trinuc[:, nn - 1] = trinuc_rate * ref_trinuc_96
 
-    # Exact (non-cumulative) group-size bins: nmin==1,2,3,4, and nmin>=5 for
-    # the last bin (5+ groups are pooled, same as the cumulative curve's
-    # bottom bin) -- "burden AT this exact group size" rather than the
-    # cumulative curve's "burden at LEAST this group size" above. Each bin
-    # is independent (no running total carried across bins), unlike the
-    # cumulative loop.
+    # Exact (non-cumulative) group-size bins: nmin == 1..4, plus pooled
+    # nmin >= 5; each bin is computed independently.
     burden_uncorrected_exact = np.zeros(5)
     burden_uncorrected_exact_lb = np.zeros(5)
     burden_uncorrected_exact_ub = np.zeros(5)
@@ -895,17 +710,11 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
             burden_corrected_exact_ub[nn - 1],
         ) = fay_feuer_confint(trinuc_mut_e, correction_ratio_e, cov_e)
 
-    # A channel with zero observed coverage already gets correction_ratio 0
-    # (_safe_correction_ratio) -- this guard keeps mutnum consistent with
-    # that in the same (now-rare, since coverage no longer excludes mutant
-    # loci) case, e.g. a mask/region change made a channel's only-ever-
-    # covered locus retroactively uncovered. Force it to 0 too, so
-    # "mutation_number_uncorrected" never shows a mutation count with no
-    # observed genome behind it.
-    # 0 (not 0.0): trinuc_mut is int-dtype (mutation counts); np.where with
-    # a float fill would upcast the whole array, breaking downstream
-    # consumers (e.g. Summarize.py's int() parse of "Uncorrected mutation
-    # number") that expect an integer-formatted total.
+    # Zero the count of any channel with zero coverage (its correction_ratio
+    # is already 0), so mutation_number_uncorrected never reports mutations
+    # without coverage. Fill with int 0, not 0.0: a float fill would upcast
+    # the int array and break consumers that parse an integer total (e.g.
+    # Summarize.py's "Uncorrected mutation number").
     trinuc_mut = np.where(trinuc_cov > 0, trinuc_mut, 0)
 
     return (
@@ -932,21 +741,15 @@ def estimate_96(trinuc_cov_96_by_rf, trinuc_mut_by_rf, ref_trinuc_64, n):
     )
 
 
-# Number of microhomology-length sub-channels folded under each deletion-
-# length group ("2","3","4","5+") in the 83-channel ID83 scheme: a length-2
-# deletion can only have mh_len==1 (mh_len<del_len by definition of "not a
-# repeat-unit deletion"), length-3 gives {1,2}, length-4 gives {1,2,3}, and
-# the "5+" group (true del_len>=5) gives {1,2,3,4,5+} — 1+2+3+5=11 channels.
+# Microhomology-length sub-channels per ID83 deletion-length group
+# ("2","3","4","5+"): mh_len < del_len, so {1}, {1,2}, {1,2,3},
+# {1,2,3,4,5+} -> 11 channels.
 INDEL83_MH_GROUP_SIZES = [1, 2, 3, 5]
 
 
 def build_indel83_labels():
-    """83-channel ID83-style indel classification — the estimation-time
-    counterpart of funcs/misc.py's classify_indel_channel (which resolves a
-    single observed call to one of these exact label strings), and the
-    successor to build_indel76_labels above now that classification is
-    sequence-based rather than repeat-annotation-based. Matches the
-    standard COSMIC ID83 scheme:
+    """83-channel COSMIC ID83 labels (internal syntax), the label set
+    classify_indel_channel resolves calls to:
       Cdelhp1-6+, Tdelhp1-6+ (6+6): homopolymer deletion, base pooled
         C+G->C / A+T->T, by existing homopolymer length.
       Cinshp0-5+, Tinshp0-5+ (6+6): homopolymer insertion, same pooling,
@@ -990,14 +793,10 @@ def build_indel83_labels():
 
 
 def build_indel83_sigprofiler_labels():
-    """Map build_indel83_labels' label strings (our internal ID83 syntax,
-    e.g. "Cdelhp1", "2delstr3", "5+delMH2") onto SigProfilerPlotting's
-    COSMIC-standard ID83 label strings (e.g. "1:Del:C:0", "2:Del:R:2",
-    "5:Del:M:2") — confirmed identical grouping/order against
-    site-packages/sigProfilerPlotting/reference_formats/ID83.txt, so this
-    mirrors build_indel83_labels' own loop structure (same base/unit-size
-    groups, same length/repeat-count bin order) rather than hardcoding an
-    83-entry lookup table that could silently drift out of sync with it.
+    """Map internal ID83 labels (e.g. "Cdelhp1", "2delstr3") to
+    SigProfilerPlotting's labels (e.g. "1:Del:C:0", "2:Del:R:2"); same
+    channel order. Mirrors build_indel83_labels' loops rather than
+    hardcoding a table.
 
     Returns {our_label: sigprofiler_label}, 83 entries.
     """
@@ -1029,25 +828,13 @@ INDEL83_TO_SIGPROFILER_LABELS = build_indel83_sigprofiler_labels()
 
 
 def expand_indel76_to_indel83(values_76):
-    """Fold the 74-canonical-class indel vector (combine_indel100_to_indel76)
-    into the 83-channel ID83 scheme, by replicating each of the 4
-    unstratified delMH_len{2,3,4,5+} values across its 1/2/3/5
-    microhomology-length sub-channels. The coverage side (_indel_by_
-    duplex_group.txt, still written by the old hp.h5-annotation-based
-    call.py) has no finer-than-deletion-length resolution for
-    microhomology — only the observed-mutation side gets true per-mh-
-    length resolution now, via classify_indel_channel — so every
-    sub-channel in a group shares its parent's coverage value verbatim.
+    """Expand a 74-class indel76 array to the ID83 layout.
 
-    Del-hp (12), STR del (24) and STR ins (24) are identical between the
-    two schemes and pass through unchanged. Ins-hp is not: indel76 has no
-    "0"/rep0 bin at all (INDEL100_INS_HP_LEN_BINS excludes it — that
-    opportunity is always thrown away and replaced anyway, see
-    override_inshp0_with_next_base_opportunity below), so ID83's two hp0
-    slots (Cinshp0 index 12, Tinshp0 index 18) are left at 0 here; the
-    caller must run override_inshp0_with_next_base_opportunity afterward
-    to fill them. The remaining 10 ins-hp values slot into ID83's other 10
-    ins-hp positions around those two gaps.
+    Coverage has no microhomology-length resolution, so each
+    delMH_len{2,3,4,5+} value is replicated across its 1/2/3/5 MH
+    sub-channels. Del-hp, STR del and STR ins pass through. indel76 has no
+    ins-hp rep0 bin, so Cinshp0 (12) and Tinshp0 (18) are left at 0; the
+    caller must fill them with override_inshp0_with_next_base_opportunity.
 
     values_76: array shaped (74,) or (74, n_groups).
     Returns an array shaped (83,) or (83, n_groups), with indices 12 and
@@ -1068,30 +855,14 @@ def expand_indel76_to_indel83(values_76):
 
 
 def override_inshp0_with_next_base_opportunity(values_83, values_100):
-    """Fill the ID83 Cinshp0/Tinshp0 entries (indices 12 and 18) — left at
-    0 by expand_indel76_to_indel83, since indel76/indel100 carry no hp0
-    bin at all — with a computation based purely on the reference's own
-    next-base identity: funcs/misc.py's 1bpins{base} columns, indices
-    96-99 of the raw 100-class scheme (build_indel100_labels), rather than
-    hp.h5 repeat annotation. rep0 for inserting base N requires only that
-    the following reference base differs from N; it has nothing to do with
-    what's actually at the insertion site itself (unlike every other
-    ID83 channel, which does depend on the local repeat context).
+    """Fill ID83 Cinshp0/Tinshp0 (indices 12/18) from the raw indel100
+    1bpins{A,T,C,G} columns (96-99), pooled C+G / A+T. A rep0 insertion of
+    base b only needs the next reference base to differ from b, which is
+    exactly what those columns count (for both reference composition and
+    coverage).
 
-    Column 96+b (b=A/T/C/G, base2num order) is already exactly "the
-    opportunity to insert base b with rep0" at both resolutions: unweighted
-    position counts for ref_indel100 (indel100_reference_bucket_indices),
-    and L-table power using base b itself (not the position's own
-    reference base) for indel100_by_rf_np (funcs/call.py's per-family
-    accumulation, cols 6-9 of cov_mat_indel). So no further transformation
-    is needed here beyond the usual C+G / A+T pooling every other ID83
-    homopolymer channel already gets.
-
-    values_83  : (83,) or (83, n_groups) ID83-resolution array (ref
-        composition or coverage), indices 12/18 still 0 from
-        expand_indel76_to_indel83 — not modified in place.
-    values_100 : (100,) or (100, n_groups) raw array at the same
-        resolution as indel100_by_rf_np/ref_indel100.
+    values_83  : (83,) or (83, n_groups); not modified in place.
+    values_100 : (100,) or (100, n_groups) raw array at the same resolution.
     Returns a new array shaped like values_83.
     """
     out = values_83.copy()
@@ -1110,21 +881,10 @@ def _indel83_mh_group_slices():
 
 
 def _grouped_indel83_correction_ratio(ref_frac, obs_frac):
-    """Per-channel correction ratio (ref_frac/obs_frac) for the first 72
-    ID83 channels, but computed per deletion-length GROUP — not per
-    individual microhomology-length sub-channel — for the last 11: the 4
-    delMH groups (channels 72-82) each share one ratio across their
-    sub-channels. This mirrors the coverage side's actual resolution
-    (expand_indel76_to_indel83 replicates one value per group already) and
-    is also just correct statistics — computing a separate ratio per
-    individual mh sub-channel would split already-thin counts even
-    further for no benefit, since the coverage data can't distinguish them
-    anyway.
-
-    Channels (individual or grouped) with zero observed fraction get
-    ratio 0 instead of Inf/NaN — see _safe_correction_ratio's docstring
-    for why that's the correct fallback rather than letting 0/0 or
-    nonzero/0 propagate into the corrected-burden sum.
+    """ID83 correction ratio ref_frac/obs_frac: per channel for 0-71, but
+    one shared ratio per delMH deletion-length group for 72-82, matching
+    the coverage resolution. Zero observed fraction gives ratio 0 (see
+    _safe_correction_ratio).
     """
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(obs_frac > 0, ref_frac / obs_frac, 0.0)
@@ -1135,11 +895,9 @@ def _grouped_indel83_correction_ratio(ref_frac, obs_frac):
 
 
 def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
-    """ID83-resolution counterpart of estimate_indel76 above: identical
-    read-depth-stratified (nmin) burden/correction machinery, except the
-    correction ratio for the 11 microhomology channels (72-82) is grouped
-    per deletion length rather than computed per individual channel — see
-    _grouped_indel83_correction_ratio.
+    """ID83 counterpart of estimate_96 (same cumulative/exact nmin curves),
+    using _grouped_indel83_correction_ratio. Coverage is per opportunity
+    channel, not per locus; callers rescale by indel_locus_multiplier.
     """
     print("........Estimating mutation rate for each indel context (ID83).......")
     ref_frac = ref_indel83 / ref_indel83.sum()
@@ -1201,10 +959,7 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
         ) = fay_feuer_confint(indel_mut, correction_ratio, cov)
         hap_indel83[:, nn - 1] = indel_rate * ref_indel83
 
-    # Exact (non-cumulative) group-size bins -- see estimate_96's matching
-    # block for the cumulative-vs-exact distinction; identical structure,
-    # just using this function's own grouped microhomology correction
-    # ratio instead of the per-channel one.
+    # Exact (non-cumulative) group-size bins, as in estimate_96.
     burden_uncorrected_exact = np.zeros(5)
     burden_uncorrected_exact_lb = np.zeros(5)
     burden_uncorrected_exact_ub = np.zeros(5)
@@ -1236,11 +991,8 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
             burden_corrected_exact_ub[nn - 1],
         ) = fay_feuer_confint(indel_mut_e, correction_ratio_e, cov_e)
 
-    # See estimate_96's matching comment: a channel with zero observed
-    # coverage already gets correction_ratio 0, but its raw mutnum can
-    # still be nonzero (e.g. a mask/region change made its only-ever-
-    # covered locus retroactively uncovered) -- force it to 0 too.
-    # 0, not 0.0 -- see estimate_96's matching comment (preserve int dtype).
+    # Zero counts in zero-coverage channels; int fill keeps int dtype
+    # (see estimate_96).
     indel_mut = np.where(indel_cov > 0, indel_mut, 0)
 
     return (
@@ -1268,44 +1020,16 @@ def estimate_indel83(indel83_cov_by_rf, indel83_mut_by_rf, ref_indel83, n):
 
 
 def _dbs78_ref_weighted(dinuc_count_16):
-    """Genome-wide reference-composition opportunity for each of the 78
-    canonical DBS78 channels.
+    """Reference opportunity for the 78 DBS78 channels.
 
-    A flat per-ref broadcast (repeating one ref-level count across every
-    alt-channel of that ref) is correct for the 6 non-self-complementary
-    refs: every one of their 9 canonical alt channels receives
-    contributions from exactly 2 raw (ref,alt) combinations (one from the
-    ref's own reading, one from its distinct RC-partner ref's reading) —
-    uniform, so a flat broadcast matches. It is NOT correct for the 4
-    self-complementary refs (AT, TA, CG, GC — see build_dbs78_labels): a
-    single locus's own 9 possible alts do not map uniformly onto that
-    ref's 6 canonical channels there. 3 alts are self-inverse
-    (RC(alt)==alt) and fold 1:1 onto their own channel, while the other 6
-    pair up under reverse-complementing into 3 merged channels, each
-    receiving 2 of the ref's own 9 alts. This weighting must match
-    dbs_opp_78/dbs_mut_78 (which inherit this same 2x/1x split via
-    combine_raw_dbs_to_dbs78), or correction_ratio picks up a spurious
-    ~2x split confined to exactly these 4 ref groups.
+    Each raw ref's genome count is credited to all 9 of its raw alts, then
+    folded with combine_raw_dbs_to_dbs78, the same fold used for observed
+    opportunity and mutations. A flat per-ref broadcast would be wrong for
+    the self-complementary refs, whose merged channels receive 2 raw alts
+    but self-inverse ones only 1, and would skew correction_ratio ~2x
+    there. No /9 normalization: it would cancel in ref_frac.
 
-    Modeled by crediting each raw ref's full genome count to every one of
-    its OWN 9 possible raw alts (dinuc_count_16[ref] each — the correct
-    null model for "no alt-specific bias": absent any information to the
-    contrary, every possible mutation at a given ref-dinucleotide type is
-    equally likely), then folding with the same combine_raw_dbs_to_dbs78
-    used for observed mutations and opportunity — so ref/obs/mut all go
-    through identical folding logic and are guaranteed self-consistent by
-    construction, rather than two independent approximations happening to
-    line up (or not). No normalizing division is applied here (e.g. by the
-    9 raw alts) — every one of the 144 raw entries gets the same
-    unscaled ref count, so any such constant would be a uniform multiplier
-    across all 78 folded channels and cancel out identically in
-    correction_ratio's ref_frac = ref_counts/ref_counts.sum() anyway;
-    leaving it out just keeps this column's numbers whole and directly
-    interpretable as genome dinucleotide counts, rather than introducing a
-    fraction that carries no additional information.
-
-    dinuc_count_16: (16,) raw reference dinucleotide counts, as returned
-        by calculate_ref_dbs (un-folded).
+    dinuc_count_16: (16,) raw counts from calculate_ref_dbs.
     Returns (78,) canonical-channel reference opportunity.
     """
     raw144 = np.zeros(144)
@@ -1316,26 +1040,16 @@ def _dbs78_ref_weighted(dinuc_count_16):
 
 
 def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
-    """Estimate DBS78 mutation rate and per-class correction ratios: one
-    whole-sample figure, no group-size breakdown (see estimate_dbs78_by_group
-    below for that).
+    """Whole-sample DBS78 burden and per-class correction ratios (see
+    estimate_dbs78_by_group for the group-size breakdown).
 
-    dbs_mut_78 : (78,) observed DBS78 mutation counts (dbs_raw_event_to_label
-        applied to every PASS record in {sample}_dbs.vcf).
-    dbs_opp_78 : (78,) DBS78 opportunity, folded with combine_raw_dbs_to_dbs78
-        from _dbs_by_duplex_group.txt summed across all duplex groups.
-    ref_dbs_78 : (78,) reference-genome dinucleotide composition, folded
-        from the 16 raw ref groups via _dbs78_ref_weighted.
+    dbs_mut_78 : (78,) PASS DBS counts.
+    dbs_opp_78 : (78,) opportunity summed over all duplex groups.
+    ref_dbs_78 : (78,) reference composition from _dbs78_ref_weighted.
     """
     print("........Estimating mutation rate for each DBS78 context.......")
-    # Every raw (un-folded) reference dinucleotide has exactly 9 possible
-    # alt combinations (build_dbs_raw144_labels), regardless of whether the
-    # ref is self-complementary -- folding 144->78 only regroups entries,
-    # it never changes their sum (combine_raw_dbs_to_dbs78 is a pure
-    # reindexing sum) -- so dividing the folded opportunity total by 9
-    # recovers the same per-locus-pair-equivalent coverage that dividing
-    # the raw144 total by 9 would, without needing per-channel handling of
-    # the varying (6 or 9) group widths.
+    # Each raw ref dinucleotide has 9 alt pairs and the 144->78 fold
+    # preserves the total, so /9 gives per-locus-pair coverage.
     cov = dbs_opp_78.sum() / 9
     mutnum = dbs_mut_78.sum()
     burden_uncorrected = mutnum / cov if cov > 0 else float("nan")
@@ -1348,10 +1062,8 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
         dbs_mut_78, correction_ratio, cov
     )
 
-    # See estimate_96's matching comment: a channel with zero observed
-    # opportunity already gets correction_ratio 0, but its raw mutnum can
-    # still be nonzero -- force it to 0 too.
-    # 0, not 0.0 -- see estimate_96's matching comment (preserve int dtype).
+    # Zero counts in zero-opportunity channels; int fill keeps int dtype
+    # (see estimate_96).
     dbs_mut_78 = np.where(dbs_opp_78 > 0, dbs_mut_78, 0)
 
     return (
@@ -1369,24 +1081,15 @@ def estimate_dbs78(dbs_mut_78, dbs_opp_78, ref_dbs_78):
 
 
 def estimate_dbs78_by_group(dbs_mut_by_rf, dbs_opp144_by_rf, ref_dbs_78, n):
-    """Group-size-stratified DBS78 burden — the DBS counterpart of
-    estimate_96/estimate_indel83's cumulative ("at least this group size")
-    and exact ("at exactly this group size") curves, using
-    _dbs_by_duplex_group.txt (call.py's _compute_dbs_opportunity) for
-    per-duplex-group DBS opportunity resolution.
+    """DBS78 cumulative and exact group-size burden curves, as in
+    estimate_96. Returns the cumulative 7-tuple followed by the exact one.
 
-    dbs_mut_by_rf    : (78, n_groups) observed DBS78 mutation counts per
-        duplex group (each PASS _dbs.vcf record's F1R2/F2R1 info fields
-        resolve which group column it belongs to).
-    dbs_opp144_by_rf : (144, n_groups) raw-144 DBS opportunity per duplex
-        group, straight from _dbs_by_duplex_group.txt — folded to 78
-        per-stratum below (each stratum sums its own opportunity slice
-        before folding, mirroring how ref_trinuc_96/covs are handled per
-        stratum in estimate_96).
-    ref_dbs_78       : (78,) reference-genome dinucleotide composition.
-    n                : duplex-group column labels ("F1R2+F2R1"), same order
-        as both matrices' columns (and as trinuc_by_rf.columns, by
-        construction — see Caller.py's shared non_zero_keys writer order).
+    dbs_mut_by_rf    : (78, n_groups) PASS DBS counts per duplex group.
+    dbs_opp144_by_rf : (144, n_groups) raw opportunity per duplex group;
+        each stratum is summed, then folded to 78.
+    ref_dbs_78       : (78,) reference composition.
+    n                : duplex-group labels ("F1R2+F2R1") in column order,
+        which must match trinuc_by_rf.columns.
     """
     print("........Estimating DBS78 mutation rate by duplex group size.......")
     n1 = np.array([int(_.split("+")[0]) for _ in n])
@@ -1449,13 +1152,11 @@ def estimate_id(trinuc_cov_by_rf, muts_by_rf, n):
     burden_indel = np.zeros(5)
     burden_indel_ub = np.zeros(5)
     burden_indel_lb = np.zeros(5)
-    ## Calculate burden when take 10 as mininum
     trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= 5].sum(axis=1)
     mutnum = muts_by_rf[:, nmin >= 5].sum(axis=1).sum()
     cov = trinuc_cov.sum() / 3
     burden_indel[4] = mutnum / cov
     burden_indel_lb[4], burden_indel_ub[4] = fay_feuer_confint(mutnum, 1.0, cov)
-    # trinuc_rate[:,9] = np.where(trinuc_cov > 0, trinuc_mut / trinuc_cov, 0)
     for nn in range(4, 0, -1):
         trinuc_cov = trinuc_mut_cov_by_rf[:, nmin >= nn].sum(axis=1)
         mutnum = muts_by_rf[:, nmin >= nn].sum(axis=1).sum()
@@ -1487,18 +1188,12 @@ def write_burden_by_group_size(
     exact_corrected_ub,
     exact_cov,
 ):
-    """Write the combined burden-by-group-size outputs shared across SBS,
-    INDEL, and DBS: one wide-format table with parallel min_group_size
-    (cumulative "at least group size N", the original per-type behavior)
-    and group_size (exact "at group size N", non-cumulative) column
-    blocks sharing one read-number (1-5) axis, plus one 2-panel PDF (one
-    panel per breakdown) each showing corrected+uncorrected burden with
-    95% CI. Every *_uncorrected/*_corrected/*_cov argument is a (5,) array
-    indexed by read-number-1 (bins 1,2,3,4,5+ of min(F1R2,F2R1) reads),
-    already computed by estimate_96/estimate_indel83/estimate_dbs78_by_group.
+    """Write {outdir}/{sample}_{mutation_type}_burden_by_group_size.{txt,pdf}:
+    a table with cumulative (min_group_size, nmin >= N) and exact
+    (group_size, nmin == N) column blocks, and a 2-panel plot with 95% CIs.
+    Every burden/cov argument is a (5,) array over N = 1,2,3,4,5+.
 
-    mutation_type: lowercase file-name infix, e.g. "sbs"/"indel"/"dbs" --
-    output files are {outdir}/{sample}_{mutation_type}_burden_by_group_size.{txt,pdf}.
+    mutation_type: lowercase file-name infix ("sbs"/"indel"/"dbs").
     """
     read_numbers = np.arange(1, 6, dtype=np.int16)
     table = pd.DataFrame(
@@ -1597,20 +1292,12 @@ def write_burden_by_group_size(
 
 
 def write_genome_extrapolation(f, point, lb, ub, scale):
-    """Write the shared 3-line genome-wide-extrapolation block ("Mutation
-    number per genome" + 95% lower/upper) common to every _*_burden.txt /
-    _*_burden_re_estimate.txt writer below.
+    """Write the "Mutation number per genome" lines (point, 95% lower/upper)
+    as burden * scale.
 
-    point/lb/ub: the already-computed corrected burden (and its Fay-Feuer
-        CI bounds), in whatever per-locus units that file's own burden
-        lines use (already combined with any locus_multiplier the caller
-        needs -- e.g. indel's indel_locus_multiplier -- before calling
-        this).
-    scale: total reference base count to extrapolate to (this file's own
-        reference_base_number/genome_cov) -- a genuine genome-wide
-        extrapolation, larger than the plain corrected mutation number
-        since it's scaled to the total considered reference footprint, not
-        just the effective duplex-covered subset.
+    point/lb/ub: corrected burden and CI bounds.
+    scale: reference base count to extrapolate to, including any unit
+        multiplier the burden needs (e.g. indel_locus_multiplier).
     """
     f.write(f"Mutation number per genome\t{point * scale}\n")
     f.write(f"Mutation number per genome 95% lower\t{lb * scale}\n")
@@ -1686,12 +1373,8 @@ def do_estimate(args):
             sep="\t",
             index_col=0,
         )
-        # Raw-144 DBS opportunity per duplex group (call.py's
-        # _compute_dbs_opportunity), columns in the same order as
-        # trinuc_by_rf.columns by construction (Caller.py writes both from
-        # the same non_zero_keys list) -- used below for genome-wide DBS
-        # opportunity and for the group-size-stratified DBS burden
-        # breakdown.
+        # Raw-144 DBS opportunity per duplex group; columns are in the same
+        # order as trinuc_by_rf.columns (Caller.py writes both from one list).
         dbs144_by_rf = pd.read_csv(
             dbs_dir + "/" + sample + "_dbs_by_duplex_group.txt", sep="\t", index_col=0
         )
@@ -1699,10 +1382,8 @@ def do_estimate(args):
         ###Estimate SNV burden
         vcf = VCF(sbs_dir + "/" + sample + "_sbs.vcf", "r")
         mut_by_rf = dict()
-        # trinuc_by_rf is the raw (un-folded) 192-row file written by
-        # Caller.py: 64 trinuc contexts x 3 non-ref alt bases, labeled
-        # "{trinuc}>{alt}". Reverse-complement pairs are combined into the
-        # 96 canonical classes later, via combine_raw192_to_sbs96.
+        # trinuc_by_rf has 192 raw rows "{trinuc}>{alt}" (64 contexts x 3
+        # alts), folded to SBS96 later by combine_raw192_to_sbs96.
         label2num_192 = {label: i for i, label in enumerate(trinuc_by_rf.index)}
         trinuc_by_rf_np = trinuc_by_rf.to_numpy().astype(float)
         trinuc_mut_np = np.zeros([96, len(trinuc_by_rf.columns)], dtype=int)
@@ -1711,7 +1392,7 @@ def do_estimate(args):
         for nn, duplex_no in enumerate(trinuc_by_rf.columns):
             duplex_no_dict[duplex_no] = nn
 
-        # Dictionary to track unique mutations and their counts
+        # (chrom, pos, ref, alt) -> [duplex count, TAC, TDP(, indel cov column)]
         unique_mutations = {}
 
         if args.dilute:
@@ -1719,26 +1400,17 @@ def do_estimate(args):
                 sbs_dir + "/" + sample + "_sbs_flt.vcf", "w", header=vcf.header
             )
         stats = parse_stats_file(f"{prefix}/{sample}_stats.txt")
-        # "Unmasked Coverage" in stats.txt is already the base (per-locus)
-        # coverage -- call.py divides its raw opportunity sum (summed over
-        # the 3 possible alt bases per locus) by 3 before writing it.
-        # --doNotOutputMaskedSite: no masked records, Unmasked Coverage is
-        # N/A, so the Unmasked burden is N/A too.
+        # "Unmasked Coverage" is already per-locus (call divides by 3).
+        # With --doNotOutputMaskedSite there are no masked records, so the
+        # Unmasked burden is N/A.
         no_masked = call_flag_set(prefix, sample, "doNotOutputMaskedSite")
         unmasked_cov = None if no_masked else float(stats["Unmasked Coverage"])
-        ###Read DBS events up front: classify each PASS event into its
-        ### DBS78 channel (used later, in the DBS burden section), and
-        ### record its two constituent genomic positions so the SBS96
-        ### counting below. A PASS DBS's two bases are not in _sbs.vcf:
-        ### call relabels them dbs_member (same read family), so SBS and
-        ### DBS counts are already mutually exclusive.
+        ###Classify PASS DBS events into DBS78 channels. Their two bases are
+        ### labeled dbs_member rather than PASS, so they are absent from
+        ### _sbs.vcf and SBS/DBS counts are mutually exclusive.
         vcf_dbs = VCF(dbs_dir + "/" + sample + "_dbs.vcf", "r")
         dbs_mut_78 = np.zeros(78, dtype=int)
-        # Per-duplex-group counterpart of dbs_mut_78, same duplex_no_dict
-        # column indexing as trinuc_mut_np/indel83_mut_np above -- lets the
-        # DBS burden section below stratify by group size the same way SBS
-        # and indel already do, using the per-group opportunity resolution
-        # _dbs_by_duplex_group.txt provides.
+        # Per-duplex-group counts, columns indexed by duplex_no_dict.
         dbs_mut_by_rf = np.zeros([78, len(trinuc_by_rf.columns)], dtype=int)
         for rec in vcf_dbs.fetch():
             if "PASS" not in rec.filter:
@@ -1750,13 +1422,10 @@ def do_estimate(args):
         vcf_dbs.close()
 
         ###Calculate masked mutation rate
-        # Unmasked burden = PASS (from _sbs.vcf) + snp/noise-masked
-        # candidates that cleared LR and got real depth extracted (from
-        # _sbs_fail.vcf, filter=="masked" with SNPM/NOISEM set and DP>0 --
-        # see call.py's emission logic and Caller.py's deferred_depth_keys).
-        # Any other "masked"/rescue-label record in the fail VCF (below LR
-        # threshold, or a non-snp/noise mask without --rescue) has no real
-        # depth and must not count.
+        # Unmasked burden = all _sbs.vcf records + _sbs_fail.vcf records
+        # with filter "masked", SNPM/NOISEM set and DP > 0 (snp/noise-masked
+        # sites that cleared LR and had depth extracted). Other fail records
+        # have no real depth and must not count.
         if no_masked:
             unmasked_sbs_burden = "N/A"
             unmasked_sbs_burden_lb = unmasked_sbs_burden_ub = "N/A"
@@ -1826,7 +1495,6 @@ def do_estimate(args):
                     continue
             if args.dilute:
                 vcf_out.write(rec)
-            # duplex_no = str(min(F1R2, F2R1)) + "+" + str(max(F1R2, F2R1))
             duplex_no = str(F1R2) + "+" + str(F2R1)
             ref = rec.ref
             raw_trinuc = rec.info["TN"]
@@ -1842,19 +1510,11 @@ def do_estimate(args):
                 )
                 alt = revcomp[raw_alt]
             trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
-            # DBS bases never reach here (call writes them as dbs_member,
-            # not PASS). A mutant locus's coverage cell is left untouched:
-            # per-locus coverage (trinuc_by_rf_np, from cov_mat in
-            # funcs/prob.py) is a fixed examined-opportunity value -- a
-            # function of read depth/orientation and the reference
-            # trinucleotide context only, never of the base actually
-            # observed there -- so a mutant (or DBS-forming) locus's own
-            # coverage contribution is no different from any other examined
-            # locus's, and belongs in the denominator exactly like every
-            # other examined locus: burden = mutations / all examined loci
-            # for that channel, not mutations / (examined loci minus the
-            # mutations themselves).
+            # Mutant loci stay in the coverage denominator: coverage depends
+            # only on depth and reference context, not the observed base.
             trinuc_mut_np[TRINUCSBS2NUM_96[trinucSbs], duplex_no_dict[duplex_no]] += 1
+        if args.dilute:
+            vcf_out.close()
 
         print("......Estimating mutational burden and SBS96 profile........")
         trinuc_cov_96_by_rf = combine_raw192_to_sbs96(trinuc_by_rf_np, label2num_192)
@@ -1885,15 +1545,10 @@ def do_estimate(args):
             ref_trinuc,
             trinuc_by_rf.columns,
         )
-        # Total reference bases actually considered (non-N, ACGT-flanked;
-        # no noise BED applied) across args.regions -- ref_trinuc.sum() (all 64 raw,
-        # un-folded classes) is exactly this count, since every considered
-        # position is credited to exactly one of those 64 classes by its
-        # own literal ref base. Reused as the shared denominator for a
-        # genuine mutations-per-base rate across SBS/DBS/indel below,
-        # unlike e.g. ref_indel83.sum() which double/quadruple-counts
-        # positions across its many opportunity columns and so isn't a
-        # literal base count.
+        # Reference bases considered across args.regions (non-N,
+        # ACGT-flanked; no noise BED): each is in exactly one of the 64
+        # trinuc classes. Shared genome-size scale for SBS/DBS/indel
+        # (ref_indel83.sum() is not a base count: positions overlap columns).
         reference_base_number = genome_cov
         corrected_trinuc_pd = pd.DataFrame(
             np.stack(
@@ -1920,17 +1575,9 @@ def do_estimate(args):
         corrected_trinuc_pd.to_csv(
             sbs_dir + "/" + sample + "_sbs_96_corrected.txt", sep="\t"
         )
-        # SigProfilerPlotting renders one page per DataFrame column (COSMIC-
-        # standard SBS96 spectrum plot); mutation_number_genome is dropped
-        # here (genome-wide extrapolated panel not needed) but stays in the
-        # _sbs_96_corrected.txt table above. Output filename is controlled
-        # by the library: SBS_96_plots_{sample}.pdf. process_input() only
-        # trusts an incoming DataFrame's index if its name is already one
-        # of MutationType/index/Mutation Types/classification — otherwise
-        # it discards the real index and tries to use the first data
-        # column's own values as the index instead, which collides on
-        # duplicate values (e.g. multiple zero-mutation channels).
-        # rename_axis pins the index name so our real SBS96 labels survive.
+        # One plot page per column (SBS_96_plots_{sample}.pdf). The index
+        # must be named "MutationType", otherwise SigProfilerPlotting
+        # discards it and uses the first column as the index.
         sigPlt.plotSBS(
             corrected_trinuc_pd[
                 ["mutation_number_uncorrected", "mutation_number_corrected"]
@@ -1971,11 +1618,7 @@ def do_estimate(args):
             write_genome_extrapolation(
                 f, burden[0], burden_lb[0], burden_ub[0], reference_base_number
             )
-            # Effective coverage at min_group_size=1 (cov_by_minread[0], the
-            # same cumulative "at least 1 read on each strand" figure as
-            # _sbs_burden_by_group_size.txt's min_group_size=1 row) rather
-            # than the reference genome's raw trinucleotide total -- that
-            # total is still available below as Reference base number.
+            # Effective coverage at min_group_size=1.
             f.write(f"Duplex coverage\t{cov_by_minread[0]}\n")
             f.write(f"Unmasked burden\t{unmasked_sbs_burden}\n")
             f.write(f"Unmasked burden 95% lower\t{unmasked_sbs_burden_lb}\n")
@@ -1986,17 +1629,9 @@ def do_estimate(args):
         ###Calculate indel burdens
         print("......Estimating Indel Burden.......")
         vcf_indel = VCF(f"{indel_dir}/{sample}_indel.vcf", "r")
-        # indel100_by_rf is the raw 100-class coverage/opportunity file
-        # written by Caller.py (build_indel100_labels, misc.py), still
-        # based on hp.h5 repeat annotation — folded down to the 74-class
-        # resolution (combine_indel100_to_indel76) and then expanded to the
-        # 83-channel ID83 layout (expand_indel76_to_indel83) as an
-        # approximation, since call.py doesn't yet compute per-locus
-        # coverage at true microhomology-length resolution. Observed
-        # mutations, by contrast, ARE classified at full ID83 resolution
-        # below, directly from reference sequence (classify_indel_channel)
-        # — so the numerator is exact while the denominator is a coarser
-        # stand-in until call.py's coverage loop is rewritten to match.
+        # indel100_by_rf: raw 100-class coverage, folded to indel76 and
+        # expanded to ID83 (no microhomology-length resolution), while
+        # observed mutations are classified at full ID83 resolution.
         indel100_by_rf = pd.read_csv(
             indel_dir + "/" + sample + "_indel_by_duplex_group.txt",
             sep="\t",
@@ -2022,9 +1657,6 @@ def do_estimate(args):
             TAC = rec.samples["TUMOR"]["AC"]
             TDP = rec.samples["TUMOR"]["DP"]
 
-            # ID83 channel from the event's sequence and the flanking
-            # reference (classify_indel_channel, SigProfilerMatrixGenerator
-            # rules).
             F1R2 = rec.info["F1R2"]
             F2R1 = rec.info["F2R1"]
             duplex_no = str(F1R2) + "+" + str(F2R1)
@@ -2032,10 +1664,8 @@ def do_estimate(args):
             duplex_idx = duplex_no_dict[duplex_no]
             indel83_mut_np[label2num_83[label], duplex_idx] += 1
             if not unique_mutations.get(mutation_key):
-                # 4th element: this event's own coverage.bed.gz column
-                # index (0-15) -- lets duplex_allele_counts.txt read this
-                # mutation's actual effective coverage at ITS alt/category,
-                # not a sum across all 16 unrelated indel categories.
+                # 4th element: this event's coverage.bed.gz indel category
+                # (0-15), used for its duplex depth.
                 unique_mutations[mutation_key] = [
                     0,
                     TAC,
@@ -2052,22 +1682,12 @@ def do_estimate(args):
         ref_indel76 = combine_indel100_to_indel76(ref_indel100, label2num_100)
         indel83_cov_by_rf = expand_indel76_to_indel83(indel76_cov_by_rf)
         ref_indel83 = expand_indel76_to_indel83(ref_indel76)
-        # Cinshp0/Tinshp0 (rep0 insertion) depend only on the reference's
-        # own next-base identity, not repeat annotation — filled in here
-        # from the raw 100-class 1bpins{base} totals, since
-        # expand_indel76_to_indel83 leaves them at 0 (indel76/indel100
-        # carry no hp0 bin at all to expand from).
         indel83_cov_by_rf = override_inshp0_with_next_base_opportunity(
             indel83_cov_by_rf, indel100_by_rf_np
         )
         ref_indel83 = override_inshp0_with_next_base_opportunity(
             ref_indel83, ref_indel100
         )
-        # A mutant locus's own coverage is intentionally left in
-        # indel83_cov_by_rf (not subtracted) -- see the matching comment in
-        # the SNV loop above: coverage is a fixed examined-opportunity
-        # value, independent of whether the locus turned out mutant, so it
-        # belongs in the denominator like every other examined locus.
         (
             indel_mut,
             indel_mut_corrected,
@@ -2120,13 +1740,8 @@ def do_estimate(args):
         indel83_corrected_pd.to_csv(
             indel_dir + "/" + sample + "_indel_83_corrected.txt", sep="\t"
         )
-        # SigProfilerPlotting's ID83 convention uses different label syntax
-        # ("1:Del:C:0" vs our "Cdelhp1") for the same 83 channels in the
-        # same order — INDEL83_TO_SIGPROFILER_LABELS translates the index
-        # before handing off. mutation_number_genome is dropped from the
-        # plot (genome-wide extrapolated panel not needed) but stays in the
-        # _indel_83_corrected.txt table above. Output filename is
-        # controlled by the library: ID_83_plots_{sample}.pdf.
+        # Translate to SigProfilerPlotting's ID83 label syntax
+        # (ID_83_plots_{sample}.pdf).
         sigPlt.plotID(
             indel83_corrected_pd[
                 ["mutation_number_uncorrected", "mutation_number_corrected"]
@@ -2137,29 +1752,13 @@ def do_estimate(args):
             sample,
             "83",
         )
-        # Every burden below must be reported per surveyed (duplex-covered)
-        # reference base, matching the SBS/DBS convention -- there, dividing
-        # the raw coverage total by its known fixed per-locus multiplier (3
-        # alt bases for SBS, 9 alt-pair combos for DBS, baked into
-        # estimate_96/estimate_dbs78(_by_group)'s own `cov`) already yields a
-        # literal per-locus count, so mutations/cov there IS mutations-per-
-        # base. Indel coverage has no such fixed multiplier:
-        # INDEL_COVERAGE_CATEGORY_LABELS sums coverage across overlapping,
-        # locus-varying opportunity columns (one locus can count toward
-        # several ID83 channels at once), so estimate_indel83's own burden/
-        # cov arrays -- unlike estimate_96/estimate_dbs78_by_group's -- are
-        # mutations/coverage per opportunity-COLUMN, not per locus.
-        # genome_indel_cov/reference_base_number is that same column-per-
-        # locus multiplicity computed from the reference genome itself (a
-        # pure sequence-composition ratio, independent of sequencing depth)
-        # -- assuming covered loci have the same average multiplicity as the
-        # region overall, multiplying by it converts the opportunity-column
-        # rate into the same per-covered-base rate SBS/DBS already report
-        # directly. Computed here (rather than only at the _indel_burden.txt
-        # write below) so it can also rescale the group-size arrays going
-        # into write_burden_by_group_size -- those come straight from
-        # estimate_indel83 and would otherwise carry the same un-rescaled
-        # per-opportunity-column units into _indel_burden_by_group_size.txt.
+        # SBS/DBS coverage has a fixed per-locus multiplicity (3 alts, 9 alt
+        # pairs) already divided out, but indel coverage sums overlapping,
+        # locus-varying opportunity columns, so estimate_indel83's burdens
+        # are per opportunity column. indel_locus_multiplier is the
+        # reference genome's columns-per-base ratio; multiplying by it
+        # (assuming covered loci share the genome-average multiplicity)
+        # gives per-base burdens. Coverage is divided by it.
         indel_locus_multiplier = genome_indel_cov / reference_base_number
         write_burden_by_group_size(
             indel_dir,
@@ -2180,25 +1779,10 @@ def do_estimate(args):
             indel_burden_corrected_exact_ub * indel_locus_multiplier,
             indel_cov_by_exact_group / indel_locus_multiplier,
         )
-        # Field order/naming mirrors _sbs_burden.txt (uncorrected block,
-        # corrected block, per-genome number, opportunity/coverage, ref base
-        # number); the 3 "Unmasked burden" lines are omitted, same reason
-        # and same omission as _dbs_burden.txt below -- there's no
-        # indel_locus_multiplier-corrected raw opportunity denominator to
-        # build an indel "Unmasked burden" from (see Caller.py's
-        # _stats.txt writer).
+        # Same layout as _sbs_burden.txt, minus the "Unmasked burden" lines
+        # (no per-base unmasked indel coverage to divide by). Uncorrected and
+        # corrected burden share estimate_indel83's ID83 coverage denominator.
         with open(indel_dir + "/" + sample + "_indel_burden.txt", "w") as f:
-            # Uncorrected burden must share the exact same (ID83-resolution)
-            # coverage denominator as Corrected burden below -- both are
-            # "mutations at this same population / this same opportunity",
-            # differing only in whether the numerator got per-channel
-            # correction-ratio reweighting. indel_burden_uncorrected[0]
-            # (from estimate_indel83, same array Corrected reads index [0]
-            # of) is that consistent denominator: it's expanded across the
-            # 83 overlapping microhomology/repeat channels the same way
-            # indel83_cov_by_rf is, unlike a flat indel_count / indel_cov
-            # ratio (which is not expanded the same way, and reads too
-            # high).
             f.write(
                 f"Uncorrected burden\t"
                 f"{indel_burden_uncorrected[0] * indel_locus_multiplier}\n"
@@ -2225,10 +1809,6 @@ def do_estimate(args):
                 f"{indel_burden_corrected_ub[0] * indel_locus_multiplier}\n"
             )
             f.write(f"Corrected mutation number\t{indel_mut_corrected.sum()}\n")
-            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
-            # corrected per-locus burden (already rescaled by
-            # indel_locus_multiplier above) times the total considered
-            # reference bases.
             write_genome_extrapolation(
                 f,
                 indel_burden_corrected[0],
@@ -2236,32 +1816,15 @@ def do_estimate(args):
                 indel_burden_corrected_ub[0],
                 indel_locus_multiplier * reference_base_number,
             )
-            # Effective coverage at min_group_size=1, rescaled to the same
-            # per-reference-locus units as the burden values above (see
-            # indel_locus_multiplier comment above) -- matches
-            # _indel_burden_by_group_size.txt's min_group_size=1
-            # Coverage_base -- rather than the reference genome's raw
-            # opportunity-column total (Reference base number below).
+            # Effective coverage at min_group_size=1, in per-base units.
             f.write(
                 f"Duplex coverage\t"
                 f"{indel_cov_by_minread[0] / indel_locus_multiplier}\n"
             )
-            # No "Unmasked burden" block here, unlike _sbs_burden.txt --
-            # its numerator (an indel-opportunity sum) can't be normalized
-            # to true per-base units without indel_locus_multiplier, which
-            # doesn't exist until this same function computes it, so
-            # there's no correctable raw denominator to build it from (see
-            # Caller.py's _stats.txt writer, which removed "Unmasked Indel
-            # Coverage" for the same reason). Same omission _dbs_burden.txt
-            # already has, below.
             f.write(f"Reference base number\t{reference_base_number}\n")
 
         ###Calculate DBS burden
         print("......Estimating DBS78 Burden.......")
-        # Genome-wide DBS opportunity, summed straight from
-        # _dbs_by_duplex_group.txt (call.py's _compute_dbs_opportunity) --
-        # coverage(alt1)*coverage(alt2) math, attributed per-duplex-group at
-        # call time.
         dbs_opp144 = dbs144_by_rf_np.sum(axis=1)
         dbs_opp_78 = combine_raw_dbs_to_dbs78(dbs_opp144, DBS_RAW144_LABEL2NUM)
         ref_dbs_16 = calculate_ref_dbs(args)
@@ -2302,10 +1865,8 @@ def do_estimate(args):
         dbs78_corrected_pd.to_csv(
             dbs_dir + "/" + sample + "_dbs_78_corrected.txt", sep="\t"
         )
-        # Our DBS78 labels ("AC>CA") already exactly match
-        # SigProfilerPlotting's DBS78 reference labels, so no relabeling is
-        # needed (unlike ID83). Output filename is controlled by the
-        # library: DBS_78_plots_{sample}.pdf.
+        # DBS78 labels already match SigProfilerPlotting's
+        # (DBS_78_plots_{sample}.pdf).
         sigPlt.plotDBS(
             dbs78_corrected_pd[
                 ["mutation_number_uncorrected", "mutation_number_corrected"]
@@ -2353,11 +1914,8 @@ def do_estimate(args):
             dbs_cov_by_exact_group,
         )
 
-        # Field order/naming mirrors _sbs_burden.txt (uncorrected block,
-        # corrected block, per-genome number, opportunity/coverage, ref base
-        # number, per-base rate); the 3 "Unmasked burden" lines are omitted
-        # since DBS calls have no masked tier to compute an unmasked variant
-        # from (_detect_dbs_pairs only ever emits filter=="PASS").
+        # Same layout as _sbs_burden.txt, minus "Unmasked burden" (DBS calls
+        # have no masked tier).
         with open(dbs_dir + "/" + sample + "_dbs_burden.txt", "w") as f:
             f.write(f"Uncorrected burden\t{dbs_burden_uncorrected}\n")
             f.write(f"Uncorrected burden 95% lower\t{dbs_burden_uncorrected_lb}\n")
@@ -2367,9 +1925,6 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{dbs_burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{dbs_burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{dbs_mut_corrected.sum()}\n")
-            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
-            # corrected per-base burden times the total considered reference
-            # bases.
             write_genome_extrapolation(
                 f,
                 dbs_burden_corrected,
@@ -2377,18 +1932,12 @@ def do_estimate(args):
                 dbs_burden_corrected_ub,
                 reference_base_number,
             )
-            # Effective coverage at min_group_size=1 (dbs_cov_by_minread[0],
-            # matching _dbs_burden_by_group_size.txt's min_group_size=1 row)
-            # rather than the reference genome's raw dinucleotide total
-            # (Reference base number below).
+            # Effective coverage at min_group_size=1.
             f.write(f"Duplex coverage\t{dbs_cov_by_minread[0]}\n")
             f.write(f"Reference base number\t{reference_base_number}\n")
 
-        # SBS/INDEL/DBS base coverage (opportunity coverage normalized by
-        # opportunity-per-genome, same values as each _*_burden.txt's Duplex
-        # coverage line above) can only be computed here, once all three
-        # burden sections have run -- appended to the stats.txt Caller.py
-        # already wrote, rather than duplicating call-time bookkeeping.
+        # Append per-base duplex coverage (same values as each burden file's
+        # "Duplex coverage") to the stats.txt written by call.
         with open(f"{prefix}/{sample}_stats.txt", "a") as f:
             f.write(f"SBS Base Coverage\t{cov_by_minread[0]}\n")
             f.write(
@@ -2403,12 +1952,10 @@ def do_estimate(args):
         if no_coverage_file:
             print("Skipping duplex allele count due to no coverage file.")
         else:
-            # Process unique mutations to extract duplex depths and create allele counts table
             print("......Processing unique mutations for duplex allele counts.......")
             coverage_file = f"{prefix}/{sample}_coverage.bed.gz"
             allele_counts_data = []
 
-            # Open the coverage file using TabixFile
             tbx = TabixFile(coverage_file)
 
             n_unique_muts = len(unique_mutations)
@@ -2430,15 +1977,11 @@ def do_estimate(args):
                     # del_unit ins_unit del_2 del_3 del_4 del_5plus
                     # ins_A ins_T ins_C ins_G ins_len2 ins_len3 ins_len4 ins_len5plus
                     # del_hp ins_hp
-                    # Columns 3-6 are per-alt-base L-weighted coverage (floats);
-                    # columns 7-22 are power-weighted indel coverage per category
-                    # (INDEL_COVERAGE_CATEGORY_LABELS, funcs/misc.py), analogous
-                    # to columns 3-6 but for indel calling. Kept as a float
-                    # (rounded to 3dp, not int-truncated) since this is a
-                    # power-weighted effective depth, not a raw read count --
-                    # truncating would silently zero out (and drop, see the
-                    # duplex_depth==0 check below) any sub-1.0 but real
-                    # single-family site, and bias duplex_vaf's denominator low.
+                    # Columns 3-6: per-alt-base L-weighted SNV coverage;
+                    # columns 7-22: power-weighted indel coverage per
+                    # INDEL_COVERAGE_CATEGORY_LABELS category. Depth is kept
+                    # as a float (3dp): int truncation would zero out, and so
+                    # drop, real sub-1.0 single-family sites.
                     alt_col = {"A": 3, "T": 4, "C": 5, "G": 6}
                     is_snv = len(ref) == 1 and len(alt) == 1 and alt in alt_col
                     # coverage.bed.gz is keyed at the SNV position, or for an
@@ -2448,14 +1991,10 @@ def do_estimate(args):
                         parts = row.split("\t")
                         if len(parts) >= 23:
                             if is_snv:
-                                # SNV: use the coverage column for this mutation's alt base
                                 duplex_depth = round(float(parts[alt_col[alt]]), 3)
                             else:
-                                # INDEL: use the single coverage column matching
-                                # this specific event's own category (element 3
-                                # of counts, stashed when this mutation_key was
-                                # first seen above) -- not a sum across all 14,
-                                # which would mix in unrelated categories' coverage.
+                                # Indel: only this event's own category column
+                                # (counts[3]).
                                 duplex_depth = round(float(parts[7 + counts[3]]), 3)
                             break
                     gene_name = "."
@@ -2489,7 +2028,6 @@ def do_estimate(args):
                 )
             tbx.close()
 
-            # Create DataFrame and write to file
             allele_counts_df = pd.DataFrame(allele_counts_data)
             allele_counts_file = (
                 args.prefix + "/" + sample + "_duplex_allele_counts.txt"
@@ -2513,29 +2051,20 @@ def do_estimate(args):
                 exon_indel_cov = 0.0
                 for loc in coverage_tbx.fetch(chrom, start, end):
                     parts = loc.split("\t")
-                    # Columns 3-6 are per-alt-base (A/T/C/G) L-weighted
-                    # float coverage (see the format comment ~60 lines
-                    # below) -- always exactly 3 nonzero entries per locus
-                    # (the self/ref-base column is 0), so summing all four
-                    # and dividing by 3 below gives the true per-base SNV
-                    # depth -- same opportunity-to-base normalization as
-                    # _sbs_burden.txt's Duplex coverage.
+                    # Columns 3-6: per-alt-base SNV coverage (ref-base column
+                    # is 0), so sum / 3 below is per-base depth.
                     exon_sbs_cov += sum(float(x) for x in parts[3:7])
-                    # Columns 7-22 are the 16-category power-weighted indel
-                    # coverage; dividing their sum by indel_locus_multiplier
-                    # (computed above from the genome-wide ID83 opportunity
-                    # composition) converts from per-opportunity-channel
-                    # units to true per-base indel depth -- same
-                    # normalization as _indel_burden.txt's Duplex coverage.
+                    # Columns 7-22: indel coverage, converted to per-base
+                    # depth below via indel_locus_multiplier.
                     exon_indel_cov += sum(float(x) for x in parts[7:23])
                 if gene in cds_len:
                     gene_sbs_cov[gene] += exon_sbs_cov
                     gene_indel_cov[gene] += exon_indel_cov
-                    cds_len[gene] += end - start + 1
+                    cds_len[gene] += end - start
                 else:
                     gene_sbs_cov[gene] = exon_sbs_cov
                     gene_indel_cov[gene] = exon_indel_cov
-                    cds_len[gene] = end - start + 1
+                    cds_len[gene] = end - start
             coverage_tbx.close()
             with open(args.prefix + "/" + sample + "_gene_coverage.txt", "w") as f:
                 f.write("gene\tsbs_duplex_depth\tindel_duplex_depth\n")
@@ -2562,10 +2091,8 @@ def do_estimate(args):
             sys.exit(1)
         sbs_dir, indel_dir, dbs_dir = _ensure_type_subdirs(prefix)
         tn_int = h5py.File(args.reference + ".tn.h5", "r")
-        # trinuc_sbs_cov_64[t, b]: L-weighted coverage for raw (un-folded)
-        # trinuc context t (0-63), alt base b. Reverse-complement pairs are
-        # only combined into the 96 canonical classes at the final burden
-        # computation below, via combine_raw192_to_sbs96.
+        # trinuc_sbs_cov_64[t, b]: L-weighted coverage for raw trinuc
+        # context t (0-63) and alt base b; folded to SBS96 at the end.
         trinuc2num_64, num2trinuc_64 = build_trinuc64_order()
         label2num_192, labels_192 = build_trinuc192_labels(num2trinuc_64)
         base2num_re = {"A": 0, "T": 1, "C": 2, "G": 3}
@@ -2577,13 +2104,9 @@ def do_estimate(args):
         )
         trinuc_sbs_cov_64 = np.zeros((64, 4))
         trinucSbs_count = np.zeros(96)
-        # Per-channel (indel100-resolution, then folded to ID83) coverage/
-        # mutation counts, redistributed from coverage.bed.gz's 16 stored
-        # columns via each locus's own hp.h5/str.h5 annotation
-        # (redistribute_indel_cov16_to_100) -- lets the re-estimate path
-        # apply the same correction_ratio-weighted, ID83-resolution scheme
-        # the main pipeline's estimate_indel83 uses, instead of a coarser
-        # 16-category correction.
+        # Indel coverage redistributed from coverage.bed.gz's 16 columns to
+        # indel100 (redistribute_indel_cov16_to_100), then folded to ID83 so
+        # the same correction scheme as estimate_indel83 applies.
         label2num_100_re, _ = build_indel100_labels()
         label2num_83, labels_indel83 = build_indel83_labels()
         indel_cov100_re = np.zeros(100)
@@ -2596,10 +2119,8 @@ def do_estimate(args):
         str_h5 = h5py.File(args.reference + ".str.h5", "r")
         indel_count = 0
         for interval in TabixFile(args.reestimatebed, parser=pysam.asBed()).fetch():
-            # Whole-interval hp.h5/str.h5/ref.h5 slices, fetched once per
-            # bed interval rather than once per coverage.bed.gz row --
-            # redistribute_indel_cov16_to_100 below only needs a single
-            # position's own annotation, indexed by pos - interval.start.
+            # Annotation slices fetched once per interval (h5 reads per row
+            # are slow), indexed by pos - interval.start.
             hp_run_slice = hp_h5[interval.contig][0, interval.start : interval.end]
             str_slice = str_h5[interval.contig][:, interval.start : interval.end]
             ref_slice = ref_h5[interval.contig][interval.start : interval.end]
@@ -2617,10 +2138,6 @@ def do_estimate(args):
                 g_cov = float(parts[6])
                 pos = int(parts[1])
                 local_idx = pos - interval.start
-                # parts[7:23]: all 16 categories, including del_hp/ins_hp
-                # (14/15) -- redistributed into indel100 resolution via
-                # this locus's own hp.h5/str.h5/ref.h5 annotation, rather
-                # than corrected at the coarser 16-category resolution.
                 redistribute_indel_cov16_to_100(
                     [float(v) for v in parts[7:23]],
                     int(hp_run_slice[local_idx]),
@@ -2644,7 +2161,6 @@ def do_estimate(args):
                 if rec.pos <= interval.start or rec.pos > interval.end:
                     continue
                 indel_count += 1
-                # Same ID83 classification as the main indel83 pipeline above.
                 label = _indel83_record_label(ref_h5, rec)[0]
                 indel_mut83_re[label2num_83[label]] += 1
             for rec in vcf.fetch():
@@ -2670,8 +2186,6 @@ def do_estimate(args):
                     ).pvalue
                     if barnard_p <= 0.05:
                         continue
-                if args.dilute:
-                    vcf_out.write(rec)
                 if ref == "C" or ref == "T":
                     trinuc = rec.info["TN"]
                     alt = rec.alts[0]
@@ -2686,9 +2200,7 @@ def do_estimate(args):
                 trinucSbs = trinuc[0] + "[" + trinuc[1] + ">" + alt + "]" + trinuc[2]
                 trinucSbs_count[TRINUCSBS2NUM_96[trinucSbs]] += 1
 
-        # Select the 192 raw (un-folded) cells, then combine reverse-
-        # complement pairs into the 96 canonical classes here, at final
-        # estimation time.
+        # Select the 192 raw cells, then fold to SBS96.
         trinuc_cov_192 = trinuc_sbs_cov_64[row_idx_192, col_idx_192]
         trinuc_cov_96 = combine_raw192_to_sbs96(trinuc_cov_192, label2num_192)
         ref_trinuc_96 = np.repeat(ref_trinuc[:32] + ref_trinuc[32:64], 3)  # (96,)
@@ -2704,7 +2216,6 @@ def do_estimate(args):
             mutnum, 1.0, cov
         )
         trinuc_rate = _safe_rate(trinuc_mut, trinuc_cov_96)
-        # Per-SBS96-class correction ratio — no np.repeat needed
         correction_ratio = _safe_correction_ratio(ref_trinuc_96, trinuc_cov_96)
         mutnum_corrected = correction_ratio * trinuc_mut
         burden_corrected = mutnum_corrected.sum() / cov
@@ -2722,9 +2233,6 @@ def do_estimate(args):
             f.write(f"Corrected burden 95% lower\t{burden_corrected_lb}\n")
             f.write(f"Corrected burden 95% upper\t{burden_corrected_ub}\n")
             f.write(f"Corrected mutation number\t{mutnum_corrected.sum()}\n")
-            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
-            # corrected per-base burden times the total considered reference
-            # bases.
             write_genome_extrapolation(
                 f,
                 burden_corrected,
@@ -2732,19 +2240,10 @@ def do_estimate(args):
                 burden_corrected_ub,
                 genome_cov,
             )
-            # cov (per-locus-equivalent duplex coverage, the actual burden
-            # denominator above), not genome_cov/ref_trinuc_sum -- this
-            # block has no cov_by_minread breakdown the way the main
-            # sbs_burden.txt does, so `cov` is the duplex-coverage
-            # equivalent here; the reference genome base total is kept
-            # separately below as Reference base number.
+            # Per-locus duplex coverage (the burden denominator).
             f.write(f"Duplex coverage\t{cov}\n")
             f.write(f"Reference base number\t{genome_cov}\n")
-        # Fold the redistributed indel100 coverage down to ID83 resolution
-        # the same way the main pipeline does (indel100 -> indel76 -> ID83,
-        # then fill the Cinshp0/Tinshp0 rep0 bins from the raw 1bpins{base}
-        # totals) -- see the `if not args.reestimatebed` branch above for
-        # the identical sequence applied to indel100_by_rf_np.
+        # indel100 -> indel76 -> ID83 (+ rep0 fill), as in the main path.
         ref_indel100_re = calculate_ref_indel100(args)
         ref_indel76_re = combine_indel100_to_indel76(ref_indel100_re, label2num_100_re)
         ref_indel83_re = expand_indel76_to_indel83(ref_indel76_re)
@@ -2756,19 +2255,8 @@ def do_estimate(args):
         indel_cov83_re = override_inshp0_with_next_base_opportunity(
             indel_cov83_re, indel_cov100_re
         )
-        # A mutant locus's own coverage is intentionally left in
-        # indel_cov83_re (not subtracted) -- mirrors the main pipeline's
-        # indel83_cov_by_rf above.
-
-        # indel_cov83_re.sum() is per opportunity-CHANNEL, not per locus
-        # (one locus can count toward several ID83 channels at once) --
-        # exactly the same units mismatch _indel_burden.txt's
-        # indel_locus_multiplier corrects for. This branch has no access
-        # to that multiplier (it's computed in the `if not
-        # args.reestimatebed` branch above, using ref_indel83 from the
-        # main indel83 pipeline, neither of which runs here), so recompute
-        # the reference-genome side of it directly from the index files
-        # the same way the main branch does.
+        # Coverage is per opportunity channel; rescale to per-base units
+        # (see indel_locus_multiplier in the main path).
         indel_locus_multiplier_re = ref_indel83_re.sum() / ref_trinuc.sum()
         indel_cov_total = indel_cov83_re.sum()
         indel_burden_re_uncorrected = (
@@ -2783,9 +2271,6 @@ def do_estimate(args):
         indel_burden_re_uncorrected_lb *= indel_locus_multiplier_re
         indel_burden_re_uncorrected_ub *= indel_locus_multiplier_re
 
-        # Corrected: same per-channel, microhomology-grouped correction_ratio
-        # scheme as estimate_indel83 itself (_grouped_indel83_correction_
-        # ratio), now that both sides are at true ID83 resolution.
         ref_frac_re = ref_indel83_re / ref_indel83_re.sum()
         with np.errstate(divide="ignore", invalid="ignore"):
             obs_frac_re = indel_cov83_re / indel_cov83_re.sum()
@@ -2823,12 +2308,7 @@ def do_estimate(args):
                 f"Corrected indel burden 95% upper\t{indel_burden_re_corrected_ub}\n"
             )
             f.write(f"Corrected indel number\t{indel_mutnum_corrected}\n")
-            # Genome-wide extrapolation, same convention as _sbs_burden.txt:
-            # corrected per-locus burden (already in per-reference-locus
-            # units via indel_locus_multiplier_re above) times the total
-            # considered reference bases (genome_cov == ref_trinuc.sum(),
-            # the same denominator indel_locus_multiplier_re was scaled
-            # against).
+            # Burdens are already per-base (indel_locus_multiplier_re).
             write_genome_extrapolation(
                 f,
                 indel_burden_re_corrected,

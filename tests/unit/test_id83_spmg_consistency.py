@@ -1,12 +1,11 @@
-"""classify_indel_channel must give the same ID83 channel as
+"""classify_indel_channel gives the same ID83 channel as
 SigProfilerMatrixGenerator (1.3.6) for left-aligned indels. Expected labels
-below are SPMG's own output for these contexts (checked 2026-10-02 against
-the installed package, and on 46,370 planted chr22 indels).
+are SPMG's own output for these contexts.
 
 Each case gives the reference from the base after the anchor onward
 (`after_anchor`) and the event; the anchor is chosen so the event stays
-left-aligned. The `anno` column (hp.h5/str.h5 values, which the classifier
-no longer reads) is kept to show that the str.h5 annotation is irrelevant.
+left-aligned. The `anno` column (hp.h5/str.h5 values) is not passed to the
+classifier; it documents that the str.h5 annotation is irrelevant.
 """
 
 import pytest
@@ -21,7 +20,7 @@ CASES = [
     ("del A from A4", "AAAAGT", "del", 1, (4, 0, 0), "1:Del:T:3"),
     ("ins G, no G after", "TTGA", "ins", "G", (2, 0, 0), "1:Ins:C:0"),
     ("ins T into T7", "TTTTTTTGA", "ins", "T", (7, 0, 0), "1:Ins:T:5"),
-    # >=2bp deletion: no MH -> Del:R:0 (fix 1), real MH -> Del:M
+    # >=2bp deletion: no MH -> Del:R:0, real MH -> Del:M
     ("del AGT, no MH", "AGTTTTTTT", "del", 3, (1, 0, 0), "3:Del:R:0"),
     ("del AT, MH1", "ATAGGG", "del", 2, (1, 0, 0), "2:Del:M:1"),
     ("del 12bp, MH5+", "ACGTTGCAAGCTACGTTGCGG", "del", 12, (1, 0, 0), "5:Del:M:5"),
@@ -29,10 +28,10 @@ CASES = [
     ("del AC from (AC)5", "ACACACACACGG", "del", 2, (1, 2, 5), "2:Del:R:4"),
     ("ins AC into (AC)5", "ACACACACACGG", "ins", "AC", (1, 2, 5), "2:Ins:R:5"),
     ("ins AG before (AG)2", "AGAGCC", "ins", "AG", (1, 2, 2), "2:Ins:R:2"),
-    # unannotated single copy (fix 2)
+    # unannotated single copy
     ("ins TA before 1 copy", "TAGCC", "ins", "TA", (1, 0, 0), "2:Ins:R:1"),
     ("ins CAG before 1 copy", "CAGTTT", "ins", "CAG", (1, 0, 0), "3:Ins:R:1"),
-    # event = k copies of the tract unit (fix 3)
+    # event = k copies of the tract unit
     ("del ACAC from (AC)8", "AC" * 8 + "GG", "del", 4, (1, 2, 8), "4:Del:R:3"),
     ("ins ACAC into (AC)8", "AC" * 8 + "GG", "ins", "ACAC", (1, 2, 8), "4:Ins:R:4"),
     ("del CAGCAG from (CAG)6", "CAG" * 6 + "TT", "del", 6, (1, 3, 6), "5:Del:R:2"),

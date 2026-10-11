@@ -28,14 +28,11 @@ def _floats_close(exp_val, act_val):
 
 
 def _compare_info_like(exp_tok, act_tok):
-    """Treats a token as a VCF-style ';'-joined 'key=value' list (e.g. the
-    INFO column) and compares each value with float tolerance. Returns True/
-    False if both tokens have this shape with matching keys, None if either
-    doesn't -- callers fall back to plain equality in that case. Needed
-    because a whole INFO string is otherwise one opaque token: a single
-    sub-value differing by float noise in its last ~ULP (observed between
-    different machines/libm builds, not a real numeric difference) would
-    otherwise fail the entire token on an exact string compare.
+    """Compares a VCF-style ';'-joined 'key=value' token (e.g. the INFO
+    column) value by value with float tolerance, so last-ULP float noise in
+    one sub-value doesn't fail the whole token. Returns True/False if both
+    tokens have this shape with matching keys, None otherwise (callers then
+    fall back to plain equality).
     """
     if ";" not in exp_tok and "=" not in exp_tok:
         return None

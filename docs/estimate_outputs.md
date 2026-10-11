@@ -240,6 +240,6 @@ A separate, shorter field set (note the field *names* differ slightly from the m
 
 ## `SBS/{sample}_sbs_flt.vcf`
 
-**Condition:** only written when `-d/--dilute` is set.
+**Condition:** only written when `-d/--dilute` is set, and not by `-rb/--reestimatebed` (which applies the same filter to its counts only).
 
 A filtered subset of `_sbs.vcf`: SNVs with a tumor alt allele count (`AC`) above 1 are dropped if their tumor and matched-normal allele counts differ significantly (Barnard's exact test, p ≤ 0.05). Intended for the case where the sample and matched normal come from the same starting DNA material.

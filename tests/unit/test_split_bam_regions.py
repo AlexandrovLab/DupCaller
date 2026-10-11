@@ -1,13 +1,9 @@
-"""Regression test for funcs/misc.py's splitBamRegions cut-site math.
+"""funcs/misc.py's splitBamRegions cut-site math.
 
-Merging origin/main's fractional within-window interpolation (fixes
-duplicate/zero-length cut sites when one window holds a disproportionate
-share of reads) with dev's existing end-of-contig clamp (fixes cut sites
-overshooting the contig when -p requests more chunks than there's read
-data to fill) introduced a new bug: the interpolation indexes
-total_reads_by_windows[cut_inds], but an oversaturated -p can pin
-cut_inds one past the end of that array, raising IndexError before the
-existing clamp ever gets a chance to run.
+With an oversaturated -p (more chunks requested than there are reads to
+fill), cut_inds can point one past the end of total_reads_by_windows; the
+within-window interpolation must not index out of range, and the
+end-of-contig clamp keeps cut sites inside each contig.
 """
 import pysam
 import pytest

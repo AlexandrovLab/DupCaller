@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# if __name__ == "__main__":
 import pandas as pd
 import os
 
@@ -21,7 +20,7 @@ def do_summarize(args):
             f"dbs_base_coverage\tdbs_mutations_per_genome\tdbs_mutations_per_genome_upper_ci\tdbs_mutations_per_genome_lower_ci\n"
         )
         for nn, sample in enumerate(samples):
-            sample = sample.strip("/")
+            sample = sample.rstrip("/")
             sample_name = os.path.basename(sample)
             stats_file = f"{sample}/{sample_name}_stats.txt"
             snv_burden_file = f"{sample}/SBS/{sample_name}_sbs_burden.txt"
@@ -57,11 +56,7 @@ def do_summarize(args):
             dup_rate = float(stats["Pass-filter Duplication Rate"])
             read_efficiency = float(stats["Efficiency"])
 
-            # parse_stats_file works on any tab-separated key\tvalue file,
-            # not just _stats.txt -- used here to key-index into
-            # _sbs_burden.txt/_indel_burden.txt/_dbs_burden.txt instead of
-            # reading by fixed line number, which breaks silently if a line
-            # is ever added/removed/reordered upstream in Estimate.py.
+            # Burden files are key\tvalue too; read by key, not line number.
             snv_burden = parse_stats_file(snv_burden_file)
             uncorrected_burden = float(snv_burden["Uncorrected burden"])
             uncorrected_burden_lci = float(snv_burden["Uncorrected burden 95% lower"])
@@ -80,9 +75,7 @@ def do_summarize(args):
             )
             genome_length = int(float(snv_burden["Reference base number"]))
 
-            # _indel_burden.txt mirrors _sbs_burden.txt's field names exactly
-            # (see Estimate.py); the uncorrected block, corrected block, and
-            # the per-genome figure are all consumed here.
+            # _indel_burden.txt uses the same keys as _sbs_burden.txt.
             indel_burden = parse_stats_file(indel_burden_file)
             indel_uncorrected_burden = float(indel_burden["Uncorrected burden"])
             indel_uncorrected_burden_lci = float(
@@ -110,9 +103,7 @@ def do_summarize(args):
                 indel_burden["Mutation number per genome 95% upper"]
             )
 
-            # _dbs_burden.txt mirrors _sbs_burden.txt (no "Unmasked burden"
-            # block -- see Estimate.py); only the per-genome figure is
-            # consumed here.
+            # Only the per-genome figure is used from _dbs_burden.txt.
             dbs_burden = parse_stats_file(dbs_burden_file)
             dbs_mutations_per_genome = float(dbs_burden["Mutation number per genome"])
             dbs_mutations_per_genome_lci = float(
@@ -136,13 +127,8 @@ def do_summarize(args):
             )
 
             sbs96_pd_now = pd.read_csv(sbs96_file, sep="\t", index_col=0)
-            # _indel_83_corrected.txt is indexed by our internal ID83 syntax
-            # (e.g. "Cdelhp1", "2delstr3") -- relabel to SigProfilerPlotting's
-            # COSMIC-standard ID83 strings (e.g. "1:Del:C:0") via
-            # INDEL83_TO_SIGPROFILER_LABELS, the same mapping Estimate.py's
-            # own per-sample sigPlt.plotID call uses, so the aggregated
-            # matrices below are directly consumable by SigProfilerPlotting/
-            # SigProfilerExtractor without any further relabeling.
+            # Relabel internal ID83 names (e.g. "Cdelhp1") to SigProfiler's
+            # COSMIC labels (e.g. "1:Del:C:0").
             indel83_pd_now = pd.read_csv(indel83_file, sep="\t", index_col=0).rename(
                 index=INDEL83_TO_SIGPROFILER_LABELS
             )

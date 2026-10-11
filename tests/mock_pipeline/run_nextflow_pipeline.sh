@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Runs nextflow/DupCaller.nf (DupCaller index + bwa-mem2 index -> trim ->
 # bwa-mem2 mem -> gatk MarkDuplicates -> call -> estimate, containerized)
-# against the synthetic dataset in data/, entirely inside OUTDIR. Companion
-# to run_pipeline.sh, which runs the same tools directly on PATH instead of
-# through Nextflow and containers -- this one instead exercises the
-# Nextflow DAG itself (staging, container images, per-process resource
-# directives) using the published yuhecheng62/dupcaller image.
+# against the synthetic dataset in data/, entirely inside OUTDIR. Unlike
+# run_pipeline.sh (same tools directly on PATH), this exercises the Nextflow
+# DAG itself (staging, container images, per-process resource directives)
+# using the published yuhecheng62/dupcaller image.
 #
-# The pipeline's CALL_VARIANTS step always wants a matched normal (no
-# tumor-only mode), unlike run_pipeline.sh's default data/ usage -- so
-# mock_1/2 are staged as both tumor and normal fastqs here. The "default"
+# CALL_VARIANTS always wants a matched normal, so mock_1/2 are staged as
+# both tumor and normal fastqs. The "default"
 # case's outputs are compared (test_mock_pipeline_nextflow.py) against
 # expected_matched_normal/, which run_pipeline.sh MATCHED_NORMAL=1 produces
 # with the direct CLI and the same options.

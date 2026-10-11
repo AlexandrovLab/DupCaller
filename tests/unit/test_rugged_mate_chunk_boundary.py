@@ -1,49 +1,22 @@
-"""Regression test for a thread-count-dependent miscount in funcs/call.py's
-callBam family-batching loop, isolated from the full callBam pipeline (no
-reference genome / error-matrix fixtures needed) by exercising the real
-batching helpers directly: bamIterateMultipleRegionWithOverflow,
+"""Family batching across chunk boundaries in callBam.
+
+Exercises the real batching helpers (bamIterateMultipleRegionWithOverflow,
 _index_rugged_mates, _drain_rugged_pool, _place_read_in_dict,
-_compute_read_label -- and callBam's own "ignore if my mate precedes my
-region start" boundary check, mirrored here to match callBam's real loop
-exactly.
+_compute_read_label) plus a mirror of callBam's "skip if my mate precedes my
+region start" check, without the reference/error-matrix machinery.
 
-Background: PCR-duplicate copies of one original molecule can disagree
-slightly on where their downstream mate maps (alignment noise) even though
-their upstream (5') end -- and hence their family "label" (barcode pair +
-signed template_length) -- agrees exactly. _index_rugged_mates reconciles
-this: when an upstream batch closes, for every read whose recorded mate
-position (next_reference_start) disagrees with the majority, it registers
-that read's query_name so its actual downstream mate, when later
-encountered, gets rerouted into the majority position's batch instead of
-opening its own (spurious) batch. This makes both copies' downstream mates
-land in ONE F1R2/F2R1-counted closure, correctly reflecting the true
-2-copy family size.
+PCR-duplicate copies of one molecule share their upstream (5') end and hence
+their family label (barcode pair + signed template_length), but their
+downstream mates can map a few bp apart. _index_rugged_mates registers the
+minority ("rugged") mate so that, when reached, it is rerouted into the
+majority position's batch, giving one closure with the true copy count.
 
-The reroute only completes if the SAME worker's scan later reaches the
-exact majority position to trigger the drain. Since `-p`/--threads
-controls how many pieces the genome is split into (splitBamRegions),
-whether a chunk boundary happens to fall between the minority position (C)
-and the majority position (B) changes with thread count. When it does
-(without the fix): the earlier worker's own scan ends before reaching B,
-so the redirected minority mate's queued entry is silently discarded when
-that worker exits; the majority mate, fetched independently by the next
-worker (which never saw the upstream anchor), closes as its own singleton.
-Net effect: a real 2-copy family ("2+0") is undercounted as a 1-copy
-family ("1+0") -- an exact, integer, thread-count-dependent drop, exactly
-matching real amp.tn.txt/dmg.tn.txt differences observed between -p 32 and
--p 64 reruns of the same production BAM.
-
-The fix (bamIterateMultipleRegionWithOverflow in funcs/misc.py): the
-EARLIER worker, instead of giving up at its own region_end, tracks how far
-past its own end any read's *mate* reaches (computed from the MC tag, not
-a random-access mate() lookup) and, if anything crosses the boundary, does
-a second "overflow" fetch past its own end far enough to reach that mate
--- continuing the SAME in-memory batching state, so the existing
-redirect+drain logic completes exactly as it would with no split at all.
-To stay exactly-once (no double-count), the LATER worker's own normal scan
-skips any read whose mate starts before its own region's start (callBam's
-prev_boundary check) -- that read is the earlier worker's overflow pass's
-responsibility, not the later worker's.
+That reroute only completes if the same worker's scan reaches the majority
+position. When a chunk boundary falls between the rugged position (C) and the
+majority position (B), the earlier worker uses the MC tag to see that a mate
+crosses its region_end and does an overflow fetch past it, continuing the same
+batching state. The later worker skips any read whose mate starts before its
+own region start, so each family is counted exactly once.
 """
 import pysam
 import pytest
@@ -98,30 +71,17 @@ FILLER_POS = U + 5  # strictly between U and C -- see _build_bam docstring
 
 
 def _build_bam(path, extra_pairs=()):
-    """Two PCR-duplicate copies of one molecule, both read1s cleanly at U
-    (same template_length -- same family label). copy1's read2 lands at
-    the majority position B; copy2's read2 -- the "rugged" one -- lands a
-    few bp off at C, but its read1 still (correctly) claims the majority
-    template_length, which is exactly the disagreement
-    _index_rugged_mates/next_reference_start detects and reconciles.
+    """Two PCR-duplicate copies of one molecule, both read1s at U with the
+    same template_length (same family label). copy1's read2 lands at the
+    majority position B; copy2's read2 (the rugged one) lands at C, while
+    its read1 still claims the majority template_length.
 
-    Also includes one unrelated single-end "filler" read at FILLER_POS,
-    strictly between U and C. Without it, C -- being the very next
-    distinct position after U in a coordinate-sorted scan -- would be the
-    very read whose own arrival triggers the U-batch's closure (and thus
-    the _index_rugged_mates call that registers it for interception); a
-    read can never be intercepted by a registration its own arrival is
-    what causes, so it would slip through unintercepted regardless of any
-    chunk boundary. In real (non-toy) data there is essentially always
-    some other read between U and a rugged mate a few bp downstream; the
-    filler reproduces that so this test isolates the boundary-specific
-    failure mode instead of a degenerate same-batch artifact.
+    A filler read at FILLER_POS sits strictly between U and C. Without it,
+    the read at C would itself close the U batch, and a read cannot be
+    intercepted by a registration its own arrival triggers.
 
-    extra_pairs: optional list of (name, start, mate_start, tlen, barcode)
-    tuples for additional, unrelated read pairs (read1 at `start`, its
-    downstream mate at `mate_start`) -- used to test that an unrelated
-    family sitting in the overflow zone is neither dropped nor
-    double-counted.
+    extra_pairs: optional (name, start, mate_start, tlen, barcode) tuples
+    for additional unrelated read pairs.
     """
     header = {
         "HD": {"VN": "1.6", "SO": "coordinate"},
@@ -151,13 +111,9 @@ def _build_bam(path, extra_pairs=()):
 
 
 def _run_family_batching(bam_path, regions):
-    """Reimplementation of callBam's batching loop (funcs/call.py
-    ~1721-1782, ~2163-2176 in the fixed version), using the real
-    misc.py/call.py helpers -- bamIterateMultipleRegionWithOverflow plus
-    the same prev_boundary skip callBam applies -- without the
-    surrounding reference-genome/error-matrix machinery callBam itself
-    needs. Returns {label: [F1R2, F2R1]} accumulated over every batch
-    closure (mirroring how duplex_read_num_dict[duplex_no] would be fed).
+    """Mirror of callBam's batching loop (funcs/call.py) using the real
+    helpers, including the prev_boundary skip. Returns one
+    (label, F1R2, F2R1) tuple per batch closure, in order.
     """
     prev_boundary_chrom = None
     prev_boundary_pos = None
@@ -219,9 +175,8 @@ DOWNSTREAM_LABEL = "AAA+TTT+-350"
 
 
 def test_rugged_mate_merges_into_one_closure_without_boundary(tmp_path):
-    """No chunk split: copy1's and copy2's downstream mates (majority B,
-    rugged C) merge into ONE closure via the redirect+drain, correctly
-    reflecting both copies (F1R2=2) as a single family observation."""
+    """No chunk split: both downstream mates (B and C) merge into one
+    F1R2=2 closure via redirect+drain."""
     bam_path = tmp_path / "family.bam"
     _build_bam(bam_path)
 
@@ -238,17 +193,10 @@ def test_rugged_mate_merges_into_one_closure_without_boundary(tmp_path):
 def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(
     tmp_path, boundary
 ):
-    """A chunk boundary strictly between C (rugged) and B (majority) used
-    to drop copy2's downstream mate entirely (see this test's previous
-    version / the module docstring for the bug). With
-    bamIterateMultipleRegionWithOverflow: the earlier worker (holding U/C)
-    notices copy1's mate (at B) crosses its own region_end (computed from
-    the MC tag, no fixed buffer needed), does a second "overflow" fetch
-    reaching B, and completes the SAME redirect+drain merge it would have
-    done with no split at all. The later worker's own normal scan skips
-    the read at B outright (its mate at U precedes the later worker's
-    region start), so the family is counted exactly once, by the earlier
-    worker, matching the no-split baseline.
+    """With a chunk boundary in (C, B], the earlier worker's overflow fetch
+    reaches B and completes the merge; the later worker skips the read at B
+    (its mate at U precedes the region start). The family is counted once,
+    by the earlier worker, matching the no-split result.
     """
     bam_path = tmp_path / "family.bam"
     _build_bam(bam_path)
@@ -264,9 +212,7 @@ def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(
         "expected the earlier worker's overflow pass to fully reconstruct "
         f"the family (F1R2=2), matching the no-split baseline; got {downstream_closures}"
     )
-    # And it must be worker1 (the one with the overflow pass) that owns
-    # this closure, not worker2 -- otherwise this "fix" would just be
-    # trading the drop for a double-count spread across both workers.
+    # worker1 (the one with the overflow pass) must own the closure.
     worker1_downstream = [c for c in worker1 if c[0] == DOWNSTREAM_LABEL]
     worker2_downstream = [c for c in worker2 if c[0] == DOWNSTREAM_LABEL]
     assert worker1_downstream == [(DOWNSTREAM_LABEL, 2, 0)]
@@ -274,15 +220,9 @@ def test_chunk_boundary_between_rugged_and_majority_position_is_fixed(
 
 
 def test_unrelated_read_in_overflow_zone_is_not_dropped_or_double_counted(tmp_path):
-    """A second, entirely unrelated family sitting inside the earlier
-    worker's overflow window (but not itself crossing the boundary) must
-    be (a) excluded from the earlier worker's overflow pass -- its mate
-    doesn't precede the boundary, so bamIterateMultipleRegionWithOverflow
-    skips it there -- and (b) picked up normally by the later worker's own
-    scan instead, exactly once, at F1R2=1. This is the complementary
-    check to the rugged-mate fix: the overflow pass must be narrowly
-    scoped to genuine boundary-crossing families, not just "everything in
-    range"."""
+    """An unrelated family inside the overflow window that does not cross
+    the boundary is skipped by the earlier worker's overflow pass and
+    counted exactly once (F1R2=1) by the later worker."""
     bam_path = tmp_path / "family_with_unrelated.bam"
     boundary = (C + B) // 2
     UNRELATED_START = boundary + 15  # inside the overflow window (boundary, last_end]
@@ -314,8 +254,7 @@ def test_unrelated_read_in_overflow_zone_is_not_dropped_or_double_counted(tmp_pa
         (unrelated_label, 1, 0)
     ], f"unrelated family must be counted exactly once, by worker2; got {worker2_unrelated}"
 
-    # And the rugged-mate fix itself must still hold with this extra data
-    # sitting nearby.
+    # The rugged-mate merge still holds with the extra family nearby.
     all_downstream = [c for c in worker1 + worker2 if c[0] == DOWNSTREAM_LABEL]
     assert all_downstream == [(DOWNSTREAM_LABEL, 2, 0)]
 

@@ -2,8 +2,8 @@
 """Generator for the synthetic dataset in tests/mock_pipeline/data/.
 
 Not run by CI -- its output (reference.fa, repeats.tsv, mock_1.fastq,
-mock_2.fastq) is committed as static data. Re-run only when deliberately
-changing the planted mutations/layout below, and regenerate
+mock_2.fastq, truth.txt) is committed as static data. Re-run only when
+deliberately changing the planted mutations/layout below, and regenerate
 tests/mock_pipeline/expected/ to match.
 """
 import random

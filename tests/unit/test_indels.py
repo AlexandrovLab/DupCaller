@@ -1,20 +1,11 @@
-"""Regression tests for funcs/indels.py.
+"""Tests for funcs/indels.py.
 
-Two bugs fixed together:
-
-1. findIndels mis-walked the N cigar op (reference skip) as if it were S
-   (soft clip): both advanced readPos, but N consumes reference bases,
-   not query bases. Any indel downstream of an N in the same read was
-   reported at the wrong genomic position.
-
-2. getIndelArr guessed an allele for reads that can't show one: soft
-   clips matching an inserted sequence counted as ALT, reads ending right
-   after the anchor or partway through a deletion counted as REF, and a
-   read not overlapping the candidate at all counted as a conflict
-   (dropping the candidate). It now returns ALT only for the read's own
-   anchored CIGAR indel, REF only for a read aligned through the whole
-   locus, CONFLICT for a different indel inside the locus, and
-   UNINFORMATIVE otherwise.
+- findIndels walks the N cigar op (reference skip) as consuming reference,
+  not query, bases.
+- getIndelArr returns ALT only for the read's own anchored CIGAR indel, REF
+  only for a read aligned through the whole locus, CONFLICT for a different
+  indel inside the locus, and UNINFORMATIVE otherwise (soft clips, reads
+  ending at the anchor or partway through a deletion, non-overlapping reads).
 """
 import pysam
 

@@ -8,12 +8,9 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --output=SAMPLE_ID_nextflow.%j.out
 #
-# SLURM-specific wrapper around the platform-agnostic run_dupcaller_sample.sh
-# -- this file only adds scheduler resource requests and your cluster's
-# real paths/account; all the actual pipeline logic lives in the generic
-# script. Adjust the #SBATCH lines above for your own scheduler/account/
-# partition; everything below only needs SAMPLE_ID and the 4 fastq paths
-# to change per sample.
+# SLURM wrapper around run_dupcaller_sample.sh: adds resource requests and
+# site paths only. Adjust the #SBATCH lines and paths below for your
+# cluster; per sample, only SAMPLE_ID and the 4 fastq paths change.
 #
 # Usage:
 #   sbatch --export=ALL,SAMPLE_ID=SAMPLE1,\
