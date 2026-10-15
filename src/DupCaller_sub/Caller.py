@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from collections import OrderedDict
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 import errno
 import h5py
 import subprocess
@@ -297,6 +297,13 @@ def do_call(args):
         args.srdMinRead = 3
     if not hasattr(args, "ssmMinRead"):
         args.ssmMinRead = 3
+    # Rescue records are made in round 2, which --skipCoveragePass skips.
+    if getattr(args, "rescue", False) and getattr(args, "skipCoveragePass", False):
+        print(
+            "ERROR: --rescue and --skipCoveragePass cannot be used together: "
+            "rescued variants are called in the coverage pass (round 2)."
+        )
+        sys.exit(1)
     check_input_files_exist(args)
     # -p 1 has no chunk boundaries to reconcile via MC tags.
     if args.threads != 1:
@@ -352,7 +359,10 @@ def do_call(args):
         "isLearn": None,
         "pseudocount": args.pseudocount,
         "normalVAF": args.naf,
-        "rescue": args.rescue,
+        # Round 1 never rescues (calls, mu and thresholds don't depend on
+        # it); round 2 turns it on and keeps rescued variants at or above
+        # their channel's final threshold.
+        "rescue": False,
         "maxDepth": args.maxPileupDepth,
         "barcodeTag": barcode_spec["tag"],
         "barcodeNormalize": barcode_spec["normalize"],
@@ -721,8 +731,8 @@ def do_call(args):
             indelsAll,
             unique_read_num,
             pass_read_num,
-            FPAll,
-            RPAll,
+            _FPs,
+            _RPs,
             unmasked_coverage,
             coverage_indel_cat,
             unmasked_coverage_indel_cat,
@@ -740,17 +750,6 @@ def do_call(args):
         ) = callBam(paramsNow, 0)
         duplex_read_nums = [duplex_read_num_single]
         power_tallies = [power_tally_single]
-        muts_positions = [
-            mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
-        ]
-        muts_dict = dict()
-        take_ind = list()
-        muts_num = len(mutsAll)
-        indels_positions = [
-            indel["chrom"] + str(indel["pos"]) + indel["ref"] + ":" + indel["alt"]
-            for indel in indelsAll
-        ]
-        indels_num = len(indelsAll)
         duplex_combinations = list(duplex_read_num_single.keys())
         duplex_combinations.sort()
         duplex_read_num = OrderedDict(
@@ -886,8 +885,6 @@ def do_call(args):
         indels = [_[6] for _ in results]
         unique_read_nums = [_[7] for _ in results]
         pass_read_nums = [_[8] for _ in results]
-        FPs = [_[9] for _ in results]
-        RPs = [_[10] for _ in results]
         unmasked_coverages = [_[11] for _ in results]
         coverages_indels_cat = [_[12] for _ in results]
         unmasked_coverages_indels_cat = [_[13] for _ in results]
@@ -916,13 +913,7 @@ def do_call(args):
         pool.close()
         pool.terminate()
         pool.join()
-        mutsAll = sum(muts, [])
-        muts_positions = [
-            mut["chrom"] + str(mut["pos"]) + mut["ref"] + mut["alt"] for mut in mutsAll
-        ]
-        muts_dict = dict()
-        take_ind = list()
-        muts_num = len(mutsAll)
+        mutsAll = [m for chunk in muts for m in chunk]
         coverage = sum(coverages)
         coverage_indel_cat = sum(coverages_indels_cat)
         unmasked_coverage = sum(unmasked_coverages)
@@ -931,17 +922,11 @@ def do_call(args):
         duplex_num = sum(duplex_nums)
         unique_read_num = sum(unique_read_nums)
         pass_read_num = sum(pass_read_nums)
-        indelsAll = sum(indels, [])
-        indels_num = len(indelsAll)
-        indels_positions = [
-            indel["chrom"] + str(indel["pos"]) + indel["ref"] + ":" + indel["alt"]
-            for indel in indelsAll
-        ]
-
+        indelsAll = [m for chunk in indels for m in chunk]
         # Per-duplex-group coverage tables (duplex_read_num*, etc.) are not
         # computed in round 1; they are built from round 2's results below.
-        FPAll = sum(FPs, [])
-        RPAll = sum(RPs, [])
+        # Free the per-worker results now that they are merged.
+        del results, muts, indels, dbs_muts
 
     tBam = BAM(args.bam, "rb", args.reference)
     contigs = tBam.references
@@ -1015,7 +1000,7 @@ def do_call(args):
     }
     filterDict = {
         "PASS": "All filters passed, including snp_mask/noise_mask (see SNPM/NOISEM INFO fields, both 0 here) -- a fully unmasked call",
-        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below its channel's final threshold) is dropped entirely and never appears in the fail vcf unless --rescue is on",
+        "masked": "Blocked by snp_mask/noise_mask only (SNPM/NOISEM INFO fields mark which); other mask types never reach this label (see the reasons below, only emitted under --rescue). A masked candidate whose raw LR clears its channel's final refined threshold gets real depth extracted and feeds the unmasked-burden numerator, unless that real depth then fails a post-hoc sanity check (see no_good_alt_read/duplex_vaf/normal_vaf/n_cov_mask below), in which case it's relabeled to that specific reason and, like any other reject reason, only kept under --rescue. A masked candidate that never got real depth extracted (LR below its channel's final threshold) is dropped entirely, --rescue or not",
         "underpowered": "Candidate with LR > 0 that failed the FDR-refined per-channel threshold",
         "zero_LR": "Candidate with no evidence for the alt over the ref (log10 LR == 0, e.g. alt and non-alt reads cancelling); reported for completeness, never PASS. A DBS inherits it from either of its own read family's SNVs",
         "high_nm": "Read family failed the NM/blacklist filter -- only reported under --rescue",
@@ -1440,6 +1425,18 @@ def do_call(args):
     def _mut_key(m):
         return (m["chrom"], m["pos"], m["ref"], m["alt"])
 
+    def _sbs_final_threshold(mut):
+        ctx_key = (trinuc2num_64.get(mut["infos"]["TN"]), base2num.get(mut["alt"]))
+        return pcutoff_sbs_override.get(ctx_key, max(params["pcutoff"], args.minLR))
+
+    def _indel_final_threshold(indel):
+        # The channel indelErrorProbs scored this call against (multi-bp:
+        # STR bin and repeat unit; 1bp: HP, or STR0_u1_ins for a mismatched
+        # insertion).
+        return channel_thresholds.get(
+            _indel_channel(indel), max(params["pcutoffi"], args.minLR)
+        )
+
     deferred_depth_keys = set()
     # Final threshold of each deferred key: picks the --skipCoveragePass
     # round-1 depth entry extracted with the families clearing it.
@@ -1448,10 +1445,7 @@ def do_call(args):
         old_filter = mut.get("filter", "PASS")
         if old_filter not in ("PASS", "masked"):
             continue
-        ctx_key = (trinuc2num_64.get(mut["infos"]["TN"]), base2num.get(mut["alt"]))
-        threshold = pcutoff_sbs_override.get(
-            ctx_key, max(params["pcutoff"], args.minLR)
-        )
+        threshold = _sbs_final_threshold(mut)
         if old_filter == "PASS":
             # LR == 0: no evidence either way.
             if mut["infos"]["LR"] <= 0:
@@ -1470,12 +1464,7 @@ def do_call(args):
         old_filter = indel.get("filter", "PASS")
         if old_filter not in ("PASS", "masked"):
             continue
-        # The channel indelErrorProbs scored this call against (multi-bp:
-        # STR bin and repeat unit; 1bp: HP, or STR0_u1_ins for a mismatched
-        # insertion).
-        threshold = channel_thresholds.get(
-            _indel_channel(indel), max(params["pcutoffi"], args.minLR)
-        )
+        threshold = _indel_final_threshold(indel)
         if old_filter == "PASS":
             if indel["infos"]["LR"] <= 0:
                 indel["filter"] = "zero_LR"
@@ -1540,8 +1529,13 @@ def do_call(args):
             paramsNow2["indel_1bp_threshold_override"] = indel_1bp_threshold_override
             paramsNow2["indel_len_threshold_override"] = indel_len_threshold_override
             paramsNow2["deferred_depth_keys"] = deferred_depth_keys
+            # Rescued variants are called here, at the final thresholds.
+            paramsNow2["rescue"] = args.rescue
             round2_args.append((paramsNow2, nn))
-        round2_pool = Pool(args.threads)
+        # forkserver: workers start from a fresh server process instead of
+        # a fork of this one, so they don't inherit (and each get counted
+        # for) round 1's records.
+        round2_pool = get_context("forkserver").Pool(args.threads)
         round2_results = round2_pool.starmap(callBam, round2_args)
         round2_pool.close()
         round2_pool.terminate()
@@ -1552,21 +1546,25 @@ def do_call(args):
             + " minutes,merging results................."
         )
 
-        # Merge deferred depth back by position key. The filter comes along:
-        # call.py may relabel a deferred candidate to a reject reason when
-        # its real depth fails a sanity check, else it stays "masked".
+        # Round 2 returns only deferred candidates (deferred=True) and,
+        # under --rescue, rescue records. Merge deferred depth back by
+        # position key. The filter comes along: call.py may relabel a
+        # deferred candidate to a reject reason when its real depth fails a
+        # sanity check, else it stays "masked".
         deferred_mut_updates = {
             _mut_key(m): (m["samples"], m["filter"])
             for r in round2_results
             for m in r[0]
-            if _mut_key(m) in deferred_depth_keys
+            if m["deferred"]
         }
         deferred_indel_updates = {
             _mut_key(m): (m["samples"], m["filter"])
             for r in round2_results
             for m in r[6]
-            if _mut_key(m) in deferred_depth_keys
+            if m["deferred"]
         }
+        rescued_muts = [m for r in round2_results for m in r[0] if not m["deferred"]]
+        rescued_indels = [m for r in round2_results for m in r[6] if not m["deferred"]]
         # Coverage below comes from round 2 (final thresholds).
         coverages = [_[1] for _ in round2_results]
         duplex_read_nums = [_[4] for _ in round2_results]
@@ -1576,6 +1574,7 @@ def do_call(args):
         unmasked_coverages_indels_cat = [_[13] for _ in round2_results]
         duplex_read_nums_indel = [_[14] for _ in round2_results]
         duplex_read_nums_dbs = [_[16] for _ in round2_results]
+        del round2_results
     else:
         print(
             "..............Skipping coverage pass (round 2): coverage from "
@@ -1627,6 +1626,8 @@ def do_call(args):
                         updates[_mut_key(m)] = entry
         for m in mutsAll + indelsAll:
             m.pop("deferred_depth", None)
+        rescued_muts = []
+        rescued_indels = []
 
     for mut in mutsAll:
         key = _mut_key(mut)
@@ -1636,6 +1637,15 @@ def do_call(args):
         key = _mut_key(indel)
         if key in deferred_indel_updates:
             indel["samples"], indel["filter"] = deferred_indel_updates[key]
+    # Rescued variants (round 2): kept only at or above their channel's
+    # final threshold.
+    mutsAll.extend(
+        m for m in rescued_muts if m["infos"]["LR"] >= _sbs_final_threshold(m)
+    )
+    indelsAll.extend(
+        m for m in rescued_indels if m["infos"]["LR"] >= _indel_final_threshold(m)
+    )
+    del rescued_muts, rescued_indels
 
     coverage = sum(coverages)
     unmasked_coverage = sum(unmasked_coverages)
@@ -1678,18 +1688,6 @@ def do_call(args):
             for num in duplex_combinations
         }
     )
-
-    # Includes the 0+n / n+0 keys.
-    muts_by_duplex_group = {k: 0 for k in duplex_read_num.keys()}
-    for mut in mutsAll:
-        TC_total = int(mut["infos"]["F1R2"])
-        BC_total = int(mut["infos"]["F2R1"])
-        key_fwd = str(TC_total) + "+" + str(BC_total)
-        key_rev = str(BC_total) + "+" + str(TC_total)
-        if key_fwd in muts_by_duplex_group:
-            muts_by_duplex_group[key_fwd] += 1
-        elif key_rev in muts_by_duplex_group:
-            muts_by_duplex_group[key_rev] += 1
 
     all_keys = sorted(
         duplex_read_num.keys(),
@@ -1773,11 +1771,37 @@ def do_call(args):
         index=True,
     )
     # Records that cleared LR but failed a post-hoc depth sanity check are
-    # reported only under --rescue. This is the single keep/drop decision
-    # for these labels (call.py never drops them). no_good_alt_read (ta==0)
-    # means the pileup re-check found no alt-supporting read at all.
-    if not params["rescue"]:
-        _reject_reasons = {"no_good_alt_read", "duplex_vaf", "normal_vaf", "n_cov_mask"}
+    # reported only under --rescue, and then only at or above their
+    # channel's final threshold (a DBS: both of its SBS). This is the single
+    # keep/drop decision for these labels (call.py never drops them).
+    # no_good_alt_read (ta==0) means the pileup re-check found no
+    # alt-supporting read at all.
+    _reject_reasons = {"no_good_alt_read", "duplex_vaf", "normal_vaf", "n_cov_mask"}
+    if args.rescue:
+        sbs_clears = {
+            _sbs_family_key(m): m["infos"]["LR"] >= _sbs_final_threshold(m)
+            for m in mutsAll
+        }
+        mutsAll = [
+            m
+            for m in mutsAll
+            if m.get("filter", "PASS") not in _reject_reasons
+            or m["infos"]["LR"] >= _sbs_final_threshold(m)
+        ]
+        indelsAll = [
+            m
+            for m in indelsAll
+            if m.get("filter", "PASS") not in _reject_reasons
+            or m["infos"]["LR"] >= _indel_final_threshold(m)
+        ]
+        dbsAll = [
+            m
+            for m in dbsAll
+            if m.get("filter", "PASS") not in _reject_reasons
+            or all(sbs_clears.get(k, False) for k in _dbs_family_keys(m))
+        ]
+        del sbs_clears
+    else:
         mutsAll = [m for m in mutsAll if m.get("filter", "PASS") not in _reject_reasons]
         indelsAll = [
             m for m in indelsAll if m.get("filter", "PASS") not in _reject_reasons
@@ -1786,18 +1810,16 @@ def do_call(args):
 
     # "masked" + all-zero samples unambiguously means never depth-extracted
     # (LR below the final threshold): a masked record that did get depth
-    # with ta==0 is relabelled no_good_alt_read by call.py. Drop these
-    # unless --rescue.
-    if not params["rescue"]:
+    # with ta==0 is relabelled no_good_alt_read by call.py. Dropped,
+    # --rescue or not.
+    def _masked_no_depth(m):
+        return m.get("filter") == "masked" and m.get("samples") == [
+            [0, 0, 0],
+            [0, 0, 0],
+        ]
 
-        def _masked_no_depth(m):
-            return m.get("filter") == "masked" and m.get("samples") == [
-                [0, 0, 0],
-                [0, 0, 0],
-            ]
-
-        mutsAll = [m for m in mutsAll if not _masked_no_depth(m)]
-        indelsAll = [m for m in indelsAll if not _masked_no_depth(m)]
+    mutsAll = [m for m in mutsAll if not _masked_no_depth(m)]
+    indelsAll = [m for m in indelsAll if not _masked_no_depth(m)]
     # --doNotOutputMaskedSite: no masked record is output, --rescue or not.
     if params["no_masked_output"]:
         mutsAll = [m for m in mutsAll if m.get("filter") != "masked"]
@@ -1945,6 +1967,11 @@ def do_call(args):
     fail_indelsAll = [m for m in indelsAll if m.get("filter", "PASS") != "PASS"]
     pass_dbsAll = [m for m in dbsAll if m.get("filter", "PASS") == "PASS"]
     fail_dbsAll = [m for m in dbsAll if m.get("filter", "PASS") != "PASS"]
+    if args.rescue:
+        # Round 2's rescued records were appended after round 1's.
+        contig_index = {contig: i for i, contig in enumerate(contigs)}
+        fail_mutsAll.sort(key=lambda m: (contig_index[m["chrom"]], m["pos"]))
+        fail_indelsAll.sort(key=lambda m: (contig_index[m["chrom"]], m["pos"]))
 
     vcfLines = createVcfStrings(
         chromDict, infoDict, formatDict, filterDict, pass_mutsAll

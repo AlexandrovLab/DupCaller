@@ -215,7 +215,7 @@ if __name__ == "__main__":
         help="skip round 2 (the coverage-only pass), roughly halving total runtime: every output "
         "except the per-locus coverage.bed.gz is still written, with coverage from round 1's "
         "power tallies contracted at the final thresholds. estimate then skips the duplex allele "
-        "counts and per-gene coverage, and -rb/--reestimatebed is unavailable.",
+        "counts and per-gene coverage, and -rb/--reestimatebed is unavailable. Not with --rescue.",
         default=False,
     )
     call_parser.add_argument(
@@ -356,7 +356,9 @@ if __name__ == "__main__":
         "--rescue",
         "-res",
         action="store_true",
-        help="output discarded variants with reason in the filter field",
+        help="output discarded variants whose LR clears their channel's final threshold, with "
+        "the reason in the filter field. They are called in the coverage pass (round 2), so "
+        "this cannot be combined with --skipCoveragePass; every other output is unchanged.",
         default=False,
     )
     call_parser.add_argument(

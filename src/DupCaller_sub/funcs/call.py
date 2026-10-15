@@ -203,14 +203,71 @@ def prepare_reference_mats(
     )
 
 
+def _load_window(
+    chrom,
+    start,
+    region,
+    readSet,
+    contig_len,
+    params,
+    germline,
+    noise,
+    indel_bed,
+    include_bed,
+    nbams,
+    bam,
+):
+    """Reference arrays and masks of the calling window starting at start
+    on chrom, for the family readSet that opens it. Returns (window end,
+    ref, trinuc, merged repeat context, raw hp, raw str, then the six
+    prepare_reference_mats masks)."""
+    try:
+        region_end = region[2]
+    except IndexError:
+        region_end = 10e10
+    # Cap measured from start so the window never exceeds the coverage
+    # arrays' 1 Mb rows.
+    end = min(
+        start + 1000000,
+        max(region_end, max([seq.reference_end for seq in readSet])),
+        contig_len,
+    )
+    ref_h5 = h5py.File(params["reference"] + ".ref.h5", "r")
+    tn_h5 = h5py.File(params["reference"] + ".tn.h5", "r")
+    hp_h5 = h5py.File(params["reference"] + ".hp.h5", "r")
+    str_h5 = h5py.File(params["reference"] + ".str.h5", "r")
+    ref_np = ref_h5[chrom][start:end]
+    trinuc_np = tn_h5[chrom][start:end]
+    # (3, window): unit_len, cut (run start), repeat_count; STR-priority
+    # merge of hp.h5 and str.h5.
+    hp_np = load_repeat_context(hp_h5[chrom], str_h5[chrom], start, end)
+    # Raw, unmerged slices, for learning and opportunity where HP and STR
+    # must be treated independently.
+    hp_raw_np = hp_h5[chrom][:, start:end]
+    str_raw_np = str_h5[chrom][:, start:end]
+    masks = prepare_reference_mats(
+        chrom,
+        start,
+        end,
+        ref_np,
+        trinuc_np,
+        germline,
+        noise,
+        indel_bed,
+        include_bed,
+        nbams,
+        bam,
+        params,
+    )
+    return (end, ref_np, trinuc_np, hp_np, hp_raw_np, str_raw_np) + tuple(masks)
+
+
 def _process_duplex_family(
     F1R2,
     F2R1,
-    FPs,
     L,
     L_indel_1bp,
     L_indel_len,
-    RPs,
     chromNow,
     coverage,
     coverage_indel_cat,
@@ -270,9 +327,10 @@ def _process_duplex_family(
     depth-composition tables, ...) in place.
 
     Window management (reference_mat_*, coverage allocation/carry) stays
-    in callBam. Returns True if any site of the family is in pass_bool
-    (reference or alt), i.e. whether it counts toward duplex_count; False
-    on every early exit (fully masked, learn mode).
+    in callBam. Returns True if the family is counted and any of its sites
+    is in pass_bool (reference or alt), i.e. whether it counts toward
+    duplex_count; False on every early exit (fully masked, learn mode)
+    and for a rescue-only family, whose coverage arrays may be None.
     """
     ### Record read names to check if mate has been processed
     processed_flag = 0
@@ -324,6 +382,11 @@ def _process_duplex_family(
             return False
     elif not np.any(unmasked_antimask):
         return False
+    # A family only --rescue lets through (failed mapq/AS-XS/NM, or fully
+    # masked by n_cov/nm/trim) emits rescue records but adds nothing to
+    # coverage, the duplex tables, Eeff or the mu solve, so --rescue leaves
+    # every other output unchanged.
+    counted = flt_rs == "PASS" and bool(np.any(unmasked_antimask))
     indel_bool = [("I" in seq.cigarstring or "D" in seq.cigarstring) for seq in readSet]
     if not isLearn:
         masks_indel = np.zeros([6, end_ind_max - start_ind], dtype=bool)
@@ -438,7 +501,7 @@ def _process_duplex_family(
                 if (
                     neg_lr_indel is None
                     or params.get("coverage_only", False)
-                    or flt_rs != "PASS"
+                    or not counted
                     or not antimask_indel[indel_slice].all()
                 ):
                     continue
@@ -457,6 +520,22 @@ def _process_duplex_family(
                 continue
             elif not LR_pass_bool[nn]:
                 continue
+            elif not counted:
+                # Rescue-only family: its own failure reason, else the
+                # position's mask reason. Never "masked", which would put
+                # it in Caller.py's deferred depth set.
+                if not rescue_antimask_indel[indel_slice].all():
+                    continue
+                if flt_rs != "PASS":
+                    flt = flt_rs
+                else:
+                    flt = _filter_reason_label(
+                        masks_indel[2, indel_slice],
+                        masks_indel[5, indel_slice],
+                        masks_indel[3, indel_slice],
+                        extra_flag=masks_indel[0, indel_slice],
+                        extra_label="indel_mask",
+                    )
             elif antimask_indel[indel_slice].all():
                 flt = flt_rs
             elif unmasked_antimask_indel[indel_slice].all():
@@ -921,7 +1000,7 @@ def _process_duplex_family(
         if (
             neg_lr_sbs is not None
             and neg_pos.size
-            and flt_rs == "PASS"
+            and counted
             and not params.get("coverage_only", False)
         ):
             neg_trinuc = trinuc_np[start_ind:end_ind][neg_pos]
@@ -964,8 +1043,6 @@ def _process_duplex_family(
                     abs(max_ref_len) - muts_ind[nn],
                     muts_ind[nn] + 1,
                 )
-            FPs.append(readPos5p)
-            RPs.append(readPos3p)
             if F1R2_count[:, muts_ind[nn]].sum() == 0:
                 continue
             if F2R1_count[:, muts_ind[nn]].sum() == 0:
@@ -974,6 +1051,18 @@ def _process_duplex_family(
                 continue
             if pass_bool[muts_ind[nn]]:
                 flt = flt_rs
+            elif not counted:
+                # Rescue-only family: as for indels above.
+                if not rescue_antimask[muts_ind[nn]]:
+                    continue
+                if flt_rs != "PASS":
+                    flt = flt_rs
+                else:
+                    flt = _filter_reason_label(
+                        masks[2, muts_ind[nn]],
+                        masks[4, muts_ind[nn]],
+                        masks[5, muts_ind[nn]],
+                    )
             elif masks[0, muts_ind[nn]] or masks[1, muts_ind[nn]]:
                 # "masked" = snp_mask/noise_mask only (as SNPM/NOISEM);
                 # other mask reasons go to the rescue branch.
@@ -1050,7 +1139,7 @@ def _process_duplex_family(
                 readSet,
             )
         )
-        if flt_rs == "PASS":
+        if counted:
             coverage[start_ind:end_ind][pass_bool] += cov_mat[pass_bool]
             duplex_read_num_dict[duplex_no][1] += np.count_nonzero(pass_bool)
             trinuc_pass = trinuc_np[start_ind:end_ind][pass_bool]
@@ -1174,7 +1263,7 @@ def _process_duplex_family(
                     16,
                 )
 
-    return bool(pass_bool.any())
+    return counted and bool(pass_bool.any())
 
 
 def _collect_call_barcode(call_barcodes, key, mut):
@@ -1723,6 +1812,8 @@ def callBam(params, processNo):
     duplex_read_num_dict_dbs = dict()
     unique_read_num = 0
     pass_read_num = 0
+    # Per-candidate read positions are no longer collected (nothing read
+    # them); empty, so the return tuple keeps its layout.
     FPs = []
     RPs = []
     indel_dict = dict()
@@ -1851,6 +1942,110 @@ def callBam(params, processNo):
     rugged_reads_pool = {}
     # Chromosome of the pending rugged entries, purged on chromosome change.
     rugged_pool_chrom = None
+    # Window of the families only --rescue lets through (failed mapq/AS-XS/
+    # NM): (chrom, start) + _load_window's tuple. Kept apart from the
+    # coverage window so --rescue never changes where it is cut.
+    rescue_win = None
+
+    def _genotype_family(
+        flt_rs,
+        readSet,
+        setBc,
+        F1R2,
+        F2R1,
+        duplex_no,
+        rs_reference_start,
+        rs_reference_end,
+        chromNow,
+        win,
+        cov,
+    ):
+        """_process_duplex_family on window win ((chrom, start) +
+        _load_window's tuple) with coverage arrays cov (all None for a
+        rescue-only family, which never touches them)."""
+        (
+            win_chrom,
+            win_start,
+            _win_end,
+            ref_np,
+            trinuc_np,
+            hp_np,
+            hp_raw_np,
+            str_raw_np,
+            snp_mask,
+            indel_mask,
+            noise_mask,
+            n_cov_mask,
+            include_mask,
+            nm_mask,
+        ) = win
+        (
+            coverage,
+            coverage_indel_cat,
+            unmasked_coverage,
+            unmasked_coverage_indel_cat,
+        ) = cov
+        return _process_duplex_family(
+            F1R2=F1R2,
+            F2R1=F2R1,
+            L=L,
+            L_indel_1bp=L_indel_1bp,
+            L_indel_len=L_indel_len,
+            chromNow=chromNow,
+            coverage=coverage,
+            coverage_indel_cat=coverage_indel_cat,
+            currentStart=currentStart,
+            depth_by_dinuc=depth_by_dinuc,
+            depth_by_hpstr=depth_by_hpstr,
+            depth_by_trinuc=depth_by_trinuc,
+            duplex_no=duplex_no,
+            duplex_read_num_dict=duplex_read_num_dict,
+            duplex_read_num_dict_dbs=duplex_read_num_dict_dbs,
+            duplex_read_num_dict_indel=duplex_read_num_dict_indel,
+            duplex_read_num_dict_trinuc=duplex_read_num_dict_trinuc,
+            flt_rs=flt_rs,
+            hp_alt_mat=hp_alt_mat,
+            hp_dmg_mat=hp_dmg_mat,
+            hp_np=hp_np,
+            hp_raw_np=hp_raw_np,
+            include_mask=include_mask,
+            indel_dict=indel_dict,
+            indel_mask=indel_mask,
+            isLearn=isLearn,
+            mismatch_dmg_mat=mismatch_dmg_mat,
+            mismatch_mat=mismatch_mat,
+            muts=muts,
+            muts_dbs=muts_dbs,
+            muts_dict=muts_dict,
+            muts_indels=muts_indels,
+            n_cov_mask=n_cov_mask,
+            nm_mask=nm_mask,
+            noise_mask=noise_mask,
+            num2base=num2base,
+            num2trinuc=num2trinuc,
+            params=params,
+            processed_read_names=processed_read_names,
+            readSet=readSet,
+            ref_np=ref_np,
+            reference_mat_chrom=win_chrom,
+            reference_mat_start=win_start,
+            rs_reference_end=rs_reference_end,
+            rs_reference_start=rs_reference_start,
+            sbs_alt_bq_hist_mat=sbs_alt_bq_hist_mat,
+            setBc=setBc,
+            snp_mask=snp_mask,
+            str_alt_mat=str_alt_mat,
+            str_dmg_mat=str_dmg_mat,
+            str_raw_np=str_raw_np,
+            trinuc_np=trinuc_np,
+            unmasked_coverage=unmasked_coverage,
+            unmasked_coverage_indel_cat=unmasked_coverage_indel_cat,
+            neg_lr_sbs=neg_lr_sbs,
+            neg_lr_indel=neg_lr_indel,
+            power_tally=power_tally,
+            coverage_totals=coverage_totals,
+        )
+
     for rec, region in bamIterateMultipleRegionWithOverflow(
         bam, regions, params.get("reference"), params.get("region_file")
     ):
@@ -1958,13 +2153,15 @@ def callBam(params, processNo):
                 F2R1 = currentReadDict[key]["F2R1"]
                 F1R2 = currentReadDict[key]["F1R2"]
                 duplex_no = f"{F1R2}+{F2R1}"
-                if duplex_read_num_dict.get(duplex_no) is None:
-                    duplex_read_num_dict[duplex_no] = [0, 0, 0]
-                    duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
-                    duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
-                    duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
-                duplex_read_num_dict[duplex_no][2] += 1
-                unique_read_num += 1
+                # A family only --rescue lets through is not counted.
+                if flt_rs == "PASS":
+                    if duplex_read_num_dict.get(duplex_no) is None:
+                        duplex_read_num_dict[duplex_no] = [0, 0, 0]
+                        duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
+                        duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
+                        duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
+                    duplex_read_num_dict[duplex_no][2] += 1
+                    unique_read_num += 1
                 if F2R1 >= 1 and F1R2 >= 1:
                     if params["maxNM"]:
                         f1r2_blacklist_num = 0
@@ -2006,6 +2203,43 @@ def callBam(params, processNo):
                             f"{rs_reference_start}-{rs_reference_end}, which "
                             f"starts at or beyond the contig length "
                             f"({contig_len_now})"
+                        )
+                        continue
+                    if flt_rs != "PASS":
+                        # Rescue-only family: genotyped in its own window,
+                        # which never moves or flushes the coverage window.
+                        if (
+                            rescue_win is None
+                            or chromNow != rescue_win[0]
+                            or rs_reference_end > rescue_win[2]
+                            or rs_reference_start < rescue_win[1]
+                        ):
+                            rescue_win = (chromNow, batch_min_start) + _load_window(
+                                chromNow,
+                                batch_min_start,
+                                region,
+                                readSet,
+                                contig_len_now,
+                                params,
+                                germline,
+                                noise,
+                                indel_bed,
+                                include_bed,
+                                nbams,
+                                bam,
+                            )
+                        _genotype_family(
+                            flt_rs,
+                            readSet,
+                            setBc,
+                            F1R2,
+                            F2R1,
+                            duplex_no,
+                            rs_reference_start,
+                            rs_reference_end,
+                            chromNow,
+                            rescue_win,
+                            (None, None, None, None),
                         )
                         continue
                     if (
@@ -2087,66 +2321,32 @@ def callBam(params, processNo):
                         reference_mat_chrom = chromNow
                         # batch_min_start <= every key's start in this batch.
                         reference_mat_start = batch_min_start
-                        try:
-                            region_end = region[2]
-                        except IndexError:
-                            region_end = 10e10
-                        contig_end = contig_len_now
-                        # Cap measured from reference_mat_start so the window
-                        # never exceeds the coverage arrays' 1 Mb rows.
-                        reference_mat_end = min(
-                            reference_mat_start + 1000000,
-                            max(
-                                region_end, max([seq.reference_end for seq in readSet])
-                            ),
-                            contig_end,
-                        )
-                        ref_h5 = h5py.File(params["reference"] + ".ref.h5", "r")
-                        tn_h5 = h5py.File(params["reference"] + ".tn.h5", "r")
-                        hp_h5 = h5py.File(params["reference"] + ".hp.h5", "r")
-                        str_h5 = h5py.File(params["reference"] + ".str.h5", "r")
-                        ref_np = ref_h5[reference_mat_chrom][
-                            reference_mat_start:reference_mat_end
-                        ]
-                        trinuc_np = tn_h5[reference_mat_chrom][
-                            reference_mat_start:reference_mat_end
-                        ]
-                        # (3, window): unit_len, cut (run start), repeat_count;
-                        # STR-priority merge of hp.h5 and str.h5.
-                        hp_np = load_repeat_context(
-                            hp_h5[reference_mat_chrom],
-                            str_h5[reference_mat_chrom],
-                            reference_mat_start,
-                            reference_mat_end,
-                        )
-                        # Raw, unmerged slices, for learning and opportunity
-                        # where HP and STR must be treated independently.
-                        hp_raw_np = hp_h5[reference_mat_chrom][
-                            :, reference_mat_start:reference_mat_end
-                        ]
-                        str_raw_np = str_h5[reference_mat_chrom][
-                            :, reference_mat_start:reference_mat_end
-                        ]
                         (
+                            reference_mat_end,
+                            ref_np,
+                            trinuc_np,
+                            hp_np,
+                            hp_raw_np,
+                            str_raw_np,
                             snp_mask,
                             indel_mask,
                             noise_mask,
                             n_cov_mask,
                             include_mask,
                             nm_mask,
-                        ) = prepare_reference_mats(
+                        ) = _load_window(
                             reference_mat_chrom,
                             reference_mat_start,
-                            reference_mat_end,
-                            ref_np,
-                            trinuc_np,
+                            region,
+                            readSet,
+                            contig_len_now,
+                            params,
                             germline,
                             noise,
                             indel_bed,
                             include_bed,
                             nbams,
                             bam,
-                            params,
                         )
                         cov_rows = _coverage_window_rows(
                             coverage_leftovers,
@@ -2157,67 +2357,38 @@ def callBam(params, processNo):
                         coverage_indel_cat = np.zeros((cov_rows, 16))
                         unmasked_coverage = np.zeros((cov_rows, 4))
                         unmasked_coverage_indel_cat = np.zeros((cov_rows, 16))
-                    if _process_duplex_family(
+                    if _genotype_family(
+                        flt_rs,
+                        readSet,
+                        setBc,
                         F1R2,
                         F2R1,
-                        FPs,
-                        L,
-                        L_indel_1bp,
-                        L_indel_len,
-                        RPs,
-                        chromNow,
-                        coverage,
-                        coverage_indel_cat,
-                        currentStart,
-                        depth_by_dinuc,
-                        depth_by_hpstr,
-                        depth_by_trinuc,
                         duplex_no,
-                        duplex_read_num_dict,
-                        duplex_read_num_dict_dbs,
-                        duplex_read_num_dict_indel,
-                        duplex_read_num_dict_trinuc,
-                        flt_rs,
-                        hp_alt_mat,
-                        hp_dmg_mat,
-                        hp_np,
-                        hp_raw_np,
-                        include_mask,
-                        indel_dict,
-                        indel_mask,
-                        isLearn,
-                        mismatch_dmg_mat,
-                        mismatch_mat,
-                        muts,
-                        muts_dbs,
-                        muts_dict,
-                        muts_indels,
-                        n_cov_mask,
-                        nm_mask,
-                        noise_mask,
-                        num2base,
-                        num2trinuc,
-                        params,
-                        processed_read_names,
-                        readSet,
-                        ref_np,
-                        reference_mat_chrom,
-                        reference_mat_start,
-                        rs_reference_end,
                         rs_reference_start,
-                        sbs_alt_bq_hist_mat,
-                        setBc,
-                        snp_mask,
-                        str_alt_mat,
-                        str_dmg_mat,
-                        str_raw_np,
-                        trinuc_np,
-                        unmasked_coverage,
-                        unmasked_coverage_indel_cat,
-                        neg_lr_sbs=neg_lr_sbs,
-                        neg_lr_indel=neg_lr_indel,
-                        power_tally=power_tally,
-                        coverage_totals=coverage_totals,
+                        rs_reference_end,
+                        chromNow,
+                        (
+                            reference_mat_chrom,
+                            reference_mat_start,
+                            reference_mat_end,
+                            ref_np,
+                            trinuc_np,
+                            hp_np,
+                            hp_raw_np,
+                            str_raw_np,
+                            snp_mask,
+                            indel_mask,
+                            noise_mask,
+                            n_cov_mask,
+                            include_mask,
+                            nm_mask,
+                        ),
+                        (
+                            coverage,
+                            coverage_indel_cat,
+                            unmasked_coverage,
+                            unmasked_coverage_indel_cat,
+                        ),
                     ):
                         duplex_count += 1
             """
@@ -2281,13 +2452,14 @@ def callBam(params, processNo):
         F2R1 = currentReadDict[key]["F2R1"]
         F1R2 = currentReadDict[key]["F1R2"]
         duplex_no = f"{F1R2}+{F2R1}"
-        if duplex_read_num_dict.get(duplex_no) is None:
-            duplex_read_num_dict[duplex_no] = [0, 0, 0]
-            duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
-            duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
-            duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
-        duplex_read_num_dict[duplex_no][2] += 1
-        unique_read_num += 1
+        if flt_rs == "PASS":
+            if duplex_read_num_dict.get(duplex_no) is None:
+                duplex_read_num_dict[duplex_no] = [0, 0, 0]
+                duplex_read_num_dict_trinuc[duplex_no] = np.zeros((64, 4))
+                duplex_read_num_dict_indel[duplex_no] = np.zeros(100)
+                duplex_read_num_dict_dbs[duplex_no] = np.zeros(144)
+            duplex_read_num_dict[duplex_no][2] += 1
+            unique_read_num += 1
         if F2R1 >= 1 and F1R2 >= 1:
             if params["maxNM"]:
                 f1r2_blacklist_num = 0
@@ -2323,6 +2495,43 @@ def callBam(params, processNo):
                     f"{rs_reference_start}-{rs_reference_end}, which "
                     f"starts at or beyond the contig length "
                     f"({contig_len_now})"
+                )
+                continue
+            if flt_rs != "PASS":
+                # Rescue-only family: genotyped in its own window, which never
+                # moves or flushes the coverage window.
+                if (
+                    rescue_win is None
+                    or chromNow != rescue_win[0]
+                    or rs_reference_end > rescue_win[2]
+                    or rs_reference_start < rescue_win[1]
+                ):
+                    rescue_win = (chromNow, batch_min_start) + _load_window(
+                        chromNow,
+                        batch_min_start,
+                        region,
+                        readSet,
+                        contig_len_now,
+                        params,
+                        germline,
+                        noise,
+                        indel_bed,
+                        include_bed,
+                        nbams,
+                        bam,
+                    )
+                _genotype_family(
+                    flt_rs,
+                    readSet,
+                    setBc,
+                    F1R2,
+                    F2R1,
+                    duplex_no,
+                    rs_reference_start,
+                    rs_reference_end,
+                    chromNow,
+                    rescue_win,
+                    (None, None, None, None),
                 )
                 continue
             if (
@@ -2399,58 +2608,32 @@ def callBam(params, processNo):
                     max_flushed_pos = -1
                 reference_mat_chrom = chromNow
                 reference_mat_start = batch_min_start
-                try:
-                    region_end = region[2]
-                except IndexError:
-                    region_end = 10e10
-                contig_end = contig_len_now
-                reference_mat_end = min(
-                    reference_mat_start + 1000000,
-                    max(region_end, max([seq.reference_end for seq in readSet])),
-                    contig_end,
-                )
-                ref_h5 = h5py.File(params["reference"] + ".ref.h5", "r")
-                tn_h5 = h5py.File(params["reference"] + ".tn.h5", "r")
-                hp_h5 = h5py.File(params["reference"] + ".hp.h5", "r")
-                str_h5 = h5py.File(params["reference"] + ".str.h5", "r")
-                ref_np = ref_h5[reference_mat_chrom][
-                    reference_mat_start:reference_mat_end
-                ]
-                trinuc_np = tn_h5[reference_mat_chrom][
-                    reference_mat_start:reference_mat_end
-                ]
-                hp_np = load_repeat_context(
-                    hp_h5[reference_mat_chrom],
-                    str_h5[reference_mat_chrom],
-                    reference_mat_start,
-                    reference_mat_end,
-                )
-                hp_raw_np = hp_h5[reference_mat_chrom][
-                    :, reference_mat_start:reference_mat_end
-                ]
-                str_raw_np = str_h5[reference_mat_chrom][
-                    :, reference_mat_start:reference_mat_end
-                ]
                 (
+                    reference_mat_end,
+                    ref_np,
+                    trinuc_np,
+                    hp_np,
+                    hp_raw_np,
+                    str_raw_np,
                     snp_mask,
                     indel_mask,
                     noise_mask,
                     n_cov_mask,
                     include_mask,
                     nm_mask,
-                ) = prepare_reference_mats(
+                ) = _load_window(
                     reference_mat_chrom,
                     reference_mat_start,
-                    reference_mat_end,
-                    ref_np,
-                    trinuc_np,
+                    region,
+                    readSet,
+                    contig_len_now,
+                    params,
                     germline,
                     noise,
                     indel_bed,
                     include_bed,
                     nbams,
                     bam,
-                    params,
                 )
                 cov_rows = _coverage_window_rows(
                     coverage_leftovers, coverage_leftover_gstart, reference_mat_start
@@ -2459,67 +2642,38 @@ def callBam(params, processNo):
                 coverage_indel_cat = np.zeros((cov_rows, 16))
                 unmasked_coverage = np.zeros((cov_rows, 4))
                 unmasked_coverage_indel_cat = np.zeros((cov_rows, 16))
-            if _process_duplex_family(
+            if _genotype_family(
+                flt_rs,
+                readSet,
+                setBc,
                 F1R2,
                 F2R1,
-                FPs,
-                L,
-                L_indel_1bp,
-                L_indel_len,
-                RPs,
-                chromNow,
-                coverage,
-                coverage_indel_cat,
-                currentStart,
-                depth_by_dinuc,
-                depth_by_hpstr,
-                depth_by_trinuc,
                 duplex_no,
-                duplex_read_num_dict,
-                duplex_read_num_dict_dbs,
-                duplex_read_num_dict_indel,
-                duplex_read_num_dict_trinuc,
-                flt_rs,
-                hp_alt_mat,
-                hp_dmg_mat,
-                hp_np,
-                hp_raw_np,
-                include_mask,
-                indel_dict,
-                indel_mask,
-                isLearn,
-                mismatch_dmg_mat,
-                mismatch_mat,
-                muts,
-                muts_dbs,
-                muts_dict,
-                muts_indels,
-                n_cov_mask,
-                nm_mask,
-                noise_mask,
-                num2base,
-                num2trinuc,
-                params,
-                processed_read_names,
-                readSet,
-                ref_np,
-                reference_mat_chrom,
-                reference_mat_start,
-                rs_reference_end,
                 rs_reference_start,
-                sbs_alt_bq_hist_mat,
-                setBc,
-                snp_mask,
-                str_alt_mat,
-                str_dmg_mat,
-                str_raw_np,
-                trinuc_np,
-                unmasked_coverage,
-                unmasked_coverage_indel_cat,
-                neg_lr_sbs=neg_lr_sbs,
-                neg_lr_indel=neg_lr_indel,
-                power_tally=power_tally,
-                coverage_totals=coverage_totals,
+                rs_reference_end,
+                chromNow,
+                (
+                    reference_mat_chrom,
+                    reference_mat_start,
+                    reference_mat_end,
+                    ref_np,
+                    trinuc_np,
+                    hp_np,
+                    hp_raw_np,
+                    str_raw_np,
+                    snp_mask,
+                    indel_mask,
+                    noise_mask,
+                    n_cov_mask,
+                    include_mask,
+                    nm_mask,
+                ),
+                (
+                    coverage,
+                    coverage_indel_cat,
+                    unmasked_coverage,
+                    unmasked_coverage_indel_cat,
+                ),
             ):
                 duplex_count += 1
     """
@@ -2551,7 +2705,7 @@ def callBam(params, processNo):
     for mut in muts:
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
         if coverage_only:
-            if key not in deferred_depth_keys:
+            if key not in deferred_depth_keys or mut["filter"] != "masked":
                 continue
         elif mut["filter"] != "PASS":
             continue
@@ -2617,14 +2771,26 @@ def callBam(params, processNo):
             extra=f"{chrom}:{pos}",
         )
         key = (chrom, pos, ref, alt)
-        eligible = key in deferred_depth_keys if coverage_only else flt == "PASS"
+        # Round 2: a deferred key's "masked" candidate (a rescue-only
+        # family's record at that key is never "masked").
+        eligible = (
+            key in deferred_depth_keys and flt == "masked"
+            if coverage_only
+            else flt == "PASS"
+        )
+        if coverage_only:
+            # Round 2 returns only what Caller.py merges: the deferred
+            # candidates and, under --rescue, the rescue records.
+            if not (eligible or (params["rescue"] and flt not in ("PASS", "masked"))):
+                continue
+            mut["deferred"] = eligible
         if eligible:
             ta, tr, ti, tdp, na, nr, ni, ndp = mut_dict[key]
         else:
             ta, tr, ti, tdp, na, nr, ni, ndp = (0, 0, 0, 0, 0, 0, 0, 0)
         # Depth-check failures are labeled, not dropped: Caller.py prunes
-        # them after merging round 2 unless --rescue (a round-2 record only
-        # feeds that merge, so dropping it here would have no effect).
+        # them after merging round 2 (under --rescue, those below their
+        # channel's final threshold).
         if eligible:
             if ta == 0:
                 mut["filter"] = "no_good_alt_read"
@@ -2649,7 +2815,7 @@ def callBam(params, processNo):
     for mut in muts_indels:
         key = (mut["chrom"], mut["pos"], mut["ref"], mut["alt"])
         if coverage_only:
-            if key not in deferred_depth_keys:
+            if key not in deferred_depth_keys or mut["filter"] != "masked":
                 continue
         elif mut["filter"] != "PASS":
             continue
@@ -2716,7 +2882,19 @@ def callBam(params, processNo):
             extra=f"{chrom}:{pos}",
         )
         key = (chrom, pos, ref, alt)
-        eligible = key in deferred_depth_keys if coverage_only else flt == "PASS"
+        # Round 2: a deferred key's "masked" candidate (a rescue-only
+        # family's record at that key is never "masked").
+        eligible = (
+            key in deferred_depth_keys and flt == "masked"
+            if coverage_only
+            else flt == "PASS"
+        )
+        if coverage_only:
+            # Round 2 returns only what Caller.py merges: the deferred
+            # candidates and, under --rescue, the rescue records.
+            if not (eligible or (params["rescue"] and flt not in ("PASS", "masked"))):
+                continue
+            mut["deferred"] = eligible
         if eligible:
             ta, tr, tdp, na, nr, ndp, ni = muts_indels_dict[key]
         else:
