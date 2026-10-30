@@ -109,15 +109,24 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
+      # Nextflow's installer needs Java 17-26 on PATH; do not rely on the
+      # runner image shipping one.
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Install Nextflow ${{ matrix.nextflow-version }}
         env:
           NXF_VER: ${{ matrix.nextflow-version }}
         run: |
+          java -version
           # The installer writes ./nextflow, which would collide with the
           # repo's nextflow/ directory.
           mkdir -p "$RUNNER_TEMP/nextflow-install"
           cd "$RUNNER_TEMP/nextflow-install"
-          curl -s https://get.nextflow.io | bash
+          curl -fsSL https://get.nextflow.io | bash
           sudo mv nextflow /usr/local/bin/
           nextflow -version
 
