@@ -5,7 +5,7 @@ All files are written under the directory specified by `-o / --output` (call it 
 ```
 {out}/
 ├── {sample}_call_params.log
-├── {sample}_coverage.bed.gz(.tbi)
+├── {sample}_coverage.bed.gz(.tbi)   (not with --skipCoveragePass)
 ├── {sample}_duplex_family_strand_composition.txt
 ├── {sample}_duplex_family_strand_composition_heatmap.pdf
 ├── {sample}_stats.txt
@@ -19,15 +19,24 @@ All files are written under the directory specified by `-o / --output` (call it 
           won't need either)
 ```
 
-Indel channels are `HP{run}_len{±1}_{C|T}` (homopolymer), `STR{bin}_u{U}_{del|ins}` (a slip of repeat unit U, any number of units, in STR length bin 1-4; U = 5 means 5+) and `STR0_u{L}_{del|ins}` (an indel of length L that isn't a slip; `STR0_u1_ins` is the mismatched 1bp insertion). In `_indel_rate_by_hp_str.txt` the STR rows have context `STR{bin}_u{U}` and the signed unit or length in `indel_length`. The two rate tables give, per channel, `n_sites` (sites in the mu solve: PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` and `mutation_rate_mle` (the channel's maximum-likelihood rate, solved from `mu*Eeff = sum of site posteriors`; 1/(Eeff+1) when the sites' LRs sum to no more than Eeff and there is no maximum-likelihood root, in which case the channel's threshold is above all its sites and it has no PASS calls; 0 for a channel with no Eeff and no sites).
+`tmp/{sample}.amp.tn.bqhist.npz` is written only when this run actually learns the error profile: not with `-E/--errprefix`, and not when a complete, current set of profiles already sits at the default `ERROR/{sample}` prefix (see [Error Profile Files](#error-profile-files-outerror)). `aggregate` fails for a run without it.
+
+Indel channels are `HP{run}_len{±1}_{C|T}` (homopolymer), `STR{bin}_u{U}_{del|ins}` (a slip of repeat unit U = 2-5, any number of units, in STR length bin 1-4; U = 5 means 5+; 1bp slips are HP channels) and `STR0_u{L}_{del|ins}` (an indel of length L = 2-5+ that isn't a slip, plus `STR0_u1_ins`, the mismatched 1bp insertion). The two rate tables are tab-separated with a header:
+
+- `_sbs96_rate_n1.txt`: `context` (`SBS96:{SBS96 label}`), `n_sites`, `Eeff`, `mutation_rate_mle`.
+- `_indel_rate_by_hp_str.txt`: `context`, `indel_length`, `n_sites`, `Eeff`, `mutation_rate_mle`, `eeff_sites`. The first row is `STR0_u1` with `indel_length` 1; HP rows have context `HP{run}_{C|T}` (run 1-10) and `indel_length` -1/+1; STR rows have context `STR{bin}_u{U}` (bin 0-4) and the signed unit (bins 1-4) or length (bin 0), ±2 to ±5, in `indel_length`. `eeff_sites` is a layout tag (`per_unit_signed`) that `-mr` checks.
+
+Per channel, `n_sites` is the number of sites in the mu solve (PASS calls, sub-threshold candidates and LR < 0 sites; not a mutation count), `Eeff` its effective coverage and `mutation_rate_mle` the channel's maximum-likelihood rate, solved from `mu*Eeff = sum of site posteriors`; 1/(Eeff+1) when the sites' LRs sum to no more than Eeff and there is no maximum-likelihood root, in which case the channel's threshold is above all its sites and it has no PASS calls; 0 for a channel with no Eeff and no sites. With `-mr/--muterateprefix`, `mutation_rate_mle` is the supplied table's value (`Eeff` and `n_sites` are still this run's).
 
 `{sample}_duplex_allele_counts.txt` is documented in [`estimate_outputs.md`](estimate_outputs.md#sampleduplex_allele_countstxt) — it requires `_coverage.bed.gz` and is actually written by `estimate`, not `call`.
+
+**`-lo/--learnOnly`:** `call` stops after error-profile learning. Only `{sample}_call_params.log`, the seven `ERROR/` files and `tmp/{sample}.amp.tn.bqhist.npz` are written; if learning is skipped (profiles already present), nothing beyond the log is.
 
 ---
 
 ## `SBS/{sample}_sbs.vcf` and `SBS/{sample}_sbs_fail.vcf`
 
-Called single-base substitutions and MNVs. `_sbs.vcf` contains only `FILTER=PASS` records; `_sbs_fail.vcf` contains everything else (unless `--rescue` is set — see below). The two files together are a complete partition of all evaluated SBS candidates with log10 LR >= 0; candidates whose reads favor the reference (log10 LR < 0) are never written to either file, though they do enter the per-channel mutation-rate (mu) solve.
+Called single-base substitutions, one record per position (no MNV records are written; two adjacent substitutions in the same read family are reported as a DBS, and `-mnv/--maxMNVlen` currently has no effect). `_sbs.vcf` contains only `FILTER=PASS` records; `_sbs_fail.vcf` contains the other written records. Only candidates with log10 LR >= 0 are written; candidates whose reads favor the reference (log10 LR < 0) are never written to either file, though they do enter the per-channel mutation-rate (mu) solve. Not every LR >= 0 candidate is written either: a `masked` candidate that never got depth extracted is always dropped, all `masked` candidates are dropped with `--doNotOutputMaskedSite`, and the rescue-only reasons below are dropped unless `--rescue` is set.
 
 ## `INDEL/{sample}_indel.vcf` and `INDEL/{sample}_indel_fail.vcf`
 
@@ -35,20 +44,20 @@ Same PASS/fail split, for short indels.
 
 ## `DBS/{sample}_dbs.vcf` and `DBS/{sample}_dbs_fail.vcf`
 
-Same PASS/fail split, for dinucleotide substitutions (DBS) — two adjacent SBS calls that form a single dinucleotide-substitution event. A PASS DBS event's two constituent positions are always individually PASS SBS calls too (so a DBS event double-counts as 2 SBS calls unless you exclude its positions when combining SBS and DBS mutation counts).
+Same PASS/fail split, for dinucleotide substitutions (DBS) — two adjacent SBS calls from the same read family that form a single dinucleotide-substitution event. A PASS DBS event's two constituent SBS are relabeled `dbs_member` and written to `_sbs_fail.vcf`, not `_sbs.vcf`, so SBS and DBS calls (and their counts, burdens and spectra) are mutually exclusive and can be added without double-counting. A DBS whose tumor/normal depth check fails `--maxAF`, `--minNdepth` or `--naf` is dropped, `--rescue` or not; one with no alt-supporting read is labeled `no_good_alt_read`.
 
 ### FILTER values (shared across all three types)
 
 | Value | Meaning |
 | --- | --- |
 | `PASS` | All filters passed, including snp_mask/noise_mask (`SNPM`/`NOISEM` INFO fields both 0) — a fully unmasked call. |
-| `masked` | Blocked only by `snp_mask`/`noise_mask` (see `SNPM`/`NOISEM` INFO fields for which). Still fully evaluated (LR + depth) and feeds the unmasked-burden numerator, but not `PASS`. A masked candidate that never got real depth extracted (LR below the channel threshold) is dropped entirely, `--rescue` or not. With `--doNotOutputMaskedSite` no masked candidate gets depth extracted and none is written, `--rescue` or not. |
+| `masked` | Blocked only by `snp_mask`/`noise_mask` (see `SNPM`/`NOISEM` INFO fields for which). Still fully evaluated (LR + depth) and, for SBS, feeds the `Unmasked burden` numerator (there is no indel or DBS unmasked burden), but not `PASS`. DBS records are never `masked`. A masked candidate that never got real depth extracted (LR below the channel threshold) is dropped entirely, `--rescue` or not. With `--doNotOutputMaskedSite` no masked candidate gets depth extracted and none is written, `--rescue` or not. |
 | `underpowered` | Candidate with LR > 0 that failed the per-channel FDR-refined threshold (never below `--minLR`). |
 | `zero_LR` | Candidate with no evidence for the alt over the ref (log10 LR == 0; near-zero floating-point LRs are snapped to exactly 0). Reported for completeness, never PASS. A DBS inherits it from either of its own read family's SBS. |
 | `strand_independence` | SBS or indel call with a strand whose strand independence hypothesis p-value (INFO `MSP`) is <= `--p_threshold` (not corrected for the number of calls): the strand has more non-alt reads than read error explains, i.e. a mixed read family (early-cycle PCR error, or two molecules sharing a barcode). Tested on the final PASS SBS and indel calls (on the unrounded p, not the printed MSP); a strand with no non-alt read has p = 1 and never fails. A DBS fails if either of its own read family's SBS (same TAG1/TAG2/SP) fails, and then its other SBS gets this FILTER too, whatever its own MSP. Always written to the fail VCF. |
 | `dbs_member` | SBS that is one of the two bases of a PASS DBS from the same read family. It is reported once, as the DBS (in `_dbs.vcf`), and kept in `_sbs_fail.vcf` for traceability, so SBS and DBS calls, burdens and spectra are mutually exclusive. |
 
-The remaining values are only ever emitted when `--rescue` is set (otherwise those candidates are dropped instead of appearing in `_fail.vcf`), and only for a candidate whose log10 LR is at or above its channel's final (FDR-refined) threshold, i.e. one that would have been `PASS` but for that reason. Rescued candidates are called in the coverage pass (round 2), after the thresholds are final, so `--rescue` cannot be combined with `--skipCoveragePass`. Read families failing a family-level filter (`high_nm`, `low_mapq`, `low_ASXS`) carry that label at every position, and are left out of coverage, the duplex-group tables and the read-family counts in `_stats.txt`: every output other than the fail VCFs is the same with and without `--rescue`.
+The remaining values are only ever emitted when `--rescue` is set (otherwise those candidates are dropped instead of appearing in `_fail.vcf`), and only for a candidate whose log10 LR is at or above its channel's final (FDR-refined) threshold, i.e. one that would have been `PASS` but for that reason. Rescued candidates are called in the coverage pass (round 2), after the thresholds are final, so `--rescue` cannot be combined with `--skipCoveragePass`. DBS records only ever get `no_good_alt_read` from this table: the family/mask reasons never reach DBS detection, and a DBS failing `--maxAF`, `--naf` or `--minNdepth` is dropped even under `--rescue`. Read families failing a family-level filter (`high_nm`, `low_mapq`, `low_ASXS`) carry that label at every position, and are left out of coverage, the duplex-group tables and the read-family counts in `_stats.txt`: every output other than the fail VCFs is the same with and without `--rescue`.
 
 | Value | Meaning |
 | --- | --- |
@@ -61,9 +70,9 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | `indel_mask` | Indel blocked by `indel_mask`; no coverage/depth extracted. |
 | `other_mask` | Blocked by a mask type not covered by a more specific reason above; no coverage/depth extracted. |
 | `no_good_alt_read` | Real depth-extraction found zero alt-supporting reads in the tumor BAM pileup, even though LR cleared its channel's threshold on family-consensus evidence alone — real AC/RC/DP attached. Applies to SBS, indel, and DBS (a DBS also inherits it from either constituent SNV). Only reported under `--rescue`. |
-| `duplex_vaf` | The extracted tumor allele fraction (AC/DP) exceeds `--maxAF` — real AC/RC/DP attached. |
-| `normal_vaf` | The extracted matched-normal allele fraction exceeds `--naf` (likely germline or a systematic artifact) — real AC/RC/DP attached. |
-| `n_cov_mask` | Matched-normal depth at this position fell below `--minNdepth` once real depth was extracted — real AC/RC/DP attached. |
+| `duplex_vaf` | The extracted tumor allele fraction (AC/DP) exceeds `--maxAF` — real AC/RC/DP attached. SBS and indel only. |
+| `normal_vaf` | The extracted matched-normal allele fraction exceeds `--naf` (likely germline or a systematic artifact) — real AC/RC/DP attached. SBS and indel only. |
+| `n_cov_mask` | Matched-normal depth at this position fell below `--minNdepth` once real depth was extracted — real AC/RC/DP attached. SBS and indel only. |
 
 ### INFO fields — SBS and INDEL records
 
@@ -73,15 +82,15 @@ The remaining values are only ever emitted when `--rescue` is set (otherwise tho
 | `F2R1` | Integer | Number of F2R1 reads in the read family (bottom-strand read count). |
 | `LR` | Float | log10 likelihood ratio of the alt allele (SBS: the position's non-reference base, majority or not; indel: the indel) over the reference allele. |
 | `LM` | Float | Maximum log10 likelihood ratio the context's damage rates allow (the call's LR ceiling). |
-| `TC` | Integer×4 | Top-strand base counts, order A, T, C, G. |
-| `BC` | Float×4 | Bottom-strand base counts, order A, T, C, G. |
+| `TC` | Integer | Top-strand (F1R2) read counts. SBS: 4 values, base counts in order A, T, C, G. Indel: 2 values, `alt,ref` read counts. (The header declares `Number=4` for both types, so a strict VCF parser may reject indel records.) |
+| `BC` | Float | Bottom-strand (F2R1) read counts, same layout as `TC` (SBS: A, T, C, G; indel: `alt,ref`). Header `Number=4`, as for `TC`. |
 | `DF` | Integer | Distance of the variant from the fragment (template) end. |
 | `DR` | Integer | Distance of the variant from the read end. |
 | `TAG1` | String | 5′ barcode of the top-strand read. |
 | `TAG2` | String | 5′ barcode of the bottom-strand read. |
 | `SP` | Integer | Read family's reference start position. |
 | `TL` | Integer | Template length of the read pair: SAM TLEN of the family's first read (negative when that read is the downstream mate). |
-| `TN` | String | Trinucleotide context of the variant (reference base ± 1 flanking base). |
+| `TN` | String | Trinucleotide context of the variant (reference base ± 1 flanking base). Always `.` for indels. |
 | `HP` | Integer | Homopolymer length at the site. Always 0 for SBS. |
 | `STR` | Integer | STR bin of the indel's reference tract: 0 = no STR, or a 2bp+ indel that isn't a whole number of the tract's repeat units (scored and counted as STR0); 1 = 2–9bp, 2 = 10–24bp, 3 = 25–39bp, 4 = 40bp+. Always 0 for SBS. |
 | `SNPM` | Integer | 1 if this position falls in `snp_mask`. SBS only, always 0 for indel. Never set on a `PASS` record. |
@@ -103,9 +112,11 @@ DBS records do **not** carry `LR`/`LM`/`TC`/`BC`/`DF`/`DR`/`TN`/`HP`/`STR`/`SNPM
 
 | Tag | Type | Description |
 | --- | --- | --- |
-| `AC` | Integer | Count of the alt allele in the read family. |
-| `RC` | Integer | Count of the ref allele in the read family. |
-| `DP` | Integer | Total read depth at the position. |
+| `AC` | Integer | Alt-allele read count in that sample's BAM pileup at the position (all reads, not just the calling read family). |
+| `RC` | Integer | Ref-allele read count in the same pileup. |
+| `DP` | Integer | Read depth in the same pileup. |
+
+These come from the depth extraction step: a pileup of the tumor BAM (and of each normal BAM, summed) at the position, counting each read pair once, skipping secondary, supplementary, duplicate-flagged and `DT`-tagged reads, and requiring BQ >= `--minBq` and MAPQ >= `--mapq`; in the tumor BAM, reads from the read families that support the call count regardless of BQ/MAPQ. `DP` also counts reads showing another base or an indel at the position. Records that never get depth extracted carry `0:0:0` for both samples: `underpowered` and `zero_LR` SBS/indel records and the rescue-only mask/family reasons (`high_nm` … `other_mask`). `PASS`, `masked`, `strand_independence`, `dbs_member`, `no_good_alt_read`, `duplex_vaf`, `normal_vaf` and `n_cov_mask` records, and every DBS record, have real counts.
 
 Two samples are always written, `TUMOR` then `NORMAL` (matching the VCF header's `...FORMAT\tTUMOR\tNORMAL` column order). If no matched normal BAM was given (`-n`/`--normalBams` omitted), the `NORMAL` sample's `AC`/`RC`/`DP` are all `0`.
 
@@ -120,25 +131,25 @@ Two samples are always written, `TUMOR` then `NORMAL` (matching the VCF header's
 Tab-separated matrix, one row per **raw, un-folded** (trinucleotide context, alt base) combination — 64 contexts × 3 non-ref alt bases = **192 rows**, labeled `{trinuc}>{alt}` (e.g. `ACC>T`). Reverse-complement pairs are only combined into the 96 canonical (pyrimidine-only) SBS96 classes later, at estimation time.
 
 - **Columns:** duplex-group labels in `F1R2+F2R1` format (e.g. `1+1`, `1+2`, `2+2`), restricted to groups that actually occurred (`duplex_group_number > 0` in the strand-composition table in `_duplex_family_strand_composition.txt` below).
-- **Values:** number of callable genomic positions in that (trinuc, alt) context, observed in read families belonging to that duplex group.
+- **Values:** power-weighted (L-weighted) duplex coverage for calling that alt base in that trinucleotide context, summed over the callable positions of read families in that duplex group (floats; the same per-alt-base weights as `_coverage.bed.gz` columns 4–7, not a count of positions).
 
 ---
 
 ## `INDEL/{sample}_indel_by_duplex_group.txt`
 
-Same shape and purpose as `SBS/{sample}_trinuc_by_duplex_group.txt` above, but for indel opportunity: 100 rows (the raw indel100 resolution, `build_indel100_labels` in `funcs/misc.py`) × the same duplex-group columns.
+Same shape and purpose as `SBS/{sample}_trinuc_by_duplex_group.txt` above, but for indel opportunity: 100 rows (the raw indel100 resolution, `build_indel100_labels` in `funcs/misc.py`) × the same duplex-group columns. Values are power-weighted indel-calling opportunity, not position counts.
 
 ---
 
 ## `DBS/{sample}_dbs_by_duplex_group.txt`
 
-Same shape and purpose, for DBS opportunity: 144 rows (raw dinucleotide-substitution resolution, `build_dbs_raw144_labels`) × the same duplex-group columns.
+Same shape and purpose, for DBS opportunity: 144 rows (raw dinucleotide-substitution resolution, `build_dbs_raw144_labels`) × the same duplex-group columns. Each value sums, over adjacent pairs of callable positions, the product of the two positions' per-alt-base power-weighted coverage (9 alt pairs per reference dinucleotide).
 
 ---
 
 ## `{sample}_call_params.log`
 
-Plain-text run log: DupCaller version, run timestamp, the exact command line invoked, the fully resolved value of every `call` argument (including the RNG `--seed`, generated automatically and recorded here if not passed explicitly), and the resolved paths of the four error-profile files actually used for calling (`amperr_file`, `amperri_file`, `dmgerr_file`, `dmgerri_file`).
+Plain-text run log: DupCaller version, run timestamp, the exact command line invoked, the fully resolved value of every `call` argument (including the RNG `--seed`, generated automatically and recorded here if not passed explicitly), and four resolved error-profile paths (`amperr_file`, `amperri_file`, `dmgerr_file`, `dmgerri_file`). `amperr_file` (`.amp.tn.srd.txt`) and `dmgerr_file` (`.dmg.tn.txt`) are files actually read. `amperri_file`/`dmgerri_file` are logged as `{prefix}.amp.id.txt`/`{prefix}.dmg.id.txt`, which are placeholder names: no such files are written or read, and the indel profiles actually used are the `.hp.txt` and `.str.txt` files at the same prefix.
 
 ---
 
@@ -155,7 +166,7 @@ A bgzip-compressed, tabix-indexed BED file with per-position, per-alt-base, powe
 | 1 | `chrom` | Chromosome name |
 | 2 | `start` | 0-based start coordinate |
 | 3 | `end` | `start + 1` |
-| 4–7 | `cov_A`, `cov_T`, `cov_C`, `cov_G` | L-weighted duplex SNV coverage for calling that specific alt base at this position (float). Exactly 3 of these 4 are ever nonzero at a given locus — whichever alt bases differ from the locus's own reference base; the self/ref-base column is always 0. |
+| 4–7 | `cov_A`, `cov_T`, `cov_C`, `cov_G` | L-weighted duplex SNV coverage for calling that specific alt base at this position (float). At most 3 of these 4 are nonzero at a given locus — the alt bases that differ from the locus's own reference base; the self/ref-base column is always 0. |
 | 8–23 | 16 indel-opportunity categories (see below) | Power-weighted indel-calling opportunity, one column per category (float). |
 
 The 16 indel columns, in order (from `INDEL_COVERAGE_CATEGORY_LABELS` in `funcs/misc.py`):
@@ -190,7 +201,7 @@ Tab-separated table describing how read families are distributed across strand-c
 | `duplex_group_strand_composition` | Strand composition label as `F1R2+F2R1` (e.g. `0+1`, `1+1`, `2+3`). |
 | `read_family_number` | Total number of read families with this strand composition. |
 | `duplex_group_number` | Number of **effective** duplex families (F1R2 ≥ 1 and F2R1 ≥ 1) in this group that cover at least one callable position. |
-| `effective_coverage` | Total power-weighted coverage contributed by families in this group. |
+| `effective_coverage` | Number of callable positions covered by families in this group (an unweighted position count, summed over families; not power-weighted). |
 
 Families with `0` on either strand (e.g. `0+2`) appear in the table but have `duplex_group_number = 0`, since they aren't true duplex (one strand is missing).
 
@@ -204,19 +215,21 @@ Heatmap visualization of the strand-composition table above. The x-axis is F1R2 
 
 ## Error Profile Files (`{out}/ERROR/`)
 
-These seven files capture the sample-specific error model learned automatically before variant calling, unless `-E/--errprefix` points at an already-learned set (in which case learning is skipped and those files are read from the given prefix instead — six of the seven are required: `.amp.tn.srd.txt`, `.amp.hp.txt`, `.amp.str.txt`, `.dmg.tn.txt`, `.dmg.hp.txt`, `.dmg.str.txt`). Learning is also skipped, even without `-E`, if a prior run already left a complete set of six at the default `ERROR/{sample}` prefix.
+These seven files hold the sample-specific error profile learned automatically before variant calling, unless `-E/--errprefix` points at an already-learned set (in which case learning is skipped and those files are read from the given prefix instead — six of the seven are required: `.amp.tn.srd.txt`, `.amp.hp.txt`, `.amp.str.txt`, `.dmg.tn.txt`, `.dmg.hp.txt`, `.dmg.str.txt`). Learning is also skipped, even without `-E`, if a prior run already left a complete set of six at the default `ERROR/{sample}` prefix. With `-E`, nothing is written to `ERROR/`.
+
+Except for `.amp.tn.srd.txt`, these are integer **count** tables (error events and the matching opportunity/reference observations per context), not rates; `call` smooths them with `-a/--pseudocount` and converts them to rates when it loads them. Being counts, they can be summed across samples, which is what `aggregate` does.
 
 | File | Description |
 | --- | --- |
-| `{sample}.amp.tn.txt` | Raw amplification (PCR) SBS mismatch profile: rows are all 64 trinucleotide contexts (not strand-folded; C/T-centred first, then their G/A-centred reverse complements), columns are the four bases A/T/C/G. A diagnostic/intermediate byproduct of learning — not itself used for calling. |
-| `{sample}.amp.tn.srd.txt` | The single-read-damage (SRD) EM-fitted SBS amplification-error rate matrix actually used for calling (`amperr_file`). Same row/column shape as `.amp.tn.txt`. |
-| `{sample}.dmg.tn.txt` | Damage SBS error rate matrix (`dmgerr_file`) — errors from DNA damage (e.g. oxidative damage producing C→A artefacts), symmetric on both strands. Same shape as `.amp.tn.txt`. |
-| `{sample}.amp.hp.txt` | Amplification indel error rates for homopolymer contexts. |
-| `{sample}.dmg.hp.txt` | Damage indel error rates for homopolymer contexts. |
-| `{sample}.amp.str.txt` | Amplification indel error rates for short-tandem-repeat (STR) contexts: rows are the STR length bins (`0-1` = not a slip of a repeat, `2-9`, `10-24`, `25-39`, `40+` bp), columns a deletion/reference/insertion triple per repeat-unit group (`u1`, `u2`, `u3`, `u4`, `u5+`). In the repeat bins an indel counts under its tract's repeat unit, whatever the number of units slipped; in `0-1` under its length (`u1`: the mismatched 1bp insertion). Each triple's reference column is that group's own opportunity count. |
-| `{sample}.dmg.str.txt` | Damage indel error rates for short-tandem-repeat (STR) contexts; same layout as `.amp.str.txt`. |
+| `{sample}.amp.tn.txt` | Raw amplification (PCR) SBS mismatch counts: rows are all 64 trinucleotide contexts (not strand-folded; C/T-centred first, then their G/A-centred reverse complements), columns are the four bases A/T/C/G (the reference-base column counts reference observations). A diagnostic/intermediate byproduct of learning — not itself used for calling (`aggregate` sums it). |
+| `{sample}.amp.tn.srd.txt` | The single-read-damage (SRD) EM-fitted SBS amplification-error **rate** matrix actually used for calling (`amperr_file`). Same row/column shape as `.amp.tn.txt`. |
+| `{sample}.dmg.tn.txt` | Damage SBS error counts (`dmgerr_file`) — errors from DNA damage (e.g. oxidative damage producing C→A artefacts), symmetric on both strands. Same shape as `.amp.tn.txt`. |
+| `{sample}.amp.hp.txt` | Amplification indel error counts for homopolymer contexts: rows `HP1`…`HP9`, `HP10+` (homopolymer run length), columns `{A,T,C,G}_{-1,0,1}` (run base × 1bp deletion / opportunity / 1bp insertion). |
+| `{sample}.dmg.hp.txt` | Damage indel error counts for homopolymer contexts; same layout as `.amp.hp.txt`. |
+| `{sample}.amp.str.txt` | Amplification indel error counts for short-tandem-repeat (STR) contexts: rows are the STR length bins (`0-1` = not a slip of a repeat, `2-9`, `10-24`, `25-39`, `40+` bp), columns a deletion/reference/insertion triple per repeat-unit group (`u1`, `u2`, `u3`, `u4`, `u5+`). In the repeat bins an indel counts under its tract's repeat unit, whatever the number of units slipped; in `0-1` under its length (`u1`: the mismatched 1bp insertion). Each triple's reference column is that group's own opportunity count. |
+| `{sample}.dmg.str.txt` | Damage indel error counts for short-tandem-repeat (STR) contexts; same layout as `.amp.str.txt`. |
 
-These files hold the sample's own learned values. STR profiles written before 1.2.12 (11 indel-length columns) are refused; relearn them. At calling time, any context with fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin × repeat unit) takes the rate for each zero-count error type from the bundled `fallback_latest.*` profiles shipped with DupCaller (`src/ERROR/`). Observed error types and well-sampled contexts keep the sample's own rates. For `.amp.tn.srd.txt` the fallback is already applied in the written file; for the other five it is applied when the file is loaded for calling.
+These files hold the sample's own learned values. STR profiles written before 1.2.12 (11 indel-length columns) are refused when given with `-E`; found at the default `ERROR/{sample}` prefix, they are relearned automatically. At calling time, any context with fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin × repeat unit) takes the rate for each zero-count error type from the bundled `fallback_latest.*` profiles shipped with DupCaller (`src/ERROR/`). Observed error types and well-sampled contexts keep the sample's own rates (homopolymer rates are additionally made non-decreasing in run length at load time). For a `call`-learned `.amp.tn.srd.txt` the fallback is already applied in the written file; for the other five it is applied when the file is loaded for calling. An `aggregate`-pooled `.amp.tn.srd.txt` is fitted from the pooled data only, without the fallback.
 
 ---
 
@@ -227,10 +240,10 @@ Tab-separated key–value file (one metric per line) with library and calling st
 | Field | Formula / Source | Description |
 | --- | --- | --- |
 | Number of Read Families | `unique_read_num` | Total distinct read families (barcode + fragment-start groups) identified. Each represents one original DNA molecule, regardless of whether both strands were captured. |
-| Number of Pass-filter Reads | `pass_read_num` | Total individual reads passing alignment quality filters (properly paired, not supplementary/secondary/QC-failed, no synthetic duplex-tag marking, not 5′ soft-clipped). |
+| Number of Pass-filter Reads | `pass_read_num` | Total individual reads passing alignment quality filters (properly paired, not supplementary/secondary/QC-failed, not marked as a sequencing/optical duplicate (`DT`/`dt` tag = `SQ`), and no clipping or other non-match CIGAR operation at the read's 5′ end). |
 | Number of Effective Read Families | `duplex_count` | Read families where **both** strand orientations are captured (F1R2 ≥ 1 **and** F2R1 ≥ 1) **and** the family covers at least one callable genomic position. Only these families contribute to variant calling. |
-| Unmasked Coverage | `sum(unmasked_coverage) / 3` | Total power-weighted SNV coverage from effective read families, computed **before** the noise mask is applied, already normalized to true per-base units (divided by 3, the number of possible alt bases per locus — same normalization `SBS Base Coverage` below applies). Used to report the pre-masking (unmasked) SNV burden in `_sbs_burden.txt`. `N/A` with `--doNotOutputMaskedSite`. |
-| Per Read Family Coverage | `(sum(coverage) / 3) / Number of Effective Read Families` | Mean number of callable positions covered per effective read family, in true per-base units. Reflects how much of the target each duplex molecule spans. |
+| Unmasked Coverage | `sum(unmasked_coverage) / 3` | Total power-weighted SNV coverage from effective read families, computed **before** the snp_mask and noise_mask are applied, already normalized to true per-base units (divided by 3, the number of possible alt bases per locus — same normalization `SBS Base Coverage` below applies). Used to report the pre-masking (unmasked) SNV burden in `_sbs_burden.txt`. `N/A` with `--doNotOutputMaskedSite`. |
+| Per Read Family Coverage | `(sum(coverage) / 3) / Number of Effective Read Families` | Mean number of callable positions covered per effective read family, in true per-base units. Reflects how much of the target each duplex molecule spans. Note the key is written with a trailing space (`Per Read Family Coverage ` before the tab), so look it up with that space or strip keys when parsing. |
 | Pass-filter Duplication Rate | `1 − (Number of Read Families / Number of Pass-filter Reads)` | Fraction of pass-filter reads that are PCR duplicates within their family. Near 0 = little amplification; higher = more copies per molecule. Only pass-filter reads are in the denominator, so this can read higher than duplication estimates from other tools. |
 | Efficiency | `Number of Effective Read Families / total alignment records read from the BAM` | Considers read *number* only, not base number; modulated by duplication rate and by other conditions (shallow matched normal, large read1/read2 overlap, etc.) that reduce the number of duplex bases. |
 | Total SBS FDR | mean local `FDR` (INFO field) over `PASS` SBS calls whose channel has a determinable `mu` | Mean per-call local false discovery rate actually realized among the SBS calls that passed. `NaN` if there are no such calls. |
@@ -238,6 +251,6 @@ Tab-separated key–value file (one metric per line) with library and calling st
 | Total DBS FDR | same, over `PASS` DBS calls | Mean realized local FDR among passing DBS calls (each combined from its two constituent SBS positions' FDRs). |
 | SBS Base Coverage | *(appended by `estimate`)* | SNV opportunity coverage normalized to true per-base units (divided by 3) at `min_group_size=1` — same value as `_sbs_burden.txt`'s `Duplex coverage` line. |
 | Indel Base Coverage | *(appended by `estimate`)* | Indel opportunity coverage normalized to true per-base units (divided by the genome-wide `indel_locus_multiplier`) at `min_group_size=1` — same value as `_indel_burden.txt`'s `Duplex coverage` line. |
-| DBS Base Coverage | *(appended by `estimate`)* | DBS opportunity coverage (already per-locus, no further normalization needed) — same value as `_dbs_burden.txt`'s `Duplex coverage` line. |
+| DBS Base Coverage | *(appended by `estimate`)* | DBS opportunity coverage normalized to per-dinucleotide units (divided by 9, the number of alt pairs per reference dinucleotide) at `min_group_size=1` — same value as `_dbs_burden.txt`'s `Duplex coverage` line. |
 
 `Unmasked Coverage` and `Per Read Family Coverage` are both SNV-only; with `--skipCoveragePass` they come from round 1's power tallies. There is no indel equivalent of `Unmasked Coverage`: unlike the SNV `/3` correction above, normalizing an indel-opportunity sum to true per-base units needs the genome-wide `indel_locus_multiplier`, which only exists once `estimate` has run — so a call-time "Unmasked Indel Coverage" field could only ever be raw, not-yet-comparable opportunity units, and isn't written. `_indel_burden.txt` correspondingly has no `Unmasked burden` row (see [`estimate_outputs.md`](estimate_outputs.md)).

@@ -119,7 +119,7 @@ def parse_stats_file(path):
 # Bump whenever the on-disk layout of .ref.h5/.tn.h5/.hp.h5/.str.h5 changes
 # in a way ndim/shape checks can't detect. Current layout: hp.h5 has 2 rows
 # (hp, cut; self-derived from the reference, homopolymers only); str.h5 has
-# 3 rows (unit_len, hp, cut; from --repeatBed/--strbed, unit_len >= 2, with
+# 3 rows (unit_len, hp, cut; from index -rt/--repeatTsv, unit_len >= 2, with
 # overlapping tracts resolved so each flagged start carries its own tract's
 # unit/count). Index.py stamps this onto each h5 file's root attrs;
 # check_h5_usable verifies it.

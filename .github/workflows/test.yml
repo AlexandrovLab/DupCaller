@@ -89,6 +89,12 @@ jobs:
 
   mock-pipeline-nextflow:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest entry must match manifest.nextflowVersion in
+        # nextflow/nextflow.config; bump both together.
+        nextflow-version: ["23.10.1", "24.10.4"]
     defaults:
       run:
         shell: bash -el {0}
@@ -103,10 +109,9 @@ jobs:
           channels: bioconda,conda-forge
           channel-priority: strict
 
-      - name: Install Nextflow
+      - name: Install Nextflow ${{ matrix.nextflow-version }}
         env:
-          # Pinned; bump deliberately (nextflow.config requires >=21.10.0).
-          NXF_VER: "24.10.4"
+          NXF_VER: ${{ matrix.nextflow-version }}
         run: |
           # The installer writes ./nextflow, which would collide with the
           # repo's nextflow/ directory.

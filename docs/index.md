@@ -6,22 +6,22 @@ This folder documents every file produced by DupCaller in detail.
 | --- | --- |
 | [call_outputs.md](call_outputs.md) | All files written by `DupCaller.py call` |
 | [estimate_outputs.md](estimate_outputs.md) | All files written by `DupCaller.py estimate` |
-| [summarize_outputs.md](summarize_outputs.md) | The cross-sample table written by `DupCaller.py summarize` |
+| [summarize_outputs.md](summarize_outputs.md) | The cross-sample table and SBS96/ID83 matrices written by `DupCaller.py summarize` |
 
 ---
 
 ## Quick File Index
 
-Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `estimate`); `{sample}` is that directory's basename.
+Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `estimate`); `{sample}` is that directory's basename. The one exception is `estimate`'s run log, written beside that directory as `{prefix}_estimate_params.log`.
 
 ### From `DupCaller.py call`
 
 | File | Description |
 | --- | --- |
-| `SBS/{sample}_sbs.vcf`, `_sbs_fail.vcf` | Called SNVs/MNVs, PASS-only and everything-else |
-| `INDEL/{sample}_indel.vcf`, `_indel_fail.vcf` | Called short indels, PASS-only and everything-else |
-| `DBS/{sample}_dbs.vcf`, `_dbs_fail.vcf` | Called dinucleotide substitutions, PASS-only and everything-else |
-| `{sample}_coverage.bed.gz` | Per-position, per-alt-base/indel-category duplex coverage (23 columns) |
+| `SBS/{sample}_sbs.vcf`, `_sbs_fail.vcf` | Called single-base substitutions, PASS-only and the other written records |
+| `INDEL/{sample}_indel.vcf`, `_indel_fail.vcf` | Called short indels, PASS-only and the other written records |
+| `DBS/{sample}_dbs.vcf`, `_dbs_fail.vcf` | Called dinucleotide substitutions, PASS-only and the other written records |
+| `{sample}_coverage.bed.gz` | Per-position, per-alt-base/indel-category duplex coverage (23 columns; not with `--skipCoveragePass`) |
 | `{sample}_stats.txt` | Library and calling quality metrics (three lines appended later by `estimate`) |
 | `{sample}_call_params.log` | Resolved `call` parameters and error-file paths for this run |
 | `SBS/{sample}_trinuc_by_duplex_group.txt` | Raw 192-row trinucleotide-context coverage by duplex group |
@@ -29,11 +29,13 @@ Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `
 | `DBS/{sample}_dbs_by_duplex_group.txt` | Raw 144-row DBS-opportunity coverage by duplex group |
 | `{sample}_duplex_family_strand_composition.txt` | Read-family strand-composition table |
 | `{sample}_duplex_family_strand_composition_heatmap.pdf` | Strand-composition heatmap |
-| `ERROR/{sample}.amp.tn.txt` | Raw learned amplification SBS mismatch profile (diagnostic) |
+| `ERROR/{sample}.amp.tn.txt` | Raw learned amplification SBS mismatch counts (diagnostic; summed by `aggregate`) |
 | `ERROR/{sample}.amp.tn.srd.txt` | Learned amplification SBS error rates actually used for calling |
-| `ERROR/{sample}.dmg.tn.txt` | Learned damage SBS error rates |
-| `ERROR/{sample}.amp.hp.txt` / `.amp.str.txt` | Learned amplification indel error rates (homopolymer / STR) |
-| `ERROR/{sample}.dmg.hp.txt` / `.dmg.str.txt` | Learned damage indel error rates (homopolymer / STR) |
+| `ERROR/{sample}.dmg.tn.txt` | Learned damage SBS error counts |
+| `ERROR/{sample}.amp.hp.txt` / `.amp.str.txt` | Learned amplification indel error counts (homopolymer / STR) |
+| `ERROR/{sample}.dmg.hp.txt` / `.dmg.str.txt` | Learned damage indel error counts (homopolymer / STR) |
+| `tmp/{sample}_sbs96_rate_n1.txt`, `tmp/{sample}_indel_rate_by_hp_str.txt` | Per-channel mutation-rate tables (input for `call -mr`) |
+| `tmp/{sample}.amp.tn.bqhist.npz` | SBS base-quality histogram for `aggregate` (only when this run learned the profile) |
 
 ### From `DupCaller.py estimate`
 
@@ -46,11 +48,12 @@ Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `
 | `INDEL/{sample}_indel_83_corrected.txt`, `ID_83_plots_{sample}.pdf` | Per-channel ID83 mutation counts and profile plot |
 | `DBS/{sample}_dbs_78_corrected.txt`, `DBS_78_plots_{sample}.pdf` | Per-channel DBS78 mutation counts and profile plot |
 | `{type}/{sample}_{sbs\|indel\|dbs}_burden_by_group_size.txt`/`.pdf` | Burden stratified by minimum/exact duplex group size, per mutation type |
-| `{sample}_duplex_allele_counts.txt` | Duplex depth and allele counts per unique mutation |
-| `{sample}_gene_coverage.txt` | Mean per-base SBS and indel duplex depth per gene (conditional, `-gb`) |
-| `{sample}_estimate_params.log` | Resolved `estimate` parameters for this run |
+| `{sample}_duplex_allele_counts.txt` | Duplex depth and allele counts per unique PASS SNV/indel (not if `call` used `--skipCoveragePass`) |
+| `{sample}_gene_coverage.txt` | Mean per-base SBS and indel duplex depth per gene (conditional, `-gb`; not with `--skipCoveragePass`) |
+| `../{sample}_estimate_params.log` | Resolved `estimate` parameters for this run (written beside the sample directory, as `{prefix}_estimate_params.log`) |
+| `-ot` file | Reference trinucleotide composition, reusable with `-ft` (conditional, `-ot/--outTrinuc`) |
 | `SBS/{sample}_sbs_flt.vcf` | Dilute-mode filtered SNVs (conditional, `-d/--dilute`) |
-| `SBS/{sample}_sbs_burden_re_estimate.txt` | Re-estimated SNV burden for a sub-region (conditional, `-rb`) |
+| `SBS/{sample}_sbs_burden_re_estimate.txt` | Re-estimated SNV burden for a sub-region (`-rb` mode, which writes only these three `-rb` rows and the log) |
 | `INDEL/{sample}_indel_burden_re_estimate.txt` | Re-estimated indel burden for a sub-region (conditional, `-rb`) |
 | `SBS/{sample}_sbs_96_corrected_re_estimate.txt`, `SBS_96_plots_{sample}_re_estimate.pdf` | Re-estimated SBS96 counts and profile plot (conditional, `-rb`) |
 
@@ -62,3 +65,6 @@ Paths are relative to the sample's output directory (`-o` for `call`, `-i` for `
 | `{output_prefix}_SBS96_uncorrected.txt` | Multi-sample matrix of raw SBS96 counts |
 | `{output_prefix}_SBS96_corrected.txt` | Multi-sample matrix of trinucleotide-corrected SBS96 counts |
 | `{output_prefix}_SBS96_genome.txt` | Multi-sample matrix of genome-extrapolated SBS96 counts |
+| `{output_prefix}_ID83_uncorrected.txt` | Multi-sample matrix of raw ID83 counts (SigProfiler labels) |
+| `{output_prefix}_ID83_corrected.txt` | Multi-sample matrix of context-corrected ID83 counts |
+| `{output_prefix}_ID83_genome.txt` | Multi-sample matrix of genome-extrapolated ID83 counts |

@@ -2,15 +2,17 @@
 
 [![Docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://github.com/AlexandrovLab/DupCaller/blob/main/README.md) [![License](<https://img.shields.io/badge/License-BSD%202--Clause-orange.svg>)](https://opensource.org/licenses/BSD-2-Clause) [![Build Status](https://github.com/AlexandrovLab/DupCaller/actions/workflows/test.yml/badge.svg)](https://github.com/AlexandrovLab/DupCaller/actions)[![Uptime Robot status](https://img.shields.io/uptimerobot/status/m795312784-02766a79f207f67626cef289)](https://stats.uptimerobot.com/jjqW4Ulymx)
 
-DupCaller is a tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS/duplex sequencing) data with matched normal (e.x. NanoSeq, UDSeq).
+DupCaller is a tool for calling somatic mutations and calculating somatic mutational burden from barcoded error-corrected next generation sequencing (ecNGS/duplex sequencing) data with matched normal (e.g. NanoSeq, UDSeq).
 
 ---
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Pipeline](#pipeline)
+  - [Protocol Settings](#protocol-settings)
   - [Step 1: Index Reference Genome](#step-1-index-reference-genome)
   - [Step 2: Trim Barcodes](#step-2-trim-barcodes)
   - [Step 3: Align Reads](#step-3-align-reads)
@@ -28,9 +30,124 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
 
 ---
 
+## Quick Start
+
+Use this if you have no preferred reference genome file and want to follow the developers' defaults: GRCh38 (human) or GRCm39 (mouse), with the reference FASTA, DupCaller index, germline VCF and noise/SNP mask(s) that `--premade` downloads (listed in [Resources](#resources)).
+
+**What you need:**
+
+- **This repository**, cloned: `git clone https://github.com/AlexandrovLab/DupCaller.git`
+- **Anaconda or equivalent**: if you use another package manager such as mamba or pixi, replace the installation commands with their equivalents.
+- **[Nextflow](https://www.nextflow.io/) >= 23.10.1** on your `PATH`.
+- **Docker** (for local/cloud) **or Singularity** (for HPC) on your `PATH`.  If you are on HPC and do not have Singularity, contact your admin to install it, or follow [Installation](#installation) and [Pipeline](#pipeline) instead.
+- **Paired-end FASTQs** (R1 and R2) for the duplex sample and, if you have one, its matched normal. Without a matched normal, see [Without a matched normal](#quick-start-without-a-matched-normal) below. We do not recommend calling samples <=100x duplex coverage without a matched normal.
+- **Internet access** on the first run, from wherever the tasks run, to pull the containers and download the genome.
+- **Disk:** ~50 GB for the downloaded genome (hg38), plus space for the Nextflow work directory and results. Expect ~300GB of space per 30x data.
+- **Memory:** ~90 GB on the first run (building the bwa-mem2 index); after that, 6 GB per CPU for variant calling (192 GB at 32 CPUs).
+
+**Installation**
+
+With Singularity (HPC):
+
+```bash
+# 1. Nextflow and Singularity
+module load singularity # Module name varies by cluster. Contact HPC admin if you have problem.
+conda create -y -n nextflow -c conda-forge -c bioconda nextflow=24.10.4
+conda activate nextflow
+
+# 2. This repository
+git clone https://github.com/AlexandrovLab/DupCaller.git
+cd DupCaller
+```
+
+With Docker (Linux workstation with sudo):
+
+```bash
+# 1. Docker, and permission to run it without sudo
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"
+newgrp docker                    # or log out and back in
+docker run --rm hello-world      # check: prints "Hello from Docker!"
+### If using macOS, install and launch Docker Desktop and ignore step 1
+
+# 2. Nextflow
+conda create -y -n nextflow -c conda-forge -c bioconda nextflow=24.10.4
+conda activate nextflow
+
+# 3. This repository
+git clone https://github.com/AlexandrovLab/DupCaller.git
+cd DupCaller
+```
+
+**Configure your scheduler profile:**
+
+- `-profile singularity,local` runs every step on the current machine (e.g. inside one batch job). To submit each step as its own cluster job instead, use `-profile singularity,slurm` (or `lsf`, `sge`, `pbs`, `pbspro`), and first replace the `"PLEASE CHANGE"` values for that scheduler in the "Scheduler settings" block of `nextflow/pipeline.config` (line 137-144) with your cluster's information: the run stops with an error until they are set. `null` omits a flag (e.g. no QOS), and `cluster_options` adds extra submit flags such as your account. For SLURM, for example:
+
+  ```groovy
+  slurm_queue     = "your_partition"       // sbatch --partition
+  slurm_qos       = "your_qos"             // sbatch --qos, or null
+  cluster_options = "--account=your_account"
+  ```
+
+**Fill in the sample map:** copy the example into the DupCaller directory and edit it:
+
+```bash
+cd /path/to/DupCaller   # change to the actual path
+cp nextflow/examples/sample.map sample.map                   # with a matched normal
+cp nextflow/examples/sample_tumor_only.map sample.map        # or: without a matched normal
+```
+
+Replace `SAMPLE1` with your sample name and each `/path/to/...` with the absolute path of that FASTQ. Alternatively, create your own tab-delimited `sample.map` with the same header as the example.
+
+**With a matched normal (Singularity):** replace each `/path/to/...` and adjust `--protocol`, the resource flags and `-profile` as described in the notes below the commands.
+
+```bash
+conda activate nextflow
+export NXF_SINGULARITY_CACHEDIR=/path/to/sif_cache   # Singularity only
+cd /path/to/DupCaller                                # change to the actual path
+
+nextflow run nextflow/DupCaller.nf \
+    -c nextflow/nextflow.config -c nextflow/pipeline.config \
+    --premade hg38 --premade_dir /path/to/dupcaller_premade \
+    --protocol renanoseq \
+    --sample_map sample.map --outdir results \
+    --threads 32 --max_cpus 32 --max_memory 192.GB \
+    -profile singularity,slurm -resume
+```
+
+<a id="quick-start-without-a-matched-normal"></a>
+**Without a matched normal (Singularity):** use the tumor-only sample map and add `--tumor_only true`:
+
+```bash
+conda activate nextflow
+export NXF_SINGULARITY_CACHEDIR=/path/to/sif_cache   # Singularity only
+cd /path/to/DupCaller                                # change to the actual path
+
+nextflow run nextflow/DupCaller.nf \
+    -c nextflow/nextflow.config -c nextflow/pipeline.config \
+    --premade hg38 --premade_dir /path/to/dupcaller_premade \
+    --protocol renanoseq \
+    --tumor_only true \
+    --sample_map sample.map --outdir results \
+    --threads 32 --max_cpus 32 --max_memory 192.GB \
+    -profile singularity,slurm -resume
+```
+
+- `-profile`: `singularity,slurm` submits each step to SLURM (configure it as above); replace `slurm` with your scheduler (`lsf`, `sge`, `pbs`, `pbspro`), or use `singularity,local` to run everything on the current machine. With Docker, use `-profile docker,local` and skip `NXF_SINGULARITY_CACHEDIR`.
+- `NXF_SINGULARITY_CACHEDIR` (on shared storage) keeps the container images, so they are downloaded once instead of into every run's work directory.
+- `--premade hg38` or `--premade mm39`. For mm39, add `--premade_strain STRAIN` (e.g. `C57BL_6NJ`) to use that mouse strain's germline VCF.
+- `--premade_dir` is where the genome is downloaded and kept (~50 GB for hg38). The first run downloads it and builds the bwa-mem2 index (~90 GB of RAM, about 20 minutes for hg38); every later run with the same `--premade_dir`, for any sample, reuses it. Put it on shared storage.
+- `--protocol` is your library protocol: `renanoseq`, `nanoseqv2`, `udseq` or `metacs`. It sets the barcode pattern and how far from fragment and read ends mutations are ignored (see [Protocol Settings](#protocol-settings)); a wrong barcode pattern silently breaks duplex family formation. `metacs` also needs `--barcode_list barcode_list.txt`, the allowed Tn5 barcodes, one per line. For another protocol, give the barcode pattern with `--barcode_pattern` instead (N = barcode base, X = skipped base).
+- `--threads`/`--max_cpus`/`--max_memory`: set to your machine or the largest job your cluster allows. `--max_memory` should be at least 6 GB × `--threads` (what `DupCaller.py call` asks for; e.g. `--threads 16 --max_memory 96.GB`), and at least ~90 GB for the first run.
+- Results go to `results/SAMPLE1/`. Rerunning the same command in the same directory resumes after a failure (`-resume`).
+
+If you have your own reference genome, see [Before running a real dataset](nextflow/README.md#before-running-a-real-dataset) and [One sample with your own reference](nextflow/README.md#one-sample-with-your-own-reference) in the Nextflow README, or run the command-line steps in [Pipeline](#pipeline) below.
+
+---
+
 ## Prerequisites
 
-DupCaller requires python>=3.11 to run (setup.py pins numpy==2.3.4/scipy==1.16.2, both of which require >=3.11). Earlier versions are not supported.
+DupCaller requires python>=3.11 to run. Earlier versions are not supported.
 The complete DupCaller pipeline also requires the following tools for data preprocessing. The Nextflow pipeline (`nextflow/`) runs exactly these versions and commands. Other versions may work but have not been validated.
 
 - bwa-mem2 2.3 (https://github.com/bwa-mem2/bwa-mem2), run as `bwa-mem2 mem -C -T 0` (Step 3). (The v2.3 release still prints `2.2.1` from `bwa-mem2 version` and in the BAM `@PG` header.)
@@ -43,10 +160,18 @@ The complete DupCaller pipeline also requires the following tools for data prepr
 
 ### pip Installation
 
-The tool uses pip for installing scripts and prerequisites. We recommend creating a new environment to install DupCaller:
+The tool uses pip for installing scripts and prerequisites. We recommend creating a new environment that also holds the [Prerequisites](#prerequisites) tools (bwa-mem2, GATK, samtools, htslib). If you do not have conda, install Miniforge first:
 
 ```bash
-conda create -n DupCaller python=3.12 bioconda::htslib
+curl -fsSL -o Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3.sh -b -p "$HOME/miniforge3"
+source "$HOME/miniforge3/bin/activate"
+```
+
+Then create the environment:
+
+```bash
+conda create -y -n DupCaller -c conda-forge -c bioconda python=3.12 bwa-mem2=2.3 gatk4=4.3.0.0 samtools htslib
 ```
 
 To install DupCaller, simply clone this repository and install via pip:
@@ -85,6 +210,30 @@ singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.12.sif DupCaller.py {your co
 ---
 
 ## Pipeline
+
+### Protocol Settings
+
+The barcode pattern (`trim -p`, Step 2) and how far from fragment and read ends mutations are ignored (`call -tt`/`-tr`, Step 5) depend on the library protocol:
+
+| Protocol   | Nextflow `protocol` | `trim -p`                                                         | `call -tt` | `call -tr` |
+| ---------- | --------------------- | ------------------------------------------------------------------- | ------------ | ------------ |
+| RE-NanoSeq | `renanoseq`         | `NNNXXXX`                                                         | 7 (default)  | 7 (default)  |
+| NanoSeq v2 | `nanoseqv2`         | `NNNXX`                                                           | 7 (default)  | 7 (default)  |
+| UDSeq      | `udseq`             | `NNNNNNNN`                                                        | 15           | 8            |
+| META-CS    | `metacs`            | `BXXXXXXXXXXXXXXXXXXX` with `-bl barcode_list.txt` (see Step 2) | 7 (default)  | 7 (default)  |
+
+The Nextflow pipeline sets all three from the protocol name (`--protocol`, or `protocol` in `pipeline.config`; `metacs` also needs `--barcode_list`); see [Quick Start](#quick-start).
+
+`-tt`/`--trimF` ignores mutations within N bp of either end of the sequenced fragment, and `-tr`/`--trimR` within N bp of either end of each read. For example, for UDSeq:
+
+```bash
+DupCaller.py trim -i ${SAMPLE}_R1.fq.gz -i2 ${SAMPLE}_R2.fq.gz -p NNNNNNNN -o ${SAMPLE}
+...
+DupCaller.py call -b ${SAMPLE}.mkdped.bam -n ${NORMAL}.mkdped.bam -f ${REF} -o ${SAMPLE} \
+    -g ${GERMLINE} -m ${NOISE} -p ${THREADS} -tt 15 -tr 8
+```
+
+**Without a matched normal**, whatever the protocol, omit `-n` and add `-maf 0.1` to `call` so that variants above 10% allele fraction (mostly germline) are not called; see [Without Matched Normal](#without-matched-normal) (the Nextflow pipeline does this with `tumor_only`; see [Quick Start](#quick-start-without-a-matched-normal)). A `-maf` below 1 also masks positions with raw tumor depth below `1/maf` (10x for 0.1).
 
 ### Step 1: Index Reference Genome
 
@@ -172,7 +321,10 @@ gatk MarkDuplicates \
     -I sample.bam -O sample.mkdped.bam -M sample.mkdp_metrics.txt \
     --READ_NAME_REGEX "(?:.*:)?([0-9]+)[^:]*:([0-9]+)[^:]*:([0-9]+)[^:]*$" \
     --DUPLEX_UMI --TAGGING_POLICY OpticalOnly --BARCODE_TAG DB
+samtools index sample.mkdped.bam
 ```
+
+`DupCaller.py call` needs the BAM index (`.bai`) of every input BAM.
 
 ---
 
@@ -236,63 +388,46 @@ These options should be understood and customized accordingly.
 
 The effect of changing these parameters should be evaluated before implementation.
 
-| Short    | Long               | Description                                                                                                                                                                                                                                                                                                                                                                                 | Default |
-| -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| --naf    |                    | Maximum VAF in matched normal for a mutation to be called                                                                                                                                                                                                                                                                                                                                   | 0.01    |
-| --rescue | -res               | Output discarded variants whose LR clears their channel's final threshold, with the reason in the FILTER field (called in the coverage pass; not with `--skipCoveragePass`)                                                                                                                                                                                                                 | False   |
-| -nm      | --nmflt            | Drop a read family when at least half of its reads have an edit distance (NM) above this value                                                                                                                                                                                                                                                                                              | 5       |
-| -ax      | --minMeanASXS      | Minimum mean AS-XS alignment score difference for a read group to be considered                                                                                                                                                                                                                                                                                                             | 50      |
-| -gaf     | --germlineAfCutoff | Skip positions with germline AF above this threshold                                                                                                                                                                                                                                                                                                                                        | 0.001   |
-| -d       | --minNdepth        | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                                              | 10      |
-| -sc      | --skipCoveragePass | Skip round 2 (the coverage-only pass), roughly halving total runtime: every output except the per-locus `coverage.bed.gz` is still written, with coverage from round 1's power tallies contracted at the final thresholds. `estimate` then skips the duplex allele counts and per-gene coverage, and `-rb/--reestimatebed` is unavailable. Not with `--rescue` | False   |
-| -nms     | --doNotOutputMaskedSite | Skip snp_mask/noise_mask (`-m`) candidates entirely: no depth extraction for them and no `masked` records in the fail VCFs. Calls, mutation rates and corrected burdens are unchanged; `Unmasked Coverage` (`_stats.txt`) and `Unmasked burden` (`_sbs_burden.txt`) are written as N/A | False   |
+| Short    | Long                    | Description                                                                                                                                                                                                                                                                                                                                                            | Default |
+| -------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+|          | --naf                   | Maximum VAF in matched normal for a mutation to be called                                                                                                                                                                                                                                                                                                              | 0.01    |
+| -res     | --rescue                | Output discarded variants whose LR clears their channel's final threshold, with the reason in the FILTER field (called in the coverage pass; not with `--skipCoveragePass`)                                                                                                                                                                                          | False   |
+| -nm      | --nmflt                 | Drop a read family when at least half of its reads have an edit distance (NM) above this value                                                                                                                                                                                                                                                                         | 5       |
+| -ax      | --minMeanASXS           | Minimum mean AS-XS alignment score difference for a read group to be considered                                                                                                                                                                                                                                                                                        | 50      |
+| -gaf     | --germlineAfCutoff      | Skip positions with germline AF above this threshold                                                                                                                                                                                                                                                                                                                   | 0.001   |
+| -d       | --minNdepth             | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                         | 10      |
+| -sc      | --skipCoveragePass      | Skip round 2 (the coverage-only pass), roughly halving total runtime: every output except the per-locus `coverage.bed.gz` is still written, with coverage from round 1's power tallies contracted at the final thresholds. `estimate` then skips the duplex allele counts and per-gene coverage, and `-rb/--reestimatebed` is unavailable. Not with `--rescue` | False   |
+| -nms     | --doNotOutputMaskedSite | Skip snp_mask/noise_mask (`-m`) candidates entirely: no depth extraction for them and no `masked` records in the fail VCFs. Calls, mutation rates and corrected burdens are unchanged; `Unmasked Coverage` (`_stats.txt`) and `Unmasked burden` (`_sbs_burden.txt`) are written as N/A                                                                     | False   |
 
 ##### Advanced
 
 These are variant calling model parameters; adjustment is unnecessary for general use.
 
-| Short        | Long              | Description                                                                                                                                                                                                                                                                                                                                            | Default              |
-| ------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
-| -E           | --errprefix       | Prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                                                                                                                             | None                 |
-| -lo          | --learnOnly       | Stop after estimating/writing the error-rate files (ERROR/ dir); skip variant calling entirely                                                                                                                                                                                                                                                         | False                |
-| -lfdr        | --lfdrThreshold   | Target per-channel lFDR (max of`(1-mutation_rate)/(LR*mutation_rate+1-mutation_rate)` over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised via a single closed-form solve using the round-1 mutation-rate estimate (non-iterative -- no re-simulation/re-estimation loop)             | 0.05                 |
-| -a           | --pseudocount     | Pseudocount (> 0) of the SBS amplification-error (SRD) fit and of the error-matrix smoothing. The per-channel mutation-rate solve uses none | 0.5                  |
-| -mlr         | --minLR           | Minimum log10 LR for a PASS call: floor on every channel's FDR-refined LR threshold, used for calling and for the detection-power simulation behind the burden's sensitivity correction | 5                    |
-| -mq          | --mapq            | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                                                                                                                         | 40                   |
-| -w           | --windowSize      | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                                                                                                                      | 100000               |
-| -bq          | --minBq           | Bases with quality below this value are zeroed out and excluded from variant calling/learning (usable iff BQ >= minBq)                                                                                                                                                                                                                                                    | 18                   |
-| -aq          | --minAltQual      | Minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it                                                                                                                                                                                                                                                  | 90                   |
-| --minRef     |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                              | 3                    |
-| --minAlt     |                   | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                              | 3                    |
-| --srdMinRead |                   | Minimum reads on a single strand (F1R2 or F2R1) for that strand to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand, and also gates the minimum BQ-qualifying bases required for a site to be counted                                                                                                     | 3                    |
-| --ssmMinRead |                   | Minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand-mutation (SSM)/damage-rate calculation                                                                                                                                                                                               | 3                    |
-| -pt          | --p_threshold     | Strand independence filter threshold for SBS and indel calls: a PASS call fails with FILTER `strand_independence` if either strand's p-value (INFO `MSP`) is <= this. Per strand, not corrected for the number of calls. Must be in [0, 1); 0 disables the filter (MSP is still reported). See [Strand Independence Filter](#strand-independence-filter)                  | 0.05                 |
-| -id          | --indelbed        | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                                                                                                                               | None                 |
-| -rt          | --regionst        | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                                                                                                                                  | same as`--regions` |
-| -pd          | --maxPileupDepth  | Maximum depth for samtools mpileup                                                                                                                                                                                                                                                                                                                     | 1000000              |
-| -mr          | --muterateprefix  | Reuse per-channel mutation-rate tables from an earlier run instead of estimating them from this run's own candidates (useful when calling a small region). Pass`{out}/tmp/{sample}` from that run, which holds `{sample}_sbs96_rate_n1.txt` and `{sample}_indel_rate_by_hp_str.txt` (tables written before the per-run indel Eeff change are refused). LR thresholds are still solved against this run's `-lfdr` | None                 |
-|              | --seed            | RNG seed for the Monte Carlo detection-power simulation, for reproducible results across runs and`-p` values. If unset, a random seed is generated and recorded in `{sample}_call_params.log`                                                                                                                                                      | random               |
+| Short        | Long             | Description                                                                                                                                                                                                                                                                                                                                                                                                              | Default              |
+| ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
+| -E           | --errprefix      | Prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                                                                                                                                                                                               | None                 |
+| -lo          | --learnOnly      | Stop after estimating/writing the error-rate files (ERROR/ dir); skip variant calling entirely                                                                                                                                                                                                                                                                                                                           | False                |
+| -lfdr        | --lfdrThreshold  | Target per-channel lFDR (max of`(1-mutation_rate)/(LR*mutation_rate+1-mutation_rate)` over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised via a single closed-form solve using the round-1 mutation-rate estimate (non-iterative -- no re-simulation/re-estimation loop)                                                                               | 0.05                 |
+| -a           | --pseudocount    | Pseudocount (> 0) of the SBS amplification-error (SRD) fit and of the error-matrix smoothing. The per-channel mutation-rate solve uses none                                                                                                                                                                                                                                                                              | 0.5                  |
+| -mlr         | --minLR          | Minimum log10 LR for a PASS call: floor on every channel's FDR-refined LR threshold, used for calling and for the detection-power simulation behind the burden's sensitivity correction                                                                                                                                                                                                                                  | 5                    |
+| -mq          | --mapq           | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                                                                                                                                                                                           | 40                   |
+| -w           | --windowSize     | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                                                                                                                                                                                        | 100000               |
+| -bq          | --minBq          | Bases with quality below this value are zeroed out and excluded from variant calling/learning (usable iff BQ >= minBq)                                                                                                                                                                                                                                                                                                   | 18                   |
+| -aq          | --minAltQual     | Minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it                                                                                                                                                                                                                                                                                                                    | 90                   |
+|              | --minRef         | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                                                                                                | 3                    |
+|              | --minAlt         | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                                                                                                | 3                    |
+|              | --srdMinRead     | Minimum reads on a single strand (F1R2 or F2R1) for that strand to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand, and also gates the minimum BQ-qualifying bases required for a site to be counted                                                                                                                                                                       | 3                    |
+|              | --ssmMinRead     | Minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand-mutation (SSM)/damage-rate calculation                                                                                                                                                                                                                                                                 | 3                    |
+| -pt          | --p_threshold    | Strand independence filter threshold for SBS and indel calls: a PASS call fails with FILTER `strand_independence` if either strand's p-value (INFO `MSP`) is <= this. Per strand, not corrected for the number of calls. Must be in [0, 1); 0 disables the filter (MSP is still reported)                                                                                                                              | 0.05                 |
+| -id          | --indelbed       | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                                                                                                                                                                                                 | None                 |
+| -rt          | --regionst       | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                                                                                                                                                                                                    | same as`--regions` |
+| -pd          | --maxPileupDepth | Maximum depth for samtools mpileup                                                                                                                                                                                                                                                                                                                                                                                       | 1000000              |
+| -mr          | --muterateprefix | Reuse per-channel mutation-rate tables from an earlier run instead of estimating them from this run's own candidates (useful when calling a small region). Pass`{out}/tmp/{sample}` from that run, which holds `{sample}_sbs96_rate_n1.txt` and `{sample}_indel_rate_by_hp_str.txt` (tables written before the per-run indel Eeff change are refused). LR thresholds are still solved against this run's `-lfdr` | None                 |
+|              | --seed           | RNG seed for the Monte Carlo detection-power simulation, for reproducible results across runs and`-p` values. If unset, a random seed is generated and recorded in `{sample}_call_params.log`                                                                                                                                                                                                                        | random               |
 
 #### Germline and Noise Masks
 
 The `-m` option accepts BED files and will ignore any mutations overlapping an excluded locus. Any custom BED file can be used as input.
-
-#### Low-Coverage Error-Profile Fallback
-
-DupCaller ships a set of reference error profiles (`src/ERROR/fallback_latest.*.txt`, installed with the package). When a context in the sample's own learned error profile has fewer than 1000 observations (a trinucleotide row, a homopolymer length × base, or an STR length bin × repeat unit), any error type in that context with zero observed counts takes its rate from the bundled profile instead of the flat pseudocount prior. Error types that were observed, and well-sampled contexts, use the sample's own rates, with one exception: a context whose error rates sum past 1 (after this fallback and the homopolymer monotonicity step) takes the bundled profile's whole row instead. This applies to the SBS amplification (SRD) and damage matrices and to the homopolymer/STR indel matrices.
-
-#### Strand Independence Filter
-
-The SBS and indel likelihoods compare alt reads against non-alt reads on each strand, so a read family where some reads carry the alt and others do not (for example, 3 alt and 2 reference reads) can score almost as well as a clean one. Such mixed families usually come from an early-cycle PCR error or from two molecules sharing a barcode.
-
-For every PASS SBS and indel call, DupCaller tests each strand (F1R2, F2R1) separately. Under the null hypothesis the strand is a clean mutant and every non-alt read is an error:
-
-- **SBS:** each covering read shows a non-alt base with probability `10^(-BQ/10)` plus the amplification error rate for that trinucleotide context. Every read covering the position is used at its actual base quality (no `--minBq` cut), and the p-value is Poisson-binomial over the reads.
-- **Indel:** the reads are the informative ones (showing the indel or spanning the reference allele, with base quality at or above `--minBq`). Each shows the reference with the learned amplification error rate that undoes the indel in the mutant molecule's own context: for example, a 1 bp deletion from a run of 7 reverts by a +1 error in a run of 6, and a base inserted next to an unrelated run reverts by losing an isolated base. The learned indel rates already include sequencing error, so there is no separate base-quality term; the p-value is binomial.
-
-The p-value is the probability of seeing at least the observed number of non-alt reads. Both strand p-values are written to INFO `MSP` (F1R2,F2R1) on every SBS and indel call that was PASS going into the filter (so PASS and `strand_independence` records); every other record gets `.`. If either strand's p-value is <= `--p_threshold` (default 0.05), the call gets FILTER `strand_independence`, is written to the fail VCF, and is not counted by `estimate`. A DBS whose own read family has a failed SBS gets the same FILTER, and so does that DBS's other SBS, so neither base is counted as a standalone SBS.
-
-A strand whose reads all show the alt has p = 1 and never fails the test, so the filter only acts on families that already contain discordant reads (and on the other SBS of a DBS that failed). For SBS with binned base qualities, a single low-quality (BQ 11) discordant read gives p of about 0.08 and passes, while two such reads, or one high-quality discordant read, fail at 0.05. For indels outside long homopolymers, learned reversion rates are small enough that a single reference read usually fails; in long homopolymers, where slippage is common, one reference read can pass. The threshold is not corrected for the number of calls.
 
 ---
 
@@ -311,14 +446,38 @@ Adjust the `-r` regions according to the reference genome used.
 For dNdScv coverage correction, DupCaller can output mean duplex depth per gene using the `-gb` option:
 
 ```bash
-DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -gb {target}.bed
+DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -gb {target}.bed.gz
 ```
 
-The gene BED should have the fourth column formatted as `{gene_name}_{exon_number}` (e.g. `tp53_1`). It must be bgzip-compressed and tabix-indexed (`bgzip {target}.bed && tabix -p bed {target}.bed.gz`).
+The gene BED is a tab-separated BED with one row per exon (or target interval). DupCaller reads only the first four columns; any further columns (score, strand, ...) are ignored:
+
+| Column | Content                               | Example     |
+| ------ | ------------------------------------- | ----------- |
+| 1      | Chromosome, named as in the reference | `chr17`   |
+| 2      | Start (0-based)                       | `7669608` |
+| 3      | End (exclusive)                       | `7669690` |
+| 4      | `{gene_name}_{exon_number}`         | `TP53_12` |
+
+```
+chr17	7669608	7669690	TP53_12	0	-
+chr17	7670608	7670715	TP53_11	0	-
+chr17	7673218	7673266	TP53_10	0	-
+```
+
+The gene name is the part of column 4 before the first `_`, and all rows with the same gene name are pooled, so a gene name must not itself contain `_`. Each gene's depth is averaged over the summed length of its rows. The file must be sorted by position within each chromosome, bgzip-compressed and tabix-indexed (`bgzip {target}.bed && tabix -p bed {target}.bed.gz`).
+
+For hg38 exomes, a ready-to-use gene BED of the IDT xGen Exome Hyb Panel v2 targets (197,769 targets, 4th column `{gene}_{exon}`) is included in this repository: `resources/xgen-exome-hyb-panel-v2-targets-hg38.bed.gz` (with its `.tbi`):
+
+```bash
+DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX \
+    -gb resources/xgen-exome-hyb-panel-v2-targets-hg38.bed.gz
+```
+
+In the Nextflow pipeline, pass the same file as `--gene_bed`.
 
 #### Re-estimation for Specific Regions
 
-To re-estimate trinucleotide-corrected mutational burden in specific regions without re-running variant calling, use `-rb`:
+To re-estimate trinucleotide-corrected mutational burden in specific regions without re-running variant calling, use `-rb`. This is a separate mode: it writes only the `_re_estimate` files (see [Optional / Conditional Files](#optional--conditional-files)) and the parameter log, not the main burden outputs, so run it after a normal `estimate`. It needs the per-locus coverage, so it is unavailable when `call` was run with `-sc/--skipCoveragePass`:
 
 ```bash
 DupCaller.py estimate -i sample -f reference.fa -r chr{1..22} chrX -rb {re_estimate}.bed.gz
@@ -343,8 +502,8 @@ As with `-gb`, the BED file must be bgzip-compressed and tabix-indexed.
 | -ot   | --outTrinuc     | Write the reference trinucleotide composition to this file, for reuse with`-ft`                                                                                                                                                                                                                         | None            |
 | -ft   | --refTrinuc     | Load a trinucleotide composition written by`-ot` instead of rescanning the reference (`-f` is still required)                                                                                                                                                                                         | None            |
 | -d    | --dilute        | Set when sample and matched normal come from the same starting DNA material: SNVs with a tumor alt allele count (`AC`) above 1 are dropped when their tumor and normal allele counts differ significantly (Barnard's exact test, p <= 0.05), and kept calls are written to `SBS/{sample}_sbs_flt.vcf` | False           |
-| -gb   | --genebed       | bgzipped, tabix-indexed gene BED file for per-gene coverage calculation                                                                                                                                                                                                                                   | None            |
-| -rb   | --reestimatebed | bgzipped, tabix-indexed BED file for burden re-estimation in specific regions                                                                                                                                                                                                                             | None            |
+| -gb   | --genebed       | bgzipped, tabix-indexed gene BED file for per-gene coverage calculation, 4th column `{gene}_{exon}` (format in [Per-Gene Coverage](#per-gene-coverage)). For hg38 exomes, use the included `resources/xgen-exome-hyb-panel-v2-targets-hg38.bed.gz`                                                     | None            |
+| -rb   | --reestimatebed | bgzipped, tabix-indexed BED file for burden re-estimation in specific regions. Writes only the `_re_estimate` outputs (see [Re-estimation for Specific Regions](#re-estimation-for-specific-regions))                                                                                                     | None            |
 
 ---
 
@@ -402,16 +561,16 @@ For detailed column-by-column and field-by-field descriptions of every output fi
 - [`docs/estimate_outputs.md`](docs/estimate_outputs.md) — all files from `DupCaller.py estimate`
 - [`docs/summarize_outputs.md`](docs/summarize_outputs.md) — the cohort summary table from `DupCaller.py summarize`
 
-Since the DBS-by-duplex-group and burden overhaul, SBS/indel/DBS-specific outputs (VCFs, corrected-context tables, burden files, and signature plots) are written into per-type `SBS/`, `INDEL/`, and `DBS/` subfolders under the sample's output directory, rather than at the sample's top level.
+SBS/indel/DBS-specific outputs (VCFs, corrected-context tables, burden files, and signature plots) are written into per-type `SBS/`, `INDEL/`, and `DBS/` subfolders of the sample's output directory.
 
 ### Core Output Files
 
 | File                                                      | Description                                                                                                                                         |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SBS/{sample}_sbs.vcf`                                  | VCF of detected SNVs and MNVs                                                                                                                       |
+| `SBS/{sample}_sbs.vcf`                                  | VCF of detected SNVs (adjacent SNVs from the same read family are reported as DBS instead)                                                          |
 | `INDEL/{sample}_indel.vcf`                              | VCF of detected short indel mutations                                                                                                               |
 | `DBS/{sample}_dbs.vcf`                                  | VCF of detected dinucleotide substitution (DBS) mutations                                                                                           |
-| `{sample}_coverage.bed.gz`                              | Duplex coverage depths across genomic positions. For multi-threaded runs, files from different threads are automatically merged with tabix indexing |
+| `{sample}_coverage.bed.gz`                              | Duplex coverage depths across genomic positions, merged across threads and tabix-indexed. Not written with `-sc/--skipCoveragePass`                  |
 | `{sample}_coverage.bed.gz.tbi`                          | Tabix index for the coverage BED file                                                                                                               |
 | `SBS/{sample}_trinuc_by_duplex_group.txt`               | Trinucleotide context counts grouped by duplex read number, used for SBS burden estimation                                                          |
 | `INDEL/{sample}_indel_by_duplex_group.txt`              | Indel context counts grouped by duplex read number, used for indel burden estimation                                                                |
@@ -427,20 +586,20 @@ Written to the `ERROR/` subfolder of the `call` output directory. If a complete 
 
 | File                              | Description                                                                       |
 | --------------------------------- | --------------------------------------------------------------------------------- |
-| `ERROR/{sample}.amp.tn.txt`     | Raw amplification SBS mismatch profile by trinucleotide context (diagnostic only) |
-| `ERROR/{sample}.amp.tn.srd.txt` | SRD-EM-fitted amplification SBS error rate matrix actually used for calling       |
-| `ERROR/{sample}.dmg.tn.txt`     | Damage SBS error profile by trinucleotide context                                 |
-| `ERROR/{sample}.amp.hp.txt`     | Amplification indel error rates for homopolymer contexts                          |
-| `ERROR/{sample}.amp.str.txt`    | Amplification indel error rates for short-tandem-repeat contexts                  |
-| `ERROR/{sample}.dmg.hp.txt`     | Damage indel error rates for homopolymer contexts                                 |
-| `ERROR/{sample}.dmg.str.txt`    | Damage indel error rates for short-tandem-repeat contexts                         |
+| `ERROR/{sample}.amp.tn.txt`     | Amplification SBS mismatch counts by trinucleotide context (diagnostic only)      |
+| `ERROR/{sample}.amp.tn.srd.txt` | SRD-EM-fitted amplification SBS error-rate matrix used for calling                |
+| `ERROR/{sample}.dmg.tn.txt`     | Damage SBS error counts by trinucleotide context                                  |
+| `ERROR/{sample}.amp.hp.txt`     | Amplification indel error counts for homopolymer contexts                         |
+| `ERROR/{sample}.amp.str.txt`    | Amplification indel error counts for short-tandem-repeat contexts                 |
+| `ERROR/{sample}.dmg.hp.txt`     | Damage indel error counts for homopolymer contexts                                |
+| `ERROR/{sample}.dmg.str.txt`    | Damage indel error counts for short-tandem-repeat contexts                        |
 
 ### Burden Estimation Files
 
 | File                                              | Description                                                                                                                                               |
 | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SBS/{sample}_sbs_burden.txt`                   | SBS burden with uncorrected and corrected estimates and 95% confidence intervals                                                                          |
-| `INDEL/{sample}_indel_burden.txt`               | Indel burden with 95% confidence intervals, including masked and unmasked calculations                                                                    |
+| `INDEL/{sample}_indel_burden.txt`               | Indel burden with uncorrected and corrected estimates and 95% confidence intervals                                                                        |
 | `DBS/{sample}_dbs_burden.txt`                   | DBS burden with uncorrected and corrected estimates and 95% confidence intervals                                                                          |
 | `SBS/{sample}_sbs_96_corrected.txt`             | Corrected SBS counts across 96 trinucleotide contexts for signature analysis, including a`mutations_per_opportunity` column                             |
 | `INDEL/{sample}_indel_83_corrected.txt`         | Corrected indel counts across the 83 ID contexts, including a`mutations_per_opportunity` column                                                         |
@@ -448,10 +607,10 @@ Written to the `ERROR/` subfolder of the `call` output directory. If a complete 
 | `SBS/{sample}_sbs_burden_by_group_size.txt`     | SBS burden stratified by duplex group size, both cumulative ("min group size >= N") and exact ("group size == N"), corrected and uncorrected, with 95% CI |
 | `INDEL/{sample}_indel_burden_by_group_size.txt` | Same stratification as above, for indels                                                                                                                  |
 | `DBS/{sample}_dbs_burden_by_group_size.txt`     | Same stratification as above, for DBS                                                                                                                     |
-| `{sample}_duplex_allele_counts.txt`             | Duplex depths and allele counts for each unique mutation                                                                                                  |
-| `{sample}_estimate_params.log`                  | Full record of all resolved parameters used for the`estimate` run                                                                                       |
+| `{sample}_duplex_allele_counts.txt`             | Duplex depths and allele counts for each PASS SNV and indel. Not written when `call` used `-sc/--skipCoveragePass`                                        |
+| `{sample}_estimate_params.log`                  | Full record of all resolved parameters used for the`estimate` run. Written next to the sample folder (`{-i}_estimate_params.log`), not inside it            |
 
-`Mutation number per genome` (and its 95% bounds) in each `_burden.txt` is the corrected burden multiplied by `Reference base number`, the number of reference bases considered (one copy of each region in `-r`). It is therefore the expected number of mutations **per haploid genome**; double it for a diploid genome. The same applies to the per-channel `mutation_number_genome` column of the `_corrected.txt` files and to `summarize`'s `*_mutations_per_genome` columns.
+`Mutation number per genome` (and its 95% bounds) in each `_burden.txt` is the corrected burden multiplied by `Reference base number`, the number of reference bases considered (one copy of each region in `-r`). It is therefore the expected number of mutations **per haploid genome**; double it for a diploid genome. The same applies to the per-channel `mutation_number_genome` column of `_sbs_96_corrected.txt` and `_indel_83_corrected.txt` and to `summarize`'s `*_mutations_per_genome` columns.
 
 ### Visualization Files
 
@@ -525,7 +684,7 @@ DupCaller.py estimate -i ${SAMPLE} -f ${REF} -r chr{1..22} chrX
 
 ### Without Matched Normal
 
-When no matched normal is available, omit `-n` and set `-maf` to cap the maximum allele frequency of called variants. A value of 0.1 is appropriate for most somatic applications to exclude common germline variants.
+When no matched normal is available, omit `-n` and set `-maf` to cap the maximum allele frequency of called variants. A value of 0.1 is appropriate for most somatic applications to exclude common germline variants. The Nextflow pipeline runs the same steps with `--tumor_only true`; see [Quick Start](#quick-start-without-a-matched-normal).
 
 ```bash
 SAMPLE=sample1
@@ -564,12 +723,13 @@ Pre-built reference indexes, germline VCFs, and noise masks are available for do
 
 ### Human (GRCh38/hg38)
 
-| Resource         | Link/Source                                                                                                                                                     |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Reference genome | [TCGA hg38 reference file](https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834)                                                                 |
-| Reference index  | [Pre-built hg38 DupCaller reference](https://drive.google.com/drive/folders/1v8ut5aky01zujXlZ0b-dhCqImWMyMbiK?usp=drive_link)                                    |
-| Germline VCF     | af-only-gnomad.hg38.vcf.gz file from the legacy GATK resource bundle. A copy of the file can be found[here](https://www.bcgsc.ca/downloads/morinlab/reference/). |
-| Noise mask       | [NanoSeq noise mask](https://github.com/cancerit/NanoSeq)                                                                                                        |
+| Resource         | Link/Source                                                                                                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Reference genome | [TCGA hg38 reference file](https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834)                                                                                      |
+| Reference index  | [Pre-built hg38 DupCaller reference](https://drive.google.com/drive/folders/1v8ut5aky01zujXlZ0b-dhCqImWMyMbiK?usp=drive_link)                                                         |
+| Germline VCF     | af-only-gnomad.hg38.vcf.gz from the GATK somatic resource bundle ([download](https://storage.googleapis.com/gatk-best-practices/somatic-hg38/af-only-gnomad.hg38.vcf.gz), [index](https://storage.googleapis.com/gatk-best-practices/somatic-hg38/af-only-gnomad.hg38.vcf.gz.tbi)) |
+| Noise mask       | NanoSeq `SNP_GRCh38.wgns.bed.gz` and `NOISE_GRCh38.wgns.bed.gz` masks from [NanoSeq](https://github.com/cancerit/NanoSeq); pass both to `call -m` (`--premade hg38` does)               |
+| Gene BED (exome) | `resources/xgen-exome-hyb-panel-v2-targets-hg38.bed.gz` in this repository: IDT xGen Exome Hyb Panel v2 targets, for `estimate -gb` (see [Per-Gene Coverage](#per-gene-coverage)) |
 
 ### Mouse (GRCm39/mm39)
 
@@ -599,7 +759,6 @@ modification, are permitted provided that the following conditions are met:
 
 1. Redistributions of source code must retain the above copyright notice, this
    list of conditions and the following disclaimer.
-
 2. Redistributions in binary form must reproduce the above copyright notice,
    this list of conditions and the following disclaimer in the documentation
    and/or other materials provided with the distribution.

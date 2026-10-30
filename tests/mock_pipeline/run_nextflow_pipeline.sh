@@ -6,8 +6,7 @@
 # DAG itself (staging, container images, per-process resource directives)
 # using the published yuhecheng62/dupcaller image.
 #
-# CALL_VARIANTS always wants a matched normal, so mock_1/2 are staged as
-# both tumor and normal fastqs. The "default"
+# mock_1/2 are staged as both tumor and normal fastqs. The "default"
 # case's outputs are compared (test_mock_pipeline_nextflow.py) against
 # expected_matched_normal/, which run_pipeline.sh MATCHED_NORMAL=1 produces
 # with the direct CLI and the same options.
@@ -27,12 +26,19 @@
 #     dilute       estimate_dilute = true
 #     normal_bam   normal_bam (the default case's own normal BAM; run
 #                  after "default")
+#     tumor_only   tumor_only = true, with a sample map that has no normal
+#                  columns
+#     udseq        protocol = "udseq" (NNNNNNNN, trim_template 15,
+#                  trim_read 8)
+#     metacs       protocol = "metacs" + barcode_list, on META-CS-style
+#                  reads from make_barcode_list_reads.py (barcode_map.tsv
+#                  maps their codes back to the original barcodes)
 #     all          every case above, in order
 #
 # Requires nextflow and python (with pysam, a DupCaller dependency) on
 # PATH, plus a working docker (or singularity) able to pull
-# yuhecheng62/dupcaller, quay.io/biocontainers/bwa-mem2, and
-# broadinstitute/gatk.
+# yuhecheng62/dupcaller, quay.io/biocontainers/{bwa-mem2,gatk4} and
+# community.wave.seqera.io/library/bwa-mem2_htslib_samtools.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +50,7 @@ shift $(( $# >= 2 ? 2 : $# ))
 CASES=("$@")
 [ ${#CASES[@]} -eq 0 ] && CASES=(default)
 if [ "${CASES[0]}" = "all" ]; then
-    CASES=(default germline noise_mask target_bed indel_bed gene_bed dilute normal_bam)
+    CASES=(default germline noise_mask target_bed indel_bed gene_bed dilute normal_bam tumor_only udseq metacs)
 fi
 
 NEXTFLOW="${NEXTFLOW:-nextflow}"
@@ -64,6 +70,10 @@ echo "[setup] faidx + optional test resources (bwa-mem2/DupCaller indexes are bu
 "$PYTHON" "${SCRIPT_DIR}/make_test_resources.py" resources reference.fa
 
 printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\tnormal_fastq_1\tnormal_fastq_2\nmock\ttumor_1.fastq\ttumor_2.fastq\tnormal_1.fastq\tnormal_2.fastq\n' > sample.map
+printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\nmock\ttumor_1.fastq\ttumor_2.fastq\n' > sample_tumor_only.map
+"$PYTHON" "${SCRIPT_DIR}/make_barcode_list_reads.py" tumor_1.fastq tumor_2.fastq \
+    metacs_1.fastq metacs_2.fastq barcodes.txt barcode_map.tsv
+printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\tnormal_fastq_1\tnormal_fastq_2\nmock\tmetacs_1.fastq\tmetacs_2.fastq\tmetacs_1.fastq\tmetacs_2.fastq\n' > sample_metacs.map
 
 R="${OUTDIR}/resources"
 for case in "${CASES[@]}"; do
@@ -85,6 +95,9 @@ for case in "${CASES[@]}"; do
             cp "$nbam" "${R}/normal_bam/mock_normal.mkdped.bam"
             cp "${nbam}.bai" "${R}/normal_bam/mock_normal.mkdped.bam.bai"
             extra="normal_bam = \"${R}/normal_bam/mock_normal.mkdped.bam\"" ;;
+        tumor_only) extra=$'tumor_only = true\n    sample_map = "sample_tumor_only.map"' ;;
+        udseq)      extra='protocol = "udseq"' ;;
+        metacs)     extra=$'protocol = "metacs"\n    barcode_list = "'"${OUTDIR}"$'/barcodes.txt"\n    sample_map = "sample_metacs.map"' ;;
         *) echo "unknown case: $case" >&2; exit 1 ;;
     esac
     printf 'params {\n    outdir = "%s/results/%s"\n    %s\n}\n' "$OUTDIR" "$case" "$extra" > "case_${case}.config"

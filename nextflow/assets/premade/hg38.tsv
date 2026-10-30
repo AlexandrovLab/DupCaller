@@ -1,0 +1,13 @@
+file	url	md5
+GRCh38.d1.vd1.fa.tar.gz	https://api.gdc.cancer.gov/data/254f697d-310d-4d7d-a27b-27fbf767a834	3ffbcfe2d05d43206f57f81ebb251dc9
+GRCh38.d1.vd1.fa.ref.h5	https://drive.google.com/uc?id=10ThLWaDMn5-A_7UVviE9O5QDR3dwnkR8	
+GRCh38.d1.vd1.fa.tn.h5	https://drive.google.com/uc?id=1D5h-4p7FzcXUKoy8D2T04nVR_NLUFmJO	
+GRCh38.d1.vd1.fa.hp.h5	https://drive.google.com/uc?id=1lscI-FBgqtifVlvBQCrQ9M6ozstf4gyj	
+GRCh38.d1.vd1.fa.str.h5	https://drive.google.com/uc?id=1xpsDxDVRt2cmICKNzHIHF5qZqTnR28f4	
+GRCh38.d1.vd1.fa.dbs.h5	https://drive.google.com/uc?id=1vg0mZyGZmrpV6-JhLKqg1tXDSl8o2aD2	
+af-only-gnomad.hg38.vcf.gz	https://storage.googleapis.com/gatk-best-practices/somatic-hg38/af-only-gnomad.hg38.vcf.gz	a4209be7fb4b5a5a8d3b778132cb7401
+af-only-gnomad.hg38.vcf.gz.tbi	https://storage.googleapis.com/gatk-best-practices/somatic-hg38/af-only-gnomad.hg38.vcf.gz.tbi	a7efccb1519f046c19cdf9f28559d747
+SNP_GRCh38.wgns.bed.gz	https://drive.google.com/uc?id=1J7kVXUbLQv3P6PI5FdFXdgCNw2XFUcGO	
+SNP_GRCh38.wgns.bed.gz.tbi	https://drive.google.com/uc?id=19VvcxZbZU8jeRG_3WPXidH3jpNbCPej6	
+NOISE_GRCh38.wgns.bed.gz	https://drive.google.com/uc?id=1d8T4-wb0zxUTQoA9N9f8nU_0RHFTejck	
+NOISE_GRCh38.wgns.bed.gz.tbi	https://drive.google.com/uc?id=1hLVeeK95Wfnxecf6FIXT8Z8w8RKrCriZ	

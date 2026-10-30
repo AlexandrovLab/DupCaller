@@ -1,0 +1,2 @@
+sample_id	tumor_fastq_1	tumor_fastq_2
+SAMPLE1	/path/to/SAMPLE1_tumor_R1.fastq.gz	/path/to/SAMPLE1_tumor_R2.fastq.gz
