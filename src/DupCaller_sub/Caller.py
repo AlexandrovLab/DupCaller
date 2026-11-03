@@ -368,6 +368,7 @@ def do_call(args):
         "barcodeNormalize": barcode_spec["normalize"],
         "barcodeSep": barcode_spec["sep"],
         "seed": args.seed,
+        "mate_merge": getattr(args, "mate_merge", False),
         "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
     if args.errprefix:
@@ -435,6 +436,8 @@ def do_call(args):
         "barcodeTag": barcode_spec["tag"],
         "barcodeNormalize": barcode_spec["normalize"],
         "barcodeSep": barcode_spec["sep"],
+        # Error learning builds families the same way as calling.
+        "mate_merge": getattr(args, "mate_merge", False),
         "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
     same_regions_flag = False
