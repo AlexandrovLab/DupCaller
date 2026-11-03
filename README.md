@@ -398,6 +398,7 @@ The effect of changing these parameters should be evaluated before implementatio
 | -d       | --minNdepth             | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                         | 10      |
 | -sc      | --skipCoveragePass      | Skip round 2 (the coverage-only pass), roughly halving total runtime: every output except the per-locus `coverage.bed.gz` is still written, with coverage from round 1's power tallies contracted at the final thresholds. `estimate` then skips the duplex allele counts and per-gene coverage, and `-rb/--reestimatebed` is unavailable. Not with `--rescue` | False   |
 | -nms     | --doNotOutputMaskedSite | Skip snp_mask/noise_mask (`-m`) candidates entirely: no depth extraction for them and no `masked` records in the fail VCFs. Calls, mutation rates and corrected burdens are unchanged; `Unmasked Coverage` (`_stats.txt`) and `Unmasked burden` (`_sbs_burden.txt`) are written as N/A                                                                     | False   |
+|          | --mate-merge            | Merge both mates of each read pair into one duplex family (one family per fragment, including read-through fragments no longer than the read); overlapping mates are collapsed to one observation per read pair. See [Mate Merging](#mate-merging) | False   |
 |          | --indel-context-trim    | Do not call an indel whose repeat context (the homopolymer run / STR tract it is scored in, plus the next base) reaches the trimmed fragment end. See [Indel Context Trim](#indel-context-trim) | False   |
 
 ##### Advanced
@@ -429,6 +430,16 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 #### Germline and Noise Masks
 
 The `-m` option accepts BED files and will ignore any mutations overlapping an excluded locus. Any custom BED file can be used as input.
+
+#### Mate Merging
+
+By default the two mates of a read pair belong to different duplex families (families are keyed by barcode pair and signed template length), and where the mates overlap only one mate's bases are used. A sequencing error in that mate (most often in its 3' end) then has no second read of the same pair to contradict it and can pass as a duplex call. Short fragments overlap most, so libraries with shorter fragments are affected most. `--mate-merge` changes this:
+
+- **One family per fragment.** The family the scan reaches first pulls in the mates of its reads, from the current batch or from a look-ahead pass over the BAM. Reverse reads of read-through pairs (fragment no longer than the read, so the reverse mate can start before the forward read) are held and placed in the batch at their mate's start.
+- **One observation per read pair.** Before genotyping, each read's 3' end is trimmed by `-tr` and the two mates of a pair are collapsed: for SNVs, mates that agree give that base at the higher base quality and mates that disagree give no base (unless one is below `--minBq`, in which case the other is used); for indels, an informative mate (showing the indel or the reference) wins over an uninformative one, and informative mates that disagree make the pair uninformative. Read counts, likelihoods, the detection-power lookup and the strand independence test are therefore per read pair, as in unmerged families.
+- **Fragment-end trim.** `-tt` is applied at the fragment's two ends (the forward reads' 5' start and the reverse reads' 5' end), so read-through tails past the other mate's 5' end are masked.
+
+Off by default; without it every output is unchanged.
 
 #### Indel Context Trim
 

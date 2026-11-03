@@ -1,5 +1,93 @@
 import numpy as np
 from scipy.stats import poisson_binom
+
+
+# Mate merging (call --mate-merge). call.py puts both mates of every read pair of a duplex family into one family
+# (one family per fragment, including read-through fragments shorter than the read). Genotyping then works per
+# read pair: each read's 3' end is trimmed (-tr) per read, and the two mates of a pair are collapsed to one
+# observation per position (SNVs) / per indel candidate, so read counts, likelihoods, the power-table lookup and the
+# strand-independence test stay per read pair as in unmerged families.
+def is_merged_family(seqs):
+    """True if seqs holds both mates of its fragment (only made by call --mate-merge)."""
+    return any(s.template_length > 0 for s in seqs) and any(s.template_length < 0 for s in seqs)
+
+
+def _blank_read_3prime(seq_mat, qual_mat, reads, reference_start, trim3):
+    """Set each read's last trim3 reference positions (its 3' end) to N / quality 0."""
+    if trim3 <= 0:
+        return
+    n = seq_mat.shape[1]
+    for mm, seq in enumerate(reads):
+        s0 = max(0, seq.reference_start - reference_start)
+        e0 = min(n, seq.reference_end - reference_start)
+        lo, hi = (max(s0, e0 - trim3), e0) if seq.is_forward else (s0, min(e0, s0 + trim3))
+        seq_mat[mm, lo:hi] = 4
+        qual_mat[mm, lo:hi] = 0
+
+
+def _collapse_mates(seq_mat, qual_mat, reads, min_bq):
+    """Collapse rows of the same read pair (query name) into one row: mates agree -> that base at the higher BQ;
+    mates disagree -> N, unless one base is below min_bq (then the other). Returns (seq_mat, qual_mat, reads) with
+    one row / representative read per pair."""
+    groups = {}
+    for mm, seq in enumerate(reads):
+        groups.setdefault(seq.query_name, []).append(mm)
+    if all(len(v) == 1 for v in groups.values()):
+        return seq_mat, qual_mat, reads
+    n = seq_mat.shape[1]
+    out_seq = np.full([len(groups), n], 4, dtype=seq_mat.dtype)
+    out_qual = np.zeros([len(groups), n], dtype=qual_mat.dtype)
+    out_reads = []
+    for k, rows in enumerate(groups.values()):
+        out_reads.append(reads[rows[0]])
+        sa, qa = seq_mat[rows[0]].copy(), qual_mat[rows[0]].copy()
+        for r in rows[1:]:
+            sb, qb = seq_mat[r], qual_mat[r]
+            a_cov, b_cov = sa != 4, sb != 4
+            both = a_cov & b_cov
+            agree = both & (sa == sb)
+            take_b = (~a_cov & b_cov) | (both & ~agree & (qa < min_bq) & (qb >= min_bq))
+            drop = both & ~agree & ~((qa < min_bq) & (qb >= min_bq)) & ~((qb < min_bq) & (qa >= min_bq))
+            qa = np.where(agree, np.maximum(qa, qb), qa)
+            sa = np.where(take_b, sb, sa)
+            qa = np.where(take_b, qb, qa)
+            sa = np.where(drop, 4, sa)
+            qa = np.where(drop, 0, qa)
+        out_seq[k], out_qual[k] = sa, qa
+    return out_seq, out_qual, out_reads
+
+
+def _collapse_mates_indel(states, quals, reads, alt, ref, uninformative):
+    """Indel counterpart of _collapse_mates. states/quals: [reads x candidates] getIndelArr output. Per pair and
+    candidate: one mate informative (ALT/REF) -> it; both informative and equal -> that state at the higher BQ; both
+    informative and different -> uninformative (BQ 0). Non-informative states never override an informative mate.
+    Returns (states, quals) with one row per pair."""
+    groups = {}
+    for mm, seq in enumerate(reads):
+        groups.setdefault(seq.query_name, []).append(mm)
+    if all(len(v) == 1 for v in groups.values()):
+        return states, quals
+    out_s = np.empty([len(groups), states.shape[1]], dtype=states.dtype)
+    out_q = np.zeros([len(groups), states.shape[1]], dtype=quals.dtype)
+    for k, rows in enumerate(groups.values()):
+        sa, qa = states[rows[0]].copy(), quals[rows[0]].copy()
+        for r in rows[1:]:
+            sb, qb = states[r], quals[r]
+            ia = (sa == alt) | (sa == ref)
+            ib = (sb == alt) | (sb == ref)
+            both = ia & ib
+            agree = both & (sa == sb)
+            take_b = ~ia & ib
+            drop = both & ~agree
+            qa = np.where(agree, np.maximum(qa, qb), qa)
+            sa = np.where(take_b, sb, sa)
+            qa = np.where(take_b, qb, qa)
+            sa = np.where(drop, uninformative, sa)
+            qa = np.where(drop, 0, qa)
+        out_s[k], out_q[k] = sa, qa
+    return out_s, out_q
+
+
 from .indels import (
     base_codes,
     str_col,
@@ -9,6 +97,7 @@ from .indels import (
     INDEL_ALT,
     INDEL_CONFLICT,
     INDEL_REF,
+    INDEL_UNINFORMATIVE,
     findIndels,
     getIndelArr,
     indel_context_fits_window,
@@ -270,6 +359,13 @@ def genotypeDSSnv(
         F2R1_seq_mat[mm, current_mat_ind:n] = 4
         F2R1_qual_mat[mm, current_mat_ind:n] = 0
 
+    if params.get("mate_merge", False) and is_merged_family(seqs):
+        # Merged family: per-read 3' trim, then one observation per read pair (see is_merged_family).
+        _blank_read_3prime(F1R2_seq_mat, F1R2_qual_mat, F1R2, reference_start, params["trim3"])
+        _blank_read_3prime(F2R1_seq_mat, F2R1_qual_mat, F2R1, reference_start, params["trim3"])
+        F1R2_seq_mat, F1R2_qual_mat, F1R2 = _collapse_mates(F1R2_seq_mat, F1R2_qual_mat, F1R2, params["minBq"])
+        F2R1_seq_mat, F2R1_qual_mat, F2R1 = _collapse_mates(F2R1_seq_mat, F2R1_qual_mat, F2R1, params["minBq"])
+        m_F1R2, m_F2R1 = len(F1R2), len(F2R1)
     # BQs for the strand independence test: no minBq cut, N/uncovered = 0.
     F1R2_strand_qual_mat = np.where(F1R2_seq_mat == 4, 0, F1R2_qual_mat)
     F2R1_strand_qual_mat = np.where(F2R1_seq_mat == 4, 0, F2R1_qual_mat)
@@ -659,24 +755,51 @@ def genotypeDSIndel(
     f2r1_alt_count = np.zeros(m)
     f2r1_ref_count = np.zeros(m)
 
-    for nn, seq in enumerate(F1R2):
-        seqArr, qualArr = getIndelArr(
-            seq, indels_masked, params["minBq"], reference_int, reference_start
-        )
-        mask_multiallele[seqArr == INDEL_CONFLICT] = 0
-        f1r2_seq[nn, :] = seqArr == INDEL_ALT
-        f1r2_prob[nn, :] = qualArr
-        f1r2_alt_count += (seqArr == INDEL_ALT).astype(int)
-        f1r2_ref_count += (seqArr == INDEL_REF).astype(int)
-    for nn, seq in enumerate(F2R1):
-        seqArr, qualArr = getIndelArr(
-            seq, indels_masked, params["minBq"], reference_int, reference_start
-        )
-        mask_multiallele[seqArr == INDEL_CONFLICT] = 0
-        f2r1_seq[nn, :] = seqArr == INDEL_ALT
-        f2r1_prob[nn, :] = qualArr
-        f2r1_alt_count += (seqArr == INDEL_ALT).astype(int)
-        f2r1_ref_count += (seqArr == INDEL_REF).astype(int)
+    if params.get("mate_merge", False) and is_merged_family(seqs):
+        # Merged family: both overlapping mates of a pair count as one observation per candidate, or a
+        # 1-pair-per-strand family would score like 2 reads per strand. A conflicting indel in either mate still
+        # drops the candidate, as in an unmerged family.
+        def _strand_states(reads):
+            st = np.full([len(reads), m], INDEL_UNINFORMATIVE, dtype=int)
+            qu = np.zeros([len(reads), m])
+            for nn, seq in enumerate(reads):
+                st[nn, :], qu[nn, :] = getIndelArr(
+                    seq, indels_masked, params["minBq"], reference_int, reference_start
+                )
+            return st, qu
+
+        f1r2_st, f1r2_qu = _strand_states(F1R2)
+        f2r1_st, f2r1_qu = _strand_states(F2R1)
+        mask_multiallele[(f1r2_st == INDEL_CONFLICT).any(axis=0)] = 0
+        mask_multiallele[(f2r1_st == INDEL_CONFLICT).any(axis=0)] = 0
+        f1r2_st, f1r2_qu = _collapse_mates_indel(f1r2_st, f1r2_qu, F1R2, INDEL_ALT, INDEL_REF, INDEL_UNINFORMATIVE)
+        f2r1_st, f2r1_qu = _collapse_mates_indel(f2r1_st, f2r1_qu, F2R1, INDEL_ALT, INDEL_REF, INDEL_UNINFORMATIVE)
+        f1r2_seq = (f1r2_st == INDEL_ALT).astype(float)
+        f2r1_seq = (f2r1_st == INDEL_ALT).astype(float)
+        f1r2_prob, f2r1_prob = f1r2_qu, f2r1_qu
+        f1r2_alt_count = (f1r2_st == INDEL_ALT).sum(axis=0).astype(float)
+        f1r2_ref_count = (f1r2_st == INDEL_REF).sum(axis=0).astype(float)
+        f2r1_alt_count = (f2r1_st == INDEL_ALT).sum(axis=0).astype(float)
+        f2r1_ref_count = (f2r1_st == INDEL_REF).sum(axis=0).astype(float)
+    else:
+        for nn, seq in enumerate(F1R2):
+            seqArr, qualArr = getIndelArr(
+                seq, indels_masked, params["minBq"], reference_int, reference_start
+            )
+            mask_multiallele[seqArr == INDEL_CONFLICT] = 0
+            f1r2_seq[nn, :] = seqArr == INDEL_ALT
+            f1r2_prob[nn, :] = qualArr
+            f1r2_alt_count += (seqArr == INDEL_ALT).astype(int)
+            f1r2_ref_count += (seqArr == INDEL_REF).astype(int)
+        for nn, seq in enumerate(F2R1):
+            seqArr, qualArr = getIndelArr(
+                seq, indels_masked, params["minBq"], reference_int, reference_start
+            )
+            mask_multiallele[seqArr == INDEL_CONFLICT] = 0
+            f2r1_seq[nn, :] = seqArr == INDEL_ALT
+            f2r1_prob[nn, :] = qualArr
+            f2r1_alt_count += (seqArr == INDEL_ALT).astype(int)
+            f2r1_ref_count += (seqArr == INDEL_REF).astype(int)
     f1r2_prob = -f1r2_prob / 10
     f2r1_prob = -f2r1_prob / 10
 
