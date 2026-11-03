@@ -68,6 +68,7 @@ from .misc import (
     _drain_rugged_pool,
 )
 from .indels import STR_NCOL, findIndels, indel_mask_span
+from .indels import _BASE2NUM, indel_context_index, str_slip_tract
 from .power_tally import (
     PowerTally,
     contract_power_tally,
@@ -260,6 +261,24 @@ def _load_window(
         params,
     )
     return (end, ref_np, trinuc_np, hp_np, hp_raw_np, str_raw_np) + tuple(masks)
+
+
+def _indel_context_hi(indel, local_pos, reference_int, hp_raw, str_raw):
+    """(call --indel-context-trim) Exclusive local end of an indel's scored repeat context: the anchor through the
+    base after the HP run / STR tract it is scored in (same rules as indels.indel_context_fits_window)."""
+    parts = indel.split(":")
+    indel_len = int(parts[1])
+    ctx = indel_context_index(local_pos)
+    if ctx >= len(reference_int):
+        return ctx + 1
+    if abs(indel_len) == 1:
+        if indel_len == 1:
+            inserted = _BASE2NUM.get(parts[2][:1].upper(), -1) if len(parts) > 2 else -1
+            if inserted != reference_int[ctx]:
+                return ctx + 1
+        return ctx + int(hp_raw[0, ctx]) + 1
+    slip = str_slip_tract(indel_len, parts[2] if indel_len > 0 else "", ctx, reference_int, str_raw)
+    return ctx + 1 if slip is None else ctx + slip[1] + 1
 
 
 def _process_duplex_family(
@@ -494,6 +513,17 @@ def _process_duplex_family(
                     indel_pos - reference_mat_start - start_ind, indel_size
                 )
             )
+            if params.get("indel_context_trim", False):
+                # Skip an indel whose repeat context reaches the trim mask: no read can show the length of a
+                # homopolymer/STR that runs into a trimmed fragment end (the aligner can fit a read-through tail
+                # into it as a 1 bp indel).
+                _lp = indel_pos - reference_mat_start - start_ind
+                _hi = _indel_context_hi(
+                    indel, _lp, ref_np[start_ind:end_ind], hp_raw_np[:, start_ind:end_ind],
+                    str_raw_np[:, start_ind:end_ind]
+                )
+                if _hi > masks_indel.shape[1] or masks_indel[3, indel_slice.start:_hi].any():
+                    continue
             # LR < 0: only where every other filter passes, its log10 LR
             # goes to neg_lr_indel[channel] as a mu-solve input; no record
             # (it skips depth extraction and is never written to a VCF).

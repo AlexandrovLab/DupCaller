@@ -398,6 +398,7 @@ The effect of changing these parameters should be evaluated before implementatio
 | -d       | --minNdepth             | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                         | 10      |
 | -sc      | --skipCoveragePass      | Skip round 2 (the coverage-only pass), roughly halving total runtime: every output except the per-locus `coverage.bed.gz` is still written, with coverage from round 1's power tallies contracted at the final thresholds. `estimate` then skips the duplex allele counts and per-gene coverage, and `-rb/--reestimatebed` is unavailable. Not with `--rescue` | False   |
 | -nms     | --doNotOutputMaskedSite | Skip snp_mask/noise_mask (`-m`) candidates entirely: no depth extraction for them and no `masked` records in the fail VCFs. Calls, mutation rates and corrected burdens are unchanged; `Unmasked Coverage` (`_stats.txt`) and `Unmasked burden` (`_sbs_burden.txt`) are written as N/A                                                                     | False   |
+|          | --indel-context-trim    | Do not call an indel whose repeat context (the homopolymer run / STR tract it is scored in, plus the next base) reaches the trimmed fragment end. See [Indel Context Trim](#indel-context-trim) | False   |
 
 ##### Advanced
 
@@ -428,6 +429,10 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 #### Germline and Noise Masks
 
 The `-m` option accepts BED files and will ignore any mutations overlapping an excluded locus. Any custom BED file can be used as input.
+
+#### Indel Context Trim
+
+By default an indel is called if its own span (anchor through the last deleted base) is outside the family's trimmed read and fragment ends. `--indel-context-trim` also requires the indel's repeat context to be untrimmed: the homopolymer run or STR tract it is scored in, through the base after it. No read can show the length of a repeat that runs into a trimmed fragment end, and the aligner can fit a read-through tail into such a run as a 1 bp indel. Off by default; without it every output is unchanged.
 
 ---
 

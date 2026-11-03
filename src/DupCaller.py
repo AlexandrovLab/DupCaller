@@ -353,6 +353,14 @@ if __name__ == "__main__":
         default=0.01,
     )
     call_parser.add_argument(
+        "--indel-context-trim",
+        dest="indel_context_trim",
+        action="store_true",
+        help="do not call an indel whose repeat context (the homopolymer run / STR tract it is scored in, plus the "
+        "next base) reaches the trimmed fragment end; no read can show the length of a repeat that runs into it.",
+        default=False,
+    )
+    call_parser.add_argument(
         "--rescue",
         "-res",
         action="store_true",

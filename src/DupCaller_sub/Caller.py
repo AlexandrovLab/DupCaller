@@ -368,6 +368,7 @@ def do_call(args):
         "barcodeNormalize": barcode_spec["normalize"],
         "barcodeSep": barcode_spec["sep"],
         "seed": args.seed,
+        "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
     if args.errprefix:
         params["amperr_file"] = args.errprefix + ".amp.tn.srd.txt"
@@ -434,6 +435,7 @@ def do_call(args):
         "barcodeTag": barcode_spec["tag"],
         "barcodeNormalize": barcode_spec["normalize"],
         "barcodeSep": barcode_spec["sep"],
+        "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
     same_regions_flag = False
     if not params_learn["regions"]:
