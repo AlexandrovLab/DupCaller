@@ -364,6 +364,15 @@ if __name__ == "__main__":
         default=False,
     )
     call_parser.add_argument(
+        "--fragment-key",
+        dest="fragment_key",
+        action="store_true",
+        help="with --mate-merge: key duplex families by barcode pair + the fragment's unclipped 5' ends (from the MC "
+        "tag) instead of the signed template length, so reads of one molecule whose alignments clip the 3' "
+        "read-through tail differently are not split across families. Requires MC tags.",
+        default=False,
+    )
+    call_parser.add_argument(
         "--indel-context-trim",
         dest="indel_context_trim",
         action="store_true",

@@ -369,8 +369,11 @@ def do_call(args):
         "barcodeSep": barcode_spec["sep"],
         "seed": args.seed,
         "mate_merge": getattr(args, "mate_merge", False),
+        "fragment_key": getattr(args, "fragment_key", False),
         "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
+    if getattr(args, "fragment_key", False) and not getattr(args, "mate_merge", False):
+        raise ValueError("--fragment-key requires --mate-merge")
     if args.errprefix:
         params["amperr_file"] = args.errprefix + ".amp.tn.srd.txt"
         params["amperri_file"] = args.errprefix + ".amp.id.txt"
@@ -438,6 +441,7 @@ def do_call(args):
         "barcodeSep": barcode_spec["sep"],
         # Error learning builds families the same way as calling.
         "mate_merge": getattr(args, "mate_merge", False),
+        "fragment_key": getattr(args, "fragment_key", False),
         "indel_context_trim": getattr(args, "indel_context_trim", False),
     }
     same_regions_flag = False
