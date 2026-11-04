@@ -353,6 +353,34 @@ if __name__ == "__main__":
         default=0.01,
     )
     call_parser.add_argument(
+        "--mate-merge",
+        dest="mate_merge",
+        action="store_true",
+        help="merge both mates of each read pair into one duplex family (one family per fragment, including "
+        "read-through fragments no longer than the read). Where mates overlap they are collapsed to one observation "
+        "per read pair (SNVs and indels; mates that disagree give no call at that base), and the template-end trim "
+        "is applied at the fragment ends. Default off (stock behaviour: the overlapping part of the reverse mate is "
+        "not used).",
+        default=False,
+    )
+    call_parser.add_argument(
+        "--fragment-key",
+        dest="fragment_key",
+        action="store_true",
+        help="with --mate-merge: key duplex families by barcode pair + the fragment's unclipped 5' ends (from the MC "
+        "tag) instead of the signed template length, so reads of one molecule whose alignments clip the 3' "
+        "read-through tail differently are not split across families. Requires MC tags.",
+        default=False,
+    )
+    call_parser.add_argument(
+        "--indel-context-trim",
+        dest="indel_context_trim",
+        action="store_true",
+        help="do not call an indel whose repeat context (the homopolymer run / STR tract it is scored in, plus the "
+        "next base) reaches the trimmed fragment end; no read can show the length of a repeat that runs into it.",
+        default=False,
+    )
+    call_parser.add_argument(
         "--rescue",
         "-res",
         action="store_true",

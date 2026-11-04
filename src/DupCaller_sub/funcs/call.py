@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from Bio import bgzf
+import collections
 
 import time
 import math
@@ -24,6 +25,7 @@ from .depth import (
     prepareAlignMask,
     detectOverlapDiscord,
 )
+from .prob import is_merged_family
 from .prob import (
     genotypeDSSnv,
     genotypeDSIndel,
@@ -68,6 +70,7 @@ from .misc import (
     _drain_rugged_pool,
 )
 from .indels import STR_NCOL, findIndels, indel_mask_span
+from .indels import _BASE2NUM, indel_context_index, str_slip_tract
 from .power_tally import (
     PowerTally,
     contract_power_tally,
@@ -262,6 +265,174 @@ def _load_window(
     return (end, ref_np, trinuc_np, hp_np, hp_raw_np, str_raw_np) + tuple(masks)
 
 
+# ---- Mate merging (call --mate-merge) ---------------------------------------------------------------------
+# Stock DupCaller groups reads by start position, so a fragment's two mates sit in different families and only one
+# mate's read is used where they overlap. With --mate-merge the family the scan reaches first pulls in the mates of
+# its reads (from the current batch, or ahead of the scan via _MateLookahead), giving one family per fragment;
+# prob.py then collapses the two mates of each pair to one observation. Read-through pairs (fragment no longer than
+# the read, so the reverse mate can start before the forward read) are handled by holding such reverse reads
+# (_rt_reroute) and placing them in the batch at their mate's start.
+RT_MAX_OFFSET = 10  # reverse read of a read-through pair held if its forward mate starts 1..RT_MAX_OFFSET bp later
+
+
+def _stream_read_ok(rec):
+    """Same per-read filters callBam applies to the streamed reads."""
+    if rec.is_supplementary or rec.is_secondary or not rec.is_proper_pair or rec.is_qcfail:
+        return False
+    for tag in ("DT", "dt"):
+        if rec.has_tag(tag) and rec.get_tag(tag) == "SQ":
+            return False
+    if (rec.is_forward and rec.cigartuples[0][0] != 0) or (rec.is_reverse and rec.cigartuples[-1][0] != 0):
+        return False
+    return True
+
+
+class _MateLookahead:
+    """Forward-only second pass over the BAM for mate merging. Buffers every read passing the stream filters whose
+    start lies between the current scan position and the furthest mate start requested so far, keyed by start then
+    query name, and drops entries the scan has passed. Each read is parsed once here."""
+
+    def __init__(self, bam_obj):
+        self.bam = bam_obj
+        self.chrom = None
+        self.it = None
+        self.pending = None
+        self.lo = 0
+        self.buf = {}
+        self.starts = collections.deque()
+
+    def _reset(self, chrom, pos):
+        self.chrom, self.lo = chrom, pos
+        self.it = self.bam.fetch(chrom, pos)
+        self.pending = next(self.it, None)
+        self.buf.clear()
+        self.starts.clear()
+
+    def get(self, chrom, ms, scan_pos):
+        """{query_name: [reads starting at ms]}; requires ms >= scan_pos and non-decreasing scan_pos."""
+        if (chrom != self.chrom or scan_pos < self.lo
+                or (self.pending is not None and self.pending.reference_start < scan_pos - 5000)):
+            self._reset(chrom, scan_pos)
+        while self.starts and self.starts[0] < scan_pos:
+            del self.buf[self.starts.popleft()]
+        self.lo = max(self.lo, scan_pos)
+        while self.pending is not None and self.pending.reference_start <= ms:
+            r = self.pending
+            self.pending = next(self.it, None)
+            if r.reference_start < self.lo or not _stream_read_ok(r):
+                continue
+            s = r.reference_start
+            if s not in self.buf:
+                self.buf[s] = {}
+                self.starts.append(s)
+            self.buf[s].setdefault(r.query_name, []).append(r)
+        return self.buf.get(ms, {})
+
+
+def _rt_reroute(rec):
+    """True for a reverse read of a read-through pair (fragment <= read length) whose forward mate starts
+    1..RT_MAX_OFFSET bp after it. Such reads are held and placed in the batch at the mate's start, so every read of
+    the molecule (both mates, both strands) is in one batch. Mates are matched by query name + R1/R2 flag."""
+    if rec.template_length >= 0 or rec.next_reference_id != rec.reference_id:
+        return False
+    d = rec.next_reference_start - rec.reference_start
+    return 0 < d <= RT_MAX_OFFSET
+
+
+def _rt_drain(rt_pool, chrom, upto, params, currentReadDict):
+    """Place rt_pool reads of chrom held for mate starts <= upto into currentReadDict (late ones too, so none is
+    lost when no streamed read starts exactly at the mate position)."""
+    for k in [k for k in rt_pool if k[0] == chrom and k[1] <= upto]:
+        for rec in rt_pool.pop(k):
+            _place_read_in_dict(rec, _compute_read_label(rec, params), currentReadDict)
+
+
+def _fetch_mates_rt(lookahead, readSet, merged_keys, batch_used, batch_index, current_start):
+    """Mates of readSet (either orientation): the read with the same query_name and the other R1/R2 flag. Taken
+    from this batch (batch_index) if it is here, else from the _MateLookahead pass if it starts at or after
+    current_start. [] (no merge, stock handling) if any mate is on another contig, starts before current_start
+    without being in this batch (already scanned and possibly processed), or was already genotyped in this batch
+    (batch_used), so no read is used twice. Pulled mates are keyed (query_name, is_read1) in merged_keys so their
+    own family drops exactly them."""
+    chrom = readSet[0].reference_name
+    own = {(r.query_name, r.is_read1) for r in readSet}
+    in_batch, want = [], {}
+    for r in readSet:
+        if r.template_length == 0 or r.next_reference_id != r.reference_id:
+            return []
+        k = (r.query_name, not r.is_read1)
+        if k in own:
+            continue
+        if k in batch_used:
+            return []
+        if k in batch_index:
+            in_batch.append(k)
+        elif r.next_reference_start < current_start:
+            return []
+        else:
+            want.setdefault(r.next_reference_start, {})[r.query_name] = not r.is_read1
+    mates = []
+    for k in in_batch:
+        if k not in merged_keys:
+            mates.append(batch_index[k])
+            merged_keys.add(k)
+    for ms in sorted(want):
+        bucket = lookahead.get(chrom, ms, current_start)
+        for nm, mate_r1 in want[ms].items():
+            for rec in bucket.get(nm, ()):
+                k = (nm, rec.is_read1)
+                if rec.is_read1 != mate_r1 or k in own or k in merged_keys:
+                    continue
+                mates.append(rec)
+                merged_keys.add(k)
+    return mates
+
+
+def _drop_merged_keys(entry, merged_keys):
+    """Remove reads whose (query_name, is_read1) was pulled into another family from a family entry (in place).
+    Returns False if nothing is left."""
+    keep = [r for r in entry["seqs"] if (r.query_name, r.is_read1) not in merged_keys]
+    if len(keep) == len(entry["seqs"]):
+        return True
+    for r in entry["seqs"]:
+        merged_keys.discard((r.query_name, r.is_read1))
+    entry["seqs"] = keep
+    entry["names"] = {r.query_name: i for i, r in enumerate(keep)}
+    entry["F1R2"] = sum((r.is_forward and r.is_read1) or (r.is_reverse and r.is_read2) for r in keep)
+    entry["F2R1"] = len(keep) - entry["F1R2"]
+    return bool(keep)
+
+
+def _merged_trim(readSet, win_start, win_end, trim5):
+    """(left, right) trim for a merged family's [win_start, win_end) window. The fragment runs from the forward
+    reads' 5' start to the reverse reads' 5' end; in read-through pairs each read's 3' tail runs past the other
+    mate's 5' end. Mask those tails plus -tt inside the fragment ends, as determineTrimLength does with
+    trim5 + (read length - |TLEN|) for unmerged families."""
+    fwd = [r.reference_start for r in readSet if not r.is_reverse]
+    rev = [r.reference_end for r in readSet if r.is_reverse]
+    frag_lo = min(fwd) if fwd else win_start
+    frag_hi = max(rev) if rev else win_end
+    return max(0, frag_lo - win_start) + trim5, max(0, win_end - frag_hi) + trim5
+
+
+def _indel_context_hi(indel, local_pos, reference_int, hp_raw, str_raw):
+    """(call --indel-context-trim) Exclusive local end of an indel's scored repeat context: the anchor through the
+    base after the HP run / STR tract it is scored in (same rules as indels.indel_context_fits_window)."""
+    parts = indel.split(":")
+    indel_len = int(parts[1])
+    ctx = indel_context_index(local_pos)
+    if ctx >= len(reference_int):
+        return ctx + 1
+    if abs(indel_len) == 1:
+        if indel_len == 1:
+            inserted = _BASE2NUM.get(parts[2][:1].upper(), -1) if len(parts) > 2 else -1
+            if inserted != reference_int[ctx]:
+                return ctx + 1
+        return ctx + int(hp_raw[0, ctx]) + 1
+    slip = str_slip_tract(indel_len, parts[2] if indel_len > 0 else "", ctx, reference_int, str_raw)
+    return ctx + 1 if slip is None else ctx + slip[1] + 1
+
+
 def _process_duplex_family(
     F1R2,
     F2R1,
@@ -334,13 +505,15 @@ def _process_duplex_family(
     """
     ### Record read names to check if mate has been processed
     processed_flag = 0
-    for seq in readSet:
-        if seq.query_name in processed_read_names:
-            processed_read_names.remove(seq.query_name)
-            processed_flag = 1
-            break
-    if processed_flag == 0 and flt_rs == "PASS":
-        processed_read_names.add(readSet[0].query_name)
+    merged_family = params.get("mate_merge", False) and is_merged_family(readSet)
+    if not merged_family:
+        for seq in readSet:
+            if seq.query_name in processed_read_names:
+                processed_read_names.remove(seq.query_name)
+                processed_flag = 1
+                break
+        if processed_flag == 0 and flt_rs == "PASS":
+            processed_read_names.add(readSet[0].query_name)
     start_ind = rs_reference_start - reference_mat_start
     end_ind = rs_reference_end - reference_mat_start
 
@@ -359,6 +532,9 @@ def _process_duplex_family(
     left, right = determineTrimLength(
         readSet[max_ref_num], params=params, processed_flag=processed_flag
     )
+    if merged_family:
+        # window = union of reads; -tt at both fragment ends, -tr applied per read in prob.py
+        left, right = _merged_trim(readSet, rs_reference_start, rs_reference_end, params["trim5"])
     masks[5, :] = trim_mask(masks.shape[1], left, right)
     antimask = np.all(~masks, axis=0)
     antimask[trinuc_np[start_ind:end_ind] > 64] = False
@@ -396,6 +572,10 @@ def _process_duplex_family(
         left, right = determineTrimLength(
             readSet[max_ref_num], params=params, processed_flag=processed_flag
         )
+        if merged_family:
+            left, right = _merged_trim(
+                readSet, rs_reference_start, rs_reference_start + (end_ind_max - start_ind), params["trim5"]
+            )
         masks_indel[3, :] = trim_mask(masks_indel.shape[1], left, right)
         masks_indel[4, :] = include_mask[start_ind:end_ind_max]
         masks_indel[5, :] = nm_mask[start_ind:end_ind_max]
@@ -494,6 +674,17 @@ def _process_duplex_family(
                     indel_pos - reference_mat_start - start_ind, indel_size
                 )
             )
+            if params.get("indel_context_trim", False):
+                # Skip an indel whose repeat context reaches the trim mask: no read can show the length of a
+                # homopolymer/STR that runs into a trimmed fragment end (the aligner can fit a read-through tail
+                # into it as a 1 bp indel).
+                _lp = indel_pos - reference_mat_start - start_ind
+                _hi = _indel_context_hi(
+                    indel, _lp, ref_np[start_ind:end_ind], hp_raw_np[:, start_ind:end_ind],
+                    str_raw_np[:, start_ind:end_ind]
+                )
+                if _hi > masks_indel.shape[1] or masks_indel[3, indel_slice.start:_hi].any():
+                    continue
             # LR < 0: only where every other filter passes, its log10 LR
             # goes to neg_lr_indel[channel] as a mu-solve input; no record
             # (it skips depth extraction and is never written to a VCF).
@@ -1851,6 +2042,12 @@ def callBam(params, processNo):
     depth_by_dinuc = np.zeros((10, 10, 16), dtype=np.int64)  # 16 dinuc contexts
     starttime = time.time()
     tumorBam = BAM(bam, "rb", params.get("reference"))
+    mate_merge = params.get("mate_merge", False)
+    # --mate-merge: second BAM handle for reads ahead of the scan; (query_name, is_read1) of reads already pulled
+    # into another family; read-through reverse reads held until the batch at their mate's start.
+    mate_bam = _MateLookahead(BAM(bam, "rb", params.get("reference"))) if mate_merge else None
+    merged_mate_names = set()
+    rt_pool = {}
     if nbams:
         normalBams = list()
         for nbam in nbams:
@@ -2089,10 +2286,15 @@ def callBam(params, processNo):
         if rec.template_length < 0 and rec.query_name in rugged_reads_index:
             rugged_reads_pool[rugged_reads_index.pop(rec.query_name)].append(rec)
             continue
+        if mate_merge and _rt_reroute(rec):
+            rt_pool.setdefault((rec.reference_name, rec.next_reference_start), []).append(rec)
+            continue
         start = rec.reference_start
         label = _compute_read_label(rec, params)
         chrom = tumorBam.get_reference_name(rec.reference_id)
         if chrom != rugged_pool_chrom:
+            if mate_merge and rugged_pool_chrom is not None:  # held reads of the old chromosome -> its last batch
+                _rt_drain(rt_pool, rugged_pool_chrom, float("inf"), params, currentReadDict)
             # Coordinate-sorted BAM: redirects left from a previous
             # chromosome can never be matched.
             rugged_reads_pool.clear()
@@ -2103,12 +2305,17 @@ def callBam(params, processNo):
             _drain_rugged_pool(
                 chrom, currentStart, rugged_reads_pool, params, currentReadDict
             )
+            if mate_merge:
+                _rt_drain(rt_pool, chrom, currentStart, params, currentReadDict)
         if start == currentStart:
             _place_read_in_dict(rec, label, currentReadDict)
         else:
             """
             Calling block starts
             """
+            if mate_merge:
+                # held reads whose mate start the scan is passing without a batch there join the closing batch
+                _rt_drain(rt_pool, chrom, start - 1, params, currentReadDict)
             _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool)
             # Rerouted rugged mates can start a few bp before currentStart,
             # so floor the window at the batch's minimum read start or a
@@ -2122,9 +2329,18 @@ def callBam(params, processNo):
                 ),
                 default=currentStart,
             )
+            batch_used = set()  # --mate-merge: reads genotyped in this batch
+            batch_index = (
+                {(r.query_name, r.is_read1): r for e_ in currentReadDict.values() for r in e_["seqs"]}
+                if mate_merge else {}
+            )
             for key in currentReadDict.keys():
                 flt_rs = "PASS"
                 readSet = currentReadDict[key]["seqs"]
+                if mate_merge and merged_mate_names:
+                    if not _drop_merged_keys(currentReadDict[key], merged_mate_names):
+                        continue
+                    readSet = currentReadDict[key]["seqs"]
                 all_dup = True
                 for _ in readSet:
                     if not _.is_duplicate:
@@ -2191,6 +2407,11 @@ def callBam(params, processNo):
                                 flt_rs = "high_nm"
                             else:
                                 continue
+                    if mate_merge:
+                        readSet = readSet + _fetch_mates_rt(
+                            mate_bam, readSet, merged_mate_names, batch_used, batch_index, currentStart
+                        )
+                        batch_used.update((r.query_name, r.is_read1) for r in readSet)
                     rs_reference_end = max([r.reference_end for r in readSet])
                     rs_reference_start = min([r.reference_start for r in readSet])
 
@@ -2405,9 +2626,13 @@ def callBam(params, processNo):
             _drain_rugged_pool(
                 chrom, currentStart, rugged_reads_pool, params, currentReadDict
             )
+            if mate_merge:
+                _rt_drain(rt_pool, chrom, currentStart, params, currentReadDict)
     """
     Calling block starts
     """
+    if mate_merge and rugged_pool_chrom is not None:  # held reads left at the end of the stream
+        _rt_drain(rt_pool, rugged_pool_chrom, float("inf"), params, currentReadDict)
     _index_rugged_mates(currentReadDict, rugged_reads_index, rugged_reads_pool)
     # Final batch: same window floor as above. currentReadDict is empty if
     # the worker's regions had no reads.
@@ -2421,9 +2646,18 @@ def callBam(params, processNo):
         else None
     )
 
+    batch_used = set()  # --mate-merge
+    batch_index = (
+        {(r.query_name, r.is_read1): r for e_ in currentReadDict.values() for r in e_["seqs"]}
+        if mate_merge else {}
+    )
     for key in currentReadDict.keys():
         flt_rs = "PASS"
         readSet = currentReadDict[key]["seqs"]
+        if mate_merge and merged_mate_names:
+            if not _drop_merged_keys(currentReadDict[key], merged_mate_names):
+                continue
+            readSet = currentReadDict[key]["seqs"]
         all_dup = True
         for _ in readSet:
             if not _.is_duplicate:
@@ -2484,6 +2718,11 @@ def callBam(params, processNo):
                         flt_rs = "high_nm"
                     else:
                         continue
+            if mate_merge:
+                readSet = readSet + _fetch_mates_rt(
+                    mate_bam, readSet, merged_mate_names, batch_used, batch_index, currentStart
+                )
+                batch_used.update((r.query_name, r.is_read1) for r in readSet)
             rs_reference_end = max([r.reference_end for r in readSet])
             rs_reference_start = min([r.reference_start for r in readSet])
 

@@ -450,6 +450,9 @@ The effect of changing these parameters should be evaluated before implementatio
 | -d       | --minNdepth             | Minimum coverage in normal for called variants                                                                                                                                                                                                                                                                                                                         | 10      |
 | -sc      | --skipCoveragePass      | Skip round 2 (the coverage-only pass), roughly halving total runtime: every output except the per-locus `coverage.bed.gz` is still written, with coverage from round 1's power tallies contracted at the final thresholds. `estimate` then skips the duplex allele counts and per-gene coverage, and `-rb/--reestimatebed` is unavailable. Not with `--rescue` | False   |
 | -nms     | --doNotOutputMaskedSite | Skip snp_mask/noise_mask (`-m`) candidates entirely: no depth extraction for them and no `masked` records in the fail VCFs. Calls, mutation rates and corrected burdens are unchanged; `Unmasked Coverage` (`_stats.txt`) and `Unmasked burden` (`_sbs_burden.txt`) are written as N/A                                                                     | False   |
+|          | --mate-merge            | Merge both mates of each read pair into one duplex family (one family per fragment, including read-through fragments no longer than the read); overlapping mates are collapsed to one observation per read pair. See [Mate Merging](#mate-merging) | False   |
+|          | --fragment-key          | With `--mate-merge`: key duplex families by barcode pair + the fragment's unclipped 5' ends (from MC tags) instead of the signed template length. See [Mate Merging](#mate-merging) | False   |
+|          | --indel-context-trim    | Do not call an indel whose repeat context (the homopolymer run / STR tract it is scored in, plus the next base) reaches the trimmed fragment end. See [Indel Context Trim](#indel-context-trim) | False   |
 
 ##### Advanced
 
@@ -480,6 +483,22 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 #### Germline and Noise Masks
 
 The `-m` option accepts BED files and will ignore any mutations overlapping an excluded locus. Any custom BED file can be used as input.
+
+#### Mate Merging
+
+By default the two mates of a read pair belong to different duplex families (families are keyed by barcode pair and signed template length), and where the mates overlap only one mate's bases are used. A sequencing error in that mate (most often in its 3' end) then has no second read of the same pair to contradict it and can pass as a duplex call. Short fragments overlap most, so libraries with shorter fragments are affected most. `--mate-merge` changes this:
+
+- **One family per fragment.** The family the scan reaches first pulls in the mates of its reads, from the current batch or from a look-ahead pass over the BAM. Reverse reads of read-through pairs (fragment no longer than the read, so the reverse mate can start before the forward read) are held and placed in the batch at their mate's start.
+- **One observation per read pair.** Before genotyping, each read's 3' end is trimmed by `-tr` and the two mates of a pair are collapsed: for SNVs, mates that agree give that base at the higher base quality and mates that disagree give no base (unless one is below `--minBq`, in which case the other is used); for indels, an informative mate (showing the indel or the reference) wins over an uninformative one, and informative mates that disagree make the pair uninformative. Read counts, likelihoods, the detection-power lookup and the strand independence test are therefore per read pair, as in unmerged families.
+- **Fragment-end trim.** `-tt` is applied at the fragment's two ends (the forward reads' 5' start and the reverse reads' 5' end), so read-through tails past the other mate's 5' end are masked.
+
+`--fragment-key` (requires `--mate-merge`) keys families by barcode pair plus the fragment's unclipped 5' ends, taken from the read and its mate's CIGAR (MC tag), instead of the signed template length. Template length and its sign depend on how much 3' read-through tail each mate's alignment keeps, so reads of one molecule can otherwise end up in separate families. Reads without an MC tag keep the template-length key. MC tags are written by, for example, `samtools fixmate` and Picard `FixMateInformation`; check your BAM with `samtools view` before relying on this option.
+
+Both options are off by default; without them every output is unchanged.
+
+#### Indel Context Trim
+
+By default an indel is called if its own span (anchor through the last deleted base) is outside the family's trimmed read and fragment ends. `--indel-context-trim` also requires the indel's repeat context to be untrimmed: the homopolymer run or STR tract it is scored in, through the base after it. No read can show the length of a repeat that runs into a trimmed fragment end, and the aligner can fit a read-through tail into such a run as a 1 bp indel. Off by default; without it every output is unchanged.
 
 ---
 

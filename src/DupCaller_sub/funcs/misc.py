@@ -1143,13 +1143,40 @@ def _filter_reason_label(
     return "other_mask"
 
 
+_CIGAR_RE = re.compile(r"(\d+)([MIDNSHPX=])")
+
+
+def _fragment_ends(rec):
+    """(left, right) unclipped 5' ends of rec's read pair (forward read's start minus its 5' soft clip, reverse
+    read's end plus its 5' soft clip; the mate's from its MC tag), or None if rec has no MC tag or is not an F-R
+    pair."""
+    if rec.is_forward == rec.mate_is_forward or not rec.has_tag("MC"):
+        return None
+    ops = _CIGAR_RE.findall(rec.get_tag("MC"))
+    if rec.is_forward:
+        lead = rec.cigartuples[0][1] if rec.cigartuples[0][0] == 4 else 0
+        mate_end = rec.next_reference_start + sum(int(n) for n, op in ops if op in "MDN=X")
+        trail = int(ops[-1][0]) if ops and ops[-1][1] == "S" else 0
+        return rec.reference_start - lead, mate_end + trail
+    trail = rec.cigartuples[-1][1] if rec.cigartuples[-1][0] == 4 else 0
+    lead = int(ops[0][0]) if ops and ops[0][1] == "S" else 0
+    return rec.next_reference_start - lead, rec.reference_end + trail
+
+
 def _compute_read_label(rec, params):
-    """Duplex-family label for rec: barcode pair plus signed template_length."""
+    """Duplex-family label for rec: barcode pair plus signed template_length, or (call --fragment-key) plus the
+    fragment's unclipped 5' ends. TLEN's sign and value follow how much 3' read-through tail each mate's alignment
+    keeps, so with --mate-merge the reads of one molecule could otherwise be split across families."""
     bc1, bc2 = get_duplex_barcode(rec, params)
+    tail = str(rec.template_length)
+    if params.get("fragment_key", False):
+        ends = _fragment_ends(rec)
+        if ends is not None:
+            tail = f"f{ends[0]}-{ends[1]}"
     if (rec.is_read1 and rec.is_forward) or (rec.is_read2 and rec.is_reverse):
-        return bc1 + "+" + bc2 + "+" + str(rec.template_length)
+        return bc1 + "+" + bc2 + "+" + tail
     else:
-        return bc2 + "+" + bc1 + "+" + str(rec.template_length)
+        return bc2 + "+" + bc1 + "+" + tail
 
 
 def _place_read_in_dict(rec, label, currentReadDict):
