@@ -681,7 +681,7 @@ def do_call(args):
             bq_values=bq_values,
         )
 
-        # SBS SRD (single-read-damage) rate matrix, EM-estimated from the BQ
+        # SBS SRD (single-read discrepancy) rate matrix, EM-estimated from the BQ
         # histogram; this is the params["amperr_file"] used for calling.
         srd_mat = estimate_sbs_srd_rates(
             sbs_alt_bq_hist, args.pseudocount, fallback=True

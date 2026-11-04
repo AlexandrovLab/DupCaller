@@ -168,7 +168,7 @@ if __name__ == "__main__":
         "-lfdr",
         "--lfdrThreshold",
         type=float,
-        help="target per-channel lFDR (max of (1-mutation_rate)/(LR*mutation_rate+1-mutation_rate) over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised via a single closed-form solve using the round-1 mutation-rate estimate (non-iterative)",
+        help="maximum local false discovery rate (lFDR) of a PASS call. A call's lFDR is (1-mu)/(LR*mu+1-mu), where LR is its likelihood ratio and mu the estimated mutation rate of its mutation channel; a call passes when its lFDR is at most this value and its log10 LR is at least --minLR, i.e. each channel's log10 LR threshold is max(--minLR, log10((1-lfdr)*(1-mu)/(lfdr*mu)))",
         default=0.05,
     )
     call_parser.add_argument(
@@ -337,13 +337,13 @@ if __name__ == "__main__":
     call_parser.add_argument(
         "--srdMinRead",
         type=nonnegative_int,
-        help="minimum reads on a single strand (F1R2 or F2R1) for that strand's reads to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand -- a family can contribute its F1R2 reads even if F2R1 doesn't meet this, or vice versa. Also gates, per site within a qualifying strand, the minimum number of BQ>=minBq bases required for that site to be counted",
+        help="minimum reads on a single strand (F1R2 or F2R1) for that strand's reads to be included in SBS single-read discrepancy (SRD) rate learning; evaluated independently per strand -- a family can contribute its F1R2 reads even if F2R1 doesn't meet this, or vice versa. Also gates, per site within a qualifying strand, the minimum number of BQ>=minBq bases required for that site to be counted",
         default=3,
     )
     call_parser.add_argument(
         "--ssmMinRead",
         type=nonnegative_int,
-        help="minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand-mutation (SSM)/damage-rate calculation",
+        help="minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand mismatch (SSM) damage-rate learning",
         default=3,
     )
     call_parser.add_argument(
@@ -479,7 +479,7 @@ if __name__ == "__main__":
         "--pseudocount",
         type=float,
         help="regularization pseudocount added to each trinuc-context's per-base "
-        "EM estimate of the SBS single-read-damage (SRD) rate matrix",
+        "EM estimate of the SBS single-read discrepancy (SRD) rate matrix",
         default=0.5,
     )
 
@@ -540,7 +540,7 @@ if __name__ == "__main__":
         "-a",
         "--pseudocount",
         type=float,
-        help="regularization pseudocount for the SBS single-read-damage (SRD) rate "
+        help="regularization pseudocount for the SBS single-read discrepancy (SRD) rate "
         "matrix EM re-fit on the aggregated BQ histogram (same convention as learn's "
         "-a/--pseudocount)",
         default=0.5,
@@ -620,7 +620,11 @@ if __name__ == "__main__":
         "-o", "--output", type=str, required=True, help="output filename"
     )
 
-    index_parser = subparsers.add_parser("index", help="Index reference genomes")
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Build the five-file DupCaller index ({reference}.ref.h5, .tn.h5, "
+        ".hp.h5, .str.h5, .dbs.h5) of a reference FASTA from it and a PERF repeat tsv (-rt)",
+    )
     index_parser.add_argument(
         "-f",
         "--reference",

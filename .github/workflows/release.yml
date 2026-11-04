@@ -1,0 +1,109 @@
+name: Release image
+
+# Builds the DupCaller image from a tagged commit, runs the Nextflow mock
+# pipeline test against it, publishes that same image to
+# ghcr.io/alexandrovlab/dupcaller:<version>, then reruns the test on a fresh
+# runner that pulls the published image anonymously.
+#
+# To release version X.Y.Z:
+#   1. In one commit, set __version__ in src/DupCaller_sub/__init__.py and
+#      DUPCALLER_VERSION in nextflow/nextflow.config to X.Y.Z, and add the
+#      CHANGELOG entry.
+#   2. Push that commit, then the tag: git tag vX.Y.Z && git push origin vX.Y.Z
+# The `check-version` job fails the release if the tag and both versions
+# disagree.
+#
+# One-time setup: the GHCR package (github.com/orgs/AlexandrovLab/packages/
+# container/package/dupcaller) must stay public, and under Package settings
+# -> "Manage Actions access" it must give this repository the Write role, or
+# the publish step's GITHUB_TOKEN gets "permission_denied: write_package".
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  REGISTRY_IMAGE: ghcr.io/alexandrovlab/dupcaller
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag, package version and Nextflow image version must match
+        id: v
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/DupCaller_sub/__init__.py)
+          nf=$(sed -n "s/^def DUPCALLER_VERSION = '\(.*\)'/\1/p" nextflow/nextflow.config)
+          echo "tag=$tag __version__=$pkg DUPCALLER_VERSION=$nf"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$nf" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match __version__ ($pkg) and DUPCALLER_VERSION ($nf)"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  build-image:
+    needs: check-version
+    uses: ./.github/workflows/build-image.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+
+  # The same test CI runs on every push, on the image about to be published.
+  test-built-image:
+    needs: build-image
+    strategy:
+      fail-fast: false
+      matrix:
+        nextflow-version: ["23.10.1", "24.10.4"]
+    uses: ./.github/workflows/nextflow-mock.yml
+    with:
+      image: dupcaller:ci
+      image-artifact: dupcaller-image
+      nextflow-version: ${{ matrix.nextflow-version }}
+
+  publish:
+    needs: [check-version, test-built-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dupcaller-image
+          path: ${{ runner.temp }}/image
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          gunzip -c "$RUNNER_TEMP/image/dupcaller-image.tar.gz" | docker load
+          docker tag dupcaller:ci "$REGISTRY_IMAGE:$VERSION"
+          docker tag dupcaller:ci "$REGISTRY_IMAGE:latest"
+          docker push "$REGISTRY_IMAGE:$VERSION"
+          docker push "$REGISTRY_IMAGE:latest"
+          echo "Published $(docker inspect --format '{{index .RepoDigests 0}}' "$REGISTRY_IMAGE:$VERSION")" >> "$GITHUB_STEP_SUMMARY"
+
+  # Fresh runner, no registry login: the published image must pull
+  # anonymously and pass the same test.
+  verify-anonymous-pull:
+    needs: [check-version, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        nextflow-version: ["23.10.1", "24.10.4"]
+    uses: ./.github/workflows/nextflow-mock.yml
+    with:
+      image: ghcr.io/alexandrovlab/dupcaller:${{ needs.check-version.outputs.version }}
+      nextflow-version: ${{ matrix.nextflow-version }}

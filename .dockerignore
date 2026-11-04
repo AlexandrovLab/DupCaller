@@ -1,0 +1,21 @@
+# Only what `pip install .` needs goes into the image build context.
+.git
+.github
+.claude
+.nextflow
+.pytest_cache
+**/__pycache__
+*.egg-info
+build
+dist
+docs
+logs
+masks
+nextflow
+resources
+test
+test2
+tests
+tmp
+*.sif
+*.img

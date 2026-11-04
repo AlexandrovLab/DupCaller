@@ -3,8 +3,13 @@
 # bwa-mem2 mem -> gatk MarkDuplicates -> call -> estimate, containerized)
 # against the synthetic dataset in data/, entirely inside OUTDIR. Unlike
 # run_pipeline.sh (same tools directly on PATH), this exercises the Nextflow
-# DAG itself (staging, container images, per-process resource directives)
-# using the published yuhecheng62/dupcaller image.
+# DAG itself (staging, container images, per-process resource directives).
+#
+# DUPCALLER_IMAGE (optional) is the DupCaller image to test, passed as
+# --dupcaller_container: CI sets it to an image built from the checked-out
+# commit (and, for a release, to the published GHCR image). Unset, the
+# image pinned in nextflow/nextflow.config is used. After the runs, every
+# DupCaller task of this invocation is checked to have run in that image.
 #
 # mock_1/2 are staged as both tumor and normal fastqs. The "default"
 # case's outputs are compared (test_mock_pipeline_nextflow.py) against
@@ -36,8 +41,8 @@
 #     all          every case above, in order
 #
 # Requires nextflow and python (with pysam, a DupCaller dependency) on
-# PATH, plus a working docker (or singularity) able to pull
-# yuhecheng62/dupcaller, quay.io/biocontainers/{bwa-mem2,gatk4} and
+# PATH, plus a working docker (or singularity) able to pull (or already
+# holding) the DupCaller image, quay.io/biocontainers/{bwa-mem2,gatk4} and
 # community.wave.seqera.io/library/bwa-mem2_htslib_samtools.
 set -euo pipefail
 
@@ -55,6 +60,8 @@ fi
 
 NEXTFLOW="${NEXTFLOW:-nextflow}"
 PYTHON="${PYTHON:-python}"
+IMAGE_ARGS=()
+[ -n "${DUPCALLER_IMAGE:-}" ] && IMAGE_ARGS=(--dupcaller_container "${DUPCALLER_IMAGE}")
 
 mkdir -p "$OUTDIR"
 cp "$DATA_DIR/reference.fa" "$DATA_DIR/repeats.tsv" "$OUTDIR/"
@@ -76,6 +83,7 @@ printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\nmock\ttumor_1.fastq\ttumor_2.fa
 printf 'sample_id\ttumor_fastq_1\ttumor_fastq_2\tnormal_fastq_1\tnormal_fastq_2\nmock\tmetacs_1.fastq\tmetacs_2.fastq\tmetacs_1.fastq\tmetacs_2.fastq\n' > sample_metacs.map
 
 R="${OUTDIR}/resources"
+: > task_dirs.txt
 for case in "${CASES[@]}"; do
     case "$case" in
         default)    extra='' ;;
@@ -109,7 +117,28 @@ for case in "${CASES[@]}"; do
         -c "case_${case}.config" \
         -profile "${PROFILE}",local \
         -w work \
+        ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} \
         -resume
+    # This run's task directories, cached ones included.
+    "$NEXTFLOW" log last -f workdir >> task_dirs.txt
 done
+
+# Every DupCaller task must have run in the requested image. Docker runs it
+# by name; Singularity runs Nextflow's cached copy, named after the image
+# with / and : replaced by - (or a local .sif path as given).
+if [ -n "${DUPCALLER_IMAGE:-}" ]; then
+    sif_name="$(printf '%s' "${DUPCALLER_IMAGE#docker://}" | tr '/:' '--')"
+    checked=0
+    while read -r dir; do
+        grep -q -E 'DupCaller\.py|PERF' "${dir}/.command.sh" 2>/dev/null || continue
+        checked=$((checked + 1))
+        if ! grep -q -F -e "${DUPCALLER_IMAGE}" -e "${sif_name}" "${dir}/.command.run"; then
+            echo "FAIL: ${dir} did not run in ${DUPCALLER_IMAGE}" >&2
+            exit 1
+        fi
+    done < <(sort -u task_dirs.txt)
+    [ "$checked" -gt 0 ] || { echo "FAIL: no DupCaller task found in this run's task directories" >&2; exit 1; }
+    echo "[check] all ${checked} DupCaller tasks ran in ${DUPCALLER_IMAGE}"
+fi
 
 echo "done"

@@ -723,7 +723,7 @@ def profileTriNucMismatches(
 def estimate_sbs_srd_rates(
     sbs_alt_bq_hist, pseudocount, max_iter=100, tol=1e-12, fallback=False
 ):
-    """EM-estimate the per-trinuc SBS single-read-damage (SRD) rate matrix
+    """EM-estimate the per-trinuc SBS single-read discrepancy (SRD) rate matrix
     from sbs_alt_bq_hist.
 
     Per row, a read at base quality BQ (e = 10**(-BQ/10)) is either a true

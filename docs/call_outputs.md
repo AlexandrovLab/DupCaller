@@ -222,7 +222,7 @@ Except for `.amp.tn.srd.txt`, these are integer **count** tables (error events a
 | File | Description |
 | --- | --- |
 | `{sample}.amp.tn.txt` | Raw amplification (PCR) SBS mismatch counts: rows are all 64 trinucleotide contexts (not strand-folded; C/T-centred first, then their G/A-centred reverse complements), columns are the four bases A/T/C/G (the reference-base column counts reference observations). A diagnostic/intermediate byproduct of learning — not itself used for calling (`aggregate` sums it). |
-| `{sample}.amp.tn.srd.txt` | The single-read-damage (SRD) EM-fitted SBS amplification-error **rate** matrix actually used for calling (`amperr_file`). Same row/column shape as `.amp.tn.txt`. |
+| `{sample}.amp.tn.srd.txt` | The single-read discrepancy (SRD) EM-fitted SBS amplification-error **rate** matrix actually used for calling (`amperr_file`). Same row/column shape as `.amp.tn.txt`. |
 | `{sample}.dmg.tn.txt` | Damage SBS error counts (`dmgerr_file`) — errors from DNA damage (e.g. oxidative damage producing C→A artefacts), symmetric on both strands. Same shape as `.amp.tn.txt`. |
 | `{sample}.amp.hp.txt` | Amplification indel error counts for homopolymer contexts: rows `HP1`…`HP9`, `HP10+` (homopolymer run length), columns `{A,T,C,G}_{-1,0,1}` (run base × 1bp deletion / opportunity / 1bp insertion). |
 | `{sample}.dmg.hp.txt` | Damage indel error counts for homopolymer contexts; same layout as `.amp.hp.txt`. |

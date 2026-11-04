@@ -87,64 +87,21 @@ jobs:
           pytest tests/mock_pipeline/ -v \
             --ignore=tests/mock_pipeline/test_mock_pipeline_nextflow.py
 
+  # The Nextflow test runs the DupCaller image built from this commit, not a
+  # published one, so Dockerfile and source changes are tested before release.
+  build-image:
+    uses: ./.github/workflows/build-image.yml
+
   mock-pipeline-nextflow:
-    runs-on: ubuntu-latest
+    needs: build-image
     strategy:
       fail-fast: false
       matrix:
-        # The oldest entry must match manifest.nextflowVersion in
-        # nextflow/nextflow.config; bump both together.
+        # Must match manifest.nextflowVersion in nextflow/nextflow.config
+        # (oldest and newest supported); bump both together.
         nextflow-version: ["23.10.1", "24.10.4"]
-    defaults:
-      run:
-        shell: bash -el {0}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up conda environment with pipeline dependencies
-        uses: conda-incubator/setup-miniconda@v3
-        with:
-          python-version: "3.12"
-          channels: bioconda,conda-forge
-          channel-priority: strict
-
-      # Nextflow's installer needs Java 17-26 on PATH; do not rely on the
-      # runner image shipping one.
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install Nextflow ${{ matrix.nextflow-version }}
-        env:
-          NXF_VER: ${{ matrix.nextflow-version }}
-        run: |
-          java -version
-          # The installer writes ./nextflow, which would collide with the
-          # repo's nextflow/ directory.
-          mkdir -p "$RUNNER_TEMP/nextflow-install"
-          cd "$RUNNER_TEMP/nextflow-install"
-          curl -fsSL https://get.nextflow.io | bash
-          sudo mv nextflow /usr/local/bin/
-          nextflow -version
-
-      # ubuntu-latest already runs Docker; this only verifies it.
-      - name: Verify Docker is available
-        run: docker info
-
-      - name: Install DupCaller
-        run: pip install .[test]
-
-      # The test skips when nextflow or a container runtime is missing; in
-      # CI both are installed above, so treat a skip as a failure.
-      - name: Run nextflow mock end-to-end pipeline test
-        run: |
-          set -o pipefail
-          pytest tests/mock_pipeline/test_mock_pipeline_nextflow.py -v -rs \
-            | tee pytest_nextflow.log
-          if grep -q "SKIPPED" pytest_nextflow.log; then
-            echo "::error::test_mock_pipeline_nextflow.py was skipped even though this job installs nextflow/docker -- fix the job setup rather than letting this pass on a skip."
-            exit 1
-          fi
+    uses: ./.github/workflows/nextflow-mock.yml
+    with:
+      image: dupcaller:ci
+      image-artifact: dupcaller-image
+      nextflow-version: ${{ matrix.nextflow-version }}

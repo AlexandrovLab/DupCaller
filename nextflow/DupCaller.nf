@@ -301,11 +301,17 @@ process PREMADE_DOWNLOAD {
     script:
     def md5_check = md5 ? "echo '${md5}  ${name}' | md5sum -c -" : ""
     """
-    # gdown (Google Drive and plain https URLs) is not in the DupCaller
-    # image, so install it into the task dir; HOME may be read-only.
-    export HOME=\$PWD PIP_DISABLE_PIP_VERSION_CHECK=1
-    pip install --quiet --no-cache-dir --target gdown_lib gdown==6.1.0
-    if ! PYTHONPATH=gdown_lib python -m gdown --no-cookies -O ${name} '${url}'; then
+    # gdown (Google Drive and plain https URLs) is bundled in DupCaller
+    # images built after 1.2.12. An older image (e.g. one set with
+    # dupcaller_container) lacks it, so it is then installed from PyPI into
+    # the task dir. HOME may be read-only.
+    export HOME=\$PWD
+    if ! python -c 'import gdown' 2>/dev/null; then
+        echo "gdown is not in this DupCaller image; installing gdown 6.1.0 from PyPI into the task directory" >&2
+        PIP_DISABLE_PIP_VERSION_CHECK=1 pip install --quiet --no-cache-dir --target gdown_lib gdown==6.1.0
+        export PYTHONPATH=gdown_lib
+    fi
+    if ! python -m gdown --no-cookies -O ${name} '${url}'; then
         echo "Could not download ${name} from ${url}" >&2
         echo "If Google Drive refused it ('Too many users have viewed or downloaded this file recently'), rerun later with -resume," >&2
         echo "or download it yourself and place it at ${premadeDir()}/${name} (a file already there is used as is)." >&2

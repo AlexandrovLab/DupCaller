@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=dc_nf_SAMPLE_ID
-#SBATCH --partition=YOUR_PARTITION
-#SBATCH --qos=YOUR_QOS
-#SBATCH --account=YOUR_ACCOUNT
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=400G
 #SBATCH --time=7-00:00:00
@@ -10,10 +7,12 @@
 #
 # SLURM wrapper around run_dupcaller_sample.sh: adds resource requests and
 # site paths only. Per sample, only SAMPLE_ID and the 4 fastq paths change.
+# Nothing site-specific is hard-coded: pass your cluster's partition, QOS
+# and account on the sbatch command line (--partition/--qos/--account, only
+# those your site uses), and override --cpus-per-task/--mem/--time there too
+# if the defaults above do not fit.
 #
 # EDIT BEFORE THE FIRST sbatch (the placeholders fail as shipped):
-#   - the #SBATCH --partition/--qos/--account lines above (YOUR_*), and
-#     --cpus-per-task/--mem/--time for your cluster;
 #   - REPO_ROOT and OUTDIR below (or pass them in --export);
 #   - REFERENCE, SNP_MASK and NOISE_MASK below, or instead pass PREMADE=hg38
 #     (or mm39) with PREMADE_DIR=/shared/dupcaller_premade in --export to
@@ -21,7 +20,8 @@
 #     PREMADE_STRAIN=C57BL_6NJ etc. picks the germline VCF, -S).
 #
 # Usage:
-#   sbatch --export=ALL,SAMPLE_ID=SAMPLE1,\
+#   sbatch --partition=YOUR_PARTITION --account=YOUR_ACCOUNT \
+#     --export=ALL,SAMPLE_ID=SAMPLE1,\
 #     TUMOR_FASTQ_1=...,TUMOR_FASTQ_2=...,\
 #     NORMAL_FASTQ_1=...,NORMAL_FASTQ_2=... \
 #     run_sample.slurm.sh
@@ -34,6 +34,12 @@
 # Nextflow memory string, e.g. MAX_MEMORY=192.GB). Default: this job's
 # Slurm memory allocation (--mem), so DupCaller.py call gets up to 6 GB per
 # CPU instead of pipeline.config's 96.GB cap.
+#
+# CONTAINER_MODULE=name runs `module load name` first (e.g. singularity or
+# apptainer; unset = nothing loaded, the runtime must be on PATH).
+# PROFILE overrides the Nextflow profile (default singularity,local, i.e.
+# every step runs inside this one allocation; docker,local also works).
+# NXF_SINGULARITY_CACHEDIR defaults to $HOME/.singularity_cache.
 #
 # PROTOCOL=renanoseq|nanoseqv2|udseq|metacs sets the barcode pattern and end
 # trimming for that protocol (metacs also needs BARCODE_LIST=file of allowed
@@ -89,9 +95,22 @@ fi
 KEEP_ARGS=()
 [ -n "${KEEP_TRIMMED_FASTQ:-}" ] && KEEP_ARGS=(-K)
 
-module load singularity  # or your cluster's equivalent module name
-export NXF_SINGULARITY_CACHEDIR="${NXF_SINGULARITY_CACHEDIR:-$HOME/.singularity_cache}"
-mkdir -p "$NXF_SINGULARITY_CACHEDIR"
+# Site-specific environment setup, all optional: CONTAINER_MODULE (e.g.
+# "singularity" or "apptainer") is loaded with `module load` if set;
+# otherwise singularity/apptainer must already be on PATH.
+if [ -n "${CONTAINER_MODULE:-}" ]; then
+    module load "${CONTAINER_MODULE}"
+fi
+PROFILE="${PROFILE:-singularity,local}"
+case "$PROFILE" in
+    singularity*)
+        command -v singularity >/dev/null || command -v apptainer >/dev/null || {
+            echo "singularity/apptainer not on PATH: set CONTAINER_MODULE to your cluster's module name, or load it before sbatch" >&2
+            exit 1
+        }
+        export NXF_SINGULARITY_CACHEDIR="${NXF_SINGULARITY_CACHEDIR:-$HOME/.singularity_cache}"
+        mkdir -p "$NXF_SINGULARITY_CACHEDIR" ;;
+esac
 
 "${REPO_ROOT}/nextflow/examples/run_dupcaller_sample.sh" \
     -s "${SAMPLE_ID}" \
@@ -103,5 +122,5 @@ mkdir -p "$NXF_SINGULARITY_CACHEDIR"
     ${MEMORY_ARGS[@]+"${MEMORY_ARGS[@]}"} \
     -p "${SLURM_CPUS_PER_TASK}" \
     -o "${OUTDIR}" \
-    -P singularity,local \
+    -P "${PROFILE}" \
     -R "${REPO_ROOT}"

@@ -1,0 +1,54 @@
+name: Build DupCaller image
+
+# Reusable: builds the DupCaller image from the checked-out commit, smoke
+# tests it, and uploads it (docker save) as an artifact for later jobs to
+# test (nextflow-mock.yml) and, in release.yml, publish. The published image
+# is therefore exactly the image the tests ran.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Value of the org.opencontainers.image.version label
+        type: string
+        default: dev
+      tag:
+        description: Local image name the artifact holds
+        type: string
+        default: dupcaller:ci
+      artifact:
+        description: Name of the uploaded image artifact
+        type: string
+        default: dupcaller-image
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image from this commit
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${{ inputs.version }}" \
+            -t "${{ inputs.tag }}" .
+
+      - name: Smoke test the image
+        run: |
+          img="${{ inputs.tag }}"
+          docker run --rm "$img" DupCaller.py --help > /dev/null
+          docker run --rm "$img" PERF --help > /dev/null
+          docker run --rm "$img" tabix --version | head -1
+          # PREMADE_DOWNLOAD uses the bundled gdown instead of PyPI.
+          docker run --rm "$img" python -c "import gdown; print('gdown', gdown.__version__)"
+          docker run --rm "$img" python -c "import DupCaller_sub; print('DupCaller', DupCaller_sub.__version__)"
+
+      - name: Save the image
+        run: docker save "${{ inputs.tag }}" | gzip -1 > dupcaller-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: dupcaller-image.tar.gz
+          retention-days: 7

@@ -1,8 +1,11 @@
 """Install-time regression test for the containerized Nextflow pipeline
 (nextflow/DupCaller.nf): DupCaller index + bwa-mem2 index -> trim ->
 bwa-mem2 mem -> gatk MarkDuplicates -> call -> estimate, run through
-Nextflow against the published yuhecheng62/dupcaller image instead of
-DupCaller.py directly on PATH (see test_mock_pipeline.py for that variant).
+Nextflow in the DupCaller container instead of DupCaller.py directly on
+PATH (see test_mock_pipeline.py for that variant). The image is the one
+pinned in nextflow/nextflow.config, or $DUPCALLER_IMAGE if set (CI sets it
+to an image built from the checked-out commit); run_nextflow_pipeline.sh
+fails if any DupCaller task ran in another image.
 
 Runs every case of run_nextflow_pipeline.sh: the default configuration
 with every optional resource unset, then one run per optional input

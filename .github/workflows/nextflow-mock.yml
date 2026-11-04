@@ -1,0 +1,107 @@
+name: Nextflow mock pipeline
+
+# Reusable: runs tests/mock_pipeline/test_mock_pipeline_nextflow.py (every
+# case of run_nextflow_pipeline.sh, the default case compared against
+# expected_matched_normal/) with the DupCaller image `image`, which
+# run_nextflow_pipeline.sh checks every DupCaller task ran in.
+#   - With `image-artifact`, the image is loaded from that artifact
+#     (build-image.yml): the image built from the checked-out commit.
+#   - Without it, the image is pulled anonymously from its registry on this
+#     fresh runner, which has never logged in to it (release.yml's check that
+#     the published image is publicly pullable).
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: DupCaller image to test (passed as --dupcaller_container)
+        type: string
+        required: true
+      image-artifact:
+        description: Artifact holding `image` (docker save); empty = pull it
+        type: string
+        default: ""
+      nextflow-version:
+        type: string
+        required: true
+
+jobs:
+  mock-pipeline-nextflow:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment with pipeline dependencies
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.12"
+          channels: bioconda,conda-forge
+          channel-priority: strict
+
+      # Nextflow's installer needs Java 17-26 on PATH; do not rely on the
+      # runner image shipping one.
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Nextflow ${{ inputs.nextflow-version }}
+        env:
+          NXF_VER: ${{ inputs.nextflow-version }}
+        run: |
+          java -version
+          # The installer writes ./nextflow, which would collide with the
+          # repo's nextflow/ directory.
+          mkdir -p "$RUNNER_TEMP/nextflow-install"
+          cd "$RUNNER_TEMP/nextflow-install"
+          curl -fsSL https://get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/
+          nextflow -version
+
+      # ubuntu-latest already runs Docker; this only verifies it.
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Download the image built in this workflow
+        if: inputs.image-artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.image-artifact }}
+          path: ${{ runner.temp }}/image
+
+      - name: Load or pull the DupCaller image
+        env:
+          IMAGE: ${{ inputs.image }}
+          IMAGE_ARTIFACT: ${{ inputs.image-artifact }}
+        run: |
+          if [ -n "$IMAGE_ARTIFACT" ]; then
+            gunzip -c "$RUNNER_TEMP/image/dupcaller-image.tar.gz" | docker load
+          else
+            # Anonymous pull: drop any registry credentials first.
+            docker logout "${IMAGE%%/*}" || true
+            docker pull "$IMAGE"
+          fi
+          docker image inspect "$IMAGE" \
+            --format 'image {{.Id}} revision {{index .Config.Labels "org.opencontainers.image.revision"}} version {{index .Config.Labels "org.opencontainers.image.version"}}'
+
+      - name: Install DupCaller
+        run: pip install .[test]
+
+      # The test skips when nextflow or a container runtime is missing; here
+      # both are installed above, so treat a skip as a failure.
+      - name: Run nextflow mock end-to-end pipeline test
+        env:
+          DUPCALLER_IMAGE: ${{ inputs.image }}
+        run: |
+          set -o pipefail
+          pytest tests/mock_pipeline/test_mock_pipeline_nextflow.py -v -rs \
+            | tee pytest_nextflow.log
+          if grep -q "SKIPPED" pytest_nextflow.log; then
+            echo "::error::test_mock_pipeline_nextflow.py was skipped even though this job installs nextflow/docker -- fix the job setup rather than letting this pass on a skip."
+            exit 1
+          fi

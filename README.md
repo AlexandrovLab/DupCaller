@@ -11,6 +11,7 @@ DupCaller is a tool for calling somatic mutations and calculating somatic mutati
 - [Quick Start](#quick-start)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Verify Installation](#verify-installation)
 - [Pipeline](#pipeline)
   - [Protocol Settings](#protocol-settings)
   - [Step 1: Index Reference Genome](#step-1-index-reference-genome)
@@ -38,12 +39,18 @@ Use this if you have no preferred reference genome file and want to follow the d
 
 - **This repository**, cloned: `git clone https://github.com/AlexandrovLab/DupCaller.git`
 - **Anaconda or equivalent**: if you use another package manager such as mamba or pixi, replace the installation commands with their equivalents.
-- **[Nextflow](https://www.nextflow.io/) >= 23.10.1** on your `PATH`.
+- **[Nextflow](https://www.nextflow.io/) 23.10.1 to 24.10.4** on your `PATH` (the versions CI tests; the commands below install 24.10.4). Other versions print a warning at launch and are untested.
 - **Docker** (for local/cloud) **or Singularity** (for HPC) on your `PATH`.  If you are on HPC and do not have Singularity, contact your admin to install it, or follow [Installation](#installation) and [Pipeline](#pipeline) instead.
 - **Paired-end FASTQs** (R1 and R2) for the duplex sample and, if you have one, its matched normal. Without a matched normal, see [Without a matched normal](#quick-start-without-a-matched-normal) below. We do not recommend calling samples <=100x duplex coverage without a matched normal.
-- **Internet access** on the first run, from wherever the tasks run, to pull the containers and download the genome.
+- **Internet access** on the first run, from wherever the tasks run, to pull the containers and download the genome (see [Pre-made genome downloads](#pre-made-genome-downloads) if your compute nodes are offline).
 - **Disk:** ~50 GB for the downloaded genome (hg38), plus space for the Nextflow work directory and results. Expect ~300GB of space per 30x data.
-- **Memory:** ~90 GB on the first run (building the bwa-mem2 index); after that, 6 GB per CPU for variant calling (192 GB at 32 CPUs).
+- **CPUs and memory:** see the box below.
+
+> **Compute requirements — set these for real data.**
+>
+> - `nextflow/pipeline.config` ships with conservative defaults, `threads = 1`, `max_cpus = 1` and `max_memory = 96.GB`, which align and call a whole genome on **one core**. Always set `--threads`, `--max_cpus` and `--max_memory` to what your machine or cluster job allows, as in the commands below (e.g. `--threads 32 --max_cpus 32 --max_memory 192.GB`). `DupCaller.py call` asks for 6 GB per CPU and `bwa-mem2 mem | samtools sort` for 32 GB + 1 GB per CPU, each capped by `--max_memory`. The pipeline warns at launch when it would run single-threaded, or when `--max_memory` is below what calling or the bwa-mem2 index needs.
+> - **The first run builds the bwa-mem2 index locally: ~90 GB of RAM on one node for hg38 (~80 GB for mm39), about 20 minutes, once per `--premade_dir`.** No pre-built bwa-mem2 index is hosted, so set `--max_memory` to at least 90.GB for that first run. Every later run reuses the index and needs only the per-CPU memory above.
+> - `--premade` (below) is the recommended route: it downloads the reference and the pre-built DupCaller index, so you never run `DupCaller.py index` yourself. With your own reference, build both indexes once on a large-memory node (bwa-mem2 index needs ~28 bytes of RAM per reference base) and reuse them; see [Before running a real dataset](nextflow/README.md#before-running-a-real-dataset).
 
 **Installation**
 
@@ -81,7 +88,7 @@ cd DupCaller
 
 **Configure your scheduler profile:**
 
-- `-profile singularity,local` runs every step on the current machine (e.g. inside one batch job). To submit each step as its own cluster job instead, use `-profile singularity,slurm` (or `lsf`, `sge`, `pbs`, `pbspro`), and first replace the `"PLEASE CHANGE"` values for that scheduler in the "Scheduler settings" block of `nextflow/pipeline.config` (line 137-144) with your cluster's information: the run stops with an error until they are set. `null` omits a flag (e.g. no QOS), and `cluster_options` adds extra submit flags such as your account. For SLURM, for example:
+- `-profile singularity,local` runs every step on the current machine (e.g. inside one batch job). To submit each step as its own cluster job instead, use `-profile singularity,slurm` (or `lsf`, `sge`, `pbs`, `pbspro`), and first replace the `"PLEASE CHANGE"` values for that scheduler in the "Scheduler settings" block of `nextflow/pipeline.config` with your cluster's information (nothing site-specific is preset): the run stops with an error until they are set. `null` omits a flag (e.g. no QOS), and `cluster_options` adds extra submit flags such as your account. For SLURM, for example:
 
   ```groovy
   slurm_queue     = "your_partition"       // sbatch --partition
@@ -137,9 +144,13 @@ nextflow run nextflow/DupCaller.nf \
 - `NXF_SINGULARITY_CACHEDIR` (on shared storage) keeps the container images, so they are downloaded once instead of into every run's work directory.
 - `--premade hg38` or `--premade mm39`. For mm39, add `--premade_strain STRAIN` (e.g. `C57BL_6NJ`) to use that mouse strain's germline VCF.
 - `--premade_dir` is where the genome is downloaded and kept (~50 GB for hg38). The first run downloads it and builds the bwa-mem2 index (~90 GB of RAM, about 20 minutes for hg38); every later run with the same `--premade_dir`, for any sample, reuses it. Put it on shared storage.
+- Each downloaded file is checked against the md5 listed in `nextflow/assets/premade/<genome>.tsv` (all hg38 files; for mm39, the FASTA and the DupCaller index). On every run, before any alignment, `PREMADE_CHECK_INDEX` opens each of the five DupCaller index files and compares its index schema version with the one the pipeline's DupCaller image reads. An outdated or incompatible index stops the run at that step with an error naming the file; it is never used silently. (With your own reference, `DupCaller.py call` and `estimate` run the same check when they start.)
 - `--protocol` is your library protocol: `renanoseq`, `nanoseqv2`, `udseq` or `metacs`. It sets the barcode pattern and how far from fragment and read ends mutations are ignored (see [Protocol Settings](#protocol-settings)); a wrong barcode pattern silently breaks duplex family formation. `metacs` also needs `--barcode_list barcode_list.txt`, the allowed Tn5 barcodes, one per line. For another protocol, give the barcode pattern with `--barcode_pattern` instead (N = barcode base, X = skipped base).
-- `--threads`/`--max_cpus`/`--max_memory`: set to your machine or the largest job your cluster allows. `--max_memory` should be at least 6 GB × `--threads` (what `DupCaller.py call` asks for; e.g. `--threads 16 --max_memory 96.GB`), and at least ~90 GB for the first run.
+- `--threads`/`--max_cpus`/`--max_memory`: **required for real data** (the shipped defaults are 1 CPU; see the box above). Set them to your machine or the largest job your cluster allows. `--max_memory` should be at least 6 GB × `--threads` (what `DupCaller.py call` asks for; e.g. `--threads 16 --max_memory 96.GB`), and at least ~90 GB for the first run.
 - Results go to `results/SAMPLE1/`. Rerunning the same command in the same directory resumes after a failure (`-resume`).
+
+<a id="pre-made-genome-downloads"></a>
+**Pre-made genome downloads.** The first `--premade` run downloads the files listed in `nextflow/assets/premade/<genome>.tsv` (GDC, GATK and Google Drive) from wherever its `PREMADE_DOWNLOAD` tasks run: the current machine with `-profile ...,local`, or the compute nodes with `-profile ...,slurm`. The download tool (`gdown`) is bundled in DupCaller images after 1.2.12, so nothing is installed at run time (the 1.2.12 image still installs `gdown` from PyPI in the download task), but the download itself needs internet access. If your compute nodes have none, either run that first `--premade` run inside an interactive job on a node that does, or download each file in the TSV yourself on such a node and put it in `<premade_dir>/<genome>/` under the name in the TSV's `file` column; files already there are used as is (see [Pre-made genomes](nextflow/README.md#pre-made-genomes---premade)). Later runs need no network access for the genome.
 
 If you have your own reference genome, see [Before running a real dataset](nextflow/README.md#before-running-a-real-dataset) and [One sample with your own reference](nextflow/README.md#one-sample-with-your-own-reference) in the Nextflow README, or run the command-line steps in [Pipeline](#pipeline) below.
 
@@ -185,14 +196,21 @@ pip install .
 
 ### Docker / Singularity
 
-A pre-built Docker image is available on Docker Hub at `yuhecheng62/dupcaller:1.2.12`.
+A pre-built image is published by the Alexandrov Lab on the GitHub Container Registry at `ghcr.io/alexandrovlab/dupcaller:1.2.12` (public, no login needed). From the release after 1.2.12 on, each release's image is built from that release's tagged source by GitHub Actions (`.github/workflows/release.yml`), which runs the Nextflow mock test on it before publishing it and again on a fresh runner that pulls it anonymously.
+
+**Pull and run with Docker:**
+
+```bash
+docker pull ghcr.io/alexandrovlab/dupcaller:1.2.12
+docker run --rm ghcr.io/alexandrovlab/dupcaller:1.2.12 DupCaller.py --help
+```
 
 **Pull and run with Singularity:**
 
-Pull the image from Docker Hub (only needed once):
+Pull the image (only needed once):
 
 ```bash
-singularity pull dupcaller-1.2.12.sif docker://yuhecheng62/dupcaller:1.2.12
+singularity pull dupcaller-1.2.12.sif docker://ghcr.io/alexandrovlab/dupcaller:1.2.12
 ```
 
 For quick verification:
@@ -206,6 +224,40 @@ For installation-free execution of DupCaller commands, run all DupCaller.py comm
 ```bash
 singularity exec --bind $(pwd):$(pwd) dupcaller-1.2.12.sif DupCaller.py {your commands}
 ```
+
+---
+
+## Verify Installation
+
+The repository ships three automated checks, the same ones GitHub Actions runs on every commit (`.github/workflows/test.yml`). Run them from the repository root. The two end-to-end tests run every step on a 3.2 kb synthetic genome with planted mutations and compare every deterministic output (VCFs, burdens, spectra, error profiles, stats) with the expected files in `tests/mock_pipeline/`, so a passing run reproduces the reference results exactly.
+
+`-rs` lists skipped tests with the reason: an end-to-end test **skips** instead of failing when a tool it needs is not on `PATH`, so a skip means "not checked", not "passed".
+
+**1. Unit tests** (DupCaller installed with pip, plus `tabix` from htslib):
+
+```bash
+conda activate DupCaller        # the environment from pip Installation
+pip install ".[test]"           # adds pytest
+pytest tests/unit/ -v -rs
+```
+
+**2. Mock end-to-end test, command line** (`index` → `trim` → `bwa-mem2 mem` → `gatk MarkDuplicates` → `call` → `estimate`, run directly; needs bwa-mem2, GATK, samtools and htslib, all in the environment from [pip Installation](#pip-installation)):
+
+```bash
+conda activate DupCaller
+pytest tests/mock_pipeline/test_mock_pipeline.py -v -rs
+```
+
+**3. Mock end-to-end test, Nextflow** (the same pipeline through `nextflow/DupCaller.nf` in containers, in 11 configurations: defaults, each optional input, tumor-only, and the `udseq` and `metacs` protocols). Needs Nextflow and Docker or Singularity on `PATH`, plus pytest and pysam (both in the DupCaller environment):
+
+```bash
+conda activate DupCaller
+conda install -y -c conda-forge -c bioconda nextflow=24.10.4   # if nextflow is not already on PATH
+module load singularity                                         # HPC only; skip with Docker
+pytest tests/mock_pipeline/test_mock_pipeline_nextflow.py -v -rs
+```
+
+It uses the DupCaller image pinned in `nextflow/nextflow.config`; set `DUPCALLER_IMAGE` to test another one (CI tests an image built from the checked-out commit this way). Without pytest, `tests/mock_pipeline/run_nextflow_pipeline.sh OUTDIR [docker|singularity] all` runs the same cases.
 
 ---
 
@@ -407,17 +459,17 @@ These are variant calling model parameters; adjustment is unnecessary for genera
 | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
 | -E           | --errprefix      | Prefix for all six error files ({prefix}.amp.tn.srd.txt, {prefix}.amp.hp.txt, {prefix}.amp.str.txt, {prefix}.dmg.tn.txt, {prefix}.dmg.hp.txt, {prefix}.dmg.str.txt); overrides the default (output prefix)                                                                                                                                                                                                               | None                 |
 | -lo          | --learnOnly      | Stop after estimating/writing the error-rate files (ERROR/ dir); skip variant calling entirely                                                                                                                                                                                                                                                                                                                           | False                |
-| -lfdr        | --lfdrThreshold  | Target per-channel lFDR (max of`(1-mutation_rate)/(LR*mutation_rate+1-mutation_rate)` over that channel's PASS calls, i.e. its weakest surviving call); channels above this get their LR threshold raised via a single closed-form solve using the round-1 mutation-rate estimate (non-iterative -- no re-simulation/re-estimation loop)                                                                               | 0.05                 |
+| -lfdr        | --lfdrThreshold  | Maximum local false discovery rate (lFDR) of a PASS call. A call's lFDR is `(1-mu)/(LR*mu+1-mu)`, where `mu` is the estimated mutation rate of its mutation channel. A call passes when its lFDR is at most this value and its log10 LR is at least `--minLR`, i.e. each channel's log10 LR threshold is `max(minLR, log10((1-lfdr)(1-mu)/(lfdr*mu)))`                                                                               | 0.05                 |
 | -a           | --pseudocount    | Pseudocount (> 0) of the SBS amplification-error (SRD) fit and of the error-matrix smoothing. The per-channel mutation-rate solve uses none                                                                                                                                                                                                                                                                              | 0.5                  |
-| -mlr         | --minLR          | Minimum log10 LR for a PASS call: floor on every channel's FDR-refined LR threshold, used for calling and for the detection-power simulation behind the burden's sensitivity correction                                                                                                                                                                                                                                  | 5                    |
+| -mlr         | --minLR          | Minimum log10 LR for a PASS call (applied together with `-lfdr`): floor on every channel's log10 LR threshold, used for calling and for the detection-power simulation behind the burden's sensitivity correction                                                                                                                                                                                                                                  | 5                    |
 | -mq          | --mapq           | Minimum MAPQ for an alignment to be considered                                                                                                                                                                                                                                                                                                                                                                           | 40                   |
 | -w           | --windowSize     | Genomic window size for coverage calculation and BAM partitioning                                                                                                                                                                                                                                                                                                                                                        | 100000               |
 | -bq          | --minBq          | Bases with quality below this value are zeroed out and excluded from variant calling/learning (usable iff BQ >= minBq)                                                                                                                                                                                                                                                                                                   | 18                   |
 | -aq          | --minAltQual     | Minimum summed per-strand consensus base quality at a position for SBS damage-rate learning to use it                                                                                                                                                                                                                                                                                                                    | 90                   |
 |              | --minRef         | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                                                                                                | 3                    |
 |              | --minAlt         | Minimum per-position read depth (ref+alt combined) for damage-rate learning to use it; the stricter of`--minRef`/`--minAlt` is applied, since the underlying check doesn't separate ref vs alt counts                                                                                                                                                                                                                | 3                    |
-|              | --srdMinRead     | Minimum reads on a single strand (F1R2 or F2R1) for that strand to be included in SBS single-read-damage (SRD) rate learning; evaluated independently per strand, and also gates the minimum BQ-qualifying bases required for a site to be counted                                                                                                                                                                       | 3                    |
-|              | --ssmMinRead     | Minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand-mutation (SSM)/damage-rate calculation                                                                                                                                                                                                                                                                 | 3                    |
+|              | --srdMinRead     | Minimum reads on a single strand (F1R2 or F2R1) for that strand to be included in SBS single-read discrepancy (SRD) rate learning; evaluated independently per strand, and also gates the minimum BQ-qualifying bases required for a site to be counted                                                                                                                                                                       | 3                    |
+|              | --ssmMinRead     | Minimum reads required on EACH strand (F1R2 and F2R1 both) for a duplex family to be considered for single-strand mismatch (SSM) damage-rate learning                                                                                                                                                                                                                                                                 | 3                    |
 | -pt          | --p_threshold    | Strand independence filter threshold for SBS and indel calls: a PASS call fails with FILTER `strand_independence` if either strand's p-value (INFO `MSP`) is <= this. Per strand, not corrected for the number of calls. Must be in [0, 1); 0 disables the filter (MSP is still reported)                                                                                                                              | 0.05                 |
 | -id          | --indelbed       | Indel enhanced Panel of Normals (ePoN) for indel calling                                                                                                                                                                                                                                                                                                                                                                 | None                 |
 | -rt          | --regionst       | Contigs to consider for error-profile training, if different from`-r`/`--regions`                                                                                                                                                                                                                                                                                                                                    | same as`--regions` |

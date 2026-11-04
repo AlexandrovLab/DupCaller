@@ -12,11 +12,15 @@ the BAM `@PG` header.)
 
 ## Prerequisites
 
-- Nextflow >= 23.10.1 (CI runs the pipeline on 23.10.1 and 24.10.4)
+- Nextflow 23.10.1 to 24.10.4, the versions CI runs the pipeline on
+  (`manifest.nextflowVersion`); other versions print a warning at launch
+  and are untested
 - Docker or Singularity/Apptainer (all processes run in containers — no
   local DupCaller/bwa-mem2/GATK install is required; see **Containers**)
-- A reference FASTA with three indexes next to it — a samtools FASTA
-  index, a DupCaller index and a bwa-mem2 index. Build or download them
+- A reference FASTA with, next to it, its samtools FASTA index (`.fai`),
+  its DupCaller index (five files: `.ref.h5`, `.tn.h5`, `.hp.h5`,
+  `.str.h5`, `.dbs.h5`, built with `DupCaller.py index -f reference.fa
+  -rt repeats.tsv`) and its bwa-mem2 index. Build or download them
   once before the first run (see **Before running a real dataset**); the
   pipeline then reuses them (`skip_index = true`, `skip_bwa_index = true`,
   the defaults). For hg38 or mm39, `--premade` can download and prepare
@@ -149,11 +153,13 @@ without `-D` each new directory downloads ~50 GB again); for mm39, `-S` sets
 
 On the first run, `PREMADE_DOWNLOAD` downloads each file listed in
 `assets/premade/<genome>.tsv` (for mm39, only `premade_strain`'s germline
-VCF) with `gdown` (checking its md5 where the
-source publishes one), `PREMADE_REFERENCE` unpacks the FASTA and builds its
-`.fai` (pysam's `faidx`), `PREMADE_CHECK_INDEX` stops the run if the
-downloaded DupCaller index does not use the index schema this DupCaller
-version reads, and
+VCF) with `gdown` and checks its md5
+against the TSV (every hg38 file; the mm39 FASTA and DupCaller index), `PREMADE_REFERENCE` unpacks the FASTA and builds its
+`.fai` (pysam's `faidx`), `PREMADE_CHECK_INDEX` checks the five DupCaller
+index files (`.ref.h5`/`.tn.h5`/`.hp.h5`/`.str.h5`/`.dbs.h5`) and
+stops the run, before any alignment, if one cannot be read or was built
+for a different index schema than this DupCaller image reads (it runs on
+every run, including on files reused from `premade_dir`), and
 `PREMADE_BWA_MEM2_INDEX` builds the bwa-mem2 index, which is not hosted.
 All of it is kept in `premade_dir/<genome>/` (`storeDir`), so every later
 run with the same `premade_dir`, including a different sample or a fresh
@@ -165,7 +171,12 @@ work directory, reuses it without downloading or indexing again.
   hg38 and ~80 GB for mm39, so set `max_memory` at least that high for
   the first run (the pipeline warns at launch otherwise).
 - **Network:** the download tasks need internet access from wherever they
-  run. The DupCaller index and mm39 files are on Google Drive, which
+  run (with `-profile ...,slurm`, the compute nodes). `gdown` is bundled
+  in DupCaller images after 1.2.12, so they install nothing from PyPI; the
+  1.2.12 image installs `gdown` from PyPI in the task (see **Containers**),
+  so it also needs PyPI access. If compute nodes are offline, run the first `--premade` run
+  in an interactive job on a node with network access, or pre-download
+  the files as described below. The DupCaller index and mm39 files are on Google Drive, which
   blocks a large file for up to a day after many downloads ("Too many
   users have viewed or downloaded this file recently"). A failed download
   is retried twice, a minute or two apart; after that, rerun later with
@@ -173,7 +184,8 @@ work directory, reuses it without downloading or indexing again.
   missing file yourself (in a browser, or via **Make a copy** to your own
   Drive) and put it in `premade_dir/<genome>/` under the name in
   `assets/premade/<genome>.tsv`. A file already there is used as is, with
-  no md5 check.
+  no md5 check (check it yourself with `md5sum` against the TSV's `md5`
+  column); the DupCaller index files are still schema-checked.
 - **Overrides:** `germline_vcf` or `noise_mask`, if set, replace the
   premade ones; `regions`, if changed from the hg38 default, is used as
   is. `skip_index`, `skip_bwa_index` and `repeat_tsv` are ignored.
@@ -214,19 +226,21 @@ of restarting from scratch.
 
 On SLURM, wrap it with `examples/run_sample.slurm.sh` (or copy/adapt it).
 It adds `#SBATCH` resource lines and calls the script above with
-`-P singularity,local`, `-p "$SLURM_CPUS_PER_TASK"` and `-M` set to the
-job's Slurm memory allocation (`--mem`; set `MAX_MEMORY`, e.g.
-`MAX_MEMORY=192.GB`, to override). **Edit it before the first `sbatch`**:
-as shipped, its placeholders fail. Replace the `#SBATCH
---partition/--qos/--account` values (`YOUR_*`, and adjust
-`--cpus-per-task`/`--mem`/`--time`), and set `REPO_ROOT`, `OUTDIR`,
-`REFERENCE`, `SNP_MASK` and `NOISE_MASK` in the script (`REPO_ROOT` and
-`OUTDIR` can instead be passed in `--export`). Then, from the repository
-root:
+`-P singularity,local` (`PROFILE` overrides it), `-p "$SLURM_CPUS_PER_TASK"`
+and `-M` set to the job's Slurm memory allocation (`--mem`; set
+`MAX_MEMORY`, e.g. `MAX_MEMORY=192.GB`, to override). It hard-codes no
+partition, QOS, account or module: pass the scheduler flags your site
+needs on the `sbatch` command line, and set `CONTAINER_MODULE` (e.g.
+`singularity` or `apptainer`) if the container runtime must be loaded with
+`module load`. **Edit it before the first `sbatch`**: as shipped, its
+placeholder paths fail. Set `REPO_ROOT`, `OUTDIR`, `REFERENCE`, `SNP_MASK`
+and `NOISE_MASK` in the script (`REPO_ROOT` and `OUTDIR` can instead be
+passed in `--export`). Then, from the repository root:
 
 ```bash
-sbatch --cpus-per-task=32 --mem=200G \
-    --export=ALL,REPO_ROOT=$PWD,OUTDIR=/path/to/results/SAMPLE1,SAMPLE_ID=SAMPLE1,\
+sbatch --partition=YOUR_PARTITION --account=YOUR_ACCOUNT \
+    --cpus-per-task=32 --mem=200G \
+    --export=ALL,REPO_ROOT=$PWD,OUTDIR=/path/to/results/SAMPLE1,SAMPLE_ID=SAMPLE1,CONTAINER_MODULE=singularity,\
 TUMOR_FASTQ_1=...,TUMOR_FASTQ_2=...,NORMAL_FASTQ_1=...,NORMAL_FASTQ_2=... \
     nextflow/examples/run_sample.slurm.sh
 ```
@@ -438,13 +452,19 @@ SLURM.
 
 | Process(es) | Image | Registry |
 |---|---|---|
-| `INDEX_REFERENCE`, `TRIM_BARCODES`, `CALL_VARIANTS`, `ESTIMATE_BURDEN`, `PREMADE_DOWNLOAD`, `PREMADE_REFERENCE`, `PREMADE_CHECK_INDEX` | `yuhecheng62/dupcaller:1.2.12` | Docker Hub |
+| `INDEX_REFERENCE`, `TRIM_BARCODES`, `CALL_VARIANTS`, `ESTIMATE_BURDEN`, `PREMADE_DOWNLOAD`, `PREMADE_REFERENCE`, `PREMADE_CHECK_INDEX` | `ghcr.io/alexandrovlab/dupcaller:1.2.12` | GitHub Container Registry (AlexandrovLab) |
 | `BWA_MEM2_INDEX`, `PREMADE_BWA_MEM2_INDEX` | `quay.io/biocontainers/bwa-mem2:2.3--he70b90d_0` | quay.io |
 | `BWA_MEM2_SORT` | `community.wave.seqera.io/library/bwa-mem2_htslib_samtools:db98f81f55b64113` (bwa-mem2 2.3, samtools 1.22.1; nf-core's `bwamem2/mem` image) | Seqera Community |
 | `MARK_DUPLICATES` | `quay.io/biocontainers/gatk4:4.3.0.0--py36hdfd78af_0` | quay.io |
 
-`PREMADE_DOWNLOAD` installs `gdown` 6.1.0 from PyPI into its task
-directory at run time, since the DupCaller image does not include it.
+The DupCaller image is built from this repository's `Dockerfile` at each
+release's tag and published by `.github/workflows/release.yml` after the
+Nextflow mock test passes on it; it includes `gdown` for
+`PREMADE_DOWNLOAD`. (The 1.2.12 image predates this and lacks `gdown`; with
+it, `PREMADE_DOWNLOAD` falls back to installing `gdown` 6.1.0 from PyPI
+into its task directory.) `--dupcaller_container IMAGE` (or
+`dupcaller_container` in a config file) replaces the image in every
+process above, e.g. with a local `.sif` file or a mirror.
 
 The quay.io and Seqera Community images are pinned in `nextflow.config` by `sha256`
 digest rather than by tag, so every run pulls exactly the same image even
@@ -454,32 +474,16 @@ only the digest is used. The GATK image contains the same GATK 4.3.0.0
 (HTSJDK 3.0.1, Picard 2.27.5) as `broadinstitute/gatk:4.3.0.0`, which
 earlier versions of this pipeline used.
 
-**Docker Hub pull limits.** Only the DupCaller image comes from Docker
-Hub, which rate-limits anonymous pulls per IP address (100 per hour, per
-Docker Hub's rate-limit headers in October 2026). One run pulls it at most
-once per host (Docker) or once per cache directory (Singularity), so a
-single run is well within the limit. The limit can still be hit when many
-users or CI jobs share one outbound IP (cluster NAT, cloud runners). To
-avoid this:
+**Image caching.** With Singularity, set
+`NXF_SINGULARITY_CACHEDIR` to a shared directory (as
+`examples/run_sample.slurm.sh` does): each image is pulled and converted
+once and reused by every later run, including on offline compute nodes. To
+use a local copy of the DupCaller image:
 
-- Log in before running: `docker login` for Docker. For Singularity, set
-  `SINGULARITY_DOCKER_USERNAME`/`SINGULARITY_DOCKER_PASSWORD`, or the
-  `APPTAINER_` equivalents for Apptainer. Authenticated pulls have a
-  higher limit.
-- With Singularity, set `NXF_SINGULARITY_CACHEDIR` to a shared directory
-  (as `examples/run_sample.slurm.sh` does): each image is pulled and
-  converted once and reused by every later run, including offline
-  compute nodes.
-- To use a mirror or a local copy, override the container in your own
-  config for every process that uses the DupCaller image:
-
-  ```groovy
-  process {
-      withName: 'INDEX_REFERENCE|TRIM_BARCODES|CALL_VARIANTS|ESTIMATE_BURDEN|PREMADE_DOWNLOAD|PREMADE_REFERENCE|PREMADE_CHECK_INDEX' {
-          container = '/path/to/dupcaller-1.2.12.sif'
-      }
-  }
-  ```
+```bash
+singularity pull dupcaller-1.2.12.sif docker://ghcr.io/alexandrovlab/dupcaller:1.2.12
+nextflow run nextflow/DupCaller.nf ... --dupcaller_container "$PWD/dupcaller-1.2.12.sif"
+```
 
 ## Output
 
@@ -524,4 +528,12 @@ must reproduce the matched-normal reference once its barcodes are mapped
 back).
 `tests/mock_pipeline/test_mock_pipeline_nextflow.py` wraps it in pytest
 and checks that each case passed the right option to DupCaller (and that
-the default case passed none).
+the default case passed none). `DUPCALLER_IMAGE=IMAGE` runs it with that
+DupCaller image instead of the pinned one and checks that every DupCaller
+task ran in it. CI (`.github/workflows/test.yml`) builds the image from the
+checked-out commit and runs this test on it with Nextflow 23.10.1 and
+24.10.4; `.github/workflows/release.yml` does the same for a release tag
+before publishing the image, then again with the published image pulled
+anonymously. See the main README's
+[Verify Installation](../README.md#verify-installation) for all three
+test suites.
