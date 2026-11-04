@@ -2042,11 +2042,24 @@ def do_estimate(args):
             gene_indel_cov = dict()
             cds_len = dict()
             coverage_tbx = TabixFile(f"{prefix}/{sample}_coverage.bed.gz")
+            coverage_contigs = set(coverage_tbx.contigs)
+            warned_genes = set()
             for rec in TabixFile(args.genebed).fetch():
                 (chrom, start, end, gene_exon) = rec.split("\t")[0:4]
                 start = int(start)
                 end = int(end)
                 gene = gene_exon.split("_")[0]
+                # Gene-bed chromosomes absent from coverage.bed.gz (e.g. chrY
+                # for a reference or sample without it) are skipped with a
+                # warning instead of crashing the tabix fetch.
+                if chrom not in coverage_contigs:
+                    if gene not in warned_genes:
+                        print(
+                            f"WARNING: gene {gene} is on {chrom}, which is not "
+                            "in the coverage file; skipping its exons there."
+                        )
+                        warned_genes.add(gene)
+                    continue
                 exon_sbs_cov = 0.0
                 exon_indel_cov = 0.0
                 for loc in coverage_tbx.fetch(chrom, start, end):
